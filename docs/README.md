@@ -115,20 +115,40 @@ This is not for:
 
 ## Development Phases
 
-### Phase 1: Passive Tracing + Test Instrumentation
-- Launch binary with Frida tracing (Linux + macOS)
+### Phase 1a: Tracing Foundation
+- Daemon architecture (lazy start, Unix socket, 30min idle shutdown)
+- Launch binary with Frida (Linux + macOS)
+- DWARF parsing to identify user code
+- Dynamic trace patterns (add/remove at runtime)
 - Capture function enter/exit, arguments, return values
-- Full multi-threading support (thread ID, name, ordering)
-- Auto-follow fork/exec with PID tagging
-- Store in SQLite with auto-retention
-- **Test instrumentation with smart hints** - run tests, get structured failures with suggested trace patterns
-- Crash capture with state snapshot
+- Store in SQLite with FTS, query with summary/verbose modes
+- MCP tools: `debug_launch`, `debug_trace`, `debug_query`, `debug_stop`
+
+**Validation:** Launch binary, add targeted traces, query events, find bug—no code changes to target.
+
+### Phase 1b: Advanced Runtime Control
+- Configurable serialization depth per pattern
+- Multi-threading support (thread name, thread-aware queries)
 - Hot function auto-detection with sampling
-- MCP tools: `debug_launch`, `debug_query`, `debug_trace`, `debug_test`, `debug_stop`
+- Storage limits and retention policies
 
-**Validation A:** Debug a real bug by running once, querying history, adjusting traces, re-triggering. No recompilation.
+**Validation:** High-throughput functions auto-sample. Deep inspection when needed.
 
-**Validation B:** Run test suite, test fails, LLM reruns single test with suggested tracing, finds root cause. No full suite reruns.
+### Phase 1c: Crash & Multi-Process
+- Crash capture (signal interception, stack, registers, locals)
+- Fork/exec following with PID tagging
+- Enhanced queries (time range, duration filters)
+
+**Validation:** App crashes → LLM gets full context. App forks → events tracked across processes.
+
+### Phase 1d: Test Instrumentation
+- `debug_test` tool for TDD workflow
+- Test adapter trait for extensibility
+- cargo test adapter (Rust)
+- Structured failures with rule-based trace hints
+- Single-test rerun with targeted tracing
+
+**Validation:** Test fails → rerun with suggested traces → find root cause. No full suite reruns.
 
 ### Phase 2: Active Debugging
 - Conditional breakpoints

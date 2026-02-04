@@ -397,24 +397,31 @@ CREATE VIRTUAL TABLE events_fts USING fts5(
 
 ## MCP Tool Definitions
 
-### debug_launch
+### debug_launch (Phase 1a)
 
 Start a new debug session.
 
 ```typescript
 debug_launch({
-  command: string,           // Path to executable
-  args?: string[],           // Command line arguments
-  cwd?: string,              // Working directory
+  command: string,              // Path to executable
+  args?: string[],              // Command line arguments
+  cwd?: string,                 // Working directory
+  projectRoot: string,          // Root directory for user code detection
   env?: Record<string, string>, // Environment variables
-  tracePatterns?: string[]   // Initial trace patterns (default: user code)
+  traceUserCode?: boolean       // Trace all functions in projectRoot (default: false)
 }) → {
-  sessionId: string,
-  pid: number
+  sessionId: string,            // Human-readable: "myapp-2026-02-05-14h32"
+  pid: number,
+  tracedFunctions: number       // Count of initially hooked functions
 }
 ```
 
-### debug_stop
+**Notes:**
+- `projectRoot` is required for user code detection via DWARF
+- Session ID is human-readable for easy reference in conversation
+- `traceUserCode: false` by default — use `debug_trace` to add patterns
+
+### debug_stop (Phase 1a)
 
 Stop a debug session.
 
@@ -424,7 +431,7 @@ debug_stop({
 }) → { success: boolean }
 ```
 
-### debug_test (Phase 1)
+### debug_test (Phase 1d)
 
 Run tests with optional tracing. Core feature for TDD workflows.
 
@@ -482,22 +489,28 @@ const events = await debug_query({
 // → Found the bug
 ```
 
-### debug_trace
+### debug_trace (Phase 1a)
 
-Adjust tracing scope at runtime. No restart required.
+Add or remove trace patterns at runtime. No restart required.
 
 ```typescript
 debug_trace({
   sessionId: string,
   add?: string[],            // Patterns to start tracing
   remove?: string[],         // Patterns to stop tracing
-  depth?: number             // Serialization depth for added patterns
+  depth?: number             // Serialization depth (Phase 1b, ignored in 1a)
 }) → {
-  activePatterns: string[]   // Current trace patterns
+  activePatterns: string[],  // Current trace patterns
+  hookedFunctions: number    // Total hooked function count
 }
 ```
 
-### debug_query
+**Pattern Syntax:**
+- `*` matches any characters except `::`
+- `**` matches any characters including `::`
+- `@usercode` expands to all functions in projectRoot
+
+### debug_query (Phase 1a)
 
 Query execution history.
 

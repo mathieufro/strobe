@@ -4,115 +4,276 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 
 ---
 
-## Phase 1: Passive Tracing + Test Instrumentation
+## Phase 1a: Tracing Foundation
 
-**Goal:** LLM can observe program execution and debug tests without code changes.
+**Goal:** Prove the core concept works. LLM can launch a program, add targeted traces, observe execution, and query what happened.
 
 ### Features
 
-#### Launch with Tracing
+#### Daemon Architecture
+- Single global daemon per user
+- Lazy start on first MCP call
+- Unix socket at `~/.strobe/strobe.sock`
+- Auto-shutdown after 30 minutes idle
+
+#### Launch Process
 - Spawns process via Frida
-- Automatically traces user code (source files in project directory)
-- Follows fork/exec automatically, tagging events with PID
-- Returns session ID for subsequent operations
+- Reads DWARF debug info to identify user code
+- No tracing by default (`traceUserCode: false`)
+- Returns human-readable session ID
+
+#### Dynamic Trace Patterns
+- Add/remove trace patterns at runtime
+- Glob syntax: `*` matches within module, `**` matches across
+- Special pattern `@usercode` for all project functions
+- Hooks injected live, no restart required
+
+#### Basic Event Capture
+- Function enter events (name, arguments)
+- Function exit events (return value, duration)
+- Nanosecond timestamps for ordering
+- Parent event tracking for call hierarchy
+
+#### Serialization (Fixed)
+- Primitives serialized directly
+- Structs serialized to depth 1
+- Arrays truncated to first 100 elements
+- Strings truncated at 1KB
+- Pointers as hex address
+
+#### Storage
+- SQLite with WAL mode
+- Events table with indexes for common queries
+- FTS5 for function name search
 
 #### Query Execution History
-- Search by function name, source file, return value, duration
-- Filter by thread ID or thread group
-- Time range filtering
-- Order by timestamp or thread-then-timestamp
-- Pagination with metadata (total count, showing first N)
-
-When queries return large result sets, the LLM receives pagination info to narrow down with follow-up queries.
-
-#### Dynamic Trace Adjustment
-- Add/remove trace patterns while app runs (no restart required)
-- Glob syntax: `*` matches within module, `**` matches across modules
-- Adjust serialization depth per pattern
-- Hot function auto-detection with sampling (LLM is warned when data is sampled)
-
-#### Crash Capture
-When app crashes (SIGSEGV, SIGABRT, etc.), Frida intercepts before termination:
-- Stack trace at crash point
-- Register state
-- Local variables in crashing frame
-- Last N events leading to crash
-
-Query with `eventType: "crash"` to retrieve full crash context.
+- Search by function name (equals, contains, regex)
+- Search by source file
+- Filter by return value (equals, isNull)
+- Pagination (default limit: 50)
+- Summary mode (default) vs verbose mode
 
 #### Stop Session
 - Detaches Frida cleanly
-- Session data deleted by default
-- Optional: retain session for later analysis (auto-purged after 7 days)
-- Storage hard limit: 10GB total, oldest sessions purged first
+- Deletes session data
+- Session stays queryable after process exits until stop
 
-#### Test Instrumentation (TDD Workflow)
+#### MCP Tools
+- `debug_launch` - Start session (no tracing by default)
+- `debug_trace` - Add/remove trace patterns
+- `debug_query` - Search execution history
+- `debug_stop` - End session and cleanup
 
-First-class support for test-driven debugging. This is a killer feature for autonomous debugging.
-
-**Run full suite** with minimal tracing for fast feedback. On failure, receive structured results with **rule-based hints**:
-- Test name, file, line number
-- Error message and stack trace
-- **Suggested trace patterns** extracted from stack trace (no AI needed)
-- **Rerun command** for just this test
-
-**Rerun single test** with targeted tracing using the suggested patterns. Now trace events are captured around the failure point.
-
-**Why this matters:**
-- LLMs often forget about lean test scripts, run full suite repeatedly
-- Test failures already tell you WHERE to look
-- No need to "trace everything" - trace what the failure suggests
-- Faster iteration, less noise
-
-### What Gets Captured
+### What Gets Captured (Phase 1a)
 
 | Data | Captured | Notes |
 |------|----------|-------|
 | Function name | Yes | Demangled (raw name also available) |
-| Source file + line | Yes | Via DWARF/PDB |
-| Arguments | Yes | JSON serialized, depth-limited, cycle-detected |
+| Source file + line | Yes | Via DWARF |
+| Arguments | Yes | JSON serialized, depth 1 |
 | Return value | Yes | JSON serialized |
 | Duration | Yes | Nanosecond precision |
-| Thread ID + name | Yes | For multi-threaded debugging |
-| Process ID | Yes | For fork/exec tracking |
+| Timestamp | Yes | Nanoseconds since session start |
+| Thread ID | Yes | Basic support |
 | Call hierarchy | Yes | Parent event tracking |
-| Sampling metadata | Yes | When auto-sampling is active |
 
-### Context-Aware Tracing Defaults
+### Platform Support (Phase 1a)
 
-Tracing scope depends on context:
+| Platform | Status |
+|----------|--------|
+| Linux (x86_64) | Supported |
+| macOS (arm64, x86_64) | Supported |
+| Windows | Future phase |
 
-| Context | Default | Rationale |
-|---------|---------|-----------|
-| `debug_launch` | User code | Broad observation for unknown bugs |
-| `debug_test` (full suite) | Minimal/none | Fast feedback, wait for failure |
-| `debug_test` (rerun failed) | Suggested patterns | Stack trace tells us what to trace |
+### Language Support (Phase 1a)
 
-**User code heuristic:**
-- **Traced:** Functions whose source file is in the project directory
-- **Not traced:** Standard library, system calls, third-party dependencies
+| Language | Status | Debug Info |
+|----------|--------|------------|
+| C | Supported | DWARF |
+| C++ | Supported | DWARF + demangling |
+| Rust | Supported | DWARF + demangling |
 
-The LLM can broaden or narrow scope at runtime via `debug_trace`.
+### Error Handling
+
+| Error | LLM Action |
+|-------|------------|
+| `NO_DEBUG_SYMBOLS` | Ask user to rebuild with `-g` |
+| `SIP_BLOCKED` | Offer: copy to /tmp, codesign, or disable SIP |
+| `SESSION_EXISTS` | Call `debug_stop` first |
 
 ### Validation Criteria
 
-**Scenario A: General debugging**
+**Scenario: Targeted tracing workflow**
+1. LLM calls `debug_launch` with no tracing
+2. User reports bug: "crashes when I click submit"
+3. LLM calls `debug_trace({ add: ["submit::*", "form::validate"] })`
+4. User reproduces bug
+5. LLM calls `debug_query` to find suspicious return values
+6. LLM queries again with `verbose: true` for full arguments
+7. LLM identifies root cause
+
+**Success:** LLM can observe what functions were called, with what arguments, and what they returned—without any code changes to the target. Tracing is targeted, not "trace everything".
+
+---
+
+## Phase 1b: Advanced Runtime Control
+
+**Goal:** Production-ready tracing with performance safeguards and deeper inspection.
+
+### Features
+
+#### Configurable Serialization Depth
+- Adjust depth per trace pattern via `debug_trace`
+- `depth: 2` for nested struct inspection
+- Cycle detection with `<circular ref>` markers
+- Per-pattern depth overrides
+
+#### Multi-Threading Support
+- Thread name capture (when available)
+- Thread-aware queries (filter by thread)
+- Order by thread-then-timestamp for per-thread analysis
+
+#### Hot Function Handling
+- Auto-detect functions called >100k/sec
+- Auto-sample to 1% (configurable)
+- Sampling indicator in query results
+- LLM can disable sampling or narrow patterns
+
+#### Storage Management
+- Configurable retention (default: delete on stop)
+- Optional retain for later analysis (`debug_stop({ retain: true })`)
+- Auto-purge retained sessions after 7 days
+- Hard limit: 10GB total, oldest purged first
+
+#### Enhanced debug_trace
+- `depth` parameter for serialization depth
+- Returns sampling warnings if active
+
+### Validation Criteria
+
+**Scenario: Deep inspection with safeguards**
+1. LLM launches app, adds trace on `process_data::*`
+2. Function called 500k times/sec — auto-sampling kicks in
+3. LLM receives warning: "sampling at 1%"
+4. LLM narrows pattern to `process_data::validate` only
+5. Full capture resumes
+6. LLM requests `depth: 2` for nested config struct
+7. LLM finds bug in nested field
+
+**Success:** High-throughput functions don't crash the system. LLM can inspect deeper when needed.
+
+---
+
+## Phase 1c: Crash & Multi-Process
+
+**Goal:** Handle crashes gracefully and track execution across fork/exec.
+
+### Features
+
+#### Crash Capture
+When app crashes (SIGSEGV, SIGABRT, etc.), Frida intercepts before termination:
+- Signal type and faulting address
+- Stack trace at crash point
+- Register state
+- Local variables in crashing frame (via DWARF)
+- Last N events leading to crash
+
+Query with `eventType: "crash"` to retrieve full crash context.
+
+#### Fork/Exec Following
+- Automatically attach to child processes
+- Tag events with process ID
+- Unified view across all spawned processes
+- Session includes all PIDs
+
+#### Enhanced Queries
+- Time range filtering (`-5s`, absolute timestamps)
+- Duration filtering (find slow functions)
+- Process ID filtering
+- Combined filters
+
+### Validation Criteria
+
+**Scenario A: Crash debugging**
 1. LLM launches app with tracing
-2. User triggers the bug
-3. LLM queries execution history
-4. LLM identifies suspicious area
-5. LLM adjusts traces to focus on that area
-6. User triggers bug again
-7. LLM finds root cause
+2. User triggers a crash (null pointer, etc.)
+3. Frida intercepts signal, captures state
+4. LLM queries `eventType: "crash"`
+5. LLM sees stack trace, registers, locals, and events leading to crash
+6. LLM identifies root cause
 
-**Scenario B: TDD workflow**
-1. LLM runs test suite via `debug_test`
+**Scenario B: Multi-process tracking**
+1. LLM launches app that forks worker processes
+2. Events captured from parent and all children
+3. LLM queries with PID filter to focus on specific process
+4. LLM correlates events across processes
+
+**Success:** Crashes don't lose information. Fork/exec doesn't break tracing.
+
+---
+
+## Phase 1d: Test Instrumentation
+
+**Goal:** First-class TDD workflow. Run tests, get structured failures with hints, rerun with targeted tracing.
+
+### Features
+
+#### Run Test Suite
+- Execute test command (e.g., `cargo test`)
+- Minimal/no tracing for fast feedback
+- Parse structured output
+
+#### Structured Failure Output
+On test failure, return:
+- Test name, file, line number
+- Error message
+- Stack trace
+- **Suggested trace patterns** (extracted from stack, rule-based)
+- **Rerun command** for single test
+
+#### Test Adapter Trait
+```rust
+pub trait TestAdapter {
+    fn detect(&self, project: &Path) -> Option<Framework>;
+    fn run_command(&self, config: &TestConfig) -> String;
+    fn rerun_command(&self, test: &str) -> String;
+    fn parse_output(&self, stdout: &str, stderr: &str) -> TestResult;
+    fn suggest_traces(&self, failure: &TestFailure) -> Vec<String>;
+}
+```
+
+#### cargo test Adapter (Rust)
+- Detect via `Cargo.toml`
+- Use `--format json` for structured output
+- Parse JSON for failures
+- Extract module names from stack for trace hints
+
+#### Rerun with Tracing
+- Run single test with trace patterns
+- Capture events around failure
+- Query to find root cause
+
+#### MCP Tools
+- `debug_test` - Run tests, get structured results
+
+### Context-Aware Tracing Defaults
+
+| Context | Default Tracing | Rationale |
+|---------|-----------------|-----------|
+| `debug_launch` | User code | Broad observation for unknown bugs |
+| `debug_test` (full suite) | Minimal/none | Fast feedback, wait for failure |
+| `debug_test` (rerun) | Suggested patterns | Stack trace tells us what to trace |
+
+### Validation Criteria
+
+**Scenario: TDD debugging workflow**
+1. LLM runs `debug_test({ command: "cargo test" })`
 2. Test fails, LLM receives structured failure with hints
-3. LLM reruns single test with suggested trace patterns
+3. LLM runs `debug_test({ command: "cargo test", test: "test_name", tracePatterns: hints })`
 4. LLM queries trace events around the failure
-5. LLM finds root cause
+5. LLM identifies root cause
 
-**No recompilation. No code changes. No manual log statements. No running full suite repeatedly.**
+**Success:** No full suite reruns. No guessing what to trace. Failure tells LLM exactly where to look.
 
 ---
 
