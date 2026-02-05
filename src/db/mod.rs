@@ -78,6 +78,7 @@ mod tests {
             arguments: Some(serde_json::json!([1, "hello"])),
             return_value: None,
             duration_ns: None,
+            text: None,
         }).unwrap();
 
         db.insert_event(Event {
@@ -94,6 +95,7 @@ mod tests {
             arguments: None,
             return_value: Some(serde_json::json!(42)),
             duration_ns: Some(1000),
+            text: None,
         }).unwrap();
 
         // Query by function name

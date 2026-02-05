@@ -8,6 +8,8 @@ use super::Database;
 pub enum EventType {
     FunctionEnter,
     FunctionExit,
+    Stdout,
+    Stderr,
 }
 
 impl EventType {
@@ -15,6 +17,8 @@ impl EventType {
         match self {
             Self::FunctionEnter => "function_enter",
             Self::FunctionExit => "function_exit",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
         }
     }
 
@@ -22,6 +26,8 @@ impl EventType {
         match s {
             "function_enter" => Some(Self::FunctionEnter),
             "function_exit" => Some(Self::FunctionExit),
+            "stdout" => Some(Self::Stdout),
+            "stderr" => Some(Self::Stderr),
             _ => None,
         }
     }
@@ -42,6 +48,7 @@ pub struct Event {
     pub arguments: Option<serde_json::Value>,
     pub return_value: Option<serde_json::Value>,
     pub duration_ns: Option<i64>,
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,8 +153,8 @@ impl Database {
         conn.execute(
             "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             arguments, return_value, duration_ns, text)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 event.id,
                 event.session_id,
@@ -162,6 +169,7 @@ impl Database {
                 event.arguments.map(|v| v.to_string()),
                 event.return_value.map(|v| v.to_string()),
                 event.duration_ns,
+                event.text,
             ],
         )?;
 
@@ -175,8 +183,8 @@ impl Database {
             conn.execute(
                 "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
                  event_type, function_name, function_name_raw, source_file, line_number,
-                 arguments, return_value, duration_ns)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 arguments, return_value, duration_ns, text)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     event.id,
                     event.session_id,
@@ -191,6 +199,7 @@ impl Database {
                     event.arguments.as_ref().map(|v| v.to_string()),
                     event.return_value.as_ref().map(|v| v.to_string()),
                     event.duration_ns,
+                    &event.text,
                 ],
             )?;
         }
@@ -208,7 +217,7 @@ impl Database {
         let mut sql = String::from(
             "SELECT id, session_id, timestamp_ns, thread_id, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns
+             arguments, return_value, duration_ns, text
              FROM events WHERE session_id = ?"
         );
 
@@ -286,6 +295,7 @@ impl Database {
                 arguments: args,
                 return_value: ret,
                 duration_ns: row.get(12)?,
+                text: row.get(13)?,
             })
         })?;
 

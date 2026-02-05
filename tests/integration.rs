@@ -64,6 +64,7 @@ fn test_database_roundtrip() {
         arguments: None,
         return_value: None,
         duration_ns: None,
+        text: None,
     }).unwrap();
 
     // Query
@@ -140,9 +141,13 @@ fn test_event_type_serialization() {
 
     assert_eq!(EventType::FunctionEnter.as_str(), "function_enter");
     assert_eq!(EventType::FunctionExit.as_str(), "function_exit");
+    assert_eq!(EventType::Stdout.as_str(), "stdout");
+    assert_eq!(EventType::Stderr.as_str(), "stderr");
 
     assert_eq!(EventType::from_str("function_enter"), Some(EventType::FunctionEnter));
     assert_eq!(EventType::from_str("function_exit"), Some(EventType::FunctionExit));
+    assert_eq!(EventType::from_str("stdout"), Some(EventType::Stdout));
+    assert_eq!(EventType::from_str("stderr"), Some(EventType::Stderr));
     assert_eq!(EventType::from_str("invalid"), None);
 }
 
@@ -185,4 +190,62 @@ fn test_hook_manager() {
     manager.remove_patterns(&["foo::*".to_string()]);
     let active = manager.active_patterns();
     assert_eq!(active.len(), 1);
+}
+
+#[test]
+fn test_output_event_insertion_and_query() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = strobe::db::Database::open(&db_path).unwrap();
+
+    db.create_session("test-session", "/bin/test", "/home", 1234).unwrap();
+
+    // Insert stdout event
+    db.insert_event(strobe::db::Event {
+        id: "evt-out-1".to_string(),
+        session_id: "test-session".to_string(),
+        timestamp_ns: 1500,
+        thread_id: 1,
+        parent_event_id: None,
+        event_type: strobe::db::EventType::Stdout,
+        function_name: String::new(),
+        function_name_raw: None,
+        source_file: None,
+        line_number: None,
+        arguments: None,
+        return_value: None,
+        duration_ns: None,
+        text: Some("Hello from stdout\n".to_string()),
+    }).unwrap();
+
+    // Insert stderr event
+    db.insert_event(strobe::db::Event {
+        id: "evt-out-2".to_string(),
+        session_id: "test-session".to_string(),
+        timestamp_ns: 2500,
+        thread_id: 1,
+        parent_event_id: None,
+        event_type: strobe::db::EventType::Stderr,
+        function_name: String::new(),
+        function_name_raw: None,
+        source_file: None,
+        line_number: None,
+        arguments: None,
+        return_value: None,
+        duration_ns: None,
+        text: Some("Error: something went wrong\n".to_string()),
+    }).unwrap();
+
+    // Query all - should return both in timestamp order
+    let all = db.query_events("test-session", |q| q).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].event_type, strobe::db::EventType::Stdout);
+    assert_eq!(all[0].text.as_deref(), Some("Hello from stdout\n"));
+    assert_eq!(all[1].event_type, strobe::db::EventType::Stderr);
+
+    // Query filtered by event type
+    let stdout_only = db.query_events("test-session", |q| {
+        q.event_type(strobe::db::EventType::Stdout)
+    }).unwrap();
+    assert_eq!(stdout_only.len(), 1);
 }

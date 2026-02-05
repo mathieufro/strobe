@@ -65,6 +65,7 @@ impl Database {
                 arguments JSON,
                 return_value JSON,
                 duration_ns INTEGER,
+                text TEXT,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )",
             [],

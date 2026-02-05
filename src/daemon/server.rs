@@ -175,7 +175,7 @@ impl Daemon {
         let tools = vec![
             McpTool {
                 name: "debug_launch".to_string(),
-                description: "Start a new debug session by launching a binary with Frida".to_string(),
+                description: "Launch a binary with Frida attached. Applies any pending trace patterns set via debug_trace (without sessionId). If no patterns were set, no functions will be traced — call debug_trace first. Process stdout/stderr are captured and queryable as events.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -190,24 +190,24 @@ impl Daemon {
             },
             McpTool {
                 name: "debug_trace".to_string(),
-                description: "Add or remove trace patterns. Without sessionId, sets patterns for next launch. With sessionId, modifies a running session.".to_string(),
+                description: "Configure trace patterns. IMPORTANT: Call BEFORE debug_launch (without sessionId) to set which functions to trace — patterns are applied when the process spawns. Can also be called WITH sessionId to add/remove patterns on a running session.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "sessionId": { "type": "string", "description": "Session ID (optional - if omitted, sets pending patterns for next launch)" },
-                        "add": { "type": "array", "items": { "type": "string" }, "description": "Patterns to start tracing" },
+                        "sessionId": { "type": "string", "description": "Session ID. Omit to set pending patterns for the next debug_launch. Provide to modify a running session." },
+                        "add": { "type": "array", "items": { "type": "string" }, "description": "Patterns to start tracing (e.g. \"mymodule::*\", \"*::init\", \"@usercode\")" },
                         "remove": { "type": "array", "items": { "type": "string" }, "description": "Patterns to stop tracing" }
                     }
                 }),
             },
             McpTool {
                 name: "debug_query".to_string(),
-                description: "Query execution history from a debug session".to_string(),
+                description: "Query the unified execution timeline: function traces AND process stdout/stderr. Returns events in chronological order. Filter by eventType to get only traces or only output.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "sessionId": { "type": "string" },
-                        "eventType": { "type": "string", "enum": ["function_enter", "function_exit"] },
+                        "eventType": { "type": "string", "enum": ["function_enter", "function_exit", "stdout", "stderr"] },
                         "function": {
                             "type": "object",
                             "properties": {
@@ -413,6 +413,8 @@ impl Daemon {
                 q = q.event_type(match et {
                     EventTypeFilter::FunctionEnter => crate::db::EventType::FunctionEnter,
                     EventTypeFilter::FunctionExit => crate::db::EventType::FunctionExit,
+                    EventTypeFilter::Stdout => crate::db::EventType::Stdout,
+                    EventTypeFilter::Stderr => crate::db::EventType::Stderr,
                 });
             }
             if let Some(ref f) = req.function {
@@ -436,11 +438,24 @@ impl Daemon {
 
         // Convert to appropriate format
         let verbose = req.verbose.unwrap_or(false);
-        let event_values: Vec<serde_json::Value> = if verbose {
-            events.iter().map(|e| {
+        let event_values: Vec<serde_json::Value> = events.iter().map(|e| {
+            // Output events have a different shape
+            if e.event_type == crate::db::EventType::Stdout || e.event_type == crate::db::EventType::Stderr {
+                return serde_json::json!({
+                    "id": e.id,
+                    "timestamp_ns": e.timestamp_ns,
+                    "eventType": e.event_type.as_str(),
+                    "threadId": e.thread_id,
+                    "text": e.text,
+                });
+            }
+
+            // Function trace events
+            if verbose {
                 serde_json::json!({
                     "id": e.id,
                     "timestamp_ns": e.timestamp_ns,
+                    "eventType": e.event_type.as_str(),
                     "function": e.function_name,
                     "functionRaw": e.function_name_raw,
                     "sourceFile": e.source_file,
@@ -451,12 +466,11 @@ impl Daemon {
                     "arguments": e.arguments,
                     "returnValue": e.return_value,
                 })
-            }).collect()
-        } else {
-            events.iter().map(|e| {
+            } else {
                 serde_json::json!({
                     "id": e.id,
                     "timestamp_ns": e.timestamp_ns,
+                    "eventType": e.event_type.as_str(),
                     "function": e.function_name,
                     "sourceFile": e.source_file,
                     "line": e.line_number,
@@ -472,8 +486,8 @@ impl Daemon {
                         })
                         .unwrap_or("void"),
                 })
-            }).collect()
-        };
+            }
+        }).collect();
 
         let response = DebugQueryResponse {
             events: event_values,

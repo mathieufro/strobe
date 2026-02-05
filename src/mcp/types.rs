@@ -50,6 +50,8 @@ pub struct DebugTraceResponse {
 pub enum EventTypeFilter {
     FunctionEnter,
     FunctionExit,
+    Stdout,
+    Stderr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

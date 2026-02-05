@@ -384,8 +384,30 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
     let event_type = match json.get("eventType")?.as_str()? {
         "function_enter" => EventType::FunctionEnter,
         "function_exit" => EventType::FunctionExit,
+        "stdout" => EventType::Stdout,
+        "stderr" => EventType::Stderr,
         _ => return None,
     };
+
+    // Output events have a simpler structure
+    if event_type == EventType::Stdout || event_type == EventType::Stderr {
+        return Some(Event {
+            id: json.get("id")?.as_str()?.to_string(),
+            session_id: session_id.to_string(),
+            timestamp_ns: json.get("timestampNs")?.as_i64()?,
+            thread_id: json.get("threadId")?.as_i64()?,
+            parent_event_id: None,
+            event_type,
+            function_name: String::new(),
+            function_name_raw: None,
+            source_file: None,
+            line_number: None,
+            arguments: None,
+            return_value: None,
+            duration_ns: None,
+            text: json.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        });
+    }
 
     Some(Event {
         id: json.get("id")?.as_str()?.to_string(),
@@ -401,6 +423,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         arguments: json.get("arguments").cloned(),
         return_value: json.get("returnValue").cloned(),
         duration_ns: json.get("durationNs").and_then(|v| v.as_i64()),
+        text: None,
     })
 }
 

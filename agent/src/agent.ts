@@ -30,6 +30,15 @@ interface TraceEvent {
   durationNs?: number;
 }
 
+interface OutputEvent {
+  id: string;
+  sessionId: string;
+  timestampNs: number;
+  threadId: number;
+  eventType: 'stdout' | 'stderr';
+  text: string;
+}
+
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
@@ -50,6 +59,9 @@ class StrobeAgent {
 
     // Periodic flush
     setInterval(() => this.flush(), this.flushInterval);
+
+    // Intercept write(2) for stdout/stderr capture
+    this.installOutputCapture();
   }
 
   initialize(sessionId: string): void {
@@ -161,6 +173,56 @@ class StrobeAgent {
 
   private getTimestampNs(): number {
     return Date.now() * 1000000 - this.sessionStartNs;
+  }
+
+  private installOutputCapture(): void {
+    const self = this;
+    const writePtr = Module.getExportByName(null, 'write');
+    if (!writePtr) return;
+
+    Interceptor.attach(writePtr, {
+      onEnter(args) {
+        const fd = args[0].toInt32();
+        if (fd !== 1 && fd !== 2) return;
+
+        const buf = args[1];
+        const count = args[2].toInt32();
+        if (count <= 0 || count > 1048576) return; // Skip empty or >1MB writes
+
+        let text: string;
+        try {
+          text = buf.readUtf8String(count) ?? '';
+        } catch {
+          try {
+            text = buf.readCString(count) ?? '';
+          } catch {
+            return; // Can't read buffer, skip
+          }
+        }
+
+        if (text.length === 0) return;
+
+        const event: OutputEvent = {
+          id: self.generateEventId(),
+          sessionId: self.sessionId,
+          timestampNs: self.getTimestampNs(),
+          threadId: Process.getCurrentThreadId(),
+          eventType: fd === 1 ? 'stdout' : 'stderr',
+          text,
+        };
+
+        self.bufferOutputEvent(event);
+      }
+    });
+  }
+
+  private bufferOutputEvent(event: OutputEvent): void {
+    // Reuse the same event buffer and flush mechanism
+    this.eventBuffer.push(event as any);
+
+    if (this.eventBuffer.length >= this.maxBufferSize) {
+      this.flush();
+    }
   }
 }
 
