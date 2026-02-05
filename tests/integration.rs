@@ -249,3 +249,144 @@ fn test_output_event_insertion_and_query() {
     }).unwrap();
     assert_eq!(stdout_only.len(), 1);
 }
+
+#[test]
+fn test_mixed_event_types_in_unified_timeline() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = strobe::db::Database::open(&db_path).unwrap();
+
+    db.create_session("test-session", "/bin/test", "/home", 1234).unwrap();
+
+    // Insert function enter
+    db.insert_event(strobe::db::Event {
+        id: "evt-1".to_string(),
+        session_id: "test-session".to_string(),
+        timestamp_ns: 1000,
+        thread_id: 1,
+        parent_event_id: None,
+        event_type: strobe::db::EventType::FunctionEnter,
+        function_name: "main::run".to_string(),
+        function_name_raw: None,
+        source_file: Some("/src/main.rs".to_string()),
+        line_number: Some(10),
+        arguments: None,
+        return_value: None,
+        duration_ns: None,
+        text: None,
+    }).unwrap();
+
+    // Insert stdout (between function enter and exit)
+    db.insert_event(strobe::db::Event {
+        id: "evt-2".to_string(),
+        session_id: "test-session".to_string(),
+        timestamp_ns: 1500,
+        thread_id: 1,
+        parent_event_id: None,
+        event_type: strobe::db::EventType::Stdout,
+        function_name: String::new(),
+        function_name_raw: None,
+        source_file: None,
+        line_number: None,
+        arguments: None,
+        return_value: None,
+        duration_ns: None,
+        text: Some("Running...\n".to_string()),
+    }).unwrap();
+
+    // Insert function exit
+    db.insert_event(strobe::db::Event {
+        id: "evt-3".to_string(),
+        session_id: "test-session".to_string(),
+        timestamp_ns: 2000,
+        thread_id: 1,
+        parent_event_id: Some("evt-1".to_string()),
+        event_type: strobe::db::EventType::FunctionExit,
+        function_name: "main::run".to_string(),
+        function_name_raw: None,
+        source_file: Some("/src/main.rs".to_string()),
+        line_number: Some(10),
+        arguments: None,
+        return_value: Some(serde_json::json!(0)),
+        duration_ns: Some(1000),
+        text: None,
+    }).unwrap();
+
+    // Query all — should return 3 events in chronological order
+    let all = db.query_events("test-session", |q| q).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].event_type, strobe::db::EventType::FunctionEnter);
+    assert_eq!(all[1].event_type, strobe::db::EventType::Stdout);
+    assert_eq!(all[1].text.as_deref(), Some("Running...\n"));
+    assert_eq!(all[2].event_type, strobe::db::EventType::FunctionExit);
+
+    // Function filter should only return function events, NOT output events
+    let func_events = db.query_events("test-session", |q| {
+        q.function_contains("run")
+    }).unwrap();
+    assert_eq!(func_events.len(), 2);
+    assert!(func_events.iter().all(|e|
+        e.event_type == strobe::db::EventType::FunctionEnter ||
+        e.event_type == strobe::db::EventType::FunctionExit
+    ));
+
+    // Event type filter still works
+    let stdout = db.query_events("test-session", |q| {
+        q.event_type(strobe::db::EventType::Stdout)
+    }).unwrap();
+    assert_eq!(stdout.len(), 1);
+}
+
+#[test]
+fn test_batch_insert_with_output_events() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = strobe::db::Database::open(&db_path).unwrap();
+
+    db.create_session("test-session", "/bin/test", "/home", 1234).unwrap();
+
+    let events = vec![
+        strobe::db::Event {
+            id: "batch-1".to_string(),
+            session_id: "test-session".to_string(),
+            timestamp_ns: 100,
+            thread_id: 1,
+            parent_event_id: None,
+            event_type: strobe::db::EventType::FunctionEnter,
+            function_name: "init".to_string(),
+            function_name_raw: None,
+            source_file: None,
+            line_number: None,
+            arguments: None,
+            return_value: None,
+            duration_ns: None,
+            text: None,
+        },
+        strobe::db::Event {
+            id: "batch-2".to_string(),
+            session_id: "test-session".to_string(),
+            timestamp_ns: 200,
+            thread_id: 1,
+            parent_event_id: None,
+            event_type: strobe::db::EventType::Stdout,
+            function_name: String::new(),
+            function_name_raw: None,
+            source_file: None,
+            line_number: None,
+            arguments: None,
+            return_value: None,
+            duration_ns: None,
+            text: Some("batch output line\n".to_string()),
+        },
+    ];
+
+    db.insert_events_batch(&events).unwrap();
+
+    let results = db.query_events("test-session", |q| q).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].event_type, strobe::db::EventType::FunctionEnter);
+    assert_eq!(results[0].function_name, "init");
+    assert!(results[0].text.is_none());
+    assert_eq!(results[1].event_type, strobe::db::EventType::Stdout);
+    assert_eq!(results[1].text.as_deref(), Some("batch output line\n"));
+}

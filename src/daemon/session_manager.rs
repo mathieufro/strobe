@@ -16,8 +16,8 @@ pub struct SessionManager {
     dwarf_cache: Arc<RwLock<HashMap<String, Arc<DwarfParser>>>>,
     /// Hooked function count per session
     hook_counts: Arc<RwLock<HashMap<String, u32>>>,
-    /// Frida spawner for managing instrumented processes
-    frida_spawner: Arc<tokio::sync::RwLock<FridaSpawner>>,
+    /// Frida spawner for managing instrumented processes (lazily initialized)
+    frida_spawner: Arc<tokio::sync::RwLock<Option<FridaSpawner>>>,
 }
 
 impl SessionManager {
@@ -29,7 +29,7 @@ impl SessionManager {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             dwarf_cache: Arc::new(RwLock::new(HashMap::new())),
             hook_counts: Arc::new(RwLock::new(HashMap::new())),
-            frida_spawner: Arc::new(tokio::sync::RwLock::new(FridaSpawner::new())),
+            frida_spawner: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -208,8 +208,9 @@ impl SessionManager {
             }
         });
 
-        // Spawn process with initial patterns
-        let mut spawner = self.frida_spawner.write().await;
+        // Spawn process with initial patterns (lazily initialize FridaSpawner)
+        let mut guard = self.frida_spawner.write().await;
+        let spawner = guard.get_or_insert_with(FridaSpawner::new);
         spawner.spawn(
             session_id,
             command,
@@ -229,7 +230,8 @@ impl SessionManager {
         add: Option<&[String]>,
         remove: Option<&[String]>,
     ) -> Result<u32> {
-        let mut spawner = self.frida_spawner.write().await;
+        let mut guard = self.frida_spawner.write().await;
+        let spawner = guard.get_or_insert_with(FridaSpawner::new);
 
         if let Some(patterns) = add {
             return spawner.add_patterns(session_id, patterns).await;
@@ -244,7 +246,8 @@ impl SessionManager {
 
     /// Stop Frida session
     pub async fn stop_frida(&self, session_id: &str) -> Result<()> {
-        let mut spawner = self.frida_spawner.write().await;
+        let mut guard = self.frida_spawner.write().await;
+        let spawner = guard.get_or_insert_with(FridaSpawner::new);
         spawner.stop(session_id).await
     }
 }

@@ -146,6 +146,12 @@ impl EventQuery {
     }
 }
 
+fn escape_like_pattern(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('%', "\\%")
+     .replace('_', "\\_")
+}
+
 impl Database {
     pub fn insert_event(&self, event: Event) -> Result<()> {
         let conn = self.connection();
@@ -229,18 +235,18 @@ impl Database {
         }
 
         if let Some(ref f) = query.function_equals {
-            sql.push_str(" AND function_name = ?");
+            sql.push_str(" AND event_type IN ('function_enter', 'function_exit') AND function_name = ?");
             params_vec.push(Box::new(f.clone()));
         }
 
         if let Some(ref f) = query.function_contains {
-            sql.push_str(" AND function_name LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", f)));
+            sql.push_str(" AND event_type IN ('function_enter', 'function_exit') AND function_name LIKE ? ESCAPE '\\'");
+            params_vec.push(Box::new(format!("%{}%", escape_like_pattern(f))));
         }
 
         if let Some(ref f) = query.source_file_contains {
-            sql.push_str(" AND source_file LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", f)));
+            sql.push_str(" AND source_file LIKE ? ESCAPE '\\'");
+            params_vec.push(Box::new(format!("%{}%", escape_like_pattern(f))));
         }
 
         if let Some(is_null) = query.return_value_is_null {

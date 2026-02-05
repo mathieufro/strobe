@@ -39,18 +39,27 @@ interface OutputEvent {
   text: string;
 }
 
+type BufferedEvent = TraceEvent | OutputEvent;
+
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
   private serializer: Serializer;
   private hookInstaller: HookInstaller;
-  private eventBuffer: TraceEvent[] = [];
+  private eventBuffer: BufferedEvent[] = [];
   private eventIdCounter: number = 0;
   private flushInterval: number = 10; // ms
   private maxBufferSize: number = 1000;
 
   // Track call stack per thread for parent tracking
   private callStacks: Map<number, string[]> = new Map();
+
+  // Re-entrancy guard for write(2) interception
+  private inOutputCapture: boolean = false;
+
+  // Per-session output capture limit (50MB)
+  private outputBytesCapture: number = 0;
+  private maxOutputBytes: number = 50 * 1024 * 1024;
 
   constructor() {
     this.serializer = new Serializer();
@@ -150,7 +159,7 @@ class StrobeAgent {
     this.bufferEvent(event);
   }
 
-  private bufferEvent(event: TraceEvent): void {
+  private bufferEvent(event: BufferedEvent): void {
     this.eventBuffer.push(event);
 
     if (this.eventBuffer.length >= this.maxBufferSize) {
@@ -182,47 +191,85 @@ class StrobeAgent {
 
     Interceptor.attach(writePtr, {
       onEnter(args) {
+        // Re-entrancy guard: skip if we're already inside an intercepted write
+        // (e.g. from Frida's own send() calling write())
+        if (self.inOutputCapture) return;
+
         const fd = args[0].toInt32();
         if (fd !== 1 && fd !== 2) return;
 
+        // Check per-session output limit
+        if (self.outputBytesCapture >= self.maxOutputBytes) return;
+
         const buf = args[1];
         const count = args[2].toInt32();
-        if (count <= 0 || count > 1048576) return; // Skip empty or >1MB writes
+        if (count <= 0) return;
 
-        let text: string;
-        try {
-          text = buf.readUtf8String(count) ?? '';
-        } catch {
+        // For writes >1MB, emit a truncation indicator instead of silently dropping
+        if (count > 1048576) {
+          self.inOutputCapture = true;
           try {
-            text = buf.readCString(count) ?? '';
-          } catch {
-            return; // Can't read buffer, skip
+            const event: OutputEvent = {
+              id: self.generateEventId(),
+              sessionId: self.sessionId,
+              timestampNs: self.getTimestampNs(),
+              threadId: Process.getCurrentThreadId(),
+              eventType: fd === 1 ? 'stdout' : 'stderr',
+              text: `[strobe: write of ${count} bytes truncated (>1MB)]`,
+            };
+            self.bufferEvent(event);
+          } finally {
+            self.inOutputCapture = false;
           }
+          return;
         }
 
-        if (text.length === 0) return;
+        self.inOutputCapture = true;
+        try {
+          let text: string;
+          try {
+            text = buf.readUtf8String(count) ?? '';
+          } catch {
+            try {
+              text = buf.readCString(count) ?? '';
+            } catch {
+              return; // Can't read buffer, skip
+            }
+          }
 
-        const event: OutputEvent = {
-          id: self.generateEventId(),
-          sessionId: self.sessionId,
-          timestampNs: self.getTimestampNs(),
-          threadId: Process.getCurrentThreadId(),
-          eventType: fd === 1 ? 'stdout' : 'stderr',
-          text,
-        };
+          if (text.length === 0) return;
 
-        self.bufferOutputEvent(event);
+          self.outputBytesCapture += count;
+
+          // Check if we just exceeded the limit
+          if (self.outputBytesCapture >= self.maxOutputBytes) {
+            const event: OutputEvent = {
+              id: self.generateEventId(),
+              sessionId: self.sessionId,
+              timestampNs: self.getTimestampNs(),
+              threadId: Process.getCurrentThreadId(),
+              eventType: fd === 1 ? 'stdout' : 'stderr',
+              text: text + '\n[strobe: output capture limit reached (50MB), further output truncated]',
+            };
+            self.bufferEvent(event);
+            return;
+          }
+
+          const event: OutputEvent = {
+            id: self.generateEventId(),
+            sessionId: self.sessionId,
+            timestampNs: self.getTimestampNs(),
+            threadId: Process.getCurrentThreadId(),
+            eventType: fd === 1 ? 'stdout' : 'stderr',
+            text,
+          };
+
+          self.bufferEvent(event);
+        } finally {
+          self.inOutputCapture = false;
+        }
       }
     });
-  }
-
-  private bufferOutputEvent(event: OutputEvent): void {
-    // Reuse the same event buffer and flush mechanism
-    this.eventBuffer.push(event as any);
-
-    if (this.eventBuffer.length >= this.maxBufferSize) {
-      this.flush();
-    }
   }
 }
 

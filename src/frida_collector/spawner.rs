@@ -609,3 +609,105 @@ impl Default for FridaSpawner {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_event_stdout() {
+        let event = parse_event("session-1", &json!({
+            "id": "evt-1",
+            "timestampNs": 1000,
+            "threadId": 42,
+            "eventType": "stdout",
+            "text": "hello world\n"
+        }));
+
+        let e = event.expect("should parse stdout event");
+        assert_eq!(e.event_type, EventType::Stdout);
+        assert_eq!(e.text.as_deref(), Some("hello world\n"));
+        assert_eq!(e.function_name, "");
+        assert_eq!(e.session_id, "session-1");
+        assert_eq!(e.thread_id, 42);
+        assert!(e.parent_event_id.is_none());
+    }
+
+    #[test]
+    fn test_parse_event_stderr() {
+        let event = parse_event("session-1", &json!({
+            "id": "evt-2",
+            "timestampNs": 2000,
+            "threadId": 1,
+            "eventType": "stderr",
+            "text": "Error: crash\n"
+        }));
+
+        let e = event.expect("should parse stderr event");
+        assert_eq!(e.event_type, EventType::Stderr);
+        assert_eq!(e.text.as_deref(), Some("Error: crash\n"));
+    }
+
+    #[test]
+    fn test_parse_event_stdout_missing_text() {
+        let event = parse_event("session-1", &json!({
+            "id": "evt-3",
+            "timestampNs": 3000,
+            "threadId": 1,
+            "eventType": "stdout"
+        }));
+
+        let e = event.expect("should parse stdout even without text");
+        assert_eq!(e.event_type, EventType::Stdout);
+        assert!(e.text.is_none());
+    }
+
+    #[test]
+    fn test_parse_event_stdout_missing_required_fields() {
+        // Missing id
+        assert!(parse_event("s", &json!({
+            "timestampNs": 1000, "threadId": 1, "eventType": "stdout"
+        })).is_none());
+
+        // Missing timestampNs
+        assert!(parse_event("s", &json!({
+            "id": "x", "threadId": 1, "eventType": "stdout"
+        })).is_none());
+
+        // Missing threadId
+        assert!(parse_event("s", &json!({
+            "id": "x", "timestampNs": 1000, "eventType": "stdout"
+        })).is_none());
+    }
+
+    #[test]
+    fn test_parse_event_function_enter() {
+        let event = parse_event("session-1", &json!({
+            "id": "evt-4",
+            "timestampNs": 4000,
+            "threadId": 1,
+            "eventType": "function_enter",
+            "functionName": "main::run",
+            "functionNameRaw": "_ZN4main3runEv",
+            "sourceFile": "/src/main.rs",
+            "lineNumber": 10,
+            "parentEventId": null,
+            "arguments": [1, 2]
+        }));
+
+        let e = event.expect("should parse function_enter event");
+        assert_eq!(e.event_type, EventType::FunctionEnter);
+        assert_eq!(e.function_name, "main::run");
+        assert_eq!(e.source_file.as_deref(), Some("/src/main.rs"));
+        assert!(e.text.is_none());
+    }
+
+    #[test]
+    fn test_parse_event_unknown_type() {
+        assert!(parse_event("s", &json!({
+            "id": "x", "timestampNs": 1000, "threadId": 1,
+            "eventType": "unknown_type"
+        })).is_none());
+    }
+}
