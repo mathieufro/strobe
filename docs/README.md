@@ -43,6 +43,7 @@ LLM: "Found it - null pointer in buffer.data at render.rs:247. Here's the fix."
 │  Strobe Daemon                                               │
 │  - Intercepts function calls (no code changes needed)        │
 │  - Captures arguments, return values, timing                 │
+│  - Captures process stdout/stderr into unified timeline      │
 │  - Stores execution history in SQLite                        │
 │  - LLM adjusts tracing scope at runtime                      │
 └─────────────────────────────────────────────────────────────┘
@@ -50,11 +51,12 @@ LLM: "Found it - null pointer in buffer.data at render.rs:247. Here's the fix."
                            ▼ MCP (Model Context Protocol)
 ┌─────────────────────────────────────────────────────────────┐
 │  LLM                                                         │
-│  - debug_launch: start app with tracing                      │
-│  - debug_query: search execution history                     │
-│  - debug_trace: adjust what gets captured (live!)            │
-│  - debug_breakpoint: pause on conditions                     │
-│  - debug_inspect: examine state                              │
+│  - debug_trace: set patterns BEFORE launch, or adjust live  │
+│  - debug_launch: start app (applies patterns, captures I/O) │
+│  - debug_query: search traces + stdout/stderr timeline       │
+│  - debug_stop: end session and clean up                      │
+│  - debug_breakpoint: pause on conditions (Phase 2)           │
+│  - debug_inspect: examine state (Phase 2)                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -78,7 +80,7 @@ The LLM gets a "black box recording" of exactly what happened.
 
 ### Searchable Execution History
 
-Query what happened, don't just observe current state. Find all null returns, slow functions, specific error patterns. Filter by thread, time range, function pattern. Pagination with metadata helps LLM narrow down large result sets.
+Query what happened, don't just observe current state. Find all null returns, slow functions, specific error patterns. Filter by thread, time range, function pattern. Process stdout/stderr are captured into the same timeline, so the LLM can correlate output with function calls. Pagination with metadata helps LLM narrow down large result sets.
 
 ### Conditional Breakpoints
 
@@ -121,10 +123,11 @@ This is not for:
 - DWARF parsing to identify user code
 - Dynamic trace patterns (add/remove at runtime)
 - Capture function enter/exit, arguments, return values
+- Capture process stdout/stderr into unified event timeline
 - Store in SQLite with FTS, query with summary/verbose modes
 - MCP tools: `debug_launch`, `debug_trace`, `debug_query`, `debug_stop`
 
-**Validation:** Launch binary, add targeted traces, query events, find bug—no code changes to target.
+**Validation:** Launch binary, add targeted traces, query events (including stdout/stderr), find bug—no code changes to target.
 
 ### Phase 1b: Advanced Runtime Control
 - Configurable serialization depth per pattern

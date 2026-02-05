@@ -33,6 +33,14 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 - Nanosecond timestamps for ordering
 - Parent event tracking for call hierarchy
 
+#### Process Output Capture
+- stdout/stderr captured automatically via `write(2)` syscall interception
+- Output events interleaved chronologically in the unified event timeline
+- Re-entrancy guard prevents infinite recursion from Frida's own write calls
+- Per-session 50MB output capture limit with truncation indicator
+- Large writes (>1MB) emit a truncation notice instead of buffering
+- Queryable via `debug_query` with `eventType: "stdout"` or `"stderr"`
+
 #### Serialization (Fixed)
 - Primitives serialized directly
 - Structs serialized to depth 1
@@ -58,9 +66,9 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 - Session stays queryable after process exits until stop
 
 #### MCP Tools
-- `debug_launch` - Start session (no tracing by default)
-- `debug_trace` - Add/remove trace patterns
-- `debug_query` - Search execution history
+- `debug_launch` - Launch binary with Frida (applies pending patterns, captures stdout/stderr)
+- `debug_trace` - Add/remove trace patterns (call before launch to set pending, or with sessionId for live)
+- `debug_query` - Query unified timeline (function traces + stdout/stderr, chronologically ordered)
 - `debug_stop` - End session and cleanup
 
 ### What Gets Captured (Phase 1a)
@@ -75,6 +83,8 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 | Timestamp | Yes | Nanoseconds since session start |
 | Thread ID | Yes | Basic support |
 | Call hierarchy | Yes | Parent event tracking |
+| Process stdout | Yes | Via write(2) interception |
+| Process stderr | Yes | Via write(2) interception |
 
 ### Platform Support (Phase 1a)
 

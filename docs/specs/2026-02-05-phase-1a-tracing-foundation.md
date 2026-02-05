@@ -69,7 +69,8 @@ debug_launch({
 - Spawns process via Frida
 - Parses DWARF debug info to identify functions
 - Returns immediately after process starts (does not wait for exit)
-- Use `debug_trace` to add patterns after launch
+- Process stdout/stderr are automatically captured and queryable as events
+- Use `debug_trace` to add patterns after launch (or before for pending patterns)
 
 **Session ID Format:**
 - Human-readable: `{binary-name}-{YYYY-MM-DD}-{HHhMM}`
@@ -111,12 +112,12 @@ debug_trace({ sessionId: "myapp-2026-02-05-14h32" })
 
 ### debug_query
 
-Query execution history.
+Query the unified execution timeline (function traces + stdout/stderr).
 
 ```typescript
 debug_query({
   sessionId: string,
-  eventType?: "function_enter" | "function_exit",
+  eventType?: "function_enter" | "function_exit" | "stdout" | "stderr",
   function?: {
     equals?: string,            // Exact match (demangled name)
     contains?: string,          // Substring match
@@ -214,6 +215,8 @@ debug_stop({
 | Timestamp | Yes | Nanoseconds since session start |
 | Thread ID | Yes | Numeric thread identifier |
 | Parent event | Yes | For call hierarchy reconstruction |
+| Process stdout | Yes | Via write(2) interception in agent |
+| Process stderr | Yes | Via write(2) interception in agent |
 
 ### Serialization Rules (Phase 1a)
 
@@ -268,7 +271,7 @@ CREATE TABLE events (
     timestamp_ns INTEGER NOT NULL,
     thread_id INTEGER NOT NULL,
     parent_event_id TEXT,
-    event_type TEXT NOT NULL,          -- "function_enter", "function_exit"
+    event_type TEXT NOT NULL,          -- "function_enter", "function_exit", "stdout", "stderr"
 
     -- Location
     function_name TEXT NOT NULL,
@@ -280,6 +283,7 @@ CREATE TABLE events (
     arguments JSON,
     return_value JSON,
     duration_ns INTEGER,
+    text TEXT,                         -- For stdout/stderr events
 
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
@@ -390,7 +394,8 @@ The Frida agent (TypeScript, compiled to JS) runs inside the target process:
 - Receives hook instructions from daemon via Frida messaging
 - Installs/removes Interceptor hooks dynamically
 - Serializes arguments and return values
-- Batches events and sends to daemon
+- Intercepts `write(2)` to capture stdout/stderr (with re-entrancy guard and 50MB limit)
+- Batches events (trace + output) and sends to daemon
 
 ### DWARF Parsing
 

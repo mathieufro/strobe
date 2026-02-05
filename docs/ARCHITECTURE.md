@@ -272,6 +272,7 @@ Errors are opportunities for LLM-guided resolution:
 │  │                   Frida Agent (JS)                          │ │
 │  │   - Hooks functions based on daemon instructions            │ │
 │  │   - Serializes arguments/returns                            │ │
+│  │   - Captures stdout/stderr via write(2) interception       │ │
 │  │   - Sends events back to daemon                             │ │
 │  │   - Intercepts crash signals                                │ │
 │  └────────────────────────────────────────────────────────────┘ │
@@ -329,6 +330,7 @@ Runs inside the target process. Compiled to JS, injected by Frida.
 Responsibilities:
 - Hook functions based on patterns from daemon
 - Serialize arguments and return values
+- Capture stdout/stderr by intercepting `write(2)` syscall (with re-entrancy guard and 50MB per-session limit)
 - Send events to daemon via Frida messaging
 - Intercept crash signals (SIGSEGV, SIGABRT)
 - Capture crash state before process dies
@@ -362,7 +364,7 @@ CREATE TABLE events (
     timestamp_ns INTEGER NOT NULL,   -- Nanoseconds since session start
     thread_id INTEGER NOT NULL,
     parent_event_id TEXT,            -- For call tree reconstruction
-    event_type TEXT NOT NULL,        -- function_enter, function_exit, crash
+    event_type TEXT NOT NULL,        -- function_enter, function_exit, stdout, stderr, crash
 
     -- Location
     module TEXT,
@@ -375,6 +377,7 @@ CREATE TABLE events (
     arguments JSON,                  -- For function_enter
     return_value JSON,               -- For function_exit
     duration_ns INTEGER,             -- For function_exit
+    text TEXT,                       -- For stdout/stderr events
     crash_info JSON                  -- For crash events
 );
 
@@ -510,12 +513,12 @@ debug_trace({
 
 ### debug_query (Phase 1a)
 
-Query execution history.
+Query the unified execution timeline (function traces + stdout/stderr).
 
 ```typescript
 debug_query({
   sessionId: string,
-  eventType?: "function_enter" | "function_exit" | "crash",
+  eventType?: "function_enter" | "function_exit" | "stdout" | "stderr" | "crash",
   function?: {
     equals?: string,
     contains?: string,
@@ -866,10 +869,11 @@ All collectors emit the same event types. Key fields:
 - `source_line` - Line number
 
 **Event Data:**
-- `event_type` - One of: function_enter, function_exit, crash, log
+- `event_type` - One of: function_enter, function_exit, stdout, stderr, crash, log
 - `arguments` - Serialized arguments (depth-limited, cycle-detected)
 - `return_value` - Serialized return value
 - `duration_ns` - Execution time (exit events only)
+- `text` - Output text (stdout/stderr events only)
 - `crash_info` - Stack trace, registers, locals (crash events only)
 
 **Sampling Metadata:**
