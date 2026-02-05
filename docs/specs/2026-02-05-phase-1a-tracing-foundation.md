@@ -58,20 +58,18 @@ debug_launch({
   args?: string[],              // Command line arguments
   cwd?: string,                 // Working directory (default: directory of command)
   projectRoot: string,          // Root directory for user code detection
-  env?: Record<string, string>, // Additional environment variables
-  traceUserCode?: boolean       // Trace all functions in projectRoot (default: false)
+  env?: Record<string, string>  // Additional environment variables
 }) → {
   sessionId: string,            // Human-readable: "myapp-2026-02-05-14h32"
-  pid: number,                  // Process ID of launched binary
-  tracedFunctions: number       // Count of initially hooked functions
+  pid: number                   // Process ID of launched binary
 }
 ```
 
 **Behavior:**
 - Spawns process via Frida
 - Parses DWARF debug info to identify functions
-- If `traceUserCode: true`, hooks all functions whose source file is within `projectRoot`
 - Returns immediately after process starts (does not wait for exit)
+- Use `debug_trace` to add patterns after launch
 
 **Session ID Format:**
 - Human-readable: `{binary-name}-{YYYY-MM-DD}-{HHhMM}`
@@ -80,7 +78,7 @@ debug_launch({
 
 ### debug_trace
 
-Add or remove trace patterns at runtime.
+Query, add, or remove trace patterns at runtime.
 
 ```typescript
 debug_trace({
@@ -91,6 +89,12 @@ debug_trace({
   activePatterns: string[],     // Current trace patterns
   hookedFunctions: number       // Total hooked function count
 }
+```
+
+**Query mode:** Call with no `add`/`remove` to get current state:
+```typescript
+debug_trace({ sessionId: "myapp-2026-02-05-14h32" })
+→ { activePatterns: ["auth::*", "form::*"], hookedFunctions: 24 }
 ```
 
 **Pattern Syntax:**
@@ -363,8 +367,7 @@ Functions are considered "user code" if their DWARF `DW_AT_decl_file` path is wi
 5. LLM calls `debug_query({ sessionId: "...", function: { contains: "validate" } })`
    - Returns events showing `form::validate` returned `false`
 
-6. LLM calls `debug_query({ sessionId: "...", function: { equals: "form::validate" }, verbose: true })`
-   - Returns full arguments showing which field failed
+6. LLM calls `debug_query({ ..., verbose: true })` for full arguments
 
 7. LLM identifies root cause, suggests fix
 

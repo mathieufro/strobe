@@ -203,6 +203,56 @@ Future phases add [Chrome DevTools Protocol](https://chromedevtools.github.io/de
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for technical details.
 
+## Setup
+
+### macOS
+
+Strobe uses Frida for dynamic instrumentation, which requires `task_for_pid` permissions. On macOS, you need to enable Developer Mode:
+
+```bash
+sudo DevToolsSecurity -enable
+```
+
+This is a one-time setup that allows debugging tools to attach to processes. You'll be prompted for your password.
+
+Additionally, binaries must be signed with the `get-task-allow` entitlement to be debugged. Debug builds typically have this, but if you encounter issues, you can sign manually:
+
+```bash
+# Create entitlements file
+cat > debug.entitlements << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.get-task-allow</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+# Sign your binary
+codesign -f -s - --entitlements debug.entitlements /path/to/your/binary
+```
+
+### Linux
+
+No special setup required. Frida works out of the box on Linux.
+
+### Debug Symbols
+
+Strobe requires debug symbols (DWARF) to identify functions and source locations. Build your code with debug info:
+
+```bash
+# C/C++ with clang/gcc
+clang -g -o myapp myapp.c
+
+# Rust (debug builds include symbols by default)
+cargo build
+
+# macOS: Generate .dSYM bundle for release builds
+dsymutil /path/to/binary
+```
+
 ## Extensibility
 
 The architecture is designed so **anyone can add support for obscure languages or test frameworks** without understanding the whole system.

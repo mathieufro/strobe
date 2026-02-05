@@ -19,11 +19,10 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 #### Launch Process
 - Spawns process via Frida
 - Reads DWARF debug info to identify user code
-- No tracing by default (`traceUserCode: false`)
 - Returns human-readable session ID
 
 #### Dynamic Trace Patterns
-- Add/remove trace patterns at runtime
+- Add/remove patterns at runtime via `debug_trace`
 - Glob syntax: `*` matches within module, `**` matches across
 - Special pattern `@usercode` for all project functions
 - Hooks injected live, no restart required

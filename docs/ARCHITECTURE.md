@@ -407,19 +407,17 @@ debug_launch({
   args?: string[],              // Command line arguments
   cwd?: string,                 // Working directory
   projectRoot: string,          // Root directory for user code detection
-  env?: Record<string, string>, // Environment variables
-  traceUserCode?: boolean       // Trace all functions in projectRoot (default: false)
+  env?: Record<string, string>  // Environment variables
 }) → {
   sessionId: string,            // Human-readable: "myapp-2026-02-05-14h32"
-  pid: number,
-  tracedFunctions: number       // Count of initially hooked functions
+  pid: number
 }
 ```
 
 **Notes:**
 - `projectRoot` is required for user code detection via DWARF
 - Session ID is human-readable for easy reference in conversation
-- `traceUserCode: false` by default — use `debug_trace` to add patterns
+- Use `debug_trace` to add patterns after launch
 
 ### debug_stop (Phase 1a)
 

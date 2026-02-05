@@ -1,0 +1,38 @@
+mod demangle;
+
+pub use demangle::demangle_symbol;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_demangle_rust_symbol() {
+        let mangled = "_ZN4test7example17h1234567890abcdefE";
+        let demangled = demangle_symbol(mangled);
+        assert!(demangled.contains("test::example"));
+    }
+
+    #[test]
+    fn test_demangle_cpp_symbol() {
+        let mangled = "_ZN4test7exampleEv";
+        let demangled = demangle_symbol(mangled);
+        assert!(demangled.contains("test::example"));
+    }
+
+    #[test]
+    fn test_demangle_c_symbol() {
+        // C symbols have no mangling
+        let symbol = "main";
+        let demangled = demangle_symbol(symbol);
+        assert_eq!(demangled, "main");
+    }
+
+    #[test]
+    fn test_demangle_unknown() {
+        // Unknown format returns as-is
+        let symbol = "some_random_symbol";
+        let demangled = demangle_symbol(symbol);
+        assert_eq!(demangled, "some_random_symbol");
+    }
+}
