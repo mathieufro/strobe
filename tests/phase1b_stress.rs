@@ -2,38 +2,31 @@
 ///
 /// This test suite validates Phase 1b features under realistic load conditions.
 ///
-/// ## Test Modes
+/// ## Stress Test Binary
 ///
-/// ### Simple Modes (for backwards compatibility):
-/// - **hot**: Single function called as fast as possible (triggers auto-sampling)
-/// - **threads**: 10 worker threads with varying call rates
-/// - **deep-structs**: Nested struct creation and processing
-/// - **all**: All simple modes in sequence
-///
-/// ### Realistic Mode (RECOMMENDED):
 /// Simulates a complete audio DSP application with:
 /// - **Multiple audio processing threads** (default: 4) - HOT PATH generating >10k calls/sec
 /// - **MIDI processing thread** - Medium frequency event bursts
 /// - **Parameter automation thread** - Continuous global state updates
 /// - **Statistics thread** - Monitoring and global state modulation
 ///
-/// #### Global Variables (for watch testing):
+/// ### Global Variables (for watch testing):
 /// - `G_SAMPLE_RATE`, `G_BUFFER_SIZE` - Audio configuration (modified from multiple threads)
 /// - `G_TEMPO` - Musical tempo (modulated by stats thread)
 /// - `G_AUDIO_BUFFER_COUNT`, `G_MIDI_NOTE_ON_COUNT`, `G_PARAMETER_UPDATES` - Performance counters
 /// - `G_EFFECT_CHAIN_DEPTH` - Current effect chain depth
 ///
-/// #### Namespaces (for pattern matching testing):
+/// ### Namespaces (for pattern matching testing):
 /// - `audio::*` - DSP processing functions (HOT)
 /// - `midi::*` - MIDI event processing (medium)
 /// - `engine::*` - State management (cold)
 ///
-/// #### Data Structures (for serialization testing):
+/// ### Data Structures (for serialization testing):
 /// - `AudioBuffer` - 512 f32 samples + metadata
 /// - `EffectChain` - Recursive linked list (depth 5)
 /// - `MidiMessage` - 3-byte MIDI data + timestamp
 ///
-/// #### Expected Behavior:
+/// ### Expected Behavior:
 /// - `audio::process_audio_buffer` triggers auto-sampling (>100k calls/sec)
 /// - Multiple thread names visible: audio-0, audio-1, midi-processor, automation, stats
 /// - Watch variables change across thread contexts
@@ -68,7 +61,7 @@ fn test_stress_binary_compiles() {
 }
 
 #[test]
-fn test_stress_binary_runs_hot_mode() {
+fn test_stress_binary_runs() {
     let binary = Path::new("tests/stress_test_phase1b/target/debug/stress_tester");
 
     if !binary.exists() {
@@ -77,57 +70,16 @@ fn test_stress_binary_runs_hot_mode() {
     }
 
     let output = Command::new(binary)
-        .args(&["--mode", "hot", "--duration", "1"])
+        .args(&["--duration", "2"])
         .output()
         .expect("Failed to run stress tester");
 
     assert!(output.status.success(), "Stress tester failed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("HOT MODE"), "Expected HOT MODE output");
-    assert!(stdout.contains("calls/sec"), "Expected call rate output");
-}
-
-#[test]
-fn test_stress_binary_runs_threads_mode() {
-    let binary = Path::new("tests/stress_test_phase1b/target/debug/stress_tester");
-
-    if !binary.exists() {
-        eprintln!("Binary not found, skipping test");
-        return;
-    }
-
-    let output = Command::new(binary)
-        .args(&["--mode", "threads", "--duration", "1"])
-        .output()
-        .expect("Failed to run stress tester");
-
-    assert!(output.status.success(), "Stress tester failed");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("THREADS MODE"), "Expected THREADS MODE output");
-    assert!(stdout.contains("worker-0"), "Expected worker thread output");
-}
-
-#[test]
-fn test_stress_binary_runs_deep_structs_mode() {
-    let binary = Path::new("tests/stress_test_phase1b/target/debug/stress_tester");
-
-    if !binary.exists() {
-        eprintln!("Binary not found, skipping test");
-        return;
-    }
-
-    let output = Command::new(binary)
-        .args(&["--mode", "deep-structs", "--duration", "1"])
-        .output()
-        .expect("Failed to run stress tester");
-
-    assert!(output.status.success(), "Stress tester failed");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("DEEP STRUCTS MODE"), "Expected DEEP STRUCTS MODE output");
-    assert!(stdout.contains("Processed"), "Expected processing output");
+    assert!(stdout.contains("AUDIO DSP STRESS TEST"), "Expected stress test output");
+    assert!(stdout.contains("audio-"), "Expected audio thread output");
+    assert!(stdout.contains("ENGINE STATS"), "Expected engine stats output");
 }
 
 /// Validation test: Verify input validation prevents extreme parameters
@@ -149,28 +101,6 @@ fn test_validation_prevents_extreme_event_limits() {
     assert!(result.unwrap_err().to_string().contains("10000000"));
 }
 
-#[test]
-fn test_stress_binary_runs_realistic_mode() {
-    let binary = Path::new("tests/stress_test_phase1b/target/debug/stress_tester");
-
-    if !binary.exists() {
-        eprintln!("Binary not found, skipping test");
-        return;
-    }
-
-    let output = Command::new(binary)
-        .args(&["--mode", "realistic", "--duration", "2"])
-        .output()
-        .expect("Failed to run stress tester");
-
-    assert!(output.status.success(), "Stress tester failed");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("REALISTIC MODE"), "Expected REALISTIC MODE output");
-    assert!(stdout.contains("audio-"), "Expected audio thread output");
-    assert!(stdout.contains("ENGINE STATS"), "Expected engine stats output");
-}
-
 /// Documentation: Manual Stress Test Procedure
 ///
 /// To manually validate Phase 1b features with the stress tester:
@@ -180,10 +110,10 @@ fn test_stress_binary_runs_realistic_mode() {
 ///
 /// 2. Start Strobe daemon (in separate terminal)
 ///
-/// 3. Via MCP, launch stress tester in REALISTIC mode:
+/// 3. Via MCP, launch stress tester:
 ///    debug_launch({
 ///      command: "tests/stress_test_phase1b/target/release/stress_tester",
-///      args: ["--mode", "realistic", "--duration", "30"],
+///      args: ["--duration", "30"],
 ///      projectRoot: "/path/to/strobe"
 ///    })
 ///
