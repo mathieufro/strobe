@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use tempfile::tempdir;
 
 // Test helper to create a simple test binary

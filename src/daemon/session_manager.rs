@@ -92,6 +92,10 @@ impl SessionManager {
         self.db.get_session(id)
     }
 
+    pub fn get_running_sessions(&self) -> Result<Vec<Session>> {
+        self.db.get_running_sessions()
+    }
+
     pub fn stop_session(&self, id: &str) -> Result<u64> {
         let count = self.db.count_session_events(id)?;
         self.db.delete_session(id)?;
@@ -249,7 +253,10 @@ impl SessionManager {
         remove: Option<&[String]>,
     ) -> Result<u32> {
         let mut guard = self.frida_spawner.write().await;
-        let spawner = guard.get_or_insert_with(FridaSpawner::new);
+        let spawner = match guard.as_mut() {
+            Some(s) => s,
+            None => return Ok(0), // No spawner — no sessions to update
+        };
 
         if let Some(patterns) = add {
             return spawner.add_patterns(session_id, patterns).await;
@@ -265,7 +272,9 @@ impl SessionManager {
     /// Stop Frida session
     pub async fn stop_frida(&self, session_id: &str) -> Result<()> {
         let mut guard = self.frida_spawner.write().await;
-        let spawner = guard.get_or_insert_with(FridaSpawner::new);
-        spawner.stop(session_id).await
+        match guard.as_mut() {
+            Some(spawner) => spawner.stop(session_id).await,
+            None => Ok(()), // No spawner — nothing to stop
+        }
     }
 }

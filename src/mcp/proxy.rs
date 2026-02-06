@@ -26,15 +26,20 @@ pub async fn stdio_proxy() -> Result<()> {
             .write(true)
             .open(&lock_path)?;
 
-        let got_lock = unsafe {
-            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+        let lock_result = unsafe {
+            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
         };
 
-        if got_lock {
+        if lock_result == 0 {
             // We won the race — start the daemon
             start_daemon(&strobe_dir)?;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(crate::Error::Io(err));
+            }
+            // EWOULDBLOCK: another proxy holds the lock, fall through to wait
         }
-        // Whether we started it or someone else did, wait for the socket
 
         // Drop the lock after spawning (or if we didn't get it)
         drop(lock_file);

@@ -11,6 +11,7 @@ use crate::Result;
 use super::SessionManager;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60); // 30 minutes
+const MAX_SESSIONS_PER_CONNECTION: usize = 10;
 
 pub struct Daemon {
     socket_path: PathBuf,
@@ -94,17 +95,25 @@ impl Daemon {
     async fn graceful_shutdown(&self) {
         tracing::info!("Starting graceful shutdown...");
 
-        // Stop all running Frida sessions
-        if let Ok(sessions) = self.session_manager.db().get_running_sessions() {
-            for session in sessions {
-                tracing::info!("Stopping session {} during shutdown", session.id);
-                let _ = self.session_manager.stop_frida(&session.id).await;
-                let _ = self.session_manager.stop_session(&session.id);
-            }
+        // Phase 1: Stop all Frida sessions (stops event generation)
+        let session_ids: Vec<String> = self.session_manager.get_running_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+
+        for id in &session_ids {
+            tracing::info!("Stopping Frida for session {} during shutdown", id);
+            let _ = self.session_manager.stop_frida(id).await;
         }
 
-        // Give DB writer tasks time to flush remaining events
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Phase 2: Let DB writer tasks flush remaining buffered events
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Phase 3: Delete sessions from DB (safe now that writers have flushed)
+        for id in &session_ids {
+            let _ = self.session_manager.stop_session(id);
+        }
 
         self.cleanup();
         tracing::info!("Graceful shutdown complete");
@@ -177,8 +186,11 @@ impl Daemon {
 
         let result = match request.method.as_str() {
             "initialize" => {
-                *initialized = true;
-                self.handle_initialize(&request.params).await
+                let result = self.handle_initialize(&request.params).await;
+                if result.is_ok() {
+                    *initialized = true;
+                }
+                result
             }
             "initialized" => Ok(serde_json::json!({})),
             "tools/list" => self.handle_tools_list().await,
@@ -410,12 +422,31 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
     async fn tool_debug_launch(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let req: DebugLaunchRequest = serde_json::from_value(args.clone())?;
 
+        // Enforce per-connection session limit
+        {
+            let sessions = self.connection_sessions.read().await;
+            if let Some(session_list) = sessions.get(connection_id) {
+                if session_list.len() >= MAX_SESSIONS_PER_CONNECTION {
+                    return Err(crate::Error::Frida(format!(
+                        "Session limit reached ({} active sessions). Stop existing sessions first.",
+                        MAX_SESSIONS_PER_CONNECTION
+                    )));
+                }
+            }
+        }
+
         // Auto-cleanup: if there's already a session for this binary, stop it first
         if let Some(existing) = self.session_manager.db().get_session_by_binary(&req.command)? {
             if existing.status == crate::db::SessionStatus::Running {
                 tracing::info!("Auto-stopping existing session {} before new launch", existing.id);
                 let _ = self.session_manager.stop_frida(&existing.id).await;
                 let _ = self.session_manager.stop_session(&existing.id);
+
+                // Remove from all connection tracking
+                let mut sessions = self.connection_sessions.write().await;
+                for session_list in sessions.values_mut() {
+                    session_list.retain(|s| s != &existing.id);
+                }
             }
         }
 
@@ -453,13 +484,14 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
         }
 
         // Get and clear this connection's pending patterns
-        let pending_patterns: Vec<String> = {
+        let mut pending_patterns: Vec<String> = {
             let mut all_pending = self.pending_patterns.write().await;
             match all_pending.remove(connection_id) {
                 Some(patterns) => patterns.into_iter().collect(),
                 None => Vec::new(),
             }
         };
+        pending_patterns.sort();
 
         if !pending_patterns.is_empty() {
             self.session_manager.add_patterns(&session_id, &pending_patterns)?;
@@ -675,5 +707,234 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
         };
 
         Ok(serde_json::to_value(response)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Create a test Daemon with a temp database
+    fn test_daemon() -> (Daemon, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let session_manager = Arc::new(SessionManager::new(&db_path).unwrap());
+
+        let daemon = Daemon {
+            socket_path: dir.path().join("test.sock"),
+            pid_path: dir.path().join("test.pid"),
+            session_manager,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            pending_patterns: Arc::new(RwLock::new(HashMap::new())),
+            connection_sessions: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        (daemon, dir)
+    }
+
+    fn make_request(method: &str, id: i64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": {}
+        }).to_string()
+    }
+
+    fn make_initialize_request() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0.1" }
+            }
+        }).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_initialize_enforcement_rejects_before_init() {
+        let (daemon, _dir) = test_daemon();
+        let mut initialized = false;
+        let conn_id = "test-conn-1";
+
+        // Call tools/list before initialize — should be rejected
+        let msg = make_request("tools/list", 1);
+        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+
+        assert!(!initialized);
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32002);
+        assert!(err.message.contains("initialize"));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_enforcement_allows_after_init() {
+        let (daemon, _dir) = test_daemon();
+        let mut initialized = false;
+        let conn_id = "test-conn-2";
+
+        // Initialize first
+        let init_msg = make_initialize_request();
+        let resp = daemon.handle_message(&init_msg, &mut initialized, conn_id).await;
+        assert!(initialized);
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+
+        // Now tools/list should succeed
+        let msg = make_request("tools/list", 2);
+        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_not_set_on_malformed_params() {
+        let (daemon, _dir) = test_daemon();
+        let mut initialized = false;
+        let conn_id = "test-conn-3";
+
+        // Send initialize — even with empty params, our handler accepts it (params are ignored)
+        // But a truly broken JSON should be rejected at parse level
+        let bad_json = "not json at all";
+        let resp = daemon.handle_message(bad_json, &mut initialized, conn_id).await;
+
+        // Parse error should not set initialized
+        assert!(!initialized);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32700);
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_cleans_pending_patterns() {
+        let (daemon, _dir) = test_daemon();
+        let conn_id = "test-conn-4";
+
+        // Set pending patterns for this connection
+        {
+            let mut pending = daemon.pending_patterns.write().await;
+            let mut patterns = HashSet::new();
+            patterns.insert("foo::*".to_string());
+            patterns.insert("bar::*".to_string());
+            pending.insert(conn_id.to_string(), patterns);
+        }
+
+        // Verify patterns exist
+        assert!(daemon.pending_patterns.read().await.contains_key(conn_id));
+
+        // Disconnect
+        daemon.handle_disconnect(conn_id).await;
+
+        // Patterns should be gone
+        assert!(!daemon.pending_patterns.read().await.contains_key(conn_id));
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_cleans_session_tracking() {
+        let (daemon, _dir) = test_daemon();
+        let conn_id = "test-conn-5";
+
+        // Create a session in the DB and register it to this connection
+        let session_id = daemon.session_manager.generate_session_id("testapp");
+        daemon.session_manager.create_session(
+            &session_id, "/bin/testapp", "/home/user", 99999,
+        ).unwrap();
+
+        {
+            let mut sessions = daemon.connection_sessions.write().await;
+            sessions.entry(conn_id.to_string()).or_default().push(session_id.clone());
+        }
+
+        // Verify session is running
+        let session = daemon.session_manager.get_session(&session_id).unwrap().unwrap();
+        assert_eq!(session.status, crate::db::SessionStatus::Running);
+
+        // Disconnect — should clean up the session
+        daemon.handle_disconnect(conn_id).await;
+
+        // Connection tracking should be cleared
+        assert!(!daemon.connection_sessions.read().await.contains_key(conn_id));
+
+        // Session should be deleted from DB (stop_session deletes)
+        let session = daemon.session_manager.get_session(&session_id).unwrap();
+        assert!(session.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_stops_sessions() {
+        let (daemon, _dir) = test_daemon();
+
+        // Create a running session in the DB
+        let session_id = daemon.session_manager.generate_session_id("testapp");
+        daemon.session_manager.create_session(
+            &session_id, "/bin/testapp", "/home/user", 99999,
+        ).unwrap();
+
+        // Verify it shows up as running
+        let running = daemon.session_manager.get_running_sessions().unwrap();
+        assert_eq!(running.len(), 1);
+
+        // Graceful shutdown
+        daemon.graceful_shutdown().await;
+
+        // Session should be cleaned up
+        let session = daemon.session_manager.get_session(&session_id).unwrap();
+        assert!(session.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_per_connection_pattern_isolation() {
+        let (daemon, _dir) = test_daemon();
+        let mut init_a = false;
+        let mut init_b = false;
+        let conn_a = "conn-a";
+        let conn_b = "conn-b";
+
+        // Initialize both connections
+        let init_msg = make_initialize_request();
+        daemon.handle_message(&init_msg, &mut init_a, conn_a).await;
+        daemon.handle_message(&init_msg, &mut init_b, conn_b).await;
+
+        // Connection A sets patterns
+        let trace_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "debug_trace",
+                "arguments": {
+                    "add": ["conn_a_pattern::*"]
+                }
+            }
+        }).to_string();
+        daemon.handle_message(&trace_msg, &mut init_a, conn_a).await;
+
+        // Connection B sets different patterns
+        let trace_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "debug_trace",
+                "arguments": {
+                    "add": ["conn_b_pattern::*"]
+                }
+            }
+        }).to_string();
+        daemon.handle_message(&trace_msg, &mut init_b, conn_b).await;
+
+        // Verify isolation
+        let pending = daemon.pending_patterns.read().await;
+        let a_patterns = pending.get(conn_a).unwrap();
+        let b_patterns = pending.get(conn_b).unwrap();
+
+        assert!(a_patterns.contains("conn_a_pattern::*"));
+        assert!(!a_patterns.contains("conn_b_pattern::*"));
+        assert!(b_patterns.contains("conn_b_pattern::*"));
+        assert!(!b_patterns.contains("conn_a_pattern::*"));
     }
 }
