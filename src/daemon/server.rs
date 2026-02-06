@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +17,10 @@ pub struct Daemon {
     pid_path: PathBuf,
     session_manager: Arc<SessionManager>,
     last_activity: Arc<RwLock<Instant>>,
-    /// Pending trace patterns to apply on next launch
-    pending_patterns: Arc<RwLock<HashSet<String>>>,
+    /// Pending trace patterns per connection, applied on next launch
+    pending_patterns: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Sessions owned by each connection (for cleanup on disconnect)
+    connection_sessions: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl Daemon {
@@ -46,7 +48,8 @@ impl Daemon {
             pid_path,
             session_manager,
             last_activity: Arc::new(RwLock::new(Instant::now())),
-            pending_patterns: Arc::new(RwLock::new(HashSet::new())),
+            pending_patterns: Arc::new(RwLock::new(HashMap::new())),
+            connection_sessions: Arc::new(RwLock::new(HashMap::new())),
         });
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -82,10 +85,29 @@ impl Daemon {
             let last = *self.last_activity.read().await;
             if last.elapsed() > IDLE_TIMEOUT {
                 tracing::info!("Idle timeout reached, shutting down");
-                self.cleanup();
+                self.graceful_shutdown().await;
                 std::process::exit(0);
             }
         }
+    }
+
+    async fn graceful_shutdown(&self) {
+        tracing::info!("Starting graceful shutdown...");
+
+        // Stop all running Frida sessions
+        if let Ok(sessions) = self.session_manager.db().get_running_sessions() {
+            for session in sessions {
+                tracing::info!("Stopping session {} during shutdown", session.id);
+                let _ = self.session_manager.stop_frida(&session.id).await;
+                let _ = self.session_manager.stop_session(&session.id);
+            }
+        }
+
+        // Give DB writer tasks time to flush remaining events
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        self.cleanup();
+        tracing::info!("Graceful shutdown complete");
     }
 
     fn cleanup(&self) {
@@ -97,6 +119,10 @@ impl Daemon {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
+        let mut initialized = false;
+        let connection_id = uuid::Uuid::new_v4().to_string();
+
+        tracing::info!("Client connected: {}", connection_id);
 
         loop {
             line.clear();
@@ -108,17 +134,25 @@ impl Daemon {
             // Update activity timestamp
             *self.last_activity.write().await = Instant::now();
 
-            let response = self.handle_message(&line).await;
+            let response = self.handle_message(&line, &mut initialized, &connection_id).await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
         }
 
+        tracing::info!("Client disconnected: {}", connection_id);
+        self.handle_disconnect(&connection_id).await;
+
         Ok(())
     }
 
-    async fn handle_message(&self, message: &str) -> JsonRpcResponse {
+    async fn handle_message(
+        &self,
+        message: &str,
+        initialized: &mut bool,
+        connection_id: &str,
+    ) -> JsonRpcResponse {
         let request: JsonRpcRequest = match serde_json::from_str(message) {
             Ok(r) => r,
             Err(e) => {
@@ -131,11 +165,24 @@ impl Daemon {
             }
         };
 
+        // Enforce MCP protocol: initialize must be called first
+        if !*initialized && request.method != "initialize" {
+            return JsonRpcResponse::error(
+                request.id,
+                -32002,
+                "Server not initialized. Call 'initialize' first.".to_string(),
+                None,
+            );
+        }
+
         let result = match request.method.as_str() {
-            "initialize" => self.handle_initialize(&request.params).await,
+            "initialize" => {
+                *initialized = true;
+                self.handle_initialize(&request.params).await
+            }
             "initialized" => Ok(serde_json::json!({})),
             "tools/list" => self.handle_tools_list().await,
-            "tools/call" => self.handle_tools_call(&request.params).await,
+            "tools/call" => self.handle_tools_call(&request.params, connection_id).await,
             _ => Err(crate::Error::Frida(format!(
                 "Unknown method: {}",
                 request.method
@@ -302,12 +349,12 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
         Ok(serde_json::to_value(response)?)
     }
 
-    async fn handle_tools_call(&self, params: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn handle_tools_call(&self, params: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let call: McpToolCallRequest = serde_json::from_value(params.clone())?;
 
         let result = match call.name.as_str() {
-            "debug_launch" => self.tool_debug_launch(&call.arguments).await,
-            "debug_trace" => self.tool_debug_trace(&call.arguments).await,
+            "debug_launch" => self.tool_debug_launch(&call.arguments, connection_id).await,
+            "debug_trace" => self.tool_debug_trace(&call.arguments, connection_id).await,
             "debug_query" => self.tool_debug_query(&call.arguments).await,
             "debug_stop" => self.tool_debug_stop(&call.arguments).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
@@ -336,7 +383,31 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
         }
     }
 
-    async fn tool_debug_launch(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn handle_disconnect(&self, connection_id: &str) {
+        // Clean up pending patterns for this connection
+        {
+            let mut pending = self.pending_patterns.write().await;
+            pending.remove(connection_id);
+        }
+
+        // Stop any sessions owned by this connection
+        let session_ids = {
+            let mut sessions = self.connection_sessions.write().await;
+            sessions.remove(connection_id).unwrap_or_default()
+        };
+
+        for session_id in session_ids {
+            if let Ok(Some(session)) = self.session_manager.get_session(&session_id) {
+                if session.status == crate::db::SessionStatus::Running {
+                    tracing::info!("Cleaning up session {} after client disconnect", session_id);
+                    let _ = self.session_manager.stop_frida(&session_id).await;
+                    let _ = self.session_manager.stop_session(&session_id);
+                }
+            }
+        }
+    }
+
+    async fn tool_debug_launch(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let req: DebugLaunchRequest = serde_json::from_value(args.clone())?;
 
         // Auto-cleanup: if there's already a session for this binary, stop it first
@@ -375,11 +446,19 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
             pid,
         )?;
 
-        // If there are pending patterns, install hooks asynchronously in the background.
-        // This will block until DWARF parsing completes, then send hooks to the agent.
+        // Register session ownership for disconnect cleanup
+        {
+            let mut sessions = self.connection_sessions.write().await;
+            sessions.entry(connection_id.to_string()).or_default().push(session_id.clone());
+        }
+
+        // Get and clear this connection's pending patterns
         let pending_patterns: Vec<String> = {
-            let pending = self.pending_patterns.read().await;
-            pending.iter().cloned().collect()
+            let mut all_pending = self.pending_patterns.write().await;
+            match all_pending.remove(connection_id) {
+                Some(patterns) => patterns.into_iter().collect(),
+                None => Vec::new(),
+            }
         };
 
         if !pending_patterns.is_empty() {
@@ -408,13 +487,14 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
         Ok(serde_json::to_value(response)?)
     }
 
-    async fn tool_debug_trace(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn tool_debug_trace(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let req: DebugTraceRequest = serde_json::from_value(args.clone())?;
 
         match req.session_id {
-            // No session ID - modify pending patterns for next launch
+            // No session ID - modify pending patterns for this connection's next launch
             None => {
-                let mut pending = self.pending_patterns.write().await;
+                let mut all_pending = self.pending_patterns.write().await;
+                let pending = all_pending.entry(connection_id.to_string()).or_default();
 
                 if let Some(ref add) = req.add {
                     for pattern in add {
@@ -580,6 +660,14 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
         self.session_manager.stop_frida(&req.session_id).await?;
 
         let events_collected = self.session_manager.stop_session(&req.session_id)?;
+
+        // Remove from connection tracking so disconnect cleanup doesn't try to stop it again
+        {
+            let mut sessions = self.connection_sessions.write().await;
+            for session_list in sessions.values_mut() {
+                session_list.retain(|s| s != &req.session_id);
+            }
+        }
 
         let response = DebugStopResponse {
             success: true,

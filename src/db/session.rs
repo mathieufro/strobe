@@ -110,6 +110,28 @@ impl Database {
         }
     }
 
+    pub fn get_running_sessions(&self) -> Result<Vec<Session>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status
+             FROM sessions WHERE status = 'running'"
+        )?;
+
+        let sessions = stmt.query_map([], |row| {
+            Ok(Session {
+                id: row.get(0)?,
+                binary_path: row.get(1)?,
+                project_root: row.get(2)?,
+                pid: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(sessions)
+    }
+
     pub fn get_session_by_binary(&self, binary_path: &str) -> Result<Option<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(

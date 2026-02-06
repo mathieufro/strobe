@@ -1,3 +1,4 @@
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11,20 +12,35 @@ pub async fn stdio_proxy() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".strobe");
 
+    std::fs::create_dir_all(&strobe_dir)?;
+
     let socket_path = strobe_dir.join("strobe.sock");
     let pid_path = strobe_dir.join("strobe.pid");
 
-    // Check if daemon is running, start if not
+    // Ensure daemon is running
     if !is_daemon_running(&pid_path, &socket_path).await {
-        start_daemon().await?;
-        // Wait for socket to be available
-        for _ in 0..50 {
-            if socket_path.exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Use a lock file to prevent multiple proxies from starting daemons simultaneously
+        let lock_path = strobe_dir.join("daemon.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)?;
+
+        let got_lock = unsafe {
+            libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+        };
+
+        if got_lock {
+            // We won the race — start the daemon
+            start_daemon(&strobe_dir)?;
         }
+        // Whether we started it or someone else did, wait for the socket
+
+        // Drop the lock after spawning (or if we didn't get it)
+        drop(lock_file);
+
+        // Wait for socket to be connectable (not just existing)
+        wait_for_daemon(&socket_path).await?;
     }
 
     // Connect to daemon
@@ -86,9 +102,25 @@ async fn is_daemon_running(pid_path: &PathBuf, socket_path: &PathBuf) -> bool {
     // Read PID and check if process exists
     if let Ok(pid_str) = std::fs::read_to_string(pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            // Check if process exists (Unix-specific)
-            unsafe {
-                return libc::kill(pid, 0) == 0;
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                // Process doesn't exist — stale files
+                let _ = std::fs::remove_file(socket_path);
+                let _ = std::fs::remove_file(pid_path);
+                return false;
+            }
+            // Process exists — verify socket is connectable
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                UnixStream::connect(socket_path),
+            ).await {
+                Ok(Ok(stream)) => {
+                    drop(stream);
+                    return true;
+                }
+                _ => {
+                    // PID exists but socket isn't accepting — could be stale PID
+                    return false;
+                }
             }
         }
     }
@@ -96,14 +128,47 @@ async fn is_daemon_running(pid_path: &PathBuf, socket_path: &PathBuf) -> bool {
     false
 }
 
-async fn start_daemon() -> Result<()> {
+async fn wait_for_daemon(socket_path: &PathBuf) -> Result<()> {
+    for _attempt in 0..50 {
+        if socket_path.exists() {
+            // Try actual connection to verify daemon is accepting
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                UnixStream::connect(socket_path),
+            ).await {
+                Ok(Ok(stream)) => {
+                    // Connected successfully — daemon is ready
+                    drop(stream);
+                    return Ok(());
+                }
+                _ => {
+                    // Socket exists but not ready yet, or timeout
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    Err(crate::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "Daemon failed to start within 5 seconds",
+    )))
+}
+
+fn start_daemon(strobe_dir: &PathBuf) -> Result<()> {
     let exe = std::env::current_exe()?;
+    let log_path = strobe_dir.join("daemon.log");
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
 
     std::process::Command::new(exe)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log_file))
         .spawn()?;
 
     Ok(())

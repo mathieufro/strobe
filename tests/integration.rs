@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
 use tempfile::tempdir;
 
 // Test helper to create a simple test binary
@@ -389,4 +389,86 @@ fn test_batch_insert_with_output_events() {
     assert!(results[0].text.is_none());
     assert_eq!(results[1].event_type, strobe::db::EventType::Stdout);
     assert_eq!(results[1].text.as_deref(), Some("batch output line\n"));
+}
+
+#[test]
+fn test_mcp_initialize_response_has_instructions() {
+    let response = strobe::mcp::McpInitializeResponse {
+        protocol_version: "2024-11-05".to_string(),
+        capabilities: strobe::mcp::McpServerCapabilities {
+            tools: strobe::mcp::McpToolsCapability { list_changed: false },
+        },
+        server_info: strobe::mcp::McpServerInfo {
+            name: "strobe".to_string(),
+            version: "0.1.0".to_string(),
+        },
+        instructions: Some("Test instructions".to_string()),
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("instructions"));
+    assert!(json.contains("Test instructions"));
+
+    // When None, instructions field should be omitted
+    let response_no_instructions = strobe::mcp::McpInitializeResponse {
+        protocol_version: "2024-11-05".to_string(),
+        capabilities: strobe::mcp::McpServerCapabilities {
+            tools: strobe::mcp::McpToolsCapability { list_changed: false },
+        },
+        server_info: strobe::mcp::McpServerInfo {
+            name: "strobe".to_string(),
+            version: "0.1.0".to_string(),
+        },
+        instructions: None,
+    };
+
+    let json = serde_json::to_string(&response_no_instructions).unwrap();
+    assert!(!json.contains("instructions"));
+}
+
+#[tokio::test]
+async fn test_pending_patterns_isolation() {
+    // Simulate per-connection pending patterns
+    let mut all_pending: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // Client A sets patterns
+    let client_a = "conn-a";
+    all_pending.entry(client_a.to_string()).or_default().insert("foo::*".to_string());
+
+    // Client B sets different patterns
+    let client_b = "conn-b";
+    all_pending.entry(client_b.to_string()).or_default().insert("bar::*".to_string());
+
+    // Client A launches — should get only its patterns, and they should be consumed
+    let a_patterns: Vec<String> = all_pending.remove(client_a)
+        .map(|s| s.into_iter().collect())
+        .unwrap_or_default();
+
+    assert_eq!(a_patterns, vec!["foo::*"]);
+    assert!(all_pending.get(client_a).is_none()); // consumed
+
+    // Client B's patterns should be unaffected
+    assert!(all_pending.get(client_b).unwrap().contains("bar::*"));
+}
+
+#[tokio::test]
+async fn test_session_cleanup_on_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = strobe::db::Database::open(&db_path).unwrap();
+
+    // Create two running sessions
+    db.create_session("session-1", "/bin/app1", "/home", 1000).unwrap();
+    db.create_session("session-2", "/bin/app2", "/home", 2000).unwrap();
+
+    // Both should be listed as running
+    let running = db.get_running_sessions().unwrap();
+    assert_eq!(running.len(), 2);
+
+    // Stop one
+    db.update_session_status("session-1", strobe::db::SessionStatus::Stopped).unwrap();
+
+    let running = db.get_running_sessions().unwrap();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].id, "session-2");
 }
