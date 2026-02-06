@@ -234,6 +234,7 @@ unsafe extern "C" fn raw_on_output(
         session_id: ctx.session_id.clone(),
         timestamp_ns: now_ns,
         thread_id: 0,
+        thread_name: None,
         event_type,
         function_name: String::new(),
         function_name_raw: None,
@@ -323,6 +324,32 @@ impl AgentMessageHandler {
             "agent_loaded" => {
                 if let Some(msg) = payload.get("message").and_then(|v| v.as_str()) {
                     tracing::info!("Agent loaded: {}", msg);
+                }
+            }
+            "sampling_state_change" => {
+                let func_name = payload.get("funcName").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let enabled = payload.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                let sample_rate = payload.get("sampleRate").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let rate_pct = (sample_rate * 100.0) as u32;
+
+                if enabled {
+                    tracing::warn!(
+                        "[{}] Hot function detected: '{}' - auto-sampling at {}%",
+                        self.session_id, func_name, rate_pct
+                    );
+                } else {
+                    tracing::info!(
+                        "[{}] Function cooled down: '{}' - full capture resumed",
+                        self.session_id, func_name
+                    );
+                }
+            }
+            "sampling_stats" => {
+                if let Some(stats) = payload.get("stats").and_then(|v| v.as_array()) {
+                    let sampling_count = stats.iter().filter(|s| {
+                        s.get("samplingEnabled").and_then(|v| v.as_bool()).unwrap_or(false)
+                    }).count();
+                    tracing::debug!("[{}] Sampling stats: {} functions being sampled", self.session_id, sampling_count);
                 }
             }
             _ => {
@@ -840,6 +867,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             session_id: session_id.to_string(),
             timestamp_ns: json.get("timestampNs")?.as_i64()?,
             thread_id: json.get("threadId")?.as_i64()?,
+            thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
             parent_event_id: None,
             event_type,
             function_name: String::new(),
@@ -860,6 +888,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         session_id: session_id.to_string(),
         timestamp_ns: json.get("timestampNs")?.as_i64()?,
         thread_id: json.get("threadId")?.as_i64()?,
+        thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
         parent_event_id: json.get("parentEventId").and_then(|v| v.as_str()).map(|s| s.to_string()),
         event_type,
         function_name: json.get("functionName")?.as_str()?.to_string(),

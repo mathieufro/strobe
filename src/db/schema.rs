@@ -79,6 +79,13 @@ impl Database {
             Err(e) => return Err(e.into()),
         }
 
+        // Add thread_name column (idempotent for existing DBs)
+        match conn.execute("ALTER TABLE events ADD COLUMN thread_name TEXT", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+
         // Create indexes
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_time ON events(session_id, timestamp_ns)",
@@ -90,6 +97,10 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_source ON events(source_file)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_thread ON events(session_id, thread_id, timestamp_ns)",
             [],
         )?;
 

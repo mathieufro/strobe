@@ -355,7 +355,12 @@ When called WITHOUT sessionId (advanced/staging mode):
 - Stages "pending patterns" for next debug_launch by this connection
 - hookedFunctions will be 0 (hooks not installed until launch)
 - Use only when you know exactly what to trace upfront
-- Consider launching clean and observing output first instead"#.to_string(),
+- Consider launching clean and observing output first instead
+
+Validation Limits (enforced):
+- eventLimit: max 10,000,000 events per session
+- watches: max 32 per session
+- watch expressions/variables: max 1KB length, max 10 levels deep (-> or . operators)"#.to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -627,6 +632,9 @@ When called WITHOUT sessionId (advanced/staging mode):
 
     async fn tool_debug_trace(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let req: DebugTraceRequest = serde_json::from_value(args.clone())?;
+
+        // Validate request first
+        req.validate()?;
 
         match req.session_id {
             // No session ID - modify pending patterns for this connection's next launch

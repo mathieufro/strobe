@@ -1,4 +1,5 @@
 import { HookInstaller, HookMode } from './hooks.js';
+import { RateTracker } from './rate-tracker.js';
 
 interface HookInstruction {
   action: 'add' | 'remove';
@@ -47,6 +48,9 @@ class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
   private hookInstaller: HookInstaller;
+  private rateTracker: RateTracker | null = null;
+  private funcIdToName: Map<number, string> = new Map();
+  private nextFuncId: number = 0;
 
   // Output event buffering (low-frequency, stays in JS)
   private outputBuffer: OutputEvent[] = [];
@@ -63,6 +67,8 @@ class StrobeAgent {
 
   constructor() {
     this.hookInstaller = new HookInstaller((events) => {
+      // Note: Full sampling integration would intercept events here
+      // For now, events flow through unchanged
       send({ type: 'events', events });
     });
     this.sessionStartNs = Date.now() * 1000000;
@@ -83,6 +89,31 @@ class StrobeAgent {
     this.sessionId = sessionId;
     this.sessionStartNs = Date.now() * 1000000;
     this.hookInstaller.setSessionId(sessionId);
+
+    // Initialize rate tracker for hot function detection
+    this.rateTracker = new RateTracker(
+      this.funcIdToName,
+      (funcId: number, enabled: boolean, rate: number) => {
+        send({
+          type: 'sampling_state_change',
+          funcId,
+          funcName: this.funcIdToName.get(funcId) || `func_${funcId}`,
+          enabled,
+          sampleRate: rate,
+        });
+      }
+    );
+
+    // Periodically send sampling stats
+    setInterval(() => {
+      if (this.rateTracker) {
+        const stats = this.rateTracker.getSamplingStats();
+        if (stats.some(s => s.samplingEnabled)) {
+          send({ type: 'sampling_stats', stats });
+        }
+      }
+    }, 1000);
+
     send({ type: 'initialized', sessionId });
   }
 
@@ -102,6 +133,9 @@ class StrobeAgent {
       if (message.action === 'add') {
         for (const func of message.functions) {
           if (this.hookInstaller.installHook(func, mode)) {
+            // Track funcId -> name mapping for rate tracker
+            const funcId = this.nextFuncId++;
+            this.funcIdToName.set(funcId, func.name);
             installed++;
           } else {
             failed++;

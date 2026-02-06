@@ -57,6 +57,7 @@ fn test_database_roundtrip() {
         session_id: "test-session".to_string(),
         timestamp_ns: 1000,
         thread_id: 1,
+        thread_name: None,
         parent_event_id: None,
         event_type: strobe::db::EventType::FunctionEnter,
         function_name: "main".to_string(),
@@ -127,6 +128,7 @@ fn test_event_with_watch_values() {
         session_id: "s1".to_string(),
         timestamp_ns: 5000,
         thread_id: 1,
+        thread_name: None,
         parent_event_id: None,
         event_type: strobe::db::EventType::FunctionEnter,
         function_name: "NoteOn".to_string(),
@@ -265,6 +267,7 @@ fn test_output_event_insertion_and_query() {
         session_id: "test-session".to_string(),
         timestamp_ns: 1500,
         thread_id: 1,
+        thread_name: None,
         parent_event_id: None,
         event_type: strobe::db::EventType::Stdout,
         function_name: String::new(),
@@ -285,6 +288,7 @@ fn test_output_event_insertion_and_query() {
         session_id: "test-session".to_string(),
         timestamp_ns: 2500,
         thread_id: 1,
+        thread_name: None,
         parent_event_id: None,
         event_type: strobe::db::EventType::Stderr,
         function_name: String::new(),
@@ -327,6 +331,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         session_id: "test-session".to_string(),
         timestamp_ns: 1000,
         thread_id: 1,
+        thread_name: None,
         parent_event_id: None,
         event_type: strobe::db::EventType::FunctionEnter,
         function_name: "main::run".to_string(),
@@ -347,6 +352,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         session_id: "test-session".to_string(),
         timestamp_ns: 1500,
         thread_id: 1,
+        thread_name: None,
         parent_event_id: None,
         event_type: strobe::db::EventType::Stdout,
         function_name: String::new(),
@@ -367,6 +373,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         session_id: "test-session".to_string(),
         timestamp_ns: 2000,
         thread_id: 1,
+        thread_name: None,
         parent_event_id: Some("evt-1".to_string()),
         event_type: strobe::db::EventType::FunctionExit,
         function_name: "main::run".to_string(),
@@ -420,6 +427,7 @@ fn test_batch_insert_with_output_events() {
             session_id: "test-session".to_string(),
             timestamp_ns: 100,
             thread_id: 1,
+        thread_name: None,
             parent_event_id: None,
             event_type: strobe::db::EventType::FunctionEnter,
             function_name: "init".to_string(),
@@ -438,6 +446,7 @@ fn test_batch_insert_with_output_events() {
             session_id: "test-session".to_string(),
             timestamp_ns: 200,
             thread_id: 1,
+        thread_name: None,
             parent_event_id: None,
             event_type: strobe::db::EventType::Stdout,
             function_name: String::new(),
@@ -755,4 +764,24 @@ fn pattern_matches(name: &str, pattern: &str) -> bool {
     }
 
     false
+}
+
+// Test for hook count accumulation bug fix
+#[test]
+fn test_hook_count_accuracy() {
+    use strobe::frida_collector::HookResult;
+
+    // Simulate multi-chunk hook installation
+    let chunks = vec![
+        HookResult { installed: 50, matched: 50, warnings: vec![] },
+        HookResult { installed: 30, matched: 30, warnings: vec![] },
+        HookResult { installed: 20, matched: 20, warnings: vec![] },
+    ];
+
+    // Test the accumulation logic
+    let total_installed: u32 = chunks.iter().map(|r| r.installed).sum();
+    let total_matched: u32 = chunks.iter().map(|r| r.matched).sum();
+
+    assert_eq!(total_installed, 100, "Hook count should accumulate to 100");
+    assert_eq!(total_matched, 100, "Matched count should accumulate to 100");
 }

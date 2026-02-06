@@ -26,6 +26,9 @@ pub enum Error {
     #[error("WATCH_FAILED: {0}")]
     WatchFailed(String),
 
+    #[error("VALIDATION_ERROR: {0}")]
+    ValidationError(String),
+
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 

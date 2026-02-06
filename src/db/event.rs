@@ -39,6 +39,7 @@ pub struct Event {
     pub session_id: String,
     pub timestamp_ns: i64,
     pub thread_id: i64,
+    pub thread_name: Option<String>,
     pub parent_event_id: Option<String>,
     pub event_type: EventType,
     pub function_name: String,
@@ -97,6 +98,8 @@ pub struct EventQuery {
     pub source_file_contains: Option<String>,
     pub return_value_equals: Option<serde_json::Value>,
     pub return_value_is_null: Option<bool>,
+    pub thread_id_equals: Option<i64>,
+    pub thread_name_contains: Option<String>,
     pub limit: u32,
     pub offset: u32,
 }
@@ -112,6 +115,8 @@ impl Default for EventQuery {
             source_file_contains: None,
             return_value_equals: None,
             return_value_is_null: None,
+            thread_id_equals: None,
+            thread_name_contains: None,
             limit: 50,
             offset: 0,
         }
@@ -161,15 +166,16 @@ impl Database {
         let conn = self.connection();
 
         conn.execute(
-            "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
+            "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
              arguments, return_value, duration_ns, text, sampled, watch_values)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 event.id,
                 event.session_id,
                 event.timestamp_ns,
                 event.thread_id,
+                event.thread_name,
                 event.parent_event_id,
                 event.event_type.as_str(),
                 event.function_name,
@@ -193,15 +199,16 @@ impl Database {
 
         for event in events {
             conn.execute(
-                "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
+                "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
                  event_type, function_name, function_name_raw, source_file, line_number,
                  arguments, return_value, duration_ns, text, sampled, watch_values)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     event.id,
                     event.session_id,
                     event.timestamp_ns,
                     event.thread_id,
+                    &event.thread_name,
                     event.parent_event_id,
                     event.event_type.as_str(),
                     event.function_name,
@@ -229,7 +236,7 @@ impl Database {
         let conn = self.connection();
 
         let mut sql = String::from(
-            "SELECT id, session_id, timestamp_ns, thread_id, parent_event_id,
+            "SELECT id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
              arguments, return_value, duration_ns, text, sampled, watch_values
              FROM events WHERE session_id = ?"
@@ -265,6 +272,16 @@ impl Database {
             }
         }
 
+        if let Some(tid) = query.thread_id_equals {
+            sql.push_str(" AND thread_id = ?");
+            params_vec.push(Box::new(tid));
+        }
+
+        if let Some(ref name) = query.thread_name_contains {
+            sql.push_str(" AND thread_name LIKE ? ESCAPE '\\'");
+            params_vec.push(Box::new(format!("%{}%", escape_like_pattern(name))));
+        }
+
         sql.push_str(" ORDER BY timestamp_ns ASC");
         sql.push_str(&format!(" LIMIT {} OFFSET {}", query.limit, query.offset));
 
@@ -272,10 +289,10 @@ impl Database {
 
         let mut stmt = conn.prepare(&sql)?;
         let events = stmt.query_map(params_refs.as_slice(), |row| {
-            let event_type_str: String = row.get(5)?;
+            let event_type_str: String = row.get(6)?;
 
             // Handle JSON columns that might be stored as different SQLite types
-            let args = match row.get_ref(10)? {
+            let args = match row.get_ref(11)? {
                 rusqlite::types::ValueRef::Null => None,
                 rusqlite::types::ValueRef::Text(s) => {
                     serde_json::from_str(std::str::from_utf8(s).unwrap_or("null")).ok()
@@ -285,7 +302,7 @@ impl Database {
                 _ => None,
             };
 
-            let ret = match row.get_ref(11)? {
+            let ret = match row.get_ref(12)? {
                 rusqlite::types::ValueRef::Null => None,
                 rusqlite::types::ValueRef::Text(s) => {
                     serde_json::from_str(std::str::from_utf8(s).unwrap_or("null")).ok()
@@ -295,7 +312,7 @@ impl Database {
                 _ => None,
             };
 
-            let watch_vals = match row.get_ref(15)? {
+            let watch_vals = match row.get_ref(16)? {
                 rusqlite::types::ValueRef::Null => None,
                 rusqlite::types::ValueRef::Text(s) => {
                     serde_json::from_str(std::str::from_utf8(s).unwrap_or("null")).ok()
@@ -308,17 +325,18 @@ impl Database {
                 session_id: row.get(1)?,
                 timestamp_ns: row.get(2)?,
                 thread_id: row.get(3)?,
-                parent_event_id: row.get(4)?,
+                thread_name: row.get(4)?,
+                parent_event_id: row.get(5)?,
                 event_type: EventType::from_str(&event_type_str).unwrap(),
-                function_name: row.get(6)?,
-                function_name_raw: row.get(7)?,
-                source_file: row.get(8)?,
-                line_number: row.get(9)?,
+                function_name: row.get(7)?,
+                function_name_raw: row.get(8)?,
+                source_file: row.get(9)?,
+                line_number: row.get(10)?,
                 arguments: args,
                 return_value: ret,
-                duration_ns: row.get(12)?,
-                text: row.get(13)?,
-                sampled: row.get(14)?,
+                duration_ns: row.get(13)?,
+                text: row.get(14)?,
+                sampled: row.get(15)?,
                 watch_values: watch_vals,
             })
         })?;
@@ -421,15 +439,16 @@ impl Database {
             // Insert events for this session
             for event in session_events {
                 tx.execute(
-                    "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
+                    "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
                      event_type, function_name, function_name_raw, source_file, line_number,
                      arguments, return_value, duration_ns, text, sampled, watch_values)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         &event.id,
                         &event.session_id,
                         event.timestamp_ns,
                         event.thread_id,
+                        &event.thread_name,
                         &event.parent_event_id,
                         event.event_type.as_str(),
                         &event.function_name,

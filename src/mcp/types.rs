@@ -111,6 +111,80 @@ pub struct DebugTraceResponse {
     pub status: Option<String>,
 }
 
+// Validation limits
+pub const MAX_EVENT_LIMIT: usize = 10_000_000;
+pub const MAX_WATCHES_PER_SESSION: usize = 32;
+pub const MAX_WATCH_EXPRESSION_LENGTH: usize = 1024;
+pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 10;
+
+impl DebugTraceRequest {
+    /// Validate request parameters against limits
+    pub fn validate(&self) -> crate::Result<()> {
+        // Validate event_limit
+        if let Some(limit) = self.event_limit {
+            if limit > MAX_EVENT_LIMIT {
+                return Err(crate::Error::ValidationError(
+                    format!("event_limit ({}) exceeds maximum of {}", limit, MAX_EVENT_LIMIT)
+                ));
+            }
+        }
+
+        // Validate watches
+        if let Some(ref watch_update) = self.watches {
+            if let Some(ref add_watches) = watch_update.add {
+                // Check watch count
+                if add_watches.len() > MAX_WATCHES_PER_SESSION {
+                    return Err(crate::Error::ValidationError(
+                        format!("Cannot add {} watches (max {})", add_watches.len(), MAX_WATCHES_PER_SESSION)
+                    ));
+                }
+
+                // Validate each watch
+                for watch in add_watches {
+                    // Check expression length and depth
+                    if let Some(ref expr) = watch.expr {
+                        if expr.len() > MAX_WATCH_EXPRESSION_LENGTH {
+                            return Err(crate::Error::ValidationError(
+                                format!("Watch expression length ({} bytes) exceeds maximum of {} bytes",
+                                    expr.len(), MAX_WATCH_EXPRESSION_LENGTH)
+                            ));
+                        }
+
+                        // Check expression depth (count -> and . operators)
+                        let depth = expr.matches("->").count() + expr.matches('.').count();
+                        if depth > MAX_WATCH_EXPRESSION_DEPTH {
+                            return Err(crate::Error::ValidationError(
+                                format!("Watch expression depth ({}) exceeds maximum of {}",
+                                    depth, MAX_WATCH_EXPRESSION_DEPTH)
+                            ));
+                        }
+                    }
+
+                    // Check variable length and depth
+                    if let Some(ref var) = watch.variable {
+                        if var.len() > MAX_WATCH_EXPRESSION_LENGTH {
+                            return Err(crate::Error::ValidationError(
+                                format!("Watch variable length ({} bytes) exceeds maximum of {} bytes",
+                                    var.len(), MAX_WATCH_EXPRESSION_LENGTH)
+                            ));
+                        }
+
+                        let depth = var.matches("->").count() + var.matches('.').count();
+                        if depth > MAX_WATCH_EXPRESSION_DEPTH {
+                            return Err(crate::Error::ValidationError(
+                                format!("Watch variable depth ({}) exceeds maximum of {}",
+                                    depth, MAX_WATCH_EXPRESSION_DEPTH)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 // ============ debug_query ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +281,7 @@ pub enum ErrorCode {
     FridaAttachFailed,
     InvalidPattern,
     WatchFailed,
+    ValidationError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +301,7 @@ impl From<crate::Error> for McpError {
             crate::Error::FridaAttachFailed(_) => ErrorCode::FridaAttachFailed,
             crate::Error::InvalidPattern { .. } => ErrorCode::InvalidPattern,
             crate::Error::WatchFailed(_) => ErrorCode::WatchFailed,
+            crate::Error::ValidationError(_) => ErrorCode::ValidationError,
             _ => ErrorCode::FridaAttachFailed, // Generic fallback
         };
 

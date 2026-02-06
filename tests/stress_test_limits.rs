@@ -144,6 +144,7 @@ fn create_event(session_id: &str, seq: usize) -> Event {
         session_id: session_id.to_string(),
         timestamp_ns: seq as i64 * 20833, // ~48kHz = 20.8μs per sample
         thread_id: 1,
+        thread_name: None,
         event_type: event_type.clone(),
         parent_event_id: if event_type == EventType::FunctionExit {
             Some(format!("{}-evt-{}", session_id, seq - 1))
