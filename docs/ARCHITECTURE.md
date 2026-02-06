@@ -402,7 +402,7 @@ CREATE VIRTUAL TABLE events_fts USING fts5(
 
 ### debug_launch (Phase 1a)
 
-Start a new debug session.
+Start a new debug session. Process stdout/stderr are ALWAYS captured automatically (no tracing needed).
 
 ```typescript
 debug_launch({
@@ -413,14 +413,17 @@ debug_launch({
   env?: Record<string, string>  // Environment variables
 }) → {
   sessionId: string,            // Human-readable: "myapp-2026-02-05-14h32"
-  pid: number
+  pid: number,
+  pendingPatternsApplied?: number,  // Count of pre-staged patterns (if any)
+  nextSteps?: string            // Recommended next action
 }
 ```
 
 **Notes:**
 - `projectRoot` is required for user code detection via DWARF
 - Session ID is human-readable for easy reference in conversation
-- Use `debug_trace` to add patterns after launch
+- stdout/stderr automatically captured - check output before adding trace patterns
+- `nextSteps` provides workflow guidance (e.g., "Query stderr/stdout with debug_query first")
 
 ### debug_stop (Phase 1a)
 
@@ -492,17 +495,22 @@ const events = await debug_query({
 
 ### debug_trace (Phase 1a)
 
-Add or remove trace patterns at runtime. No restart required.
+Add or remove trace patterns on a RUNNING session. No restart required.
+
+**Recommended workflow:** Launch clean (no patterns) → check stderr/stdout → add targeted patterns only if needed.
 
 ```typescript
 debug_trace({
-  sessionId: string,
+  sessionId?: string,        // Omit for pending (pre-launch) mode, provide for runtime mode
   add?: string[],            // Patterns to start tracing
   remove?: string[],         // Patterns to stop tracing
   depth?: number             // Serialization depth (Phase 1b, ignored in 1a)
 }) → {
-  activePatterns: string[],  // Current trace patterns
-  hookedFunctions: number    // Total hooked function count
+  mode: "pending" | "runtime",   // Indicates pre-launch vs. running session
+  activePatterns: string[],      // Current trace patterns
+  hookedFunctions: number,       // Actual hooked function count (0 if pending or no matches)
+  matchedFunctions?: number,     // If different from hookedFunctions (e.g., crash during install)
+  status?: string                // Contextual guidance (e.g., troubleshooting for 0 hooks)
 }
 ```
 
@@ -510,6 +518,11 @@ debug_trace({
 - `*` matches any characters except `::`
 - `**` matches any characters including `::`
 - `@usercode` expands to all functions in projectRoot
+
+**Response Fields:**
+- `mode: "pending"` - Patterns staged for next launch (without sessionId)
+- `mode: "runtime"` - Patterns applied to running session (with sessionId)
+- `status` - Actionable guidance based on current state (e.g., why hookedFunctions is 0, stability recommendations)
 
 ### debug_query (Phase 1a)
 

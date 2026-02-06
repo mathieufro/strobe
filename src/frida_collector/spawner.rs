@@ -8,6 +8,7 @@ use crate::db::{Event, EventType};
 use crate::dwarf::{DwarfParser, DwarfHandle, FunctionInfo};
 use crate::Result;
 use super::{HookManager, HookMode};
+use libc;
 
 // ---------------------------------------------------------------------------
 // Raw frida-sys wrappers
@@ -244,6 +245,7 @@ unsafe extern "C" fn raw_on_output(
         return_value: None,
         text: Some(text),
         sampled: None,
+        watch_values: None,
     };
 
     let _ = ctx.event_tx.try_send(event);
@@ -296,6 +298,17 @@ impl AgentMessageHandler {
                 tracing::info!("Hooks updated for session {}: {} active", self.session_id, count);
 
                 // Signal the worker that hooks are installed
+                if let Ok(mut guard) = self.hooks_ready.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(count);
+                    }
+                }
+            }
+            "watches_updated" => {
+                let count = payload.get("activeCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                tracing::info!("Watches updated for session {}: {} active", self.session_id, count);
+
+                // Signal the worker that watches are installed (reuse hooks_ready signal)
                 if let Ok(mut guard) = self.hooks_ready.lock() {
                     if let Some(tx) = guard.take() {
                         let _ = tx.send(count);
@@ -361,10 +374,28 @@ enum FridaCommand {
         functions: Vec<FunctionTarget>,
         response: oneshot::Sender<Result<()>>,
     },
+    SetWatches {
+        session_id: String,
+        watches: Vec<WatchTarget>,
+        response: oneshot::Sender<Result<()>>,
+    },
     Stop {
         session_id: String,
         response: oneshot::Sender<Result<()>>,
     },
+}
+
+#[derive(Clone)]
+pub struct WatchTarget {
+    pub label: String,
+    pub address: u64,
+    pub size: u8,
+    pub type_kind_str: String,
+    pub deref_depth: u8,
+    pub deref_offset: u64,
+    pub type_name: Option<String>,
+    pub on_func_ids: Option<Vec<u32>>,
+    pub on_patterns: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -707,6 +738,62 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                 let _ = response.send(result);
             }
 
+            FridaCommand::SetWatches {
+                session_id,
+                watches,
+                response,
+            } => {
+                let result = (|| -> Result<u64> {
+                    let session = sessions.get_mut(&session_id)
+                        .ok_or_else(|| crate::Error::SessionNotFound(session_id.clone()))?;
+
+                    // Set up signal to wait for confirmation
+                    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+                    {
+                        let mut guard = session.hooks_ready.lock().unwrap();
+                        *guard = Some(signal_tx);
+                    }
+
+                    let watch_list: Vec<serde_json::Value> = watches.iter().map(|w| {
+                        serde_json::json!({
+                            "label": w.label,
+                            "address": format!("0x{:x}", w.address),
+                            "size": w.size,
+                            "typeKind": w.type_kind_str,
+                            "derefDepth": w.deref_depth,
+                            "derefOffset": w.deref_offset,
+                            "typeName": w.type_name,
+                            "onFuncIds": w.on_func_ids,
+                            "onPatterns": w.on_patterns,
+                        })
+                    }).collect();
+
+                    let watches_msg = serde_json::json!({
+                        "type": "watches",
+                        "watches": watch_list,
+                    });
+
+                    unsafe {
+                        post_message_raw(session.script_ptr, &serde_json::to_string(&watches_msg).unwrap())
+                            .map_err(|e| crate::Error::WatchFailed(format!("Failed to send watches: {}", e)))?;
+                    }
+
+                    // Wait for agent confirmation
+                    match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(count) => {
+                            tracing::info!("Agent confirmed {} watches active", count);
+                            Ok(count)
+                        }
+                        Err(_) => {
+                            tracing::warn!("Timeout waiting for watch confirmation");
+                            Err(crate::Error::WatchFailed("Timeout waiting for watch confirmation".into()))
+                        }
+                    }
+                })();
+
+                let _ = response.send(result.map(|_| ()));
+            }
+
             FridaCommand::Stop {
                 session_id,
                 response,
@@ -716,10 +803,21 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                     if let Ok(mut reg) = output_registry.lock() {
                         reg.remove(&session.pid);
                     }
-                    // Kill the traced process
-                    tracing::info!("Killing process {} for session {}", session.pid, session_id);
-                    device.kill(session.pid)
-                        .unwrap_or_else(|e| tracing::warn!("Failed to kill PID {}: {:?}", session.pid, e));
+
+                    // Check if process is still alive before trying to kill
+                    // Using libc::kill(pid, 0) to check existence without sending signal
+                    let is_alive = unsafe {
+                        libc::kill(session.pid as i32, 0) == 0
+                    };
+
+                    if is_alive {
+                        // Kill the traced process
+                        tracing::info!("Killing process {} for session {}", session.pid, session_id);
+                        device.kill(session.pid)
+                            .unwrap_or_else(|e| tracing::warn!("Failed to kill PID {}: {:?}", session.pid, e));
+                    } else {
+                        tracing::info!("Process {} already dead for session {}", session.pid, session_id);
+                    }
                 }
                 let _ = response.send(Ok(()));
             }
@@ -753,6 +851,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             duration_ns: None,
             text: json.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
             sampled: None,
+            watch_values: None,
         });
     }
 
@@ -772,6 +871,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         duration_ns: json.get("durationNs").and_then(|v| v.as_i64()),
         text: None,
         sampled: json.get("sampled").and_then(|v| v.as_bool()),
+        watch_values: json.get("watchValues").cloned(),
     })
 }
 
@@ -918,7 +1018,7 @@ impl FridaSpawner {
         // Send full-mode chunks
         for chunk in full_funcs.chunks(CHUNK_SIZE) {
             match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Full).await {
-                Ok(count) => total_hooks = count,
+                Ok(count) => total_hooks += count,
                 Err(e) => {
                     warnings.push(format!("Hook installation error: {}", e));
                     break;
@@ -929,7 +1029,7 @@ impl FridaSpawner {
         // Send light-mode chunks
         for chunk in light_funcs.chunks(CHUNK_SIZE) {
             match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Light).await {
-                Ok(count) => total_hooks = count,
+                Ok(count) => total_hooks += count,
                 Err(e) => {
                     warnings.push(format!("Hook installation error: {}", e));
                     break;
@@ -996,6 +1096,19 @@ impl FridaSpawner {
 
         self.cmd_tx.send(FridaCommand::Stop {
             session_id: session_id.to_string(),
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Worker thread died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Worker response lost".to_string()))?
+    }
+
+    pub async fn set_watches(&mut self, session_id: &str, watches: Vec<WatchTarget>) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.cmd_tx.send(FridaCommand::SetWatches {
+            session_id: session_id.to_string(),
+            watches,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Worker thread died".to_string()))?;
 

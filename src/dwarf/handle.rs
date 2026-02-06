@@ -63,6 +63,9 @@ mod tests {
         Arc::new(DwarfParser {
             functions: vec![],
             functions_by_name: std::collections::HashMap::new(),
+            variables: vec![],
+            variables_by_name: std::collections::HashMap::new(),
+            struct_members: std::collections::HashMap::new(),
             image_base: 0x100000,
         })
     }

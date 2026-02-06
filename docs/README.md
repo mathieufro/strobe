@@ -79,6 +79,25 @@ When your app crashes, Strobe captures the stderr output (ASAN reports, stack tr
 
 Query what happened, don't just observe current state. Find all null returns, slow functions, specific error patterns. Filter by thread, time range, function pattern. Process stdout/stderr are captured into the same timeline, so the LLM can correlate output with function calls. Pagination with metadata helps LLM narrow down large result sets.
 
+### Watch Variables
+
+Read global and static variable values at the exact moment traced functions execute. No manual logging or printf debugging. The LLM specifies which variables to watch and optionally which functions to watch them in:
+
+```typescript
+debug_trace({
+  sessionId: "...",
+  watches: {
+    add: [
+      { variable: "gCounter" },                        // Always captured
+      { variable: "gTempo", on: ["audio::process"] },  // Only during audio::process
+      { variable: "gClock->member", on: ["midi::*"] }  // Pointer dereferencing with wildcard
+    ]
+  }
+})
+```
+
+Supports DWARF-based variable resolution (`gVar`, `gPtr->member`), raw memory addresses, and JavaScript expressions. Pattern matching with `on` field enables contextual filtering—capture a variable only during specific functions to reduce noise.
+
 ### Conditional Breakpoints
 
 Pause only when it matters. Set conditions on field values, hit counts. The LLM sets a breakpoint, inspects state when it triggers, and continues - all programmatically.

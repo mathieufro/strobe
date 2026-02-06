@@ -23,6 +23,9 @@ pub enum Error {
     #[error("INVALID_PATTERN: Invalid trace pattern '{pattern}': {reason}")]
     InvalidPattern { pattern: String, reason: String },
 
+    #[error("WATCH_FAILED: {0}")]
+    WatchFailed(String),
+
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 

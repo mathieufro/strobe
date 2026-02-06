@@ -3,7 +3,7 @@ mod function;
 mod handle;
 
 pub use parser::DwarfParser;
-pub use function::FunctionInfo;
+pub use function::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe};
 pub use handle::DwarfHandle;
 
 // Re-export PatternMatcher for integration tests
@@ -36,6 +36,49 @@ mod tests {
 
         assert!(func.contains_address(0x1050));
         assert!(!func.contains_address(0x2000));
+    }
+
+    #[test]
+    fn test_variable_info_basics() {
+        let var = VariableInfo {
+            name: "gCounter".to_string(),
+            name_raw: Some("_ZN7gCounter".to_string()),
+            address: 0x1000,
+            byte_size: 4,
+            type_name: Some("uint32_t".to_string()),
+            type_kind: TypeKind::Integer { signed: false },
+            source_file: Some("/src/main.cpp".to_string()),
+        };
+        assert_eq!(var.byte_size, 4);
+        assert!(matches!(var.type_kind, TypeKind::Integer { signed: false }));
+    }
+
+    #[test]
+    fn test_watch_recipe_simple_global() {
+        let recipe = WatchRecipe {
+            label: "gCounter".to_string(),
+            base_address: 0x1000,
+            deref_chain: vec![],
+            final_size: 4,
+            type_kind: TypeKind::Integer { signed: false },
+            type_name: Some("uint32_t".to_string()),
+        };
+        assert!(recipe.deref_chain.is_empty());
+        assert_eq!(recipe.final_size, 4);
+    }
+
+    #[test]
+    fn test_watch_recipe_ptr_member() {
+        let recipe = WatchRecipe {
+            label: "gClock->counter".to_string(),
+            base_address: 0x2000,
+            deref_chain: vec![0x10],
+            final_size: 8,
+            type_kind: TypeKind::Integer { signed: true },
+            type_name: Some("int64_t".to_string()),
+        };
+        assert_eq!(recipe.deref_chain.len(), 1);
+        assert_eq!(recipe.deref_chain[0], 0x10);
     }
 
     #[test]

@@ -2,7 +2,7 @@ mod server;
 mod session_manager;
 
 pub use server::Daemon;
-pub use session_manager::SessionManager;
+pub use session_manager::{SessionManager, ActiveWatchState};
 
 #[cfg(test)]
 mod tests {

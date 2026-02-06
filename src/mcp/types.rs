@@ -20,6 +20,12 @@ pub struct DebugLaunchRequest {
 pub struct DebugLaunchResponse {
     pub session_id: String,
     pub pid: u32,
+    /// Number of pending patterns that were applied (0 if none)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_patterns_applied: Option<usize>,
+    /// Guidance on recommended next steps
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_steps: Option<String>,
 }
 
 // ============ debug_trace ============
@@ -34,17 +40,75 @@ pub struct DebugTraceRequest {
     pub add: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remove: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watches: Option<WatchUpdate>,
+    /// Maximum events to keep for this session (default: 200,000)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add: Option<Vec<WatchTarget>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchTarget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
+    /// Optional function patterns to restrict when this watch is captured.
+    /// Supports wildcards: `*` (shallow, doesn't cross ::), `**` (deep, crosses ::).
+    /// Examples: ["NoteOn"], ["audio::*"], ["juce::**"]
+    /// If omitted, watch is global (captured on all traced functions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveWatch {
+    pub label: String,
+    pub address: String,
+    pub size: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugTraceResponse {
+    /// Mode: "pending" (pre-launch) or "runtime" (on running session)
+    pub mode: String,
+    /// Active trace patterns
     pub active_patterns: Vec<String>,
+    /// Number of functions actually hooked (0 if pending or no matches)
     pub hooked_functions: u32,
+    /// If different from hooked_functions, shows total matched before hook limit
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_functions: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub active_watches: Vec<ActiveWatch>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
+    pub event_limit: usize,
+    /// Contextual status message explaining current state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 // ============ debug_query ============
@@ -142,6 +206,7 @@ pub enum ErrorCode {
     ProcessExited,
     FridaAttachFailed,
     InvalidPattern,
+    WatchFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +225,7 @@ impl From<crate::Error> for McpError {
             crate::Error::ProcessExited(_) => ErrorCode::ProcessExited,
             crate::Error::FridaAttachFailed(_) => ErrorCode::FridaAttachFailed,
             crate::Error::InvalidPattern { .. } => ErrorCode::InvalidPattern,
+            crate::Error::WatchFailed(_) => ErrorCode::WatchFailed,
             _ => ErrorCode::FridaAttachFailed, // Generic fallback
         };
 

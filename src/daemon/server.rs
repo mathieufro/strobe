@@ -270,6 +270,30 @@ ALWAYS start with the narrowest pattern that covers your hypothesis. You can wid
 
 Best strategy: start with 1-3 exact function names or a very specific `@file:` pattern. Add more patterns incrementally as you learn from the first round of events.
 
+## Event Storage Limits
+
+- **Default: 200,000 events per session** — Oldest events are automatically deleted when limit is reached (FIFO)
+- Adjust with debug_trace({ sessionId, eventLimit: N }) on a running session
+- Performance guidelines:
+  - 200k: Fast queries (<10ms), small DB (~56MB) — good for most use cases
+  - 500k: Moderate queries (~28ms), medium DB (~140MB) — use for audio/DSP debugging
+  - 1M+: Slow queries (>300ms), large DB (>280MB) — avoid unless necessary
+- Cleanup happens asynchronously and never blocks event generation
+
+## Watching Variables
+
+Read global/static variable values during function execution. Requires debug symbols (DWARF).
+
+- Variable syntax: `gCounter`, `gClock->counter` (pointer dereferencing)
+- Raw address: `{ address: \"0x1234\", type: \"f64\", label: \"tempo\" }`
+- JS expressions: `{ expr: \"ptr(0x5678).readU32()\", label: \"custom\" }`
+- Max 32 watches per session (4 native CModule watches for best performance, unlimited JS expression watches)
+- **Contextual filtering with `on` field:**
+  - Scope watches to specific functions: `{ variable: \"gTempo\", on: [\"audio::process\"] }`
+  - Supports wildcards: `*` (shallow, stops at ::), `**` (deep, crosses ::)
+  - Examples: `[\"NoteOn\"]`, `[\"audio::*\"]`, `[\"juce::**\"]`
+  - If `on` is omitted, watch is global (captured on all traced functions)
+
 ## Query Tips
 
 - eventType "stderr" / "stdout" — program output (always captured)
@@ -286,14 +310,19 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
 - Do NOT use broad `@file:` patterns that match many source files. Be specific: `@file:parser.cpp` not `@file:src`.
 - Do NOT restart the session to add traces. Use debug_trace with sessionId on the running session.
 - Always check stderr before instrumenting — the answer is often already there.
-- If debug_trace returns warnings about hook limits, narrow your patterns. Do NOT retry the same broad pattern."#
+- If debug_trace returns warnings about hook limits, narrow your patterns. Do NOT retry the same broad pattern.
+- If hookedFunctions is 0 on a running session (mode: "runtime"), DO NOT blindly try more patterns. Check the status message for guidance:
+  1. Verify debug symbols exist (check for .dSYM on macOS, separate debug info on Linux)
+  2. Functions may be inline/constexpr (won't appear in binary)
+  3. Try @file:filename.cpp patterns to match by source file instead
+  4. Use 'nm' tool to verify actual symbol names in binary"#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
         let tools = vec![
             McpTool {
                 name: "debug_launch".to_string(),
-                description: "Launch a binary with Frida attached. Applies any pending trace patterns set via debug_trace (without sessionId). If no patterns were set, no functions will be traced — call debug_trace first. Process stdout/stderr are captured and queryable as events.".to_string(),
+                description: "Launch a binary with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Follow the observation loop: 1) Launch clean, 2) Check stderr/stdout first, 3) Add traces only if needed. Applies any pending patterns if debug_trace was called beforehand (advanced usage).".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -308,13 +337,61 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
             },
             McpTool {
                 name: "debug_trace".to_string(),
-                description: "Configure trace patterns. Call BEFORE debug_launch (without sessionId) to set which functions to trace — patterns are applied when the process spawns. Can also be called WITH sessionId to add/remove patterns on a running session.".to_string(),
+                description: r#"Add or remove function trace patterns on a RUNNING debug session.
+
+RECOMMENDED WORKFLOW (Observation Loop):
+1. Launch with debug_launch (no prior debug_trace needed)
+2. Query stderr/stdout first - most issues visible in output alone
+3. If output insufficient, add targeted patterns: debug_trace({ sessionId, add: [...] })
+4. Query traces, iterate patterns as needed
+
+When called WITH sessionId (recommended):
+- Immediately installs hooks on running process
+- Returns actual hook count showing pattern matches
+- Start with 1-3 specific patterns (under 50 hooks ideal)
+- hookedFunctions: 0 means patterns didn't match - see status for guidance
+
+When called WITHOUT sessionId (advanced/staging mode):
+- Stages "pending patterns" for next debug_launch by this connection
+- hookedFunctions will be 0 (hooks not installed until launch)
+- Use only when you know exactly what to trace upfront
+- Consider launching clean and observing output first instead"#.to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "sessionId": { "type": "string", "description": "Session ID. Omit to set pending patterns for the next debug_launch. Provide to modify a running session." },
                         "add": { "type": "array", "items": { "type": "string" }, "description": "Patterns to start tracing (e.g. \"mymodule::*\", \"*::init\", \"@usercode\")" },
-                        "remove": { "type": "array", "items": { "type": "string" }, "description": "Patterns to stop tracing" }
+                        "remove": { "type": "array", "items": { "type": "string" }, "description": "Patterns to stop tracing" },
+                        "eventLimit": { "type": "integer", "description": "Maximum events to keep for this session (default: 200,000). Oldest events are deleted when limit is reached. Use higher limits (500k-1M) for audio/DSP debugging." },
+                        "watches": {
+                            "type": "object",
+                            "description": "Watch global/static variables during function execution (requires debug symbols)",
+                            "properties": {
+                                "add": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "variable": { "type": "string", "description": "Variable name or expression like 'gClock->counter' (pointer dereferencing)" },
+                                            "address": { "type": "string", "description": "Hex address for raw memory watches" },
+                                            "type": { "type": "string", "description": "Type hint: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer" },
+                                            "label": { "type": "string", "description": "Display label for this watch" },
+                                            "expr": { "type": "string", "description": "JavaScript expression for custom reads (e.g. 'ptr(0x5678).readU32()')" },
+                                            "on": {
+                                                "type": "array",
+                                                "items": { "type": "string" },
+                                                "description": "Optional function patterns to scope this watch (e.g. ['NoteOn', 'audio::*']). Supports wildcards: * (shallow, stops at ::), ** (deep, crosses ::). If omitted, watch is global (captured on all traced functions)."
+                                            }
+                                        }
+                                    }
+                                },
+                                "remove": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Labels of watches to remove"
+                                }
+                            }
+                        }
                     }
                 }),
             },
@@ -504,6 +581,10 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
         };
         pending_patterns.sort();
 
+        // Capture count before move
+        let patterns_count = pending_patterns.len();
+        let had_pending_patterns = !pending_patterns.is_empty();
+
         if !pending_patterns.is_empty() {
             self.session_manager.add_patterns(&session_id, &pending_patterns)?;
 
@@ -525,9 +606,20 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
             });
         }
 
+        let (pending_count, next_steps) = if !had_pending_patterns {
+            (None, Some("Query stderr/stdout with debug_query first. Add trace patterns with debug_trace only if output is insufficient.".to_string()))
+        } else {
+            (
+                Some(patterns_count),
+                Some(format!("Applied {} pre-configured pattern(s). Note: Recommended workflow is to launch clean, check output first, then add targeted traces. Hooks are installing in background.", patterns_count))
+            )
+        };
+
         let response = DebugLaunchResponse {
             session_id,
             pid,
+            pending_patterns_applied: pending_count,
+            next_steps,
         };
 
         Ok(serde_json::to_value(response)?)
@@ -554,11 +646,21 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                 }
 
                 let patterns: Vec<String> = pending.iter().cloned().collect();
+                let status_msg = if patterns.is_empty() {
+                    "No pending patterns. Call debug_launch to start a session, then use debug_trace with sessionId to add patterns.".to_string()
+                } else {
+                    format!("Staged {} pattern(s) for next debug_launch. Note: Recommended workflow is to launch clean, check output first, then add patterns only if needed.", patterns.len())
+                };
+
                 let response = DebugTraceResponse {
+                    mode: "pending".to_string(),
                     active_patterns: patterns,
                     hooked_functions: 0, // Not hooked yet, just pending
                     matched_functions: None,
+                    active_watches: vec![],
                     warnings: vec![],
+                    event_limit: crate::daemon::session_manager::DEFAULT_MAX_EVENTS_PER_SESSION,
+                    status: Some(status_msg),
                 };
                 Ok(serde_json::to_value(response)?)
             }
@@ -588,9 +690,163 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
 
                 self.session_manager.set_hook_count(session_id, hook_result.installed);
 
+                // Update event limit if provided
+                const MAX_EVENT_LIMIT: usize = 10_000_000; // 10M hard cap
+
+                if let Some(limit) = req.event_limit {
+                    if limit == 0 {
+                        return Err(crate::Error::Frida("Event limit must be > 0".into()));
+                    }
+                    if limit > MAX_EVENT_LIMIT {
+                        return Err(crate::Error::Frida(format!(
+                            "Event limit {} exceeds maximum allowed ({})",
+                            limit, MAX_EVENT_LIMIT
+                        )));
+                    }
+                    self.session_manager.set_event_limit(session_id, limit);
+                }
+
                 let patterns = self.session_manager.get_patterns(session_id);
+                let event_limit = self.session_manager.get_event_limit(session_id);
+
+                // Handle watches if present
+                let mut active_watches = vec![];
+                let mut watch_warnings = vec![];
+                if let Some(ref watch_update) = req.watches {
+                    if let Some(ref add_watches) = watch_update.add {
+                        // Get DWARF parser for this session
+                        if let Some(dwarf) = self.session_manager.get_dwarf(session_id).await? {
+                            let mut frida_watches = vec![];
+                            let mut state_watches = vec![];
+
+                            const MAX_WATCH_EXPR_LEN: usize = 256;
+                            const MAX_DEREF_DEPTH: usize = 4;
+                            const MAX_WATCHES_PER_SESSION: usize = 32;
+
+                            for watch_target in add_watches {
+                                // Check watch count limit
+                                if frida_watches.len() >= MAX_WATCHES_PER_SESSION {
+                                    watch_warnings.push(format!(
+                                        "Watch limit reached ({} max). Additional watches ignored.",
+                                        MAX_WATCHES_PER_SESSION
+                                    ));
+                                    break;
+                                }
+                                // Validate expression/variable before parsing
+                                let expr_str = watch_target.expr.as_ref()
+                                    .or(watch_target.variable.as_ref());
+
+                                if let Some(expr) = expr_str {
+                                    if expr.len() > MAX_WATCH_EXPR_LEN {
+                                        watch_warnings.push(format!(
+                                            "Watch expression too long (max {} chars): {}...",
+                                            MAX_WATCH_EXPR_LEN,
+                                            &expr[..50.min(expr.len())]
+                                        ));
+                                        continue;
+                                    }
+                                    if expr.matches("->").count() > MAX_DEREF_DEPTH {
+                                        watch_warnings.push(format!(
+                                            "Watch expression has too many dereferences (max {}): {}",
+                                            MAX_DEREF_DEPTH,
+                                            expr
+                                        ));
+                                        continue;
+                                    }
+                                }
+
+                                // Resolve watch expression or variable
+                                let recipe = if let Some(ref expr) = watch_target.expr {
+                                    dwarf.resolve_watch_expression(expr)?
+                                } else if let Some(ref var_name) = watch_target.variable {
+                                    dwarf.resolve_watch_expression(var_name)?
+                                } else {
+                                    continue; // Skip invalid watch
+                                };
+
+                                // Pass pattern strings to agent for runtime matching
+                                // Agent will match these patterns against installed hook names
+                                // and build the funcId set dynamically
+                                let on_func_ids: Option<Vec<u32>> = None; // Not used anymore
+                                let on_patterns = watch_target.on.clone();
+
+                                let label = watch_target.label.as_ref().unwrap_or(&recipe.label).clone();
+                                let type_kind_str = match recipe.type_kind {
+                                    crate::dwarf::TypeKind::Integer { signed } => {
+                                        if signed { "int".to_string() } else { "uint".to_string() }
+                                    }
+                                    crate::dwarf::TypeKind::Float => "float".to_string(),
+                                    crate::dwarf::TypeKind::Pointer => "pointer".to_string(),
+                                    crate::dwarf::TypeKind::Unknown => "unknown".to_string(),
+                                };
+
+                                // Build WatchTarget for Frida
+                                frida_watches.push(crate::frida_collector::WatchTarget {
+                                    label: label.clone(),
+                                    address: recipe.base_address,
+                                    size: recipe.final_size,
+                                    type_kind_str: type_kind_str.clone(),
+                                    deref_depth: recipe.deref_chain.len() as u8,
+                                    deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
+                                    type_name: recipe.type_name.clone(),
+                                    on_func_ids: on_func_ids.clone(),
+                                    on_patterns: on_patterns.clone(),
+                                });
+
+                                // Store for state tracking
+                                state_watches.push(crate::daemon::ActiveWatchState {
+                                    label: label.clone(),
+                                    address: recipe.base_address,
+                                    size: recipe.final_size,
+                                    type_kind_str: type_kind_str.clone(),
+                                    deref_depth: recipe.deref_chain.len() as u8,
+                                    deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
+                                    type_name: recipe.type_name.clone(),
+                                    on_patterns: watch_target.on.clone(),
+                                    is_expr: watch_target.expr.is_some(),
+                                    expr: watch_target.expr.clone(),
+                                });
+
+                                // Add to response
+                                active_watches.push(crate::mcp::ActiveWatch {
+                                    label,
+                                    address: format!("0x{:x}", recipe.base_address),
+                                    size: recipe.final_size,
+                                    type_name: recipe.type_name,
+                                    on: watch_target.on.clone(),
+                                });
+                            }
+
+                            // Send watches to Frida agent
+                            if !frida_watches.is_empty() {
+                                self.session_manager.update_frida_watches(session_id, frida_watches).await?;
+                                self.session_manager.set_watches(session_id, state_watches);
+                            }
+                        }
+                    }
+                }
+
+                // Combine hook warnings and watch warnings
+                let mut all_warnings = hook_result.warnings;
+                all_warnings.extend(watch_warnings);
+
+                // Generate contextual status message
+                let status_msg = if hook_result.installed == 0 && hook_result.matched > 0 {
+                    format!("Warning: {} function(s) matched but 0 hooks installed. Process likely crashed during hook installation. Check stderr for crash reports.", hook_result.matched)
+                } else if hook_result.installed == 0 && !patterns.is_empty() {
+                    "Warning: 0 functions matched patterns. Possible causes: 1) Functions are inline/constexpr (not in binary), 2) Name mangling differs from pattern, 3) Missing debug symbols. Try: use @file:filename.cpp patterns, verify debug symbols exist (dSYM on macOS), or check function names with 'nm' tool.".to_string()
+                } else if hook_result.installed == 0 && patterns.is_empty() {
+                    "No trace patterns active. Add patterns with debug_trace({ sessionId, add: [...] }). Remember: stdout/stderr are always captured automatically.".to_string()
+                } else if hook_result.installed < 50 {
+                    format!("Successfully hooked {} function(s). Under 50 hooks - excellent stability.", hook_result.installed)
+                } else if hook_result.installed < 100 {
+                    format!("Hooked {} function(s). 50-100 hooks range - good stability, but watch for performance impact.", hook_result.installed)
+                } else {
+                    format!("Hooked {} function(s). Over 100 hooks - high crash risk. Consider narrowing patterns for better stability.", hook_result.installed)
+                };
 
                 let response = DebugTraceResponse {
+                    mode: "runtime".to_string(),
                     active_patterns: patterns,
                     hooked_functions: hook_result.installed,
                     matched_functions: if hook_result.matched != hook_result.installed {
@@ -598,7 +854,10 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                     } else {
                         None
                     },
-                    warnings: hook_result.warnings,
+                    active_watches,
+                    warnings: all_warnings,
+                    event_limit,
+                    status: Some(status_msg),
                 };
 
                 Ok(serde_json::to_value(response)?)
@@ -673,6 +932,7 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                     "parentEventId": e.parent_event_id,
                     "arguments": e.arguments,
                     "returnValue": e.return_value,
+                    "watchValues": e.watch_values,
                 })
             } else {
                 serde_json::json!({
@@ -693,6 +953,7 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                             serde_json::Value::Object(_) => "object",
                         })
                         .unwrap_or("void"),
+                    "watchValues": e.watch_values,
                 })
             }
         }).collect();

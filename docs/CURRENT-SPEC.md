@@ -55,7 +55,7 @@ strobe mcp      # Stdio proxy for MCP clients (auto-starts daemon)
 
 ### debug_launch
 
-Spawn a process with Frida attached. Pending patterns (if any) are installed as hooks before the process resumes. Process stdout/stderr are automatically captured and queryable as events.
+Spawn a process with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Pending patterns (if any) are installed as hooks before the process resumes.
 
 ```
 Request:
@@ -66,30 +66,44 @@ Request:
   env?: {[key]: string}    # Environment variables
 
 Response:
-  session_id: string       # Human-readable: "myapp-2026-02-05-14h32"
+  session_id: string               # Human-readable: "myapp-2026-02-05-14h32"
   pid: number
+  pending_patterns_applied?: number  # Count of pre-staged patterns (if any)
+  next_steps?: string              # Recommended next action (e.g., "Query stderr/stdout first")
 ```
 
 Session IDs get numeric suffixes on collision (`myapp-2026-02-05-14h32-2`).
 
+The `next_steps` field provides workflow guidance, encouraging the observation loop: check output before adding trace patterns.
+
 ### debug_trace
 
-Add or remove trace patterns. Works in two modes:
+Add or remove trace patterns. **Recommended workflow:** Launch clean → check stderr/stdout → add patterns only if needed.
 
-**Pending mode** (no `session_id`): modifies patterns applied to the next launch. Patterns persist until explicitly removed.
+Works in two modes:
 
-**Live mode** (with `session_id`): modifies hooks on a running process. No restart required.
+**Pending mode** (no `session_id`): Stages patterns for next launch (advanced usage). Patterns persist until explicitly removed.
+
+**Runtime mode** (with `session_id`): Modifies hooks on running process (recommended). No restart required.
 
 ```
 Request:
-  session_id?: string      # Omit for pending patterns
+  session_id?: string      # Omit for pending patterns, provide for runtime
   add?: string[]           # Patterns to add
   remove?: string[]        # Patterns to remove
 
 Response:
-  active_patterns: string[]
-  hooked_functions: number
+  mode: string                   # "pending" or "runtime"
+  active_patterns: string[]      # Current trace patterns
+  hooked_functions: number       # Actual hooks installed (0 if pending or no matches)
+  matched_functions?: number     # If different from hooked (e.g., crash during install)
+  status?: string                # Contextual guidance based on current state
 ```
+
+**Status messages** provide actionable guidance:
+- When `hooked_functions: 0` on runtime mode, explains possible causes (inline functions, missing symbols, etc.)
+- When hooks succeed, provides stability guidance (e.g., "Under 50 hooks - excellent stability")
+- In pending mode, reminds about recommended workflow (launch clean first)
 
 ### debug_query
 

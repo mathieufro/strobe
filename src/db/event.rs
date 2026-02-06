@@ -50,6 +50,7 @@ pub struct Event {
     pub duration_ns: Option<i64>,
     pub text: Option<String>,
     pub sampled: Option<bool>,
+    pub watch_values: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +84,8 @@ pub struct TraceEventVerbose {
     pub arguments: Vec<serde_json::Value>,
     #[serde(rename = "returnValue")]
     pub return_value: serde_json::Value,
+    #[serde(rename = "watchValues", skip_serializing_if = "Option::is_none")]
+    pub watch_values: Option<serde_json::Value>,
 }
 
 pub struct EventQuery {
@@ -160,8 +163,8 @@ impl Database {
         conn.execute(
             "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns, text, sampled)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             arguments, return_value, duration_ns, text, sampled, watch_values)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 event.id,
                 event.session_id,
@@ -178,6 +181,7 @@ impl Database {
                 event.duration_ns,
                 event.text,
                 event.sampled,
+                event.watch_values.map(|v| v.to_string()),
             ],
         )?;
 
@@ -191,8 +195,8 @@ impl Database {
             conn.execute(
                 "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
                  event_type, function_name, function_name_raw, source_file, line_number,
-                 arguments, return_value, duration_ns, text, sampled)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 arguments, return_value, duration_ns, text, sampled, watch_values)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     event.id,
                     event.session_id,
@@ -209,6 +213,7 @@ impl Database {
                     event.duration_ns,
                     &event.text,
                     event.sampled,
+                    event.watch_values.as_ref().map(|v| v.to_string()),
                 ],
             )?;
         }
@@ -226,7 +231,7 @@ impl Database {
         let mut sql = String::from(
             "SELECT id, session_id, timestamp_ns, thread_id, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns, text, sampled
+             arguments, return_value, duration_ns, text, sampled, watch_values
              FROM events WHERE session_id = ?"
         );
 
@@ -290,6 +295,14 @@ impl Database {
                 _ => None,
             };
 
+            let watch_vals = match row.get_ref(15)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Text(s) => {
+                    serde_json::from_str(std::str::from_utf8(s).unwrap_or("null")).ok()
+                }
+                _ => None,
+            };
+
             Ok(Event {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -306,6 +319,7 @@ impl Database {
                 duration_ns: row.get(12)?,
                 text: row.get(13)?,
                 sampled: row.get(14)?,
+                watch_values: watch_vals,
             })
         })?;
 
@@ -315,4 +329,134 @@ impl Database {
     pub fn count_events(&self, session_id: &str) -> Result<u64> {
         self.count_session_events(session_id)
     }
+
+    /// Delete oldest events for a session, keeping only the most recent N.
+    /// Returns the number of events deleted.
+    pub fn cleanup_old_events(&self, session_id: &str, keep_count: usize) -> Result<u64> {
+        let conn = self.connection();
+
+        // Delete all but the most recent keep_count events
+        // Uses timestamp_ns (which is indexed) for ordering
+        let deleted = conn.execute(
+            "DELETE FROM events
+             WHERE session_id = ?
+             AND id NOT IN (
+                 SELECT id FROM events
+                 WHERE session_id = ?
+                 ORDER BY timestamp_ns DESC
+                 LIMIT ?
+             )",
+            params![session_id, session_id, keep_count as i64],
+        )?;
+
+        Ok(deleted as u64)
+    }
+
+    /// Insert events with automatic cleanup to enforce per-session limits.
+    /// If inserting would exceed max_events_per_session, oldest events are deleted first.
+    /// Returns stats about the operation.
+    pub fn insert_events_with_limit(
+        &self,
+        events: &[Event],
+        max_events_per_session: usize,
+    ) -> Result<EventInsertStats> {
+        if events.is_empty() {
+            return Ok(EventInsertStats::default());
+        }
+
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+
+        let mut stats = EventInsertStats::default();
+        let mut session_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        // Count current events per session
+        for event in events {
+            if !session_counts.contains_key(&event.session_id) {
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?",
+                    params![&event.session_id],
+                    |row| row.get(0),
+                )?;
+                session_counts.insert(event.session_id.clone(), count as usize);
+            }
+        }
+
+        // Group events by session for efficient cleanup
+        let mut events_by_session: std::collections::HashMap<String, Vec<&Event>> =
+            std::collections::HashMap::new();
+        for event in events {
+            events_by_session
+                .entry(event.session_id.clone())
+                .or_default()
+                .push(event);
+        }
+
+        // For each session, cleanup if needed, then insert
+        for (session_id, session_events) in events_by_session {
+            let current_count = session_counts.get(&session_id).copied().unwrap_or(0);
+            let new_count = current_count + session_events.len();
+
+            // If we'll exceed the limit, delete oldest events first
+            if new_count > max_events_per_session {
+                let to_delete = new_count - max_events_per_session;
+                let deleted = tx.execute(
+                    "DELETE FROM events
+                     WHERE session_id = ?
+                     AND id IN (
+                         SELECT id FROM events
+                         WHERE session_id = ?
+                         ORDER BY timestamp_ns ASC
+                         LIMIT ?
+                     )",
+                    params![&session_id, &session_id, to_delete as i64],
+                )?;
+
+                stats.events_deleted += deleted as u64;
+                if deleted > 0 {
+                    stats.sessions_cleaned.push(session_id.clone());
+                }
+            }
+
+            // Insert events for this session
+            for event in session_events {
+                tx.execute(
+                    "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
+                     event_type, function_name, function_name_raw, source_file, line_number,
+                     arguments, return_value, duration_ns, text, sampled, watch_values)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        &event.id,
+                        &event.session_id,
+                        event.timestamp_ns,
+                        event.thread_id,
+                        &event.parent_event_id,
+                        event.event_type.as_str(),
+                        &event.function_name,
+                        &event.function_name_raw,
+                        &event.source_file,
+                        event.line_number,
+                        event.arguments.as_ref().map(|v| v.to_string()),
+                        event.return_value.as_ref().map(|v| v.to_string()),
+                        event.duration_ns,
+                        &event.text,
+                        event.sampled,
+                        event.watch_values.as_ref().map(|v| v.to_string()),
+                    ],
+                )?;
+                stats.events_inserted += 1;
+            }
+        }
+
+        tx.commit()?;
+        Ok(stats)
+    }
+}
+
+/// Statistics returned from insert_events_with_limit
+#[derive(Debug, Default)]
+pub struct EventInsertStats {
+    pub events_inserted: u64,
+    pub events_deleted: u64,
+    pub sessions_cleaned: Vec<String>,
 }
