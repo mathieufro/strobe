@@ -13,7 +13,7 @@ use crate::Result;
 /// This prevents unbounded database growth and maintains system stability.
 ///
 /// Default: 200,000 events (~2 seconds of 48kHz audio tracing, or several minutes of normal tracing)
-/// Can be overridden via STROBE_MAX_EVENTS_PER_SESSION environment variable or debug_trace MCP endpoint.
+/// Can be overridden via STROBE_MAX_EVENTS_PER_SESSION environment variable.
 ///
 /// Performance characteristics (from stress testing):
 /// - 200k: Query <10ms, Cleanup ~94ms, DB ~56MB
