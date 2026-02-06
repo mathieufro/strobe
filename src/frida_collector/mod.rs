@@ -2,6 +2,7 @@ mod spawner;
 mod hooks;
 
 pub use spawner::FridaSpawner;
+pub use spawner::HookResult;
 pub use hooks::HookManager;
 pub use hooks::HookMode;
 

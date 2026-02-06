@@ -128,4 +128,37 @@ mod tests {
     fn test_classify_with_count_full_stays_full() {
         assert_eq!(HookManager::classify_with_count("foo::bar", 1), HookMode::Full);
     }
+
+    #[test]
+    fn test_hookmode_serde() {
+        assert_eq!(serde_json::to_string(&HookMode::Full).unwrap(), "\"full\"");
+        assert_eq!(serde_json::to_string(&HookMode::Light).unwrap(), "\"light\"");
+        assert_eq!(serde_json::from_str::<HookMode>("\"full\"").unwrap(), HookMode::Full);
+        assert_eq!(serde_json::from_str::<HookMode>("\"light\"").unwrap(), HookMode::Light);
+    }
+
+    #[test]
+    fn test_classify_mode_splitting() {
+        // Simulate the mode-splitting logic from spawner::add_patterns
+        let patterns = vec![
+            ("foo::bar".to_string(), 1),       // exact -> Full
+            ("foo::**".to_string(), 50),        // deep glob, many -> Light
+            ("@file:tiny".to_string(), 3),      // file pattern, few -> upgraded to Full
+            ("@file:big".to_string(), 200),     // file pattern, many -> Light
+        ];
+
+        let mut full_count = 0;
+        let mut light_count = 0;
+
+        for (pattern, match_count) in &patterns {
+            let mode = HookManager::classify_with_count(pattern, *match_count);
+            match mode {
+                HookMode::Full => full_count += match_count,
+                HookMode::Light => light_count += match_count,
+            }
+        }
+
+        assert_eq!(full_count, 4);    // foo::bar(1) + @file:tiny(3)
+        assert_eq!(light_count, 250); // foo::**(50) + @file:big(200)
+    }
 }

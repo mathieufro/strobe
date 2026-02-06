@@ -41,6 +41,10 @@ pub struct DebugTraceRequest {
 pub struct DebugTraceResponse {
     pub active_patterns: Vec<String>,
     pub hooked_functions: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_functions: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 // ============ debug_query ============

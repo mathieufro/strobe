@@ -67,6 +67,7 @@ fn test_database_roundtrip() {
         return_value: None,
         duration_ns: None,
         text: None,
+        sampled: None,
     }).unwrap();
 
     // Query
@@ -218,6 +219,7 @@ fn test_output_event_insertion_and_query() {
         return_value: None,
         duration_ns: None,
         text: Some("Hello from stdout\n".to_string()),
+        sampled: None,
     }).unwrap();
 
     // Insert stderr event
@@ -236,6 +238,7 @@ fn test_output_event_insertion_and_query() {
         return_value: None,
         duration_ns: None,
         text: Some("Error: something went wrong\n".to_string()),
+        sampled: None,
     }).unwrap();
 
     // Query all - should return both in timestamp order
@@ -276,6 +279,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         return_value: None,
         duration_ns: None,
         text: None,
+        sampled: None,
     }).unwrap();
 
     // Insert stdout (between function enter and exit)
@@ -294,6 +298,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         return_value: None,
         duration_ns: None,
         text: Some("Running...\n".to_string()),
+        sampled: None,
     }).unwrap();
 
     // Insert function exit
@@ -312,6 +317,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         return_value: Some(serde_json::json!(0)),
         duration_ns: Some(1000),
         text: None,
+        sampled: None,
     }).unwrap();
 
     // Query all — should return 3 events in chronological order
@@ -363,6 +369,7 @@ fn test_batch_insert_with_output_events() {
             return_value: None,
             duration_ns: None,
             text: None,
+            sampled: None,
         },
         strobe::db::Event {
             id: "batch-2".to_string(),
@@ -379,6 +386,7 @@ fn test_batch_insert_with_output_events() {
             return_value: None,
             duration_ns: None,
             text: Some("batch output line\n".to_string()),
+            sampled: None,
         },
     ];
 

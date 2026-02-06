@@ -243,6 +243,7 @@ unsafe extern "C" fn raw_on_output(
         arguments: None,
         return_value: None,
         text: Some(text),
+        sampled: None,
     };
 
     let _ = ctx.event_tx.try_send(event);
@@ -317,6 +318,22 @@ impl AgentMessageHandler {
         }
     }
 }
+
+/// Result of a hook installation attempt
+pub struct HookResult {
+    pub installed: u32,
+    pub matched: u32,
+    pub warnings: Vec<String>,
+}
+
+/// Safety limits for hook installation.
+/// Empirically determined on ARM64 with 79MB binary:
+///   ~50 hooks: fast install (~5s), rock solid
+///   ~100 hooks: install ~10s, stable
+///   ~150+ hooks: crash risk with hot functions
+const MAX_HOOKS_PER_CALL: usize = 100;
+const CHUNK_SIZE: usize = 50;
+const TIMEOUT_PER_CHUNK_SECS: u64 = 45;
 
 /// Commands sent to the Frida worker thread
 enum FridaCommand {
@@ -642,15 +659,15 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                             .map_err(|e| crate::Error::Frida(format!("Failed to send hooks: {}", e)))?;
                     }
 
-                    // Wait for agent confirmation
-                    match signal_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                    // Wait for agent confirmation (timeout scales with chunk size)
+                    match signal_rx.recv_timeout(std::time::Duration::from_secs(TIMEOUT_PER_CHUNK_SECS)) {
                         Ok(count) => {
                             tracing::info!("Agent confirmed {} hooks active after add", count);
                             Ok(count as u32)
                         }
                         Err(_) => {
-                            tracing::warn!("Timed out waiting for hooks confirmation (60s)");
-                            Ok(functions.len() as u32)
+                            tracing::warn!("Timed out waiting for hooks confirmation ({}s)", TIMEOUT_PER_CHUNK_SECS);
+                            Ok(0) // Return 0 — we don't know how many actually installed
                         }
                     }
                 })();
@@ -735,6 +752,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             return_value: None,
             duration_ns: None,
             text: json.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            sampled: None,
         });
     }
 
@@ -753,6 +771,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         return_value: json.get("returnValue").cloned(),
         duration_ns: json.get("durationNs").and_then(|v| v.as_i64()),
         text: None,
+        sampled: json.get("sampled").and_then(|v| v.as_bool()),
     })
 }
 
@@ -848,7 +867,7 @@ impl FridaSpawner {
         Ok(pid)
     }
 
-    pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String]) -> Result<u32> {
+    pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String]) -> Result<HookResult> {
         let session = self.sessions.get_mut(session_id)
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
@@ -872,23 +891,56 @@ impl FridaSpawner {
             }
         }
 
+        let matched = (full_funcs.len() + light_funcs.len()) as u32;
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Enforce hook cap — truncate light funcs first (cheaper to skip), then full
+        let total = full_funcs.len() + light_funcs.len();
+        if total > MAX_HOOKS_PER_CALL {
+            let excess = total - MAX_HOOKS_PER_CALL;
+            let light_trim = excess.min(light_funcs.len());
+            light_funcs.truncate(light_funcs.len() - light_trim);
+            let remaining_excess = excess - light_trim;
+            if remaining_excess > 0 {
+                full_funcs.truncate(full_funcs.len() - remaining_excess);
+            }
+            warnings.push(format!(
+                "Pattern matched {} functions (limit: {}). Only {} were hooked. \
+                 Use more specific patterns like @file:specific_module to stay under the limit.",
+                matched, MAX_HOOKS_PER_CALL, full_funcs.len() + light_funcs.len()
+            ));
+            tracing::warn!("Hook cap: {} matched, {} capped to {}", matched, total, MAX_HOOKS_PER_CALL);
+        }
+
         let image_base = session.image_base;
         let mut total_hooks = 0u32;
 
-        // Send full-mode batch
-        if !full_funcs.is_empty() {
-            total_hooks += self.send_add_patterns(session_id, full_funcs, image_base, HookMode::Full).await?;
+        // Send full-mode chunks
+        for chunk in full_funcs.chunks(CHUNK_SIZE) {
+            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Full).await {
+                Ok(count) => total_hooks = count,
+                Err(e) => {
+                    warnings.push(format!("Hook installation error: {}", e));
+                    break;
+                }
+            }
         }
 
-        // Send light-mode batch
-        if !light_funcs.is_empty() {
-            total_hooks += self.send_add_patterns(session_id, light_funcs, image_base, HookMode::Light).await?;
+        // Send light-mode chunks
+        for chunk in light_funcs.chunks(CHUNK_SIZE) {
+            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Light).await {
+                Ok(count) => total_hooks = count,
+                Err(e) => {
+                    warnings.push(format!("Hook installation error: {}", e));
+                    break;
+                }
+            }
         }
 
-        Ok(total_hooks)
+        Ok(HookResult { installed: total_hooks, matched, warnings })
     }
 
-    async fn send_add_patterns(
+    async fn send_add_chunk(
         &self,
         session_id: &str,
         functions: Vec<FunctionTarget>,

@@ -235,10 +235,14 @@ recv('initialize', (message: { sessionId: string }) => {
   agent.initialize(message.sessionId);
 });
 
-recv('hooks', (message: HookInstruction) => {
+function onHooksMessage(message: HookInstruction): void {
+  // Re-register BEFORE processing — recv() is one-shot in Frida.
+  // Without this, only the first hooks message is ever received.
+  recv('hooks', onHooksMessage);
   send({ type: 'log', message: `Received hooks: action=${message.action} count=${message.functions.length} imageBase=${message.imageBase}` });
   agent.handleMessage(message);
-});
+}
+recv('hooks', onHooksMessage);
 
 // Export for potential direct usage
 (globalThis as any).strobeAgent = agent;

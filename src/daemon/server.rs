@@ -244,21 +244,31 @@ You have full control over the program lifecycle. You launch it, observe its beh
 2. Launch with no tracing — Call debug_launch with no prior debug_trace. stdout/stderr are always captured automatically.
 3. Let the behavior occur — If the behavior requires a user action or external event, tell the user what to trigger. Be specific.
 4. Read output first — debug_query({ eventType: "stderr" }) then stdout. Crash reports, ASAN output, assertion failures, error logs are often the complete answer.
-5. Instrument only if needed — If output doesn't explain the issue, add targeted trace patterns on the running session with debug_trace({ sessionId, add: [...] }). Do not restart.
+5. Instrument only if needed — If output doesn't explain the issue, add targeted trace patterns on the running session with debug_trace({ sessionId, add: [...] }). Start small and specific. Do not restart.
 6. Iterate — Narrow or widen patterns based on what you learn. Remove noisy patterns, add specific ones. The session stays alive.
+
+## Hook Limits
+
+Each Interceptor.attach() rewrites a function's prologue in memory. This is fast for small numbers but destabilizes the process at scale. Practical limits:
+
+- Under 50 hooks: fast install (~5s), rock solid — aim for this
+- 50-100 hooks: install ~10s, stable
+- 100+ hooks: crash risk increases, especially with hot functions
+- Hard cap: 100 hooks per debug_trace call. Patterns exceeding this are truncated with a warning.
+
+ALWAYS start with the narrowest pattern that covers your hypothesis. You can widen later — you cannot un-crash a process.
 
 ## Pattern Syntax
 
-- `foo::bar` — exact function match
-- `foo::*` — all direct functions in foo (not nested)
+- `foo::bar` — exact function match (1 hook)
+- `foo::*` — all direct functions in foo, not nested
 - `foo::**` — all functions under foo, any depth
 - `*::validate` — any function named "validate", one level deep
 - `@file:parser.cpp` — all functions in files matching "parser.cpp"
 
 `*` does not cross `::` boundaries. Use `**` for deep matching.
-`@file:` is your best starting point when you know which source file is involved.
 
-AVOID `@usercode` — it instruments ALL project functions. On any non-trivial codebase this hooks thousands of functions, floods events, and makes the process unresponsive. Use `@file:` or namespace patterns instead.
+Best strategy: start with 1-3 exact function names or a very specific `@file:` pattern. Add more patterns incrementally as you learn from the first round of events.
 
 ## Query Tips
 
@@ -272,10 +282,11 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
 ## Common Mistakes
 
 - Do NOT set trace patterns before launch unless you already know exactly what to trace. Launch clean, read output first.
-- Do NOT use @usercode. It hooks all project functions and will overwhelm the target. Use @file: or namespace patterns.
+- Do NOT use @usercode. It hooks all project functions and will overwhelm the target.
+- Do NOT use broad `@file:` patterns that match many source files. Be specific: `@file:parser.cpp` not `@file:src`.
 - Do NOT restart the session to add traces. Use debug_trace with sessionId on the running session.
 - Always check stderr before instrumenting — the answer is often already there.
-- When tracing produces too many events, narrow your patterns instead of reading through noise."#
+- If debug_trace returns warnings about hook limits, narrow your patterns. Do NOT retry the same broad pattern."#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
@@ -500,9 +511,12 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
             let sid = session_id.clone();
             tokio::spawn(async move {
                 match sm.update_frida_patterns(&sid, Some(&pending_patterns), None).await {
-                    Ok(count) => {
-                        tracing::info!("Deferred hooks installed for {}: {} functions hooked", sid, count);
-                        sm.set_hook_count(&sid, count);
+                    Ok(result) => {
+                        tracing::info!("Deferred hooks installed for {}: {} hooked ({} matched)", sid, result.installed, result.matched);
+                        if !result.warnings.is_empty() {
+                            tracing::warn!("Deferred hook warnings for {}: {:?}", sid, result.warnings);
+                        }
+                        sm.set_hook_count(&sid, result.installed);
                     }
                     Err(e) => {
                         tracing::error!("Failed to install deferred hooks for {}: {}", sid, e);
@@ -543,6 +557,8 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
                 let response = DebugTraceResponse {
                     active_patterns: patterns,
                     hooked_functions: 0, // Not hooked yet, just pending
+                    matched_functions: None,
+                    warnings: vec![],
                 };
                 Ok(serde_json::to_value(response)?)
             }
@@ -561,19 +577,28 @@ AVOID `@usercode` — it instruments ALL project functions. On any non-trivial c
                 }
 
                 // Update Frida hooks
-                let hook_count = self.session_manager.update_frida_patterns(
+                let default_result = crate::frida_collector::HookResult {
+                    installed: 0, matched: 0, warnings: vec![],
+                };
+                let hook_result = self.session_manager.update_frida_patterns(
                     session_id,
                     req.add.as_deref(),
                     req.remove.as_deref(),
-                ).await.unwrap_or(0);
+                ).await.unwrap_or(default_result);
 
-                self.session_manager.set_hook_count(session_id, hook_count);
+                self.session_manager.set_hook_count(session_id, hook_result.installed);
 
                 let patterns = self.session_manager.get_patterns(session_id);
 
                 let response = DebugTraceResponse {
                     active_patterns: patterns,
-                    hooked_functions: hook_count,
+                    hooked_functions: hook_result.installed,
+                    matched_functions: if hook_result.matched != hook_result.installed {
+                        Some(hook_result.matched)
+                    } else {
+                        None
+                    },
+                    warnings: hook_result.warnings,
                 };
 
                 Ok(serde_json::to_value(response)?)

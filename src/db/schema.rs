@@ -66,6 +66,7 @@ impl Database {
                 return_value JSON,
                 duration_ns INTEGER,
                 text TEXT,
+                sampled INTEGER,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )",
             [],

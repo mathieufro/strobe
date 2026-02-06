@@ -5,7 +5,7 @@ use chrono::{Utc, Timelike};
 use tokio::sync::mpsc;
 use crate::db::{Database, Session, SessionStatus, Event};
 use crate::dwarf::{DwarfParser, DwarfHandle};
-use crate::frida_collector::FridaSpawner;
+use crate::frida_collector::{FridaSpawner, HookResult};
 use crate::Result;
 
 pub struct SessionManager {
@@ -251,11 +251,11 @@ impl SessionManager {
         session_id: &str,
         add: Option<&[String]>,
         remove: Option<&[String]>,
-    ) -> Result<u32> {
+    ) -> Result<HookResult> {
         let mut guard = self.frida_spawner.write().await;
         let spawner = match guard.as_mut() {
             Some(s) => s,
-            None => return Ok(0), // No spawner — no sessions to update
+            None => return Ok(HookResult { installed: 0, matched: 0, warnings: vec![] }),
         };
 
         if let Some(patterns) = add {
@@ -266,7 +266,7 @@ impl SessionManager {
             spawner.remove_patterns(session_id, patterns).await?;
         }
 
-        Ok(0)
+        Ok(HookResult { installed: 0, matched: 0, warnings: vec![] })
     }
 
     /// Stop Frida session

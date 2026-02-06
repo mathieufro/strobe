@@ -49,6 +49,7 @@ pub struct Event {
     pub return_value: Option<serde_json::Value>,
     pub duration_ns: Option<i64>,
     pub text: Option<String>,
+    pub sampled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,8 +160,8 @@ impl Database {
         conn.execute(
             "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns, text)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             arguments, return_value, duration_ns, text, sampled)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 event.id,
                 event.session_id,
@@ -176,6 +177,7 @@ impl Database {
                 event.return_value.map(|v| v.to_string()),
                 event.duration_ns,
                 event.text,
+                event.sampled,
             ],
         )?;
 
@@ -189,8 +191,8 @@ impl Database {
             conn.execute(
                 "INSERT INTO events (id, session_id, timestamp_ns, thread_id, parent_event_id,
                  event_type, function_name, function_name_raw, source_file, line_number,
-                 arguments, return_value, duration_ns, text)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 arguments, return_value, duration_ns, text, sampled)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     event.id,
                     event.session_id,
@@ -206,6 +208,7 @@ impl Database {
                     event.return_value.as_ref().map(|v| v.to_string()),
                     event.duration_ns,
                     &event.text,
+                    event.sampled,
                 ],
             )?;
         }
@@ -223,7 +226,7 @@ impl Database {
         let mut sql = String::from(
             "SELECT id, session_id, timestamp_ns, thread_id, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns, text
+             arguments, return_value, duration_ns, text, sampled
              FROM events WHERE session_id = ?"
         );
 
@@ -302,6 +305,7 @@ impl Database {
                 return_value: ret,
                 duration_ns: row.get(12)?,
                 text: row.get(13)?,
+                sampled: row.get(14)?,
             })
         })?;
 

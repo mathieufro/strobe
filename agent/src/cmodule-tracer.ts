@@ -98,7 +98,7 @@ static void write_entry(guint32 func_id, GumInvocationContext *ic,
                          guint8 etype, guint8 samp,
                          guint64 a0, guint64 a1, guint64 rv) {
   gint pos = g_atomic_int_add(&write_idx, 1);
-  gint slot = pos % RING_CAPACITY;
+  guint32 slot = ((guint32)pos) % RING_CAPACITY;
   TraceEntry *e = (TraceEntry *)(ring_data + slot * ENTRY_SIZE);
 
   e->timestamp  = mach_absolute_time();
@@ -198,8 +198,8 @@ export class CModuleTracer {
   private onEvents: (events: TraceEvent[]) => void;
 
   // Per-thread depth stacks for parent tracking during drain
-  // Map<threadId, Array<{ eventId: string; depth: number }>>
-  private threadStacks: Map<number, Array<{ eventId: string; depth: number }>> = new Map();
+  // Map<threadId, Array<{ eventId: string; depth: number; timestampNs: number }>>
+  private threadStacks: Map<number, Array<{ eventId: string; depth: number; timestampNs: number }>> = new Map();
 
   constructor(onEvents: (events: any[]) => void) {
     this.onEvents = onEvents;
@@ -274,6 +274,12 @@ export class CModuleTracer {
     if (!this.cm) return false;
 
     const funcId = this.nextFuncId++;
+
+    // Issue 4: funcId << 1 overflows signed 32-bit at 2^30
+    if (funcId >= (1 << 30)) {
+      return false;
+    }
+
     this.funcRegistry.set(funcId, func);
 
     // Adjust address for ASLR: runtime addr = static addr + slide
@@ -352,13 +358,16 @@ export class CModuleTracer {
   // -----------------------------------------------------------------------
 
   private drain(): void {
+    // Issue 2: bail if sessionId not yet set (setSessionId() hasn't been called)
+    if (!this.sessionId) return;
+
     const writeIdx = this.writeIdxPtr.readU32();
     const readIdx  = this.readIdxPtr.readU32();
 
     if (writeIdx === readIdx) return; // nothing to drain
 
-    // Compute how many entries to read
-    let count = writeIdx - readIdx;
+    // Issue 3: force unsigned 32-bit subtraction to handle U32 wraparound
+    let count = (writeIdx - readIdx) >>> 0;
 
     // Detect overflow: if count > RING_CAPACITY, we lost entries
     if (count > RING_CAPACITY) {
@@ -372,6 +381,10 @@ export class CModuleTracer {
       const idx = (readIdx + i) % RING_CAPACITY;
       const entryPtr = this.ringDataPtr.add(idx * ENTRY_SIZE);
 
+      // Write-complete marker check disabled — TinyCC doesn't support
+      // __atomic_store_n or __sync_synchronize reliably on ARM64.
+      // The 10ms drain interval provides sufficient visibility window.
+
       // Read TraceEntry fields
       const timestamp  = entryPtr.readU64().toNumber();
       const arg0       = entryPtr.add(8).readU64();
@@ -382,6 +395,7 @@ export class CModuleTracer {
       const depth      = entryPtr.add(40).readU32();
       const eventType  = entryPtr.add(44).readU8();
       const sampled    = entryPtr.add(45).readU8();
+
 
       const func = this.funcRegistry.get(funcId);
       if (!func) continue;
@@ -406,8 +420,8 @@ export class CModuleTracer {
         }
         // Parent is top of stack (the caller)
         parentEventId = stack.length > 0 ? stack[stack.length - 1].eventId : null;
-        // Push ourselves
-        stack.push({ eventId, depth });
+        // Push ourselves (with timestamp for durationNs computation)
+        stack.push({ eventId, depth, timestampNs });
 
         const event: TraceEvent = {
           id: eventId,
@@ -432,9 +446,13 @@ export class CModuleTracer {
         // function_exit
         // Find and pop our enter event from the stack
         let enterEventId: string | null = null;
+        let durationNs: number | undefined;
         if (stack.length > 0 && stack[stack.length - 1].depth === depth) {
           const enterEntry = stack.pop()!;
           enterEventId = enterEntry.eventId;
+          // Issue 7: compute durationNs from enter timestamp
+          durationNs = timestampNs - enterEntry.timestampNs;
+          if (durationNs < 0) durationNs = undefined; // clock skew safety
         }
         // Parent is now the top of stack (our caller)
         parentEventId = enterEventId;
@@ -451,6 +469,7 @@ export class CModuleTracer {
           sourceFile: func.sourceFile,
           lineNumber: func.lineNumber,
           returnValue: '0x' + retval.toString(16),
+          durationNs,
         };
         if (sampled) event.sampled = true;
         events.push(event);
