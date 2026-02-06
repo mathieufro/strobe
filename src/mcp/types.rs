@@ -20,6 +20,12 @@ pub struct DebugLaunchRequest {
 pub struct DebugLaunchResponse {
     pub session_id: String,
     pub pid: u32,
+    /// Number of pending patterns that were applied (0 if none)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_patterns_applied: Option<usize>,
+    /// Guidance on recommended next steps
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_steps: Option<String>,
 }
 
 // ============ debug_trace ============
@@ -86,8 +92,13 @@ pub struct ActiveWatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugTraceResponse {
+    /// Mode: "pending" (pre-launch) or "runtime" (on running session)
+    pub mode: String,
+    /// Active trace patterns
     pub active_patterns: Vec<String>,
+    /// Number of functions actually hooked (0 if pending or no matches)
     pub hooked_functions: u32,
+    /// If different from hooked_functions, shows total matched before hook limit
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_functions: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -95,6 +106,9 @@ pub struct DebugTraceResponse {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
     pub event_limit: usize,
+    /// Contextual status message explaining current state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 // ============ debug_query ============

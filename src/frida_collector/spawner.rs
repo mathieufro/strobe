@@ -8,6 +8,7 @@ use crate::db::{Event, EventType};
 use crate::dwarf::{DwarfParser, DwarfHandle, FunctionInfo};
 use crate::Result;
 use super::{HookManager, HookMode};
+use libc;
 
 // ---------------------------------------------------------------------------
 // Raw frida-sys wrappers
@@ -802,10 +803,21 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                     if let Ok(mut reg) = output_registry.lock() {
                         reg.remove(&session.pid);
                     }
-                    // Kill the traced process
-                    tracing::info!("Killing process {} for session {}", session.pid, session_id);
-                    device.kill(session.pid)
-                        .unwrap_or_else(|e| tracing::warn!("Failed to kill PID {}: {:?}", session.pid, e));
+
+                    // Check if process is still alive before trying to kill
+                    // Using libc::kill(pid, 0) to check existence without sending signal
+                    let is_alive = unsafe {
+                        libc::kill(session.pid as i32, 0) == 0
+                    };
+
+                    if is_alive {
+                        // Kill the traced process
+                        tracing::info!("Killing process {} for session {}", session.pid, session_id);
+                        device.kill(session.pid)
+                            .unwrap_or_else(|e| tracing::warn!("Failed to kill PID {}: {:?}", session.pid, e));
+                    } else {
+                        tracing::info!("Process {} already dead for session {}", session.pid, session_id);
+                    }
                 }
                 let _ = response.send(Ok(()));
             }

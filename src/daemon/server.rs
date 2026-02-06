@@ -310,14 +310,19 @@ Read global/static variable values during function execution. Requires debug sym
 - Do NOT use broad `@file:` patterns that match many source files. Be specific: `@file:parser.cpp` not `@file:src`.
 - Do NOT restart the session to add traces. Use debug_trace with sessionId on the running session.
 - Always check stderr before instrumenting — the answer is often already there.
-- If debug_trace returns warnings about hook limits, narrow your patterns. Do NOT retry the same broad pattern."#
+- If debug_trace returns warnings about hook limits, narrow your patterns. Do NOT retry the same broad pattern.
+- If hookedFunctions is 0 on a running session (mode: "runtime"), DO NOT blindly try more patterns. Check the status message for guidance:
+  1. Verify debug symbols exist (check for .dSYM on macOS, separate debug info on Linux)
+  2. Functions may be inline/constexpr (won't appear in binary)
+  3. Try @file:filename.cpp patterns to match by source file instead
+  4. Use 'nm' tool to verify actual symbol names in binary"#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
         let tools = vec![
             McpTool {
                 name: "debug_launch".to_string(),
-                description: "Launch a binary with Frida attached. Applies any pending trace patterns set via debug_trace (without sessionId). If no patterns were set, no functions will be traced — call debug_trace first. Process stdout/stderr are captured and queryable as events.".to_string(),
+                description: "Launch a binary with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Follow the observation loop: 1) Launch clean, 2) Check stderr/stdout first, 3) Add traces only if needed. Applies any pending patterns if debug_trace was called beforehand (advanced usage).".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -332,7 +337,25 @@ Read global/static variable values during function execution. Requires debug sym
             },
             McpTool {
                 name: "debug_trace".to_string(),
-                description: "Configure trace patterns and event limits. Call BEFORE debug_launch (without sessionId) to set which functions to trace — patterns are applied when the process spawns. Can also be called WITH sessionId to add/remove patterns or adjust event limits on a running session.".to_string(),
+                description: r#"Add or remove function trace patterns on a RUNNING debug session.
+
+RECOMMENDED WORKFLOW (Observation Loop):
+1. Launch with debug_launch (no prior debug_trace needed)
+2. Query stderr/stdout first - most issues visible in output alone
+3. If output insufficient, add targeted patterns: debug_trace({ sessionId, add: [...] })
+4. Query traces, iterate patterns as needed
+
+When called WITH sessionId (recommended):
+- Immediately installs hooks on running process
+- Returns actual hook count showing pattern matches
+- Start with 1-3 specific patterns (under 50 hooks ideal)
+- hookedFunctions: 0 means patterns didn't match - see status for guidance
+
+When called WITHOUT sessionId (advanced/staging mode):
+- Stages "pending patterns" for next debug_launch by this connection
+- hookedFunctions will be 0 (hooks not installed until launch)
+- Use only when you know exactly what to trace upfront
+- Consider launching clean and observing output first instead"#.to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -558,6 +581,10 @@ Read global/static variable values during function execution. Requires debug sym
         };
         pending_patterns.sort();
 
+        // Capture count before move
+        let patterns_count = pending_patterns.len();
+        let had_pending_patterns = !pending_patterns.is_empty();
+
         if !pending_patterns.is_empty() {
             self.session_manager.add_patterns(&session_id, &pending_patterns)?;
 
@@ -579,9 +606,20 @@ Read global/static variable values during function execution. Requires debug sym
             });
         }
 
+        let (pending_count, next_steps) = if !had_pending_patterns {
+            (None, Some("Query stderr/stdout with debug_query first. Add trace patterns with debug_trace only if output is insufficient.".to_string()))
+        } else {
+            (
+                Some(patterns_count),
+                Some(format!("Applied {} pre-configured pattern(s). Note: Recommended workflow is to launch clean, check output first, then add targeted traces. Hooks are installing in background.", patterns_count))
+            )
+        };
+
         let response = DebugLaunchResponse {
             session_id,
             pid,
+            pending_patterns_applied: pending_count,
+            next_steps,
         };
 
         Ok(serde_json::to_value(response)?)
@@ -608,13 +646,21 @@ Read global/static variable values during function execution. Requires debug sym
                 }
 
                 let patterns: Vec<String> = pending.iter().cloned().collect();
+                let status_msg = if patterns.is_empty() {
+                    "No pending patterns. Call debug_launch to start a session, then use debug_trace with sessionId to add patterns.".to_string()
+                } else {
+                    format!("Staged {} pattern(s) for next debug_launch. Note: Recommended workflow is to launch clean, check output first, then add patterns only if needed.", patterns.len())
+                };
+
                 let response = DebugTraceResponse {
+                    mode: "pending".to_string(),
                     active_patterns: patterns,
                     hooked_functions: 0, // Not hooked yet, just pending
                     matched_functions: None,
                     active_watches: vec![],
                     warnings: vec![],
                     event_limit: crate::daemon::session_manager::DEFAULT_MAX_EVENTS_PER_SESSION,
+                    status: Some(status_msg),
                 };
                 Ok(serde_json::to_value(response)?)
             }
@@ -784,7 +830,23 @@ Read global/static variable values during function execution. Requires debug sym
                 let mut all_warnings = hook_result.warnings;
                 all_warnings.extend(watch_warnings);
 
+                // Generate contextual status message
+                let status_msg = if hook_result.installed == 0 && hook_result.matched > 0 {
+                    format!("Warning: {} function(s) matched but 0 hooks installed. Process likely crashed during hook installation. Check stderr for crash reports.", hook_result.matched)
+                } else if hook_result.installed == 0 && !patterns.is_empty() {
+                    "Warning: 0 functions matched patterns. Possible causes: 1) Functions are inline/constexpr (not in binary), 2) Name mangling differs from pattern, 3) Missing debug symbols. Try: use @file:filename.cpp patterns, verify debug symbols exist (dSYM on macOS), or check function names with 'nm' tool.".to_string()
+                } else if hook_result.installed == 0 && patterns.is_empty() {
+                    "No trace patterns active. Add patterns with debug_trace({ sessionId, add: [...] }). Remember: stdout/stderr are always captured automatically.".to_string()
+                } else if hook_result.installed < 50 {
+                    format!("Successfully hooked {} function(s). Under 50 hooks - excellent stability.", hook_result.installed)
+                } else if hook_result.installed < 100 {
+                    format!("Hooked {} function(s). 50-100 hooks range - good stability, but watch for performance impact.", hook_result.installed)
+                } else {
+                    format!("Hooked {} function(s). Over 100 hooks - high crash risk. Consider narrowing patterns for better stability.", hook_result.installed)
+                };
+
                 let response = DebugTraceResponse {
+                    mode: "runtime".to_string(),
                     active_patterns: patterns,
                     hooked_functions: hook_result.installed,
                     matched_functions: if hook_result.matched != hook_result.installed {
@@ -795,6 +857,7 @@ Read global/static variable values during function execution. Requires debug sym
                     active_watches,
                     warnings: all_warnings,
                     event_limit,
+                    status: Some(status_msg),
                 };
 
                 Ok(serde_json::to_value(response)?)
