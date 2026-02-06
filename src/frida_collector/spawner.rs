@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::db::{Event, EventType};
 use crate::dwarf::{DwarfParser, DwarfHandle, FunctionInfo};
 use crate::Result;
-use super::HookManager;
+use super::{HookManager, HookMode};
 
 // ---------------------------------------------------------------------------
 // Raw frida-sys wrappers
@@ -336,6 +336,7 @@ enum FridaCommand {
         session_id: String,
         functions: Vec<FunctionTarget>,
         image_base: u64,
+        mode: HookMode,
         response: oneshot::Sender<Result<u32>>,
     },
     RemovePatterns {
@@ -596,9 +597,10 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                 session_id,
                 functions,
                 image_base,
+                mode,
                 response,
             } => {
-                tracing::info!("AddPatterns: {} functions for session {}", functions.len(), session_id);
+                tracing::info!("AddPatterns: {} functions ({:?} mode) for session {}", functions.len(), mode, session_id);
                 let result = (|| -> Result<u32> {
                     let session = sessions.get_mut(&session_id)
                         .ok_or_else(|| crate::Error::SessionNotFound(session_id.clone()))?;
@@ -613,7 +615,7 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                         })
                     }).collect();
 
-                    tracing::debug!("Sending hooks message with {} functions", func_list.len());
+                    tracing::debug!("Sending hooks message with {} functions ({:?} mode)", func_list.len(), mode);
 
                     // Set up signal to wait for confirmation
                     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -622,11 +624,17 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                         *guard = Some(signal_tx);
                     }
 
+                    let mode_str = match mode {
+                        HookMode::Full => "full",
+                        HookMode::Light => "light",
+                    };
+
                     let hooks_msg = serde_json::json!({
                         "type": "hooks",
                         "action": "add",
                         "functions": func_list,
                         "imageBase": format!("0x{:x}", image_base),
+                        "mode": mode_str,
                     });
 
                     unsafe {
@@ -849,21 +857,51 @@ impl FridaSpawner {
         // Await DWARF parse completion (may block if still parsing in background)
         let dwarf = session.dwarf_handle.clone().get().await?;
 
-        let mut functions: Vec<FunctionTarget> = Vec::new();
+        // Group functions by mode
+        let mut full_funcs: Vec<FunctionTarget> = Vec::new();
+        let mut light_funcs: Vec<FunctionTarget> = Vec::new();
+
         for pattern in patterns {
-            for func in resolve_pattern(&dwarf, pattern, &session.project_root) {
-                functions.push(FunctionTarget::from(func));
+            let matches: Vec<&FunctionInfo> = resolve_pattern(&dwarf, pattern, &session.project_root);
+            let mode = HookManager::classify_with_count(pattern, matches.len());
+            tracing::info!("Pattern '{}' -> {:?} mode ({} functions)", pattern, mode, matches.len());
+
+            let target = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
+            for func in matches {
+                target.push(FunctionTarget::from(func));
             }
         }
 
         let image_base = session.image_base;
+        let mut total_hooks = 0u32;
 
+        // Send full-mode batch
+        if !full_funcs.is_empty() {
+            total_hooks += self.send_add_patterns(session_id, full_funcs, image_base, HookMode::Full).await?;
+        }
+
+        // Send light-mode batch
+        if !light_funcs.is_empty() {
+            total_hooks += self.send_add_patterns(session_id, light_funcs, image_base, HookMode::Light).await?;
+        }
+
+        Ok(total_hooks)
+    }
+
+    async fn send_add_patterns(
+        &self,
+        session_id: &str,
+        functions: Vec<FunctionTarget>,
+        image_base: u64,
+        mode: HookMode,
+    ) -> Result<u32> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.cmd_tx.send(FridaCommand::AddPatterns {
             session_id: session_id.to_string(),
             functions,
             image_base,
+            mode,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Worker thread died".to_string()))?;
 

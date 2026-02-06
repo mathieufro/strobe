@@ -3,6 +3,7 @@ mod hooks;
 
 pub use spawner::FridaSpawner;
 pub use hooks::HookManager;
+pub use hooks::HookMode;
 
 #[cfg(test)]
 mod tests {

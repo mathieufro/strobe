@@ -1,10 +1,10 @@
-import { Serializer } from './serializer.js';
-import { HookInstaller } from './hooks.js';
+import { HookInstaller, HookMode } from './hooks.js';
 
 interface HookInstruction {
   action: 'add' | 'remove';
   functions: FunctionTarget[];
   imageBase?: string;
+  mode?: HookMode;
 }
 
 interface FunctionTarget {
@@ -13,22 +13,6 @@ interface FunctionTarget {
   nameRaw?: string;
   sourceFile?: string;
   lineNumber?: number;
-}
-
-interface TraceEvent {
-  id: string;
-  sessionId: string;
-  timestampNs: number;
-  threadId: number;
-  parentEventId: string | null;
-  eventType: 'function_enter' | 'function_exit';
-  functionName: string;
-  functionNameRaw?: string;
-  sourceFile?: string;
-  lineNumber?: number;
-  arguments?: any[];
-  returnValue?: any;
-  durationNs?: number;
 }
 
 interface OutputEvent {
@@ -40,20 +24,16 @@ interface OutputEvent {
   text: string;
 }
 
-type BufferedEvent = TraceEvent | OutputEvent;
-
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
-  private serializer: Serializer;
   private hookInstaller: HookInstaller;
-  private eventBuffer: BufferedEvent[] = [];
-  private eventIdCounter: number = 0;
-  private flushInterval: number = 10; // ms
-  private maxBufferSize: number = 1000;
 
-  // Track call stack per thread for parent tracking
-  private callStacks: Map<number, string[]> = new Map();
+  // Output event buffering (low-frequency, stays in JS)
+  private outputBuffer: OutputEvent[] = [];
+  private outputIdCounter: number = 0;
+  private outputFlushInterval: number = 10; // ms
+  private maxOutputBufferSize: number = 1000;
 
   // Re-entrancy guard for write(2) interception
   private inOutputCapture: boolean = false;
@@ -63,12 +43,13 @@ class StrobeAgent {
   private maxOutputBytes: number = 50 * 1024 * 1024;
 
   constructor() {
-    this.serializer = new Serializer();
-    this.hookInstaller = new HookInstaller(this.onEnter.bind(this), this.onLeave.bind(this));
+    this.hookInstaller = new HookInstaller((events) => {
+      send({ type: 'events', events });
+    });
     this.sessionStartNs = Date.now() * 1000000;
 
-    // Periodic flush
-    setInterval(() => this.flush(), this.flushInterval);
+    // Periodic flush for output events
+    setInterval(() => this.flushOutput(), this.outputFlushInterval);
 
     // Intercept write(2) for stdout/stderr capture (non-fatal if it fails,
     // e.g. with ASAN-instrumented binaries where write() isn't hookable)
@@ -82,6 +63,7 @@ class StrobeAgent {
   initialize(sessionId: string): void {
     this.sessionId = sessionId;
     this.sessionStartNs = Date.now() * 1000000;
+    this.hookInstaller.setSessionId(sessionId);
     send({ type: 'initialized', sessionId });
   }
 
@@ -94,12 +76,13 @@ class StrobeAgent {
         send({ type: 'log', message: `ASLR slide computed` });
       }
 
+      const mode: HookMode = message.mode || 'full';
       let installed = 0;
       let failed = 0;
 
       if (message.action === 'add') {
         for (const func of message.functions) {
-          if (this.hookInstaller.installHook(func)) {
+          if (this.hookInstaller.installHook(func, mode)) {
             installed++;
           } else {
             failed++;
@@ -126,88 +109,25 @@ class StrobeAgent {
     }
   }
 
-  private onEnter(
-    threadId: number,
-    func: FunctionTarget,
-    args: NativePointer[]
-  ): string {
-    const eventId = this.generateEventId();
-    const stack = this.callStacks.get(threadId) || [];
-    const parentId = stack.length > 0 ? stack[stack.length - 1] : null;
+  private bufferOutputEvent(event: OutputEvent): void {
+    this.outputBuffer.push(event);
 
-    // Push this event onto call stack
-    stack.push(eventId);
-    this.callStacks.set(threadId, stack);
-
-    const event: TraceEvent = {
-      id: eventId,
-      sessionId: this.sessionId,
-      timestampNs: this.getTimestampNs(),
-      threadId,
-      parentEventId: parentId,
-      eventType: 'function_enter',
-      functionName: func.name,
-      functionNameRaw: func.nameRaw,
-      sourceFile: func.sourceFile,
-      lineNumber: func.lineNumber,
-      arguments: args.map(arg => this.serializer.serialize(arg)),
-    };
-
-    this.bufferEvent(event);
-    return eventId;
-  }
-
-  private onLeave(
-    threadId: number,
-    func: FunctionTarget,
-    retval: NativePointer,
-    enterEventId: string,
-    enterTimestampNs: number
-  ): void {
-    const now = this.getTimestampNs();
-
-    // Pop from call stack
-    const stack = this.callStacks.get(threadId) || [];
-    stack.pop();
-    this.callStacks.set(threadId, stack);
-
-    const event: TraceEvent = {
-      id: this.generateEventId(),
-      sessionId: this.sessionId,
-      timestampNs: now,
-      threadId,
-      parentEventId: enterEventId,
-      eventType: 'function_exit',
-      functionName: func.name,
-      functionNameRaw: func.nameRaw,
-      sourceFile: func.sourceFile,
-      lineNumber: func.lineNumber,
-      returnValue: this.serializer.serialize(retval),
-      durationNs: now - enterTimestampNs,
-    };
-
-    this.bufferEvent(event);
-  }
-
-  private bufferEvent(event: BufferedEvent): void {
-    this.eventBuffer.push(event);
-
-    if (this.eventBuffer.length >= this.maxBufferSize) {
-      this.flush();
+    if (this.outputBuffer.length >= this.maxOutputBufferSize) {
+      this.flushOutput();
     }
   }
 
-  private flush(): void {
-    if (this.eventBuffer.length === 0) return;
+  private flushOutput(): void {
+    if (this.outputBuffer.length === 0) return;
 
-    const events = this.eventBuffer;
-    this.eventBuffer = [];
+    const events = this.outputBuffer;
+    this.outputBuffer = [];
 
     send({ type: 'events', events });
   }
 
-  private generateEventId(): string {
-    return `${this.sessionId}-${++this.eventIdCounter}`;
+  private generateOutputEventId(): string {
+    return `${this.sessionId}-out-${++this.outputIdCounter}`;
   }
 
   private getTimestampNs(): number {
@@ -216,7 +136,7 @@ class StrobeAgent {
 
   private installOutputCapture(): void {
     const self = this;
-    const writePtr = Module.getExportByName(null, 'write');
+    const writePtr = Process.getModuleByName('libSystem.B.dylib').getExportByName('write');
     if (!writePtr) return;
 
     Interceptor.attach(writePtr, {
@@ -240,14 +160,14 @@ class StrobeAgent {
           self.inOutputCapture = true;
           try {
             const event: OutputEvent = {
-              id: self.generateEventId(),
+              id: self.generateOutputEventId(),
               sessionId: self.sessionId,
               timestampNs: self.getTimestampNs(),
               threadId: Process.getCurrentThreadId(),
               eventType: fd === 1 ? 'stdout' : 'stderr',
               text: `[strobe: write of ${count} bytes truncated (>1MB)]`,
             };
-            self.bufferEvent(event);
+            self.bufferOutputEvent(event);
           } finally {
             self.inOutputCapture = false;
           }
@@ -274,19 +194,19 @@ class StrobeAgent {
           // Check if we just exceeded the limit
           if (self.outputBytesCapture >= self.maxOutputBytes) {
             const event: OutputEvent = {
-              id: self.generateEventId(),
+              id: self.generateOutputEventId(),
               sessionId: self.sessionId,
               timestampNs: self.getTimestampNs(),
               threadId: Process.getCurrentThreadId(),
               eventType: fd === 1 ? 'stdout' : 'stderr',
               text: text + '\n[strobe: output capture limit reached (50MB), further output truncated]',
             };
-            self.bufferEvent(event);
+            self.bufferOutputEvent(event);
             return;
           }
 
           const event: OutputEvent = {
-            id: self.generateEventId(),
+            id: self.generateOutputEventId(),
             sessionId: self.sessionId,
             timestampNs: self.getTimestampNs(),
             threadId: Process.getCurrentThreadId(),
@@ -294,7 +214,7 @@ class StrobeAgent {
             text,
           };
 
-          self.bufferEvent(event);
+          self.bufferOutputEvent(event);
         } finally {
           self.inOutputCapture = false;
         }
