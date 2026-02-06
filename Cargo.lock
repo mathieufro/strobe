@@ -1553,6 +1553,7 @@ dependencies = [
  "cpp_demangle",
  "dirs",
  "frida",
+ "frida-sys",
  "gimli",
  "jsonrpc-core",
  "libc",

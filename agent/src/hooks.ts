@@ -24,10 +24,20 @@ export class HookInstaller {
   private hooks: Map<string, InvocationListener> = new Map();
   private onEnter: EnterCallback;
   private onLeave: LeaveCallback;
+  private aslrSlide: NativePointer = ptr(0);
+  private imageBaseSet: boolean = false;
 
   constructor(onEnter: EnterCallback, onLeave: LeaveCallback) {
     this.onEnter = onEnter;
     this.onLeave = onLeave;
+  }
+
+  setImageBase(imageBase: string): void {
+    if (this.imageBaseSet) return;
+    const staticBase = ptr(imageBase);
+    const runtimeBase = Process.mainModule!.base;
+    this.aslrSlide = runtimeBase.sub(staticBase);
+    this.imageBaseSet = true;
   }
 
   installHook(func: FunctionTarget): boolean {
@@ -35,7 +45,8 @@ export class HookInstaller {
       return true; // Already hooked
     }
 
-    const addr = ptr(func.address);
+    // Adjust address for ASLR: runtime addr = static addr + slide
+    const addr = ptr(func.address).add(this.aslrSlide);
     const self = this;
 
     try {

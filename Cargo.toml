@@ -27,6 +27,7 @@ rustc-demangle = "0.1"
 
 # Frida bindings (auto-download devkit)
 frida = { version = "0.17", features = ["auto-download"] }
+frida-sys = "0.17"
 
 # MCP protocol
 jsonrpc-core = "18"

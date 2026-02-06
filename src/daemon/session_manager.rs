@@ -24,6 +24,9 @@ impl SessionManager {
     pub fn new(db_path: &Path) -> Result<Self> {
         let db = Database::open(db_path)?;
 
+        // Clean up any sessions left as 'running' from a previous daemon instance
+        db.cleanup_stale_sessions()?;
+
         Ok(Self {
             db,
             patterns: Arc::new(RwLock::new(HashMap::new())),
@@ -65,7 +68,14 @@ impl SessionManager {
         // Check for existing active session on this binary
         if let Some(existing) = self.db.get_session_by_binary(binary_path)? {
             if existing.status == SessionStatus::Running {
-                return Err(crate::Error::SessionExists);
+                // Verify the old process is actually alive before blocking
+                let pid_alive = unsafe { libc::kill(existing.pid as i32, 0) } == 0;
+                if pid_alive {
+                    return Err(crate::Error::SessionExists);
+                }
+                // Stale session — process is dead, clean it up
+                tracing::warn!("Session {} has dead PID {}, marking as stopped", existing.id, existing.pid);
+                self.db.update_session_status(&existing.id, SessionStatus::Stopped)?;
             }
         }
 

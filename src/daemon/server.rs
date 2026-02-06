@@ -291,6 +291,15 @@ impl Daemon {
     async fn tool_debug_launch(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let req: DebugLaunchRequest = serde_json::from_value(args.clone())?;
 
+        // Auto-cleanup: if there's already a session for this binary, stop it first
+        if let Some(existing) = self.session_manager.db().get_session_by_binary(&req.command)? {
+            if existing.status == crate::db::SessionStatus::Running {
+                tracing::info!("Auto-stopping existing session {} before new launch", existing.id);
+                let _ = self.session_manager.stop_frida(&existing.id).await;
+                let _ = self.session_manager.stop_session(&existing.id);
+            }
+        }
+
         // Extract binary name from path
         let binary_name = std::path::Path::new(&req.command)
             .file_name()

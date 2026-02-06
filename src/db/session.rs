@@ -42,6 +42,21 @@ pub struct Session {
 }
 
 impl Database {
+    /// Mark all sessions with status='running' as 'stopped'.
+    /// Called on daemon startup to clean up stale sessions from previous runs.
+    pub fn cleanup_stale_sessions(&self) -> Result<()> {
+        let conn = self.connection();
+        let ended_at = chrono::Utc::now().timestamp();
+        let count = conn.execute(
+            "UPDATE sessions SET status = 'stopped', ended_at = ? WHERE status = 'running'",
+            params![ended_at],
+        )?;
+        if count > 0 {
+            tracing::info!("Cleaned up {} stale running sessions from previous daemon", count);
+        }
+        Ok(())
+    }
+
     pub fn create_session(
         &self,
         id: &str,

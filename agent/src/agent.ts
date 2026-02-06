@@ -4,6 +4,7 @@ import { HookInstaller } from './hooks.js';
 interface HookInstruction {
   action: 'add' | 'remove';
   functions: FunctionTarget[];
+  imageBase?: string;
 }
 
 interface FunctionTarget {
@@ -69,8 +70,13 @@ class StrobeAgent {
     // Periodic flush
     setInterval(() => this.flush(), this.flushInterval);
 
-    // Intercept write(2) for stdout/stderr capture
-    this.installOutputCapture();
+    // Intercept write(2) for stdout/stderr capture (non-fatal if it fails,
+    // e.g. with ASAN-instrumented binaries where write() isn't hookable)
+    try {
+      this.installOutputCapture();
+    } catch (e) {
+      // Output capture is best-effort; function tracing still works
+    }
   }
 
   initialize(sessionId: string): void {
@@ -80,20 +86,44 @@ class StrobeAgent {
   }
 
   handleMessage(message: HookInstruction): void {
-    if (message.action === 'add') {
-      for (const func of message.functions) {
-        this.hookInstaller.installHook(func);
+    try {
+      // Set imageBase for ASLR slide computation (only needs to happen once)
+      if (message.imageBase) {
+        send({ type: 'log', message: `Setting imageBase=${message.imageBase}` });
+        this.hookInstaller.setImageBase(message.imageBase);
+        send({ type: 'log', message: `ASLR slide computed` });
       }
-    } else if (message.action === 'remove') {
-      for (const func of message.functions) {
-        this.hookInstaller.removeHook(func.address);
-      }
-    }
 
-    send({
-      type: 'hooks_updated',
-      activeCount: this.hookInstaller.activeHookCount()
-    });
+      let installed = 0;
+      let failed = 0;
+
+      if (message.action === 'add') {
+        for (const func of message.functions) {
+          if (this.hookInstaller.installHook(func)) {
+            installed++;
+          } else {
+            failed++;
+          }
+        }
+        send({ type: 'log', message: `Hooks: ${installed} installed, ${failed} failed` });
+      } else if (message.action === 'remove') {
+        for (const func of message.functions) {
+          this.hookInstaller.removeHook(func.address);
+        }
+      }
+
+      send({
+        type: 'hooks_updated',
+        activeCount: this.hookInstaller.activeHookCount()
+      });
+    } catch (e: any) {
+      send({ type: 'log', message: `handleMessage CRASHED: ${e.message}\n${e.stack}` });
+      // Still try to send hooks_updated so the worker doesn't hang
+      send({
+        type: 'hooks_updated',
+        activeCount: this.hookInstaller.activeHookCount()
+      });
+    }
   }
 
   private onEnter(
@@ -286,7 +316,7 @@ recv('initialize', (message: { sessionId: string }) => {
 });
 
 recv('hooks', (message: HookInstruction) => {
-  send({ type: 'log', message: 'Received hooks: ' + JSON.stringify(message) });
+  send({ type: 'log', message: `Received hooks: action=${message.action} count=${message.functions.length} imageBase=${message.imageBase}` });
   agent.handleMessage(message);
 });
 

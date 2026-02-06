@@ -1,5 +1,5 @@
 use gimli::{self, RunTimeEndian, EndianSlice, SectionId};
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSegment};
 use memmap2::Mmap;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -12,12 +12,19 @@ use super::FunctionInfo;
 pub struct DwarfParser {
     pub functions: Vec<FunctionInfo>,
     functions_by_name: HashMap<String, Vec<usize>>,
+    /// The image base address from the Mach-O/ELF binary (e.g., __TEXT vmaddr).
+    /// Used to compute offsets for ASLR adjustment at runtime.
+    pub image_base: u64,
 }
 
 impl DwarfParser {
     pub fn parse(binary_path: &Path) -> Result<Self> {
+        // Extract image base from the original binary (needed for ASLR adjustment)
+        let image_base = Self::extract_image_base(binary_path).unwrap_or(0);
+
         // First try the binary itself
-        if let Ok(parser) = Self::parse_file(binary_path) {
+        if let Ok(mut parser) = Self::parse_file(binary_path) {
+            parser.image_base = image_base;
             return Ok(parser);
         }
 
@@ -32,12 +39,42 @@ impl DwarfParser {
                     .join("DWARF")
                     .join(binary_name);
                 if dwarf_file.exists() {
-                    return Self::parse_file(&dwarf_file);
+                    let mut parser = Self::parse_file(&dwarf_file)?;
+                    parser.image_base = image_base;
+                    return Ok(parser);
                 }
             }
         }
 
         Err(Error::NoDebugSymbols)
+    }
+
+    /// Extract the image base address from a binary's __TEXT segment (Mach-O) or
+    /// first LOAD segment (ELF). This is the expected load address before ASLR.
+    fn extract_image_base(binary_path: &Path) -> Result<u64> {
+        let file = File::open(binary_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let object = object::File::parse(&*mmap)
+            .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
+
+        // Find the first executable segment (typically __TEXT on Mach-O, LOAD on ELF)
+        for segment in object.segments() {
+            if let Some(name) = segment.name().ok().flatten() {
+                if name == "__TEXT" {
+                    return Ok(segment.address());
+                }
+            }
+        }
+
+        // Fallback: use the first segment with a non-zero address
+        for segment in object.segments() {
+            let addr = segment.address();
+            if addr > 0 {
+                return Ok(addr);
+            }
+        }
+
+        Ok(0)
     }
 
     fn parse_file(path: &Path) -> Result<Self> {
@@ -110,6 +147,7 @@ impl DwarfParser {
         Ok(Self {
             functions,
             functions_by_name,
+            image_base: 0, // Set by parse() from the actual binary
         })
     }
 
@@ -118,39 +156,65 @@ impl DwarfParser {
         unit: &gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
     ) -> Result<Option<FunctionInfo>> {
-        // Get function name
-        let name = match entry.attr_value(gimli::DW_AT_name)
+        // Get function name: prefer DW_AT_linkage_name (fully qualified mangled name) over
+        // DW_AT_name (short name). Handles DWARF v4 and v5 string forms.
+        let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name)
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                let s = dwarf.attr_string(unit, v).ok()?;
+                let cow = s.to_string_lossy().ok()?;
+                Some(cow.to_string())
+            });
+
+        let short_name = match entry.attr_value(gimli::DW_AT_name)
             .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
         {
-            Some(gimli::AttributeValue::DebugStrRef(offset)) => {
-                dwarf.debug_str.get_str(offset)
-                    .map_err(|e| Error::Frida(format!("DWARF string error: {}", e)))?
-                    .to_string_lossy()
-                    .map_err(|e| Error::Frida(format!("UTF-8 error: {}", e)))?
-                    .to_string()
+            Some(attr_val) => {
+                match dwarf.attr_string(unit, attr_val) {
+                    Ok(s) => Some(
+                        s.to_string_lossy()
+                            .map_err(|e| Error::Frida(format!("UTF-8 error: {}", e)))?
+                            .to_string()
+                    ),
+                    Err(_) => None,
+                }
             }
-            Some(gimli::AttributeValue::String(s)) => {
-                s.to_string_lossy()
-                    .map_err(|e| Error::Frida(format!("UTF-8 error: {}", e)))?
-                    .to_string()
-            }
-            _ => return Ok(None),
+            _ => None,
         };
 
-        // Get low_pc
+        // Use linkage name for demangling (gives qualified names), fall back to short name
+        let name = match linkage_name.or(short_name) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+
+        // Get low_pc (handles DWARF v4 Addr and DWARF v5 DebugAddrIndex)
         let low_pc = match entry.attr_value(gimli::DW_AT_low_pc)
             .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
         {
-            Some(gimli::AttributeValue::Addr(addr)) => addr,
+            Some(attr_val) => {
+                match dwarf.attr_address(unit, attr_val)
+                    .map_err(|e| Error::Frida(format!("DWARF address error: {}", e)))?
+                {
+                    Some(addr) => addr,
+                    None => return Ok(None),
+                }
+            }
             _ => return Ok(None),
         };
 
-        // Get high_pc (can be absolute address or offset from low_pc)
+        // Get high_pc (can be absolute address, indexed address, or offset from low_pc)
         let high_pc = match entry.attr_value(gimli::DW_AT_high_pc)
             .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
         {
-            Some(gimli::AttributeValue::Addr(addr)) => addr,
             Some(gimli::AttributeValue::Udata(offset)) => low_pc + offset,
+            Some(attr_val) => {
+                match dwarf.attr_address(unit, attr_val) {
+                    Ok(Some(addr)) => addr,
+                    _ => low_pc + 1,
+                }
+            }
             _ => low_pc + 1, // Minimal range if not specified
         };
 
@@ -228,6 +292,19 @@ impl DwarfParser {
         self.functions
             .iter()
             .filter(|f| f.is_user_code(project_root))
+            .collect()
+    }
+
+    /// Find all functions whose source file path contains the given substring.
+    /// Used by the `@file:` pattern, e.g. `@file:lv_obj_style.c`.
+    pub fn find_by_source_file(&self, file_pattern: &str) -> Vec<&FunctionInfo> {
+        self.functions
+            .iter()
+            .filter(|f| {
+                f.source_file
+                    .as_ref()
+                    .is_some_and(|sf| sf.contains(file_pattern))
+            })
             .collect()
     }
 }
