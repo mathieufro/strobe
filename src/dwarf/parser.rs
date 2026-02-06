@@ -11,7 +11,7 @@ use super::FunctionInfo;
 
 pub struct DwarfParser {
     pub functions: Vec<FunctionInfo>,
-    functions_by_name: HashMap<String, Vec<usize>>,
+    pub(crate) functions_by_name: HashMap<String, Vec<usize>>,
     /// The image base address from the Mach-O/ELF binary (e.g., __TEXT vmaddr).
     /// Used to compute offsets for ASLR adjustment at runtime.
     pub image_base: u64,
@@ -51,7 +51,7 @@ impl DwarfParser {
 
     /// Extract the image base address from a binary's __TEXT segment (Mach-O) or
     /// first LOAD segment (ELF). This is the expected load address before ASLR.
-    fn extract_image_base(binary_path: &Path) -> Result<u64> {
+    pub fn extract_image_base(binary_path: &Path) -> Result<u64> {
         let file = File::open(binary_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let object = object::File::parse(&*mmap)

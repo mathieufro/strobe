@@ -166,9 +166,57 @@ impl Daemon {
                 name: "strobe".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
+            instructions: Some(Self::debugging_instructions().to_string()),
         };
 
         Ok(serde_json::to_value(response)?)
+    }
+
+    fn debugging_instructions() -> &'static str {
+        r#"Strobe is a dynamic instrumentation tool. You launch programs, observe their runtime behavior (stdout/stderr, function calls, arguments, return values), and stop them — all without modifying source code or recompiling. Observation is non-intrusive and adjustable at runtime.
+
+## Mindset
+
+You have full control over the program lifecycle. You launch it, observe its behavior, and stop it. The behavior you want to observe may happen on startup, or it may require an external trigger — a user action, a network event, a specific input. Your role is to set up observation, let the behavior occur, then analyze what happened. Work backwards from the symptom to the root cause. Read the code, form a hypothesis, then use Strobe to confirm or refute it.
+
+## The Observation Loop
+
+1. Understand the goal — Read the code around the area of interest. Form a hypothesis about what should happen at runtime.
+2. Launch with no tracing — Call debug_launch with no prior debug_trace. stdout/stderr are always captured automatically.
+3. Let the behavior occur — If the behavior requires a user action or external event, tell the user what to trigger. Be specific.
+4. Read output first — debug_query({ eventType: "stderr" }) then stdout. Crash reports, ASAN output, assertion failures, error logs are often the complete answer.
+5. Instrument only if needed — If output doesn't explain the issue, add targeted trace patterns on the running session with debug_trace({ sessionId, add: [...] }). Do not restart.
+6. Iterate — Narrow or widen patterns based on what you learn. Remove noisy patterns, add specific ones. The session stays alive.
+
+## Pattern Syntax
+
+- `foo::bar` — exact function match
+- `foo::*` — all direct functions in foo (not nested)
+- `foo::**` — all functions under foo, any depth
+- `*::validate` — any function named "validate", one level deep
+- `@file:parser.cpp` — all functions in files matching "parser.cpp"
+
+`*` does not cross `::` boundaries. Use `**` for deep matching.
+`@file:` is your best starting point when you know which source file is involved.
+
+AVOID `@usercode` — it instruments ALL project functions. On any non-trivial codebase this hooks thousands of functions, floods events, and makes the process unresponsive. Use `@file:` or namespace patterns instead.
+
+## Query Tips
+
+- eventType "stderr" / "stdout" — program output (always captured)
+- eventType "function_enter" / "function_exit" — trace events (only when patterns are set)
+- function: { contains: "parse" } — search by function name substring
+- sourceFile: { contains: "auth" } — search by source file
+- verbose: true — includes arguments, return values, raw symbol names
+- Default limit is 50 events. Use offset to paginate. Check hasMore.
+
+## Common Mistakes
+
+- Do NOT set trace patterns before launch unless you already know exactly what to trace. Launch clean, read output first.
+- Do NOT use @usercode. It hooks all project functions and will overwhelm the target. Use @file: or namespace patterns.
+- Do NOT restart the session to add traces. Use debug_trace with sessionId on the running session.
+- Always check stderr before instrumenting — the answer is often already there.
+- When tracing produces too many events, narrow your patterns instead of reading through noise."#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
@@ -308,13 +356,8 @@ impl Daemon {
 
         let session_id = self.session_manager.generate_session_id(binary_name);
 
-        // Get pending patterns to apply on launch (don't clear them)
-        let initial_patterns: Vec<String> = {
-            let pending = self.pending_patterns.read().await;
-            pending.iter().cloned().collect()
-        };
-
-        // Spawn with Frida, passing initial patterns
+        // Launch always starts fast (no DWARF blocking, no initial hooks).
+        // DWARF parsing happens in the background.
         let args_vec = req.args.unwrap_or_default();
         let pid = self.session_manager.spawn_with_frida(
             &session_id,
@@ -323,7 +366,6 @@ impl Daemon {
             req.cwd.as_deref(),
             &req.project_root,
             req.env.as_ref(),
-            &initial_patterns,
         ).await?;
 
         self.session_manager.create_session(
@@ -333,9 +375,29 @@ impl Daemon {
             pid,
         )?;
 
-        // Store initial patterns in the session
-        if !initial_patterns.is_empty() {
-            self.session_manager.add_patterns(&session_id, &initial_patterns)?;
+        // If there are pending patterns, install hooks asynchronously in the background.
+        // This will block until DWARF parsing completes, then send hooks to the agent.
+        let pending_patterns: Vec<String> = {
+            let pending = self.pending_patterns.read().await;
+            pending.iter().cloned().collect()
+        };
+
+        if !pending_patterns.is_empty() {
+            self.session_manager.add_patterns(&session_id, &pending_patterns)?;
+
+            let sm = Arc::clone(&self.session_manager);
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                match sm.update_frida_patterns(&sid, Some(&pending_patterns), None).await {
+                    Ok(count) => {
+                        tracing::info!("Deferred hooks installed for {}: {} functions hooked", sid, count);
+                        sm.set_hook_count(&sid, count);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to install deferred hooks for {}: {}", sid, e);
+                    }
+                }
+            });
         }
 
         let response = DebugLaunchResponse {

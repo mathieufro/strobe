@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use chrono::{Utc, Timelike};
 use tokio::sync::mpsc;
 use crate::db::{Database, Session, SessionStatus, Event};
-use crate::dwarf::DwarfParser;
+use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::FridaSpawner;
 use crate::Result;
 
@@ -12,8 +12,8 @@ pub struct SessionManager {
     db: Database,
     /// Active trace patterns per session
     patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    /// Cached DWARF parsers per binary
-    dwarf_cache: Arc<RwLock<HashMap<String, Arc<DwarfParser>>>>,
+    /// Cached DWARF handles per binary (background-parsed)
+    dwarf_cache: Arc<RwLock<HashMap<String, DwarfHandle>>>,
     /// Hooked function count per session
     hook_counts: Arc<RwLock<HashMap<String, u32>>>,
     /// Frida spawner for managing instrumented processes (lazily initialized)
@@ -151,30 +151,33 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
-    pub fn get_or_parse_dwarf(&self, binary_path: &str) -> Result<Arc<DwarfParser>> {
+    /// Get or start a background DWARF parse. Returns a handle immediately.
+    /// If the binary was already parsed (or is being parsed), returns the cached handle.
+    pub fn get_or_start_dwarf_parse(&self, binary_path: &str) -> DwarfHandle {
         // Check cache first
         {
             let cache = self.dwarf_cache.read().unwrap();
-            if let Some(parser) = cache.get(binary_path) {
-                return Ok(Arc::clone(parser));
+            if let Some(handle) = cache.get(binary_path) {
+                return handle.clone();
             }
         }
 
-        // Parse and cache
-        let parser = Arc::new(DwarfParser::parse(Path::new(binary_path))?);
+        // Start background parse and cache the handle
+        let handle = DwarfHandle::spawn_parse(binary_path);
         self.dwarf_cache
             .write()
             .unwrap()
-            .insert(binary_path.to_string(), Arc::clone(&parser));
+            .insert(binary_path.to_string(), handle.clone());
 
-        Ok(parser)
+        handle
     }
 
     pub fn db(&self) -> &Database {
         &self.db
     }
 
-    /// Spawn a process with Frida attached
+    /// Spawn a process with Frida attached.
+    /// DWARF parsing happens in the background — launch is fast (~1s).
     pub async fn spawn_with_frida(
         &self,
         session_id: &str,
@@ -183,14 +186,18 @@ impl SessionManager {
         cwd: Option<&str>,
         project_root: &str,
         env: Option<&std::collections::HashMap<String, String>>,
-        initial_patterns: &[String],
     ) -> Result<u32> {
+        // Extract image base cheaply (<10ms) — only reads __TEXT segment address
+        let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
+
+        // Start background DWARF parse (or get cached handle)
+        let dwarf_handle = self.get_or_start_dwarf_parse(command);
+
         // Create event channel
         let (tx, mut rx) = mpsc::channel::<Event>(10000);
 
         // Spawn database writer task
         let db = self.db.clone();
-        let _session_id_clone = session_id.to_string();
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(100);
 
@@ -218,7 +225,7 @@ impl SessionManager {
             }
         });
 
-        // Spawn process with initial patterns (lazily initialize FridaSpawner)
+        // Spawn process (lazily initialize FridaSpawner)
         let mut guard = self.frida_spawner.write().await;
         let spawner = guard.get_or_insert_with(FridaSpawner::new);
         spawner.spawn(
@@ -228,7 +235,8 @@ impl SessionManager {
             cwd,
             project_root,
             env,
-            initial_patterns,
+            dwarf_handle,
+            image_base,
             tx,
         ).await
     }

@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
 use crate::db::{Event, EventType};
-use crate::dwarf::{DwarfParser, FunctionInfo};
+use crate::dwarf::{DwarfParser, DwarfHandle, FunctionInfo};
 use crate::Result;
 use super::HookManager;
 
@@ -434,6 +433,8 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                 response,
             } => {
                 let result = (|| -> Result<u32> {
+                    let spawn_start = std::time::Instant::now();
+
                     let mut argv: Vec<&str> = vec![&command];
                     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                     argv.extend(arg_refs);
@@ -458,10 +459,11 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                         spawn_opts = spawn_opts.envp(env_tuples);
                     }
 
+                    let t = std::time::Instant::now();
                     let pid = device.spawn(&command, &spawn_opts)
                         .map_err(|e| crate::Error::FridaAttachFailed(format!("Spawn failed: {}", e)))?;
-
                     tracing::info!("Spawned process {} with PID {}", command, pid);
+                    tracing::debug!("PERF: device.spawn() took {:?}", t.elapsed());
 
                     // Register output context so raw_on_output can map this PID
                     let output_ctx = Arc::new(OutputContext {
@@ -478,11 +480,13 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                         reg.insert(pid, output_ctx);
                     }
 
+                    let t = std::time::Instant::now();
                     let frida_session = device.attach(pid)
                         .map_err(|e| {
                             tracing::error!("Attach to PID {} failed: {:?}", pid, e);
                             crate::Error::FridaAttachFailed(format!("Attach to PID {} failed: {}", pid, e))
                         })?;
+                    tracing::debug!("PERF: device.attach() took {:?}", t.elapsed());
 
                     // Extract raw session pointer (Session has only one non-ZST field)
                     let raw_session = unsafe { session_raw_ptr(&frida_session) };
@@ -490,12 +494,14 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                     std::mem::forget(frida_session);
 
                     // Create script via frida-sys (bypasses frida::Script entirely)
+                    let t = std::time::Instant::now();
                     let script_ptr = unsafe {
                         create_script_raw(raw_session, AGENT_CODE)
                             .map_err(|e| crate::Error::FridaAttachFailed(format!("Script creation failed: {}", e)))?
                     };
+                    tracing::debug!("PERF: create_script took {:?}", t.elapsed());
 
-                    tracing::info!("Script created, ptr={:?}", script_ptr);
+                    let t = std::time::Instant::now();
 
                     // Shared signal for hooks completion
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
@@ -514,6 +520,7 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                         load_script_raw(script_ptr)
                             .map_err(|e| crate::Error::FridaAttachFailed(format!("Script load failed: {}", e)))?;
                     }
+                    tracing::debug!("PERF: script load + handler setup took {:?}", t.elapsed());
 
                     // Initialize agent
                     let init_msg = serde_json::json!({ "type": "initialize", "sessionId": session_id });
@@ -567,8 +574,11 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                     }
 
                     // Resume process (hooks are now installed)
+                    let t = std::time::Instant::now();
                     device.resume(pid)
                         .map_err(|e| crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)))?;
+                    tracing::debug!("PERF: device.resume() took {:?}", t.elapsed());
+                    tracing::debug!("PERF: Total Frida worker spawn took {:?}", spawn_start.elapsed());
 
                     sessions.insert(session_id.clone(), WorkerSession {
                         script_ptr,
@@ -759,7 +769,8 @@ pub struct FridaSession {
     pub binary_path: String,
     pub project_root: String,
     hook_manager: HookManager,
-    dwarf: Option<Arc<DwarfParser>>,
+    dwarf_handle: DwarfHandle,
+    image_base: u64,
 }
 
 /// Spawner that communicates with the Frida worker thread
@@ -790,25 +801,14 @@ impl FridaSpawner {
         cwd: Option<&str>,
         project_root: &str,
         env: Option<&HashMap<String, String>>,
-        initial_patterns: &[String],
+        dwarf_handle: DwarfHandle,
+        image_base: u64,
         event_sender: mpsc::Sender<Event>,
     ) -> Result<u32> {
-        let dwarf = DwarfParser::parse(Path::new(command))?;
-        let dwarf = Arc::new(dwarf);
-
-        let mut initial_functions: Vec<FunctionTarget> = Vec::new();
-        if !initial_patterns.is_empty() {
-            for pattern in initial_patterns {
-                for func in resolve_pattern(&dwarf, pattern, project_root) {
-                    initial_functions.push(FunctionTarget::from(func));
-                }
-            }
-            tracing::info!("Found {} functions matching {} initial patterns", initial_functions.len(), initial_patterns.len());
-        }
+        // No DWARF parsing here — it happens in the background via DwarfHandle.
+        // Launch always starts with zero hooks; patterns are installed later.
 
         let (response_tx, response_rx) = oneshot::channel();
-
-        let image_base = dwarf.image_base;
 
         self.cmd_tx.send(FridaCommand::Spawn {
             session_id: session_id.to_string(),
@@ -817,7 +817,7 @@ impl FridaSpawner {
             cwd: cwd.map(|s| s.to_string()),
             project_root: project_root.to_string(),
             env: env.cloned(),
-            initial_functions,
+            initial_functions: Vec::new(),
             image_base,
             event_tx: event_sender,
             response: response_tx,
@@ -826,17 +826,14 @@ impl FridaSpawner {
         let pid = response_rx.await
             .map_err(|_| crate::Error::Frida("Worker response lost".to_string()))??;
 
-        let mut session = FridaSession {
+        let session = FridaSession {
             pid,
             binary_path: command.to_string(),
             project_root: project_root.to_string(),
             hook_manager: HookManager::new(),
-            dwarf: Some(dwarf),
+            dwarf_handle,
+            image_base,
         };
-
-        if !initial_patterns.is_empty() {
-            session.hook_manager.add_patterns(initial_patterns);
-        }
 
         self.sessions.insert(session_id.to_string(), session);
 
@@ -849,16 +846,17 @@ impl FridaSpawner {
 
         session.hook_manager.add_patterns(patterns);
 
+        // Await DWARF parse completion (may block if still parsing in background)
+        let dwarf = session.dwarf_handle.clone().get().await?;
+
         let mut functions: Vec<FunctionTarget> = Vec::new();
-        if let Some(ref dwarf) = session.dwarf {
-            for pattern in patterns {
-                for func in resolve_pattern(dwarf, pattern, &session.project_root) {
-                    functions.push(FunctionTarget::from(func));
-                }
+        for pattern in patterns {
+            for func in resolve_pattern(&dwarf, pattern, &session.project_root) {
+                functions.push(FunctionTarget::from(func));
             }
         }
 
-        let image_base = session.dwarf.as_ref().map(|d| d.image_base).unwrap_or(0);
+        let image_base = session.image_base;
 
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -877,12 +875,13 @@ impl FridaSpawner {
         let session = self.sessions.get_mut(session_id)
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
+        // Await DWARF parse completion
+        let dwarf = session.dwarf_handle.clone().get().await?;
+
         let mut functions: Vec<FunctionTarget> = Vec::new();
-        if let Some(ref dwarf) = session.dwarf {
-            for pattern in patterns {
-                for func in resolve_pattern(dwarf, pattern, &session.project_root) {
-                    functions.push(FunctionTarget::from(func));
-                }
+        for pattern in patterns {
+            for func in resolve_pattern(&dwarf, pattern, &session.project_root) {
+                functions.push(FunctionTarget::from(func));
             }
         }
 

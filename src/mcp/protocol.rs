@@ -80,6 +80,8 @@ pub struct McpInitializeResponse {
     pub capabilities: McpServerCapabilities,
     #[serde(rename = "serverInfo")]
     pub server_info: McpServerInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

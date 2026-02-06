@@ -1,8 +1,10 @@
 mod parser;
 mod function;
+mod handle;
 
 pub use parser::DwarfParser;
 pub use function::FunctionInfo;
+pub use handle::DwarfHandle;
 
 // Re-export PatternMatcher for integration tests
 pub use parser::PatternMatcher;
