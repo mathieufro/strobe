@@ -94,10 +94,24 @@ mod audio {
     pub fn process_audio_buffer(buffer: &mut AudioBuffer, chain: &EffectChain) -> f32 {
         let mut sum = 0.0f32;
 
-        // Simulate DSP processing
+        // Read MIDI state during audio processing (contextual watch target)
+        let current_tempo = G_TEMPO.load(Ordering::Relaxed);
+        let active_notes = G_MIDI_NOTE_ON_COUNT.load(Ordering::Relaxed);
+
+        // Tempo modulates processing intensity
+        let tempo_factor = (current_tempo as f32 / 120_000.0).clamp(0.5, 1.5);
+
+        // Active MIDI notes affect DSP behavior
+        let note_modulation = if active_notes > 0 {
+            1.0 + (active_notes % 10) as f32 * 0.01
+        } else {
+            1.0
+        };
+
+        // Simulate DSP processing with MIDI state influence
         for i in 0..buffer.samples.len() {
             let sample = buffer.samples[i];
-            let processed = apply_effect_chain(sample, chain);
+            let processed = apply_effect_chain(sample, chain) * tempo_factor * note_modulation;
             buffer.samples[i] = processed;
             sum += processed.abs();
         }
@@ -158,25 +172,45 @@ mod midi {
     pub fn process_note_on(note: u8, velocity: u8) -> bool {
         G_MIDI_NOTE_ON_COUNT.fetch_add(1, Ordering::Relaxed);
 
+        // Read audio state during MIDI processing (contextual watch target)
         let tempo = G_TEMPO.load(Ordering::Relaxed);
-        let should_trigger = (note as u64 * velocity as u64) % tempo < 1000;
+        let sample_rate = G_SAMPLE_RATE.load(Ordering::Relaxed);
+        let audio_buffers_processed = G_AUDIO_BUFFER_COUNT.load(Ordering::Relaxed);
+
+        // MIDI timing depends on audio buffer position
+        let buffer_phase = audio_buffers_processed % 16;
+        let should_trigger = ((note as u64 * velocity as u64) % tempo < 1000) && (buffer_phase < 8);
 
         if should_trigger {
-            println!("[MIDI] Note ON: {} vel: {} at tempo {}", note, velocity, tempo / 1000);
+            println!("[MIDI] Note ON: {} vel: {} at tempo {} (SR: {}, buf: {})",
+                     note, velocity, tempo / 1000, sample_rate, audio_buffers_processed);
         }
 
         should_trigger
     }
 
-    pub fn process_control_change(cc: u8, _value: u8) {
+    pub fn process_control_change(cc: u8, value: u8) {
         G_PARAMETER_UPDATES.fetch_add(1, Ordering::Relaxed);
 
-        match cc {
-            7 => { /* Volume */ }
-            10 => { /* Pan */ }
-            74 => { /* Filter cutoff */ }
-            _ => {}
-        }
+        // Read audio and MIDI state during automation (contextual watch target)
+        let audio_load = G_AUDIO_BUFFER_COUNT.load(Ordering::Relaxed);
+        let midi_activity = G_MIDI_NOTE_ON_COUNT.load(Ordering::Relaxed);
+        let current_tempo = G_TEMPO.load(Ordering::Relaxed);
+
+        // Automation behavior depends on system state
+        let _effective_value = match cc {
+            7 => {  // Volume - scales with audio load
+                let load_factor = (audio_load % 100) as f32 / 100.0;
+                (value as f32 * (0.8 + load_factor * 0.4)) as u8
+            }
+            10 => {  // Pan - influenced by MIDI activity
+                if midi_activity % 10 < 5 { value } else { 127 - value }
+            }
+            74 => {  // Filter - tempo-synced
+                ((value as u64 * current_tempo / 120_000) % 128) as u8
+            }
+            _ => value
+        };
     }
 
     pub fn generate_midi_sequence(pattern: u8) -> Vec<MidiMessage> {

@@ -26,10 +26,15 @@
 /// - `EffectChain` - Recursive linked list (depth 5)
 /// - `MidiMessage` - 3-byte MIDI data + timestamp
 ///
+/// ### Cross-Module State Dependencies (Contextual Watch Testing):
+/// - `audio::process_audio_buffer` reads: G_TEMPO, G_MIDI_NOTE_ON_COUNT (MIDI state during audio)
+/// - `midi::process_note_on` reads: G_SAMPLE_RATE, G_AUDIO_BUFFER_COUNT (audio state during MIDI)
+/// - `midi::process_control_change` reads: G_AUDIO_BUFFER_COUNT, G_MIDI_NOTE_ON_COUNT, G_TEMPO
+///
 /// ### Expected Behavior:
 /// - `audio::process_audio_buffer` triggers auto-sampling (>100k calls/sec)
 /// - Multiple thread names visible: audio-0, audio-1, midi-processor, automation, stats
-/// - Watch variables change across thread contexts
+/// - Watch variables show cross-module reads (e.g., G_TEMPO read from audio threads)
 /// - Deep recursive call stacks in effect chain processing
 /// - Realistic event generation patterns (millions of events in 30 seconds)
 ///
@@ -117,7 +122,7 @@ fn test_validation_prevents_extreme_event_limits() {
 ///      projectRoot: "/path/to/strobe"
 ///    })
 ///
-/// 4. Add trace patterns for multiple namespaces:
+/// 4. Add trace patterns for multiple namespaces with contextual watches:
 ///    debug_trace({
 ///      sessionId: "<session-id>",
 ///      add: ["audio::process_audio_buffer", "audio::apply_effect_chain",
@@ -125,10 +130,13 @@ fn test_validation_prevents_extreme_event_limits() {
 ///            "engine::*"],
 ///      watches: {
 ///        add: [
-///          { variable: "G_SAMPLE_RATE", on: ["audio::*"] },
-///          { variable: "G_TEMPO", on: ["midi::*"] },
-///          { variable: "G_AUDIO_BUFFER_COUNT" },
-///          { variable: "G_MIDI_NOTE_ON_COUNT" }
+///          // Cross-module contextual watches (THIS IS THE KEY FEATURE):
+///          { variable: "G_TEMPO", on: ["audio::process_audio_buffer"] },
+///          { variable: "G_MIDI_NOTE_ON_COUNT", on: ["audio::process_audio_buffer"] },
+///          { variable: "G_SAMPLE_RATE", on: ["midi::process_note_on"] },
+///          { variable: "G_AUDIO_BUFFER_COUNT", on: ["midi::process_note_on"] },
+///          // Global watches (captured during all traced functions):
+///          { variable: "G_PARAMETER_UPDATES" }
 ///        ]
 ///      }
 ///    })
@@ -153,7 +161,10 @@ fn test_validation_prevents_extreme_event_limits() {
 /// - audio::process_audio_buffer should be HOT (>10k calls/sec), trigger sampling
 /// - audio::apply_effect_chain called recursively (depth 5)
 /// - Multiple thread names visible: audio-0, audio-1, audio-2, audio-3, midi-processor, automation, stats
-/// - Watch variables change across threads (G_SAMPLE_RATE in audio threads, G_TEMPO from stats thread)
+/// - **CONTEXTUAL WATCHES**: G_TEMPO captured only during audio::process_audio_buffer, NOT during midi::*
+/// - **CONTEXTUAL WATCHES**: G_AUDIO_BUFFER_COUNT captured only during midi::process_note_on, NOT during audio::*
+/// - **CROSS-MODULE READS**: Audio threads reading MIDI state (G_TEMPO, G_MIDI_NOTE_ON_COUNT)
+/// - **CROSS-MODULE READS**: MIDI thread reading audio state (G_SAMPLE_RATE, G_AUDIO_BUFFER_COUNT)
 /// - Deep struct serialization in EffectChain and AudioBuffer arguments
 /// - MIDI events appear in bursts (realistic pattern)
 /// - No crashes or hangs under sustained load

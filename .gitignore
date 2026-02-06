@@ -1,7 +1,8 @@
-/target
+/target/**
 /agent/node_modules
 /agent/dist
 *.db
 *.db-wal
 *.db-shm
 .strobe/
+tests/**/target/
