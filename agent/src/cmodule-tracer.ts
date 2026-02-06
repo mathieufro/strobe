@@ -36,6 +36,15 @@ interface TraceEvent {
   returnValue?: string;
   durationNs?: number;
   sampled?: boolean;
+  watchValues?: Record<string, number | string>;
+}
+
+interface WatchConfig {
+  label: string;
+  size: number;
+  typeKind: 'int' | 'uint' | 'float' | 'pointer';
+  isGlobal: boolean;
+  onFuncIds: Set<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,8 +52,8 @@ interface TraceEvent {
 // ---------------------------------------------------------------------------
 
 const RING_CAPACITY = 16384;
-const ENTRY_SIZE = 48;
-const HEADER_SIZE = 32;
+const ENTRY_SIZE = 80;
+const HEADER_SIZE = 128;
 const RING_BUFFER_SIZE = HEADER_SIZE + RING_CAPACITY * ENTRY_SIZE;
 
 // Adaptive sampling thresholds
@@ -63,6 +72,8 @@ const DRAIN_INTERVAL_MS = 10;
 // Single CModule with onEnter + onLeave. Per-hook mode (full vs light) is
 // encoded in the data pointer's low bit:
 //   data = (func_id << 1) | is_light
+// The shift limits func_id to 2^30 (1 billion) to prevent signed 32-bit overflow
+// (2^31 - 1 = 2,147,483,647). In practice, hook cap of 100 means we never approach this.
 // In onEnter: light hooks check sampling, full hooks don't.
 // In onLeave: light hooks are skipped entirely (enter-only).
 
@@ -78,8 +89,14 @@ extern volatile gint sample_interval;
 extern volatile gint global_counter;
 extern guint8 *ring_data;
 
+extern volatile gint watch_count;
+extern guint64 watch_addrs[4];
+extern guint8 watch_sizes[4];
+extern guint8 watch_deref_depths[4];
+extern guint64 watch_deref_offsets[4];
+
 #define RING_CAPACITY 16384
-#define ENTRY_SIZE 48
+#define ENTRY_SIZE 80
 
 typedef struct {
   guint64 timestamp;
@@ -91,7 +108,12 @@ typedef struct {
   guint32 depth;
   guint8  event_type;
   guint8  sampled;
-  guint16 _pad;
+  guint8  watch_entry_count;
+  guint8  _pad;
+  guint64 watch0;
+  guint64 watch1;
+  guint64 watch2;
+  guint64 watch3;
 } TraceEntry;
 
 static void write_entry(guint32 func_id, GumInvocationContext *ic,
@@ -111,6 +133,56 @@ static void write_entry(guint32 func_id, GumInvocationContext *ic,
   e->arg0       = a0;
   e->arg1       = a1;
   e->retval     = rv;
+
+  /* Read watch values */
+  guint32 wc = (guint32)g_atomic_int_add(&watch_count, 0);
+
+  // Early exit optimization: if no watches, zero out slots and skip
+  if (wc == 0) {
+    e->watch_entry_count = 0;
+    for (guint32 w = 0; w < 4; w++) {
+      *((guint64*)(((guint8*)e) + 48 + w * 8)) = 0;
+    }
+  } else {
+    if (wc > 4) wc = 4;
+    e->watch_entry_count = (guint8)wc;
+
+    guint32 w;
+    for (w = 0; w < wc; w++) {
+    guint64 addr = watch_addrs[w];
+    guint8 dd = watch_deref_depths[w];
+    guint8 sz = watch_sizes[w];
+    guint64 val = 0;
+
+    if (addr != 0) {
+      if (dd > 0) {
+        guint64 ptr_val = *(volatile guint64*)(gpointer)addr;
+        if (ptr_val != 0) {
+          addr = ptr_val + watch_deref_offsets[w];
+        } else {
+          addr = 0;
+        }
+      }
+      if (addr != 0) {
+        // Check alignment before reading to avoid crashes on ARM64
+        if ((sz == 2 && (addr % 2) != 0) ||
+            (sz == 4 && (addr % 4) != 0) ||
+            (sz == 8 && (addr % 8) != 0)) {
+          val = 0; // Unaligned address, skip read
+        } else {
+          if (sz == 1) val = *(volatile guint8*)(gpointer)addr;
+          else if (sz == 2) val = *(volatile guint16*)(gpointer)addr;
+          else if (sz == 4) val = *(volatile guint32*)(gpointer)addr;
+          else val = *(volatile guint64*)(gpointer)addr;
+        }
+      }
+    }
+      *((guint64*)(((guint8*)e) + 48 + w * 8)) = val;
+    }
+    for (; w < 4; w++) {
+      *((guint64*)(((guint8*)e) + 48 + w * 8)) = 0;
+    }
+  }
 }
 
 void onEnter(GumInvocationContext *ic) {
@@ -160,6 +232,12 @@ export class CModuleTracer {
   private overflowCountPtr: NativePointer;
   private sampleIntervalPtr: NativePointer;
   private globalCounterPtr: NativePointer;
+  // Watch table pointers in header
+  private watchCountPtr: NativePointer;
+  private watchAddrsPtr: NativePointer;
+  private watchSizesPtr: NativePointer;
+  private watchDerefDepthsPtr: NativePointer;
+  private watchDerefOffsetsPtr: NativePointer;
   // Pointer to the data region after the header
   private ringDataPtr: NativePointer;
   // Pointer-to-pointer for ring_data extern (CModule needs guint8 *)
@@ -173,7 +251,7 @@ export class CModuleTracer {
   private nextFuncId: number = 1;
 
   // Hook tracking: address string -> { listener, funcId }
-  private hooks: Map<string, { listener: InvocationListener; funcId: number }> = new Map();
+  private hooks: Map<string, { listener: InvocationListener; funcId: number; funcName: string }> = new Map();
 
   // ASLR
   private aslrSlide: NativePointer = ptr(0);
@@ -201,6 +279,17 @@ export class CModuleTracer {
   // Map<threadId, Array<{ eventId: string; depth: number; timestampNs: number }>>
   private threadStacks: Map<number, Array<{ eventId: string; depth: number; timestampNs: number }>> = new Map();
 
+  // Watch configurations (up to 4 CModule watches)
+  private watchConfigs: (WatchConfig | null)[] = [null, null, null, null];
+  // JS expression watches (unlimited)
+  private exprWatches: Array<{
+    label: string;
+    expr: string;
+    compiledFn: () => any;
+    isGlobal: boolean;
+    onFuncIds: Set<number>;
+  }> = [];
+
   constructor(onEvents: (events: any[]) => void) {
     this.onEvents = onEvents;
 
@@ -216,6 +305,16 @@ export class CModuleTracer {
     this.overflowCountPtr  = this.ringBuffer.add(8);     // offset 8
     this.sampleIntervalPtr = this.ringBuffer.add(12);    // offset 12
     this.globalCounterPtr  = this.ringBuffer.add(16);    // offset 16
+
+    // Watch table in header (offsets 24-103)
+    this.watchCountPtr       = this.ringBuffer.add(24);
+    this.watchAddrsPtr       = this.ringBuffer.add(32);   // 4 × 8 bytes
+    this.watchSizesPtr       = this.ringBuffer.add(64);   // 4 × 1 byte
+    this.watchDerefDepthsPtr = this.ringBuffer.add(68);   // 4 × 1 byte
+    this.watchDerefOffsetsPtr = this.ringBuffer.add(72);  // 4 × 8 bytes = 32 bytes
+
+    // Initialize watch_count to 0
+    this.watchCountPtr.writeU32(0);
 
     // Data region starts at offset HEADER_SIZE
     this.ringDataPtr = this.ringBuffer.add(HEADER_SIZE);
@@ -240,11 +339,16 @@ export class CModuleTracer {
     // --- Create CModule ---
     this.cm = new CModule(CMODULE_SOURCE, {
       mach_absolute_time: machAbsTimePtr,
-      write_idx:       this.writeIdxPtr,
-      overflow_count:  this.overflowCountPtr,
-      sample_interval: this.sampleIntervalPtr,
-      global_counter:  this.globalCounterPtr,
-      ring_data:       this.ringDataPtrHolder,
+      write_idx:            this.writeIdxPtr,
+      overflow_count:       this.overflowCountPtr,
+      sample_interval:      this.sampleIntervalPtr,
+      global_counter:       this.globalCounterPtr,
+      ring_data:            this.ringDataPtrHolder,
+      watch_count:          this.watchCountPtr,
+      watch_addrs:          this.watchAddrsPtr,
+      watch_sizes:          this.watchSizesPtr,
+      watch_deref_depths:   this.watchDerefDepthsPtr,
+      watch_deref_offsets:  this.watchDerefOffsetsPtr,
     });
 
     // --- Start drain timer ---
@@ -295,7 +399,7 @@ export class CModuleTracer {
       // Type definitions don't include the CModule overload, but it works at runtime.
       const listener = Interceptor.attach(addr, this.cm as any, data);
 
-      this.hooks.set(func.address, { listener, funcId });
+      this.hooks.set(func.address, { listener, funcId, funcName: func.name });
       return true;
     } catch (_e) {
       // Silently skip functions that can't be hooked
@@ -325,6 +429,133 @@ export class CModuleTracer {
     this.funcRegistry.clear();
     this.nextFuncId = 1;
     this.threadStacks.clear();
+
+    // Clear watch state
+    this.watchCountPtr.writeU32(0);
+    this.watchConfigs = [null, null, null, null];
+    this.exprWatches = [];
+  }
+
+  updateWatches(watches: Array<{
+    address: string; size: number; label: string;
+    derefDepth: number; derefOffset: number;
+    typeKind: string; isGlobal: boolean; onFuncIds?: number[]; onPatterns?: string[];
+  }>): void {
+    if (watches.length > 4) throw new Error('Max 4 CModule watches');
+
+    // Atomic disable
+    this.watchCountPtr.writeU32(0);
+
+    for (let i = 0; i < 4; i++) {
+      if (i < watches.length) {
+        const w = watches[i];
+        const runtimeAddr = ptr(w.address).add(this.aslrSlide);
+
+        // Validate address is readable
+        const range = Process.findRangeByAddress(runtimeAddr);
+        if (!range || !range.protection.includes('r')) {
+          throw new Error(`Watch address ${runtimeAddr} not readable`);
+        }
+
+        this.watchAddrsPtr.add(i * 8).writeU64(uint64(runtimeAddr.toString()));
+        this.watchSizesPtr.add(i).writeU8(w.size);
+        this.watchDerefDepthsPtr.add(i).writeU8(w.derefDepth);
+        this.watchDerefOffsetsPtr.add(i * 8).writeU64(uint64(w.derefOffset.toString()));
+
+        // Resolve patterns to funcIds by matching against installed hooks
+        let resolvedFuncIds: Set<number>;
+        if (w.onPatterns && w.onPatterns.length > 0) {
+          resolvedFuncIds = this.matchPatternsToFuncIds(w.onPatterns);
+        } else {
+          resolvedFuncIds = w.onFuncIds ? new Set(w.onFuncIds) : new Set();
+        }
+
+        this.watchConfigs[i] = {
+          label: w.label,
+          size: w.size,
+          typeKind: w.typeKind as WatchConfig['typeKind'],
+          // Treat as global if no patterns/funcIds provided or empty set
+          isGlobal: w.isGlobal || resolvedFuncIds.size === 0,
+          onFuncIds: resolvedFuncIds,
+        };
+      } else {
+        this.watchAddrsPtr.add(i * 8).writeU64(uint64(0));
+        this.watchSizesPtr.add(i).writeU8(0);
+        this.watchDerefDepthsPtr.add(i).writeU8(0);
+        this.watchDerefOffsetsPtr.add(i * 8).writeU64(uint64(0));
+        this.watchConfigs[i] = null;
+      }
+    }
+
+    // Atomic enable
+    this.watchCountPtr.writeU32(watches.length);
+  }
+
+  // Match patterns against installed hook function names and return matching funcIds
+  private matchPatternsToFuncIds(patterns: string[]): Set<number> {
+    const matchedIds = new Set<number>();
+
+    // Iterate through all installed hooks
+    for (const [_address, entry] of this.hooks) {
+      const funcName = entry.funcName;
+
+      // Check if function name matches any pattern
+      for (const pattern of patterns) {
+        if (this.matchPattern(funcName, pattern)) {
+          matchedIds.add(entry.funcId);
+          break; // Found a match, no need to check other patterns
+        }
+      }
+    }
+
+    return matchedIds;
+  }
+
+  // Simple pattern matching: supports * wildcards and ** for deep matching
+  private matchPattern(name: string, pattern: string): boolean {
+    // Exact match
+    if (name === pattern) return true;
+
+    // @file: pattern - match source file substring
+    if (pattern.startsWith('@file:')) {
+      // We don't have source file info at runtime, so treat as no match
+      // In practice, @file patterns should be resolved at hook installation time
+      return false;
+    }
+
+    // Pattern with wildcards
+    if (pattern.includes('*')) {
+      // Step 1: Replace ** with a temporary marker (deep wildcard)
+      let regexPattern = pattern.replace(/\*\*/g, '\x00DEEP\x00');
+
+      // Step 2: Escape regex special chars (but not single *)
+      const charsToEscape = /[\\.\+\?\^\$\{\}\(\)\|\[\]]/g;
+      regexPattern = regexPattern.replace(charsToEscape, '\\$&');
+
+      // Step 3: Convert single * to regex (matches one or more non-colon chars)
+      regexPattern = regexPattern.replace(/\*/g, '[^:]+');
+
+      // Step 4: Restore ** marker as .* (matches anything including ::)
+      regexPattern = regexPattern.replace(/\x00DEEP\x00/g, '.*');
+
+      const regex = new RegExp(`^${regexPattern}$`);
+      return regex.test(name);
+    }
+
+    return false;
+  }
+
+  updateExprWatches(exprs: Array<{
+    expr: string; label: string; isGlobal: boolean; onFuncIds: number[];
+  }>): void {
+    this.exprWatches = exprs.map(e => ({
+      label: e.label,
+      expr: e.expr,
+      compiledFn: new Function('return ' + e.expr) as () => any,
+      // Treat as global if isGlobal is true OR onFuncIds is null/undefined/empty
+      isGlobal: e.isGlobal || !e.onFuncIds || e.onFuncIds.length === 0,
+      onFuncIds: e.onFuncIds ? new Set(e.onFuncIds) : new Set(),
+    }));
   }
 
   // -----------------------------------------------------------------------
@@ -395,7 +626,7 @@ export class CModuleTracer {
       const depth      = entryPtr.add(40).readU32();
       const eventType  = entryPtr.add(44).readU8();
       const sampled    = entryPtr.add(45).readU8();
-
+      const watchEntryCount = entryPtr.add(46).readU8();
 
       const func = this.funcRegistry.get(funcId);
       if (!func) continue;
@@ -440,6 +671,33 @@ export class CModuleTracer {
           ],
         };
         if (sampled) event.sampled = true;
+
+        // Read watch values
+        if (watchEntryCount > 0 || this.exprWatches.length > 0) {
+          const watchValues: Record<string, number | string> = {};
+
+          // CModule watches
+          for (let w = 0; w < watchEntryCount && w < 4; w++) {
+            const cfg = this.watchConfigs[w];
+            if (!cfg) continue;
+            if (!cfg.isGlobal && !cfg.onFuncIds.has(funcId)) continue;
+
+            const raw = entryPtr.add(48 + w * 8).readU64();
+            watchValues[cfg.label] = this.formatWatchValue(raw, cfg);
+          }
+
+          // JS expression watches
+          for (const ew of this.exprWatches) {
+            if (!ew.isGlobal && !ew.onFuncIds.has(funcId)) continue;
+            try { watchValues[ew.label] = ew.compiledFn(); }
+            catch { watchValues[ew.label] = '<error>'; }
+          }
+
+          if (Object.keys(watchValues).length > 0) {
+            event.watchValues = watchValues;
+          }
+        }
+
         events.push(event);
 
       } else {
@@ -524,6 +782,28 @@ export class CModuleTracer {
   // -----------------------------------------------------------------------
   // Helpers
   // -----------------------------------------------------------------------
+
+  private formatWatchValue(raw: UInt64, cfg: WatchConfig): number | string {
+    if (cfg.typeKind === 'float') {
+      const buf = new ArrayBuffer(8);
+      const view = new DataView(buf);
+      if (cfg.size === 4) {
+        view.setUint32(0, raw.toNumber(), true);
+        return view.getFloat32(0, true);
+      } else {
+        view.setBigUint64(0, BigInt(raw.toString()), true);
+        return view.getFloat64(0, true);
+      }
+    }
+    if (cfg.typeKind === 'int') {
+      const n = raw.toNumber();
+      if (cfg.size === 1) return (n << 24) >> 24;
+      if (cfg.size === 2) return (n << 16) >> 16;
+      if (cfg.size === 4) return n | 0;
+      return n;
+    }
+    return raw.toNumber();
+  }
 
   private generateEventId(): string {
     return `${this.sessionId}-${++this.eventIdCounter}`;

@@ -4,7 +4,7 @@ mod event;
 
 pub use schema::Database;
 pub use session::{Session, SessionStatus};
-pub use event::{Event, EventType, TraceEventSummary, TraceEventVerbose};
+pub use event::{Event, EventType, TraceEventSummary, TraceEventVerbose, EventInsertStats};
 
 #[cfg(test)]
 mod tests {
@@ -80,6 +80,7 @@ mod tests {
             duration_ns: None,
             text: None,
             sampled: None,
+            watch_values: None,
         }).unwrap();
 
         db.insert_event(Event {
@@ -98,6 +99,7 @@ mod tests {
             duration_ns: Some(1000),
             text: None,
             sampled: None,
+            watch_values: None,
         }).unwrap();
 
         // Query by function name

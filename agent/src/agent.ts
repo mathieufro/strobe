@@ -24,6 +24,25 @@ interface OutputEvent {
   text: string;
 }
 
+interface WatchInstruction {
+  watches: Array<{
+    address: string;
+    size: number;
+    label: string;
+    derefDepth: number;
+    derefOffset: number;
+    typeKind: string;
+    isGlobal: boolean;
+    onFuncIds: number[];
+  }>;
+  exprWatches?: Array<{
+    expr: string;
+    label: string;
+    isGlobal: boolean;
+    onFuncIds: number[];
+  }>;
+}
+
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
@@ -106,6 +125,19 @@ class StrobeAgent {
         type: 'hooks_updated',
         activeCount: this.hookInstaller.activeHookCount()
       });
+    }
+  }
+
+  handleWatches(message: WatchInstruction): void {
+    try {
+      this.hookInstaller.updateWatches(message.watches);
+      if (message.exprWatches) {
+        this.hookInstaller.updateExprWatches(message.exprWatches);
+      }
+      send({ type: 'watches_updated', activeCount: message.watches.length });
+    } catch (e: any) {
+      send({ type: 'log', message: `handleWatches error: ${e.message}` });
+      send({ type: 'watches_updated', activeCount: 0 });
     }
   }
 
@@ -243,6 +275,12 @@ function onHooksMessage(message: HookInstruction): void {
   agent.handleMessage(message);
 }
 recv('hooks', onHooksMessage);
+
+function onWatchesMessage(message: WatchInstruction): void {
+  recv('watches', onWatchesMessage);
+  agent.handleWatches(message);
+}
+recv('watches', onWatchesMessage);
 
 // Export for potential direct usage
 (globalThis as any).strobeAgent = agent;

@@ -7,11 +7,27 @@ use std::fs::File;
 use std::path::Path;
 use crate::{Error, Result};
 use crate::symbols::demangle_symbol;
-use super::FunctionInfo;
+use super::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe};
+
+#[derive(Debug, Clone)]
+pub(crate) struct StructMember {
+    pub name: String,
+    pub offset: u64,
+    pub byte_size: u8,
+    pub type_kind: TypeKind,
+    pub type_name: Option<String>,
+    pub is_pointer: bool,
+    pub pointed_struct_members: Option<Vec<StructMember>>,
+}
 
 pub struct DwarfParser {
     pub functions: Vec<FunctionInfo>,
     pub(crate) functions_by_name: HashMap<String, Vec<usize>>,
+    pub variables: Vec<VariableInfo>,
+    pub(crate) variables_by_name: HashMap<String, Vec<usize>>,
+    /// Struct member layouts for pointer-type global variables.
+    /// Key: variable name → members of the pointed-to struct.
+    pub(crate) struct_members: HashMap<String, Vec<StructMember>>,
     /// The image base address from the Mach-O/ELF binary (e.g., __TEXT vmaddr).
     /// Used to compute offsets for ASLR adjustment at runtime.
     pub image_base: u64,
@@ -118,6 +134,8 @@ impl DwarfParser {
         });
 
         let mut functions = Vec::new();
+        let mut variables = Vec::new();
+        let mut struct_members_map: HashMap<String, Vec<StructMember>> = HashMap::new();
 
         // Iterate through compilation units
         let mut units = dwarf.units();
@@ -126,16 +144,40 @@ impl DwarfParser {
                 .map_err(|e| Error::Frida(format!("Failed to parse unit: {}", e)))?;
 
             let mut entries = unit.entries();
-            while let Ok(Some((_, entry))) = entries.next_dfs() {
-                if entry.tag() == gimli::DW_TAG_subprogram {
-                    if let Some(func) = Self::parse_function(&dwarf, &unit, entry)? {
-                        functions.push(func);
+            let mut in_subprogram = false;
+            let mut subprogram_depth: isize = 0;
+            let mut current_depth: isize = 0;
+
+            while let Ok(Some((delta, entry))) = entries.next_dfs() {
+                current_depth += delta;
+
+                // Track whether we're inside a function (to skip local variables)
+                if in_subprogram && current_depth <= subprogram_depth {
+                    in_subprogram = false;
+                }
+
+                match entry.tag() {
+                    gimli::DW_TAG_subprogram => {
+                        in_subprogram = true;
+                        subprogram_depth = current_depth;
+                        if let Some(func) = Self::parse_function(&dwarf, &unit, entry)? {
+                            functions.push(func);
+                        }
                     }
+                    gimli::DW_TAG_variable if !in_subprogram => {
+                        if let Some((var, members)) = Self::parse_variable(&dwarf, &unit, entry)? {
+                            if let Some(members) = members {
+                                struct_members_map.insert(var.name.clone(), members);
+                            }
+                            variables.push(var);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Build index
+        // Build indexes
         let mut functions_by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (idx, func) in functions.iter().enumerate() {
             functions_by_name
@@ -144,9 +186,20 @@ impl DwarfParser {
                 .push(idx);
         }
 
+        let mut variables_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, var) in variables.iter().enumerate() {
+            variables_by_name
+                .entry(var.name.clone())
+                .or_default()
+                .push(idx);
+        }
+
         Ok(Self {
             functions,
             functions_by_name,
+            variables,
+            variables_by_name,
+            struct_members: struct_members_map,
             image_base: 0, // Set by parse() from the actual binary
         })
     }
@@ -271,6 +324,400 @@ impl DwarfParser {
             source_file,
             line_number,
         }))
+    }
+
+    /// Parse a global variable. Returns (VariableInfo, Option<struct members>) —
+    /// struct members are present when the variable is a pointer to a struct.
+    fn parse_variable<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Result<Option<(VariableInfo, Option<Vec<StructMember>>)>> {
+        // Get name: prefer linkage_name over short name
+        let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
+            .and_then(|v| dwarf.attr_string(unit, v).ok())
+            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+
+        let short_name = entry.attr_value(gimli::DW_AT_name).ok().flatten()
+            .and_then(|v| dwarf.attr_string(unit, v).ok())
+            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+
+        let name = match linkage_name.or(short_name) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+
+        // Get location — only accept simple DW_OP_addr (fixed address globals)
+        let address = match Self::parse_variable_address(unit, entry) {
+            Some(addr) => addr,
+            None => return Ok(None),
+        };
+
+        // Get type info
+        let (byte_size, type_kind, type_name) = Self::resolve_type_info(dwarf, unit, entry)
+            .unwrap_or((0, TypeKind::Unknown, None));
+
+        // Skip if size is not 1, 2, 4, or 8
+        if !matches!(byte_size, 1 | 2 | 4 | 8) {
+            return Ok(None);
+        }
+
+        // For pointer variables, try to parse the pointed-to struct members
+        let struct_members = if matches!(type_kind, TypeKind::Pointer) {
+            Self::parse_pointed_struct_members(dwarf, unit, entry)
+        } else {
+            None
+        };
+
+        // Get source file
+        let source_file = Self::parse_source_file(dwarf, unit, entry);
+
+        // Demangle
+        let demangled = demangle_symbol(&name);
+        let name_raw = if name != demangled { Some(name) } else { None };
+
+        Ok(Some((VariableInfo {
+            name: demangled,
+            name_raw,
+            address,
+            byte_size,
+            type_name,
+            type_kind,
+            source_file,
+        }, struct_members)))
+    }
+
+    fn parse_variable_address<R: gimli::Reader>(
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Option<u64> {
+        let loc_attr = entry.attr_value(gimli::DW_AT_location).ok()??;
+        match loc_attr {
+            gimli::AttributeValue::Exprloc(expr) => {
+                let mut ops = expr.operations(unit.encoding());
+                match ops.next().ok()? {
+                    Some(gimli::Operation::Address { address }) => Some(address),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_type_info<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Option<(u8, TypeKind, Option<String>)> {
+        let type_attr = entry.attr_value(gimli::DW_AT_type).ok()??;
+        Self::follow_type_chain(dwarf, unit, type_attr, 0)
+    }
+
+    fn follow_type_chain<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        type_attr: gimli::AttributeValue<R>,
+        depth: usize,
+    ) -> Option<(u8, TypeKind, Option<String>)> {
+        if depth > 10 { return None; } // prevent infinite loops
+
+        let offset = match type_attr {
+            gimli::AttributeValue::UnitRef(o) => o,
+            _ => return None,
+        };
+
+        let mut tree = unit.entries_tree(Some(offset)).ok()?;
+        let root = tree.root().ok()?;
+        let type_entry = root.entry();
+
+        match type_entry.tag() {
+            gimli::DW_TAG_base_type => {
+                let byte_size = type_entry.attr_value(gimli::DW_AT_byte_size).ok()?
+                    .and_then(|v| match v {
+                        gimli::AttributeValue::Udata(n) => Some(n as u8),
+                        _ => None,
+                    })?;
+                let encoding = type_entry.attr_value(gimli::DW_AT_encoding).ok()?
+                    .and_then(|v| match v {
+                        gimli::AttributeValue::Encoding(e) => Some(e),
+                        _ => None,
+                    });
+                let type_kind = match encoding {
+                    Some(gimli::DW_ATE_float) => TypeKind::Float,
+                    Some(gimli::DW_ATE_signed) | Some(gimli::DW_ATE_signed_char) =>
+                        TypeKind::Integer { signed: true },
+                    _ => TypeKind::Integer { signed: false },
+                };
+                let type_name = type_entry.attr_value(gimli::DW_AT_name).ok()?
+                    .and_then(|v| dwarf.attr_string(unit, v).ok())
+                    .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+                Some((byte_size, type_kind, type_name))
+            }
+            gimli::DW_TAG_pointer_type | gimli::DW_TAG_reference_type => {
+                let size = unit.encoding().address_size;
+                Some((size, TypeKind::Pointer, Some("pointer".to_string())))
+            }
+            gimli::DW_TAG_typedef | gimli::DW_TAG_const_type
+            | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type => {
+                let next = type_entry.attr_value(gimli::DW_AT_type).ok()??;
+                Self::follow_type_chain(dwarf, unit, next, depth + 1)
+            }
+            gimli::DW_TAG_enumeration_type => {
+                let byte_size = type_entry.attr_value(gimli::DW_AT_byte_size).ok()?
+                    .and_then(|v| match v {
+                        gimli::AttributeValue::Udata(n) => Some(n as u8),
+                        _ => None,
+                    })?;
+                Some((byte_size, TypeKind::Integer { signed: false }, Some("enum".to_string())))
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_source_file<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Option<String> {
+        match entry.attr_value(gimli::DW_AT_decl_file).ok()? {
+            Some(gimli::AttributeValue::FileIndex(index)) => {
+                if let Some(line_program) = &unit.line_program {
+                    let header = line_program.header();
+                    if let Some(file) = header.file(index) {
+                        let mut path = String::new();
+                        if let Some(dir) = file.directory(header) {
+                            if let Ok(s) = dwarf.attr_string(unit, dir) {
+                                path.push_str(&s.to_string_lossy().unwrap_or_default());
+                                path.push('/');
+                            }
+                        }
+                        if let Ok(s) = dwarf.attr_string(unit, file.path_name()) {
+                            path.push_str(&s.to_string_lossy().unwrap_or_default());
+                        }
+                        if !path.is_empty() { return Some(path); }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// For a pointer-type variable, follow the type chain to find the pointed-to struct
+    /// and parse its member layout.
+    fn parse_pointed_struct_members<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Option<Vec<StructMember>> {
+        // Get the type attribute (should be a pointer type)
+        let type_attr = entry.attr_value(gimli::DW_AT_type).ok()??;
+        let ptr_offset = match type_attr {
+            gimli::AttributeValue::UnitRef(o) => o,
+            _ => return None,
+        };
+
+        // Navigate to the pointer type DIE
+        let mut ptr_tree = unit.entries_tree(Some(ptr_offset)).ok()?;
+        let ptr_root = ptr_tree.root().ok()?;
+        let ptr_entry = ptr_root.entry();
+
+        // Must be a pointer type
+        if ptr_entry.tag() != gimli::DW_TAG_pointer_type {
+            return None;
+        }
+
+        // Get the pointed-to type
+        let pointee_attr = ptr_entry.attr_value(gimli::DW_AT_type).ok()??;
+        Self::parse_struct_members_from_type(dwarf, unit, pointee_attr, 0)
+    }
+
+    /// Follow type chain (through typedefs, const, volatile) to find a struct/class
+    /// and parse its members.
+    fn parse_struct_members_from_type<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        type_attr: gimli::AttributeValue<R>,
+        depth: usize,
+    ) -> Option<Vec<StructMember>> {
+        if depth > 10 { return None; }
+
+        let offset = match type_attr {
+            gimli::AttributeValue::UnitRef(o) => o,
+            _ => return None,
+        };
+
+        let mut tree = unit.entries_tree(Some(offset)).ok()?;
+        let root = tree.root().ok()?;
+        let type_entry = root.entry();
+
+        match type_entry.tag() {
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type => {
+                // Parse member children
+                let mut members = Vec::new();
+                let mut children = root.children();
+                while let Ok(Some(child)) = children.next() {
+                    let child_entry = child.entry();
+                    if child_entry.tag() != gimli::DW_TAG_member {
+                        continue;
+                    }
+
+                    let member_name = child_entry.attr_value(gimli::DW_AT_name).ok().flatten()
+                        .and_then(|v| dwarf.attr_string(unit, v).ok())
+                        .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+
+                    let member_name = match member_name {
+                        Some(n) => n,
+                        None => continue,
+                    };
+
+                    // Get member offset (DW_AT_data_member_location)
+                    let member_offset = child_entry.attr_value(gimli::DW_AT_data_member_location)
+                        .ok().flatten()
+                        .and_then(|v| match v {
+                            gimli::AttributeValue::Udata(n) => Some(n),
+                            gimli::AttributeValue::Sdata(n) if n >= 0 => Some(n as u64),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+
+                    // Get member type info
+                    let member_type_attr = child_entry.attr_value(gimli::DW_AT_type).ok().flatten();
+                    let (byte_size, type_kind, type_name) = member_type_attr.as_ref()
+                        .and_then(|attr| Self::follow_type_chain(dwarf, unit, attr.clone(), 0))
+                        .unwrap_or((0, TypeKind::Unknown, None));
+
+                    let is_pointer = matches!(type_kind, TypeKind::Pointer);
+
+                    // For pointer members, try to parse their pointed-to struct (nested)
+                    let pointed_struct = if is_pointer && depth < 3 {
+                        member_type_attr.and_then(|attr| {
+                            let ptr_off = match attr {
+                                gimli::AttributeValue::UnitRef(o) => o,
+                                _ => return None,
+                            };
+                            let mut pt = unit.entries_tree(Some(ptr_off)).ok()?;
+                            let pr = pt.root().ok()?;
+                            let pe = pr.entry();
+                            let pointee = pe.attr_value(gimli::DW_AT_type).ok()??;
+                            Self::parse_struct_members_from_type(dwarf, unit, pointee, depth + 1)
+                        })
+                    } else {
+                        None
+                    };
+
+                    members.push(StructMember {
+                        name: member_name,
+                        offset: member_offset,
+                        byte_size,
+                        type_kind,
+                        type_name,
+                        is_pointer,
+                        pointed_struct_members: pointed_struct,
+                    });
+                }
+
+                if members.is_empty() { None } else { Some(members) }
+            }
+            gimli::DW_TAG_typedef | gimli::DW_TAG_const_type
+            | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type => {
+                let next = type_entry.attr_value(gimli::DW_AT_type).ok()??;
+                Self::parse_struct_members_from_type(dwarf, unit, next, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn resolve_watch_expression(&self, expr: &str) -> Result<WatchRecipe> {
+        if !expr.contains("->") {
+            // Simple variable — direct read
+            let var = self.find_variable_by_name(expr)
+                .ok_or_else(|| Error::Frida(format!("Variable '{}' not found", expr)))?;
+            return Ok(WatchRecipe {
+                label: expr.to_string(),
+                base_address: var.address,
+                deref_chain: vec![],
+                final_size: var.byte_size,
+                type_kind: var.type_kind.clone(),
+                type_name: var.type_name.clone(),
+            });
+        }
+
+        // Parse "varName->member1->member2"
+        let parts: Vec<&str> = expr.split("->").collect();
+        let root_name = parts[0];
+
+        let var = self.find_variable_by_name(root_name)
+            .ok_or_else(|| Error::Frida(format!("Variable '{}' not found", root_name)))?;
+
+        // Root must be a pointer
+        if !matches!(var.type_kind, TypeKind::Pointer) {
+            return Err(Error::Frida(format!(
+                "'{}' is not a pointer type (is {:?}), cannot use -> syntax",
+                root_name, var.type_kind
+            )));
+        }
+
+        self.resolve_member_chain(var, &parts[1..], expr)
+    }
+
+    fn resolve_member_chain(
+        &self,
+        root_var: &VariableInfo,
+        member_path: &[&str],
+        full_expr: &str,
+    ) -> Result<WatchRecipe> {
+        let mut deref_chain = Vec::new();
+        let mut current_members = self.struct_members.get(&root_var.name)
+            .ok_or_else(|| Error::Frida(format!(
+                "No struct info for pointer '{}'", root_var.name
+            )))?;
+
+        let mut final_size = 0u8;
+        let mut final_type_kind = TypeKind::Unknown;
+        let mut final_type_name = None;
+
+        for (i, &member_name) in member_path.iter().enumerate() {
+            let member = current_members.iter()
+                .find(|m| m.name == member_name)
+                .ok_or_else(|| Error::Frida(format!(
+                    "Member '{}' not found in struct", member_name
+                )))?;
+
+            deref_chain.push(member.offset);
+            final_size = member.byte_size;
+            final_type_kind = member.type_kind.clone();
+            final_type_name = member.type_name.clone();
+
+            // If this member is itself a pointer and there are more parts, continue
+            if member.is_pointer && i + 1 < member_path.len() {
+                current_members = member.pointed_struct_members.as_ref()
+                    .ok_or_else(|| Error::Frida(format!(
+                        "No struct info for pointer member '{}'", member_name
+                    )))?;
+            }
+        }
+
+        Ok(WatchRecipe {
+            label: full_expr.to_string(),
+            base_address: root_var.address,
+            deref_chain,
+            final_size,
+            type_kind: final_type_kind,
+            type_name: final_type_name,
+        })
+    }
+
+    pub fn find_variable_by_name(&self, name: &str) -> Option<&VariableInfo> {
+        self.variables_by_name
+            .get(name)
+            .and_then(|indices| indices.first())
+            .map(|&i| &self.variables[i])
+    }
+
+    pub fn find_variables_by_pattern(&self, pattern: &str) -> Vec<&VariableInfo> {
+        let matcher = PatternMatcher::new(pattern);
+        self.variables.iter().filter(|v| matcher.matches(&v.name)).collect()
     }
 
     pub fn find_by_name(&self, name: &str) -> Vec<&FunctionInfo> {

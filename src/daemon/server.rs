@@ -270,6 +270,30 @@ ALWAYS start with the narrowest pattern that covers your hypothesis. You can wid
 
 Best strategy: start with 1-3 exact function names or a very specific `@file:` pattern. Add more patterns incrementally as you learn from the first round of events.
 
+## Event Storage Limits
+
+- **Default: 200,000 events per session** — Oldest events are automatically deleted when limit is reached (FIFO)
+- Adjust with debug_trace({ sessionId, eventLimit: N }) on a running session
+- Performance guidelines:
+  - 200k: Fast queries (<10ms), small DB (~56MB) — good for most use cases
+  - 500k: Moderate queries (~28ms), medium DB (~140MB) — use for audio/DSP debugging
+  - 1M+: Slow queries (>300ms), large DB (>280MB) — avoid unless necessary
+- Cleanup happens asynchronously and never blocks event generation
+
+## Watching Variables
+
+Read global/static variable values during function execution. Requires debug symbols (DWARF).
+
+- Variable syntax: `gCounter`, `gClock->counter` (pointer dereferencing)
+- Raw address: `{ address: \"0x1234\", type: \"f64\", label: \"tempo\" }`
+- JS expressions: `{ expr: \"ptr(0x5678).readU32()\", label: \"custom\" }`
+- Max 32 watches per session (4 native CModule watches for best performance, unlimited JS expression watches)
+- **Contextual filtering with `on` field:**
+  - Scope watches to specific functions: `{ variable: \"gTempo\", on: [\"audio::process\"] }`
+  - Supports wildcards: `*` (shallow, stops at ::), `**` (deep, crosses ::)
+  - Examples: `[\"NoteOn\"]`, `[\"audio::*\"]`, `[\"juce::**\"]`
+  - If `on` is omitted, watch is global (captured on all traced functions)
+
 ## Query Tips
 
 - eventType "stderr" / "stdout" — program output (always captured)
@@ -308,13 +332,43 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
             },
             McpTool {
                 name: "debug_trace".to_string(),
-                description: "Configure trace patterns. Call BEFORE debug_launch (without sessionId) to set which functions to trace — patterns are applied when the process spawns. Can also be called WITH sessionId to add/remove patterns on a running session.".to_string(),
+                description: "Configure trace patterns and event limits. Call BEFORE debug_launch (without sessionId) to set which functions to trace — patterns are applied when the process spawns. Can also be called WITH sessionId to add/remove patterns or adjust event limits on a running session.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "sessionId": { "type": "string", "description": "Session ID. Omit to set pending patterns for the next debug_launch. Provide to modify a running session." },
                         "add": { "type": "array", "items": { "type": "string" }, "description": "Patterns to start tracing (e.g. \"mymodule::*\", \"*::init\", \"@usercode\")" },
-                        "remove": { "type": "array", "items": { "type": "string" }, "description": "Patterns to stop tracing" }
+                        "remove": { "type": "array", "items": { "type": "string" }, "description": "Patterns to stop tracing" },
+                        "eventLimit": { "type": "integer", "description": "Maximum events to keep for this session (default: 200,000). Oldest events are deleted when limit is reached. Use higher limits (500k-1M) for audio/DSP debugging." },
+                        "watches": {
+                            "type": "object",
+                            "description": "Watch global/static variables during function execution (requires debug symbols)",
+                            "properties": {
+                                "add": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "variable": { "type": "string", "description": "Variable name or expression like 'gClock->counter' (pointer dereferencing)" },
+                                            "address": { "type": "string", "description": "Hex address for raw memory watches" },
+                                            "type": { "type": "string", "description": "Type hint: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer" },
+                                            "label": { "type": "string", "description": "Display label for this watch" },
+                                            "expr": { "type": "string", "description": "JavaScript expression for custom reads (e.g. 'ptr(0x5678).readU32()')" },
+                                            "on": {
+                                                "type": "array",
+                                                "items": { "type": "string" },
+                                                "description": "Optional function patterns to scope this watch (e.g. ['NoteOn', 'audio::*']). Supports wildcards: * (shallow, stops at ::), ** (deep, crosses ::). If omitted, watch is global (captured on all traced functions)."
+                                            }
+                                        }
+                                    }
+                                },
+                                "remove": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Labels of watches to remove"
+                                }
+                            }
+                        }
                     }
                 }),
             },
@@ -558,7 +612,9 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                     active_patterns: patterns,
                     hooked_functions: 0, // Not hooked yet, just pending
                     matched_functions: None,
+                    active_watches: vec![],
                     warnings: vec![],
+                    event_limit: crate::daemon::session_manager::DEFAULT_MAX_EVENTS_PER_SESSION,
                 };
                 Ok(serde_json::to_value(response)?)
             }
@@ -588,7 +644,145 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
 
                 self.session_manager.set_hook_count(session_id, hook_result.installed);
 
+                // Update event limit if provided
+                const MAX_EVENT_LIMIT: usize = 10_000_000; // 10M hard cap
+
+                if let Some(limit) = req.event_limit {
+                    if limit == 0 {
+                        return Err(crate::Error::Frida("Event limit must be > 0".into()));
+                    }
+                    if limit > MAX_EVENT_LIMIT {
+                        return Err(crate::Error::Frida(format!(
+                            "Event limit {} exceeds maximum allowed ({})",
+                            limit, MAX_EVENT_LIMIT
+                        )));
+                    }
+                    self.session_manager.set_event_limit(session_id, limit);
+                }
+
                 let patterns = self.session_manager.get_patterns(session_id);
+                let event_limit = self.session_manager.get_event_limit(session_id);
+
+                // Handle watches if present
+                let mut active_watches = vec![];
+                let mut watch_warnings = vec![];
+                if let Some(ref watch_update) = req.watches {
+                    if let Some(ref add_watches) = watch_update.add {
+                        // Get DWARF parser for this session
+                        if let Some(dwarf) = self.session_manager.get_dwarf(session_id).await? {
+                            let mut frida_watches = vec![];
+                            let mut state_watches = vec![];
+
+                            const MAX_WATCH_EXPR_LEN: usize = 256;
+                            const MAX_DEREF_DEPTH: usize = 4;
+                            const MAX_WATCHES_PER_SESSION: usize = 32;
+
+                            for watch_target in add_watches {
+                                // Check watch count limit
+                                if frida_watches.len() >= MAX_WATCHES_PER_SESSION {
+                                    watch_warnings.push(format!(
+                                        "Watch limit reached ({} max). Additional watches ignored.",
+                                        MAX_WATCHES_PER_SESSION
+                                    ));
+                                    break;
+                                }
+                                // Validate expression/variable before parsing
+                                let expr_str = watch_target.expr.as_ref()
+                                    .or(watch_target.variable.as_ref());
+
+                                if let Some(expr) = expr_str {
+                                    if expr.len() > MAX_WATCH_EXPR_LEN {
+                                        watch_warnings.push(format!(
+                                            "Watch expression too long (max {} chars): {}...",
+                                            MAX_WATCH_EXPR_LEN,
+                                            &expr[..50.min(expr.len())]
+                                        ));
+                                        continue;
+                                    }
+                                    if expr.matches("->").count() > MAX_DEREF_DEPTH {
+                                        watch_warnings.push(format!(
+                                            "Watch expression has too many dereferences (max {}): {}",
+                                            MAX_DEREF_DEPTH,
+                                            expr
+                                        ));
+                                        continue;
+                                    }
+                                }
+
+                                // Resolve watch expression or variable
+                                let recipe = if let Some(ref expr) = watch_target.expr {
+                                    dwarf.resolve_watch_expression(expr)?
+                                } else if let Some(ref var_name) = watch_target.variable {
+                                    dwarf.resolve_watch_expression(var_name)?
+                                } else {
+                                    continue; // Skip invalid watch
+                                };
+
+                                // Pass pattern strings to agent for runtime matching
+                                // Agent will match these patterns against installed hook names
+                                // and build the funcId set dynamically
+                                let on_func_ids: Option<Vec<u32>> = None; // Not used anymore
+                                let on_patterns = watch_target.on.clone();
+
+                                let label = watch_target.label.as_ref().unwrap_or(&recipe.label).clone();
+                                let type_kind_str = match recipe.type_kind {
+                                    crate::dwarf::TypeKind::Integer { signed } => {
+                                        if signed { "int".to_string() } else { "uint".to_string() }
+                                    }
+                                    crate::dwarf::TypeKind::Float => "float".to_string(),
+                                    crate::dwarf::TypeKind::Pointer => "pointer".to_string(),
+                                    crate::dwarf::TypeKind::Unknown => "unknown".to_string(),
+                                };
+
+                                // Build WatchTarget for Frida
+                                frida_watches.push(crate::frida_collector::WatchTarget {
+                                    label: label.clone(),
+                                    address: recipe.base_address,
+                                    size: recipe.final_size,
+                                    type_kind_str: type_kind_str.clone(),
+                                    deref_depth: recipe.deref_chain.len() as u8,
+                                    deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
+                                    type_name: recipe.type_name.clone(),
+                                    on_func_ids: on_func_ids.clone(),
+                                    on_patterns: on_patterns.clone(),
+                                });
+
+                                // Store for state tracking
+                                state_watches.push(crate::daemon::ActiveWatchState {
+                                    label: label.clone(),
+                                    address: recipe.base_address,
+                                    size: recipe.final_size,
+                                    type_kind_str: type_kind_str.clone(),
+                                    deref_depth: recipe.deref_chain.len() as u8,
+                                    deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
+                                    type_name: recipe.type_name.clone(),
+                                    on_patterns: watch_target.on.clone(),
+                                    is_expr: watch_target.expr.is_some(),
+                                    expr: watch_target.expr.clone(),
+                                });
+
+                                // Add to response
+                                active_watches.push(crate::mcp::ActiveWatch {
+                                    label,
+                                    address: format!("0x{:x}", recipe.base_address),
+                                    size: recipe.final_size,
+                                    type_name: recipe.type_name,
+                                    on: watch_target.on.clone(),
+                                });
+                            }
+
+                            // Send watches to Frida agent
+                            if !frida_watches.is_empty() {
+                                self.session_manager.update_frida_watches(session_id, frida_watches).await?;
+                                self.session_manager.set_watches(session_id, state_watches);
+                            }
+                        }
+                    }
+                }
+
+                // Combine hook warnings and watch warnings
+                let mut all_warnings = hook_result.warnings;
+                all_warnings.extend(watch_warnings);
 
                 let response = DebugTraceResponse {
                     active_patterns: patterns,
@@ -598,7 +792,9 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                     } else {
                         None
                     },
-                    warnings: hook_result.warnings,
+                    active_watches,
+                    warnings: all_warnings,
+                    event_limit,
                 };
 
                 Ok(serde_json::to_value(response)?)
@@ -673,6 +869,7 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                     "parentEventId": e.parent_event_id,
                     "arguments": e.arguments,
                     "returnValue": e.return_value,
+                    "watchValues": e.watch_values,
                 })
             } else {
                 serde_json::json!({
@@ -693,6 +890,7 @@ Best strategy: start with 1-3 exact function names or a very specific `@file:` p
                             serde_json::Value::Object(_) => "object",
                         })
                         .unwrap_or("void"),
+                    "watchValues": e.watch_values,
                 })
             }
         }).collect();

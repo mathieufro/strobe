@@ -72,6 +72,13 @@ impl Database {
             [],
         )?;
 
+        // Add watch_values column (idempotent for existing DBs)
+        match conn.execute("ALTER TABLE events ADD COLUMN watch_values JSON", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+
         // Create indexes
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_time ON events(session_id, timestamp_ns)",

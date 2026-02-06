@@ -1,12 +1,46 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock;
 use chrono::{Utc, Timelike};
 use tokio::sync::mpsc;
 use crate::db::{Database, Session, SessionStatus, Event};
 use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::{FridaSpawner, HookResult};
 use crate::Result;
+
+/// Maximum events to keep per session. Oldest events are deleted when limit is reached.
+/// This prevents unbounded database growth and maintains system stability.
+///
+/// Default: 200,000 events (~2 seconds of 48kHz audio tracing, or several minutes of normal tracing)
+/// Can be overridden via STROBE_MAX_EVENTS_PER_SESSION environment variable or debug_trace MCP endpoint.
+///
+/// Performance characteristics (from stress testing):
+/// - 200k: Query <10ms, Cleanup ~94ms, DB ~56MB
+/// - 500k: Query ~28ms, Cleanup ~200ms, DB ~140MB (use for extended audio debugging)
+/// - 1M+: Queries become slow (>300ms), cleanup expensive (>700ms)
+pub const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 200_000;
+
+fn get_max_events_per_session() -> usize {
+    std::env::var("STROBE_MAX_EVENTS_PER_SESSION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION)
+}
+
+#[derive(Clone)]
+pub struct ActiveWatchState {
+    pub label: String,
+    pub address: u64,
+    pub size: u8,
+    pub type_kind_str: String,
+    pub deref_depth: u8,
+    pub deref_offset: u64,
+    pub type_name: Option<String>,
+    pub on_patterns: Option<Vec<String>>,
+    pub is_expr: bool,
+    pub expr: Option<String>,
+}
 
 pub struct SessionManager {
     db: Database,
@@ -16,6 +50,10 @@ pub struct SessionManager {
     dwarf_cache: Arc<RwLock<HashMap<String, DwarfHandle>>>,
     /// Hooked function count per session
     hook_counts: Arc<RwLock<HashMap<String, u32>>>,
+    /// Active watches per session
+    watches: Arc<RwLock<HashMap<String, Vec<ActiveWatchState>>>>,
+    /// Per-session event limits (for dynamic configuration)
+    event_limits: Arc<RwLock<HashMap<String, usize>>>,
     /// Frida spawner for managing instrumented processes (lazily initialized)
     frida_spawner: Arc<tokio::sync::RwLock<Option<FridaSpawner>>>,
 }
@@ -32,6 +70,8 @@ impl SessionManager {
             patterns: Arc::new(RwLock::new(HashMap::new())),
             dwarf_cache: Arc::new(RwLock::new(HashMap::new())),
             hook_counts: Arc::new(RwLock::new(HashMap::new())),
+            watches: Arc::new(RwLock::new(HashMap::new())),
+            event_limits: Arc::new(RwLock::new(HashMap::new())),
             frida_spawner: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
@@ -81,9 +121,11 @@ impl SessionManager {
 
         let session = self.db.create_session(id, binary_path, project_root, pid)?;
 
-        // Initialize pattern storage
+        // Initialize pattern storage, watches, and event limit
         self.patterns.write().unwrap().insert(id.to_string(), Vec::new());
         self.hook_counts.write().unwrap().insert(id.to_string(), 0);
+        self.watches.write().unwrap().insert(id.to_string(), Vec::new());
+        self.event_limits.write().unwrap().insert(id.to_string(), get_max_events_per_session());
 
         Ok(session)
     }
@@ -103,6 +145,8 @@ impl SessionManager {
         // Clean up in-memory state
         self.patterns.write().unwrap().remove(id);
         self.hook_counts.write().unwrap().remove(id);
+        self.watches.write().unwrap().remove(id);
+        self.event_limits.write().unwrap().remove(id);
 
         Ok(count)
     }
@@ -155,6 +199,22 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
+    pub fn set_event_limit(&self, session_id: &str, limit: usize) {
+        self.event_limits
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), limit);
+    }
+
+    pub fn get_event_limit(&self, session_id: &str) -> usize {
+        self.event_limits
+            .read()
+            .unwrap()
+            .get(session_id)
+            .copied()
+            .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION)
+    }
+
     /// Get or start a background DWARF parse. Returns a handle immediately.
     /// If the binary was already parsed (or is being parsed), returns the cached handle.
     pub fn get_or_start_dwarf_parse(&self, binary_path: &str) -> DwarfHandle {
@@ -200,10 +260,13 @@ impl SessionManager {
         // Create event channel
         let (tx, mut rx) = mpsc::channel::<Event>(10000);
 
-        // Spawn database writer task
+        // Spawn database writer task with automatic event limit enforcement
         let db = self.db.clone();
+        let event_limits = Arc::clone(&self.event_limits);
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(100);
+            let mut cached_limit = DEFAULT_MAX_EVENTS_PER_SESSION;
+            let mut batches_since_refresh = 0;
 
             loop {
                 tokio::select! {
@@ -211,16 +274,64 @@ impl SessionManager {
                         batch.push(event);
 
                         if batch.len() >= 100 {
-                            if let Err(e) = db.insert_events_batch(&batch) {
-                                tracing::error!("Failed to insert events: {}", e);
+                            // Refresh cached limit every 10 batches to reduce lock contention
+                            if batches_since_refresh >= 10 {
+                                let session_id = &batch[0].session_id;
+                                cached_limit = event_limits.read().unwrap()
+                                    .get(session_id)
+                                    .copied()
+                                    .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION);
+                                batches_since_refresh = 0;
+                            }
+                            batches_since_refresh += 1;
+                            let max_events = cached_limit;
+
+                            match db.insert_events_with_limit(&batch, max_events) {
+                                Ok(stats) => {
+                                    if stats.events_deleted > 0 {
+                                        tracing::warn!(
+                                            "Event limit cleanup: deleted {} old events from {} session(s) to stay within {} event limit",
+                                            stats.events_deleted,
+                                            stats.sessions_cleaned.len(),
+                                            max_events
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to insert events: {}", e);
+                                }
                             }
                             batch.clear();
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
                         if !batch.is_empty() {
-                            if let Err(e) = db.insert_events_batch(&batch) {
-                                tracing::error!("Failed to insert events: {}", e);
+                            // Refresh cached limit every 10 batches to reduce lock contention
+                            if batches_since_refresh >= 10 {
+                                let session_id = &batch[0].session_id;
+                                cached_limit = event_limits.read().unwrap()
+                                    .get(session_id)
+                                    .copied()
+                                    .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION);
+                                batches_since_refresh = 0;
+                            }
+                            batches_since_refresh += 1;
+                            let max_events = cached_limit;
+
+                            match db.insert_events_with_limit(&batch, max_events) {
+                                Ok(stats) => {
+                                    if stats.events_deleted > 0 {
+                                        tracing::warn!(
+                                            "Event limit cleanup: deleted {} old events from {} session(s) to stay within {} event limit",
+                                            stats.events_deleted,
+                                            stats.sessions_cleaned.len(),
+                                            max_events
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to insert events: {}", e);
+                                }
                             }
                             batch.clear();
                         }
@@ -269,12 +380,59 @@ impl SessionManager {
         Ok(HookResult { installed: 0, matched: 0, warnings: vec![] })
     }
 
+    /// Update Frida watches
+    pub async fn update_frida_watches(
+        &self,
+        session_id: &str,
+        watches: Vec<crate::frida_collector::WatchTarget>,
+    ) -> Result<()> {
+        let mut guard = self.frida_spawner.write().await;
+        let spawner = match guard.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        spawner.set_watches(session_id, watches).await
+    }
+
     /// Stop Frida session
     pub async fn stop_frida(&self, session_id: &str) -> Result<()> {
         let mut guard = self.frida_spawner.write().await;
         match guard.as_mut() {
             Some(spawner) => spawner.stop(session_id).await,
             None => Ok(()), // No spawner — nothing to stop
+        }
+    }
+
+    /// Set active watches for a session
+    pub fn set_watches(&self, session_id: &str, watches: Vec<ActiveWatchState>) {
+        self.watches
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), watches);
+    }
+
+    /// Get active watches for a session
+    pub fn get_watches(&self, session_id: &str) -> Vec<ActiveWatchState> {
+        self.watches
+            .read()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get DWARF parser for a session's binary
+    pub async fn get_dwarf(&self, session_id: &str) -> Result<Option<Arc<DwarfParser>>> {
+        let session = match self.get_session(session_id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let mut handle = self.get_or_start_dwarf_parse(&session.binary_path);
+        match handle.get().await {
+            Ok(parser) => Ok(Some(parser)),
+            Err(e) => Err(e),
         }
     }
 }

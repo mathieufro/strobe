@@ -40,4 +40,12 @@ export class HookInstaller {
   removeAll(): void {
     this.tracer.removeAll();
   }
+
+  updateWatches(watches: Parameters<CModuleTracer['updateWatches']>[0]): void {
+    this.tracer.updateWatches(watches);
+  }
+
+  updateExprWatches(exprs: Parameters<CModuleTracer['updateExprWatches']>[0]): void {
+    this.tracer.updateExprWatches(exprs);
+  }
 }

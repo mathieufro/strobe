@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -68,6 +68,7 @@ fn test_database_roundtrip() {
         duration_ns: None,
         text: None,
         sampled: None,
+        watch_values: None,
     }).unwrap();
 
     // Query
@@ -90,6 +91,61 @@ fn test_mcp_types_serialization() {
     let parsed: strobe::mcp::DebugLaunchRequest = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed.command, "/path/to/app");
+}
+
+#[test]
+fn test_watch_types_serialization() {
+    let target = strobe::mcp::WatchTarget {
+        variable: Some("gClock->counter".to_string()),
+        address: None,
+        type_hint: None,
+        label: None,
+        expr: None,
+        on: Some(vec!["NoteOn".to_string()]),
+    };
+    let json = serde_json::to_string(&target).unwrap();
+    assert!(json.contains("gClock->counter"));
+    assert!(json.contains("NoteOn"));
+
+    let update = strobe::mcp::WatchUpdate {
+        add: Some(vec![target]),
+        remove: Some(vec!["old_watch".to_string()]),
+    };
+    let json = serde_json::to_string(&update).unwrap();
+    assert!(json.contains("gClock->counter"));
+    assert!(json.contains("old_watch"));
+}
+
+#[test]
+fn test_event_with_watch_values() {
+    let dir = tempdir().unwrap();
+    let db = strobe::db::Database::open(&dir.path().join("test.db")).unwrap();
+    db.create_session("s1", "/bin/test", "/home", 1).unwrap();
+
+    let event = strobe::db::Event {
+        id: "evt-w1".to_string(),
+        session_id: "s1".to_string(),
+        timestamp_ns: 5000,
+        thread_id: 1,
+        parent_event_id: None,
+        event_type: strobe::db::EventType::FunctionEnter,
+        function_name: "NoteOn".to_string(),
+        function_name_raw: None,
+        source_file: None,
+        line_number: None,
+        arguments: None,
+        return_value: None,
+        duration_ns: None,
+        text: None,
+        sampled: None,
+        watch_values: Some(serde_json::json!({"gClock": 48291, "tempo": 120.5})),
+    };
+    db.insert_event(event).unwrap();
+
+    let events = db.query_events("s1", |q| q).unwrap();
+    assert_eq!(events.len(), 1);
+    let wv = events[0].watch_values.as_ref().unwrap();
+    assert_eq!(wv["gClock"], 48291);
 }
 
 #[test]
@@ -220,6 +276,7 @@ fn test_output_event_insertion_and_query() {
         duration_ns: None,
         text: Some("Hello from stdout\n".to_string()),
         sampled: None,
+        watch_values: None,
     }).unwrap();
 
     // Insert stderr event
@@ -239,6 +296,7 @@ fn test_output_event_insertion_and_query() {
         duration_ns: None,
         text: Some("Error: something went wrong\n".to_string()),
         sampled: None,
+        watch_values: None,
     }).unwrap();
 
     // Query all - should return both in timestamp order
@@ -280,6 +338,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         duration_ns: None,
         text: None,
         sampled: None,
+        watch_values: None,
     }).unwrap();
 
     // Insert stdout (between function enter and exit)
@@ -299,6 +358,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         duration_ns: None,
         text: Some("Running...\n".to_string()),
         sampled: None,
+        watch_values: None,
     }).unwrap();
 
     // Insert function exit
@@ -318,6 +378,7 @@ fn test_mixed_event_types_in_unified_timeline() {
         duration_ns: Some(1000),
         text: None,
         sampled: None,
+        watch_values: None,
     }).unwrap();
 
     // Query all — should return 3 events in chronological order
@@ -370,6 +431,7 @@ fn test_batch_insert_with_output_events() {
             duration_ns: None,
             text: None,
             sampled: None,
+            watch_values: None,
         },
         strobe::db::Event {
             id: "batch-2".to_string(),
@@ -387,6 +449,7 @@ fn test_batch_insert_with_output_events() {
             duration_ns: None,
             text: Some("batch output line\n".to_string()),
             sampled: None,
+            watch_values: None,
         },
     ];
 
@@ -481,4 +544,215 @@ async fn test_session_cleanup_on_stop() {
     let running = db.get_running_sessions().unwrap();
     assert_eq!(running.len(), 1);
     assert_eq!(running[0].id, "session-2");
+}
+
+#[cfg(target_os = "macos")]
+fn create_c_test_binary_with_globals(dir: &std::path::Path) -> PathBuf {
+    let src = r#"
+#include <stdint.h>
+
+uint32_t gCounter = 42;
+int64_t gSignedVal = -100;
+double gTempo = 120.5;
+static float sLocalFloat = 3.14f;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    double value;
+} Point;
+
+Point gPoint = { 10, 20, 99.9 };
+Point *gPointPtr = &gPoint;
+
+int main(void) {
+    gCounter++;
+    (void)sLocalFloat;
+    return 0;
+}
+"#;
+    let src_path = dir.join("test_globals.c");
+    std::fs::write(&src_path, src).unwrap();
+    let out_path = dir.join("test_globals");
+
+    let status = std::process::Command::new("cc")
+        .args(["-g", "-O0", "-o"])
+        .arg(&out_path)
+        .arg(&src_path)
+        .status()
+        .expect("Failed to compile C test binary");
+    assert!(status.success(), "C test binary compilation failed");
+    out_path
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_dwarf_global_variable_parsing() {
+    let dir = tempdir().unwrap();
+    let binary = create_c_test_binary_with_globals(dir.path());
+    let parser = strobe::dwarf::DwarfParser::parse(&binary).unwrap();
+
+    // Should find global variables
+    assert!(!parser.variables.is_empty(), "Should find global variables");
+
+    // Find specific globals by name
+    let counter = parser.find_variable_by_name("gCounter");
+    assert!(counter.is_some(), "Should find gCounter");
+    let counter = counter.unwrap();
+    assert_eq!(counter.byte_size, 4);
+    assert!(matches!(counter.type_kind, strobe::dwarf::TypeKind::Integer { signed: false }));
+
+    let signed_val = parser.find_variable_by_name("gSignedVal");
+    assert!(signed_val.is_some(), "Should find gSignedVal");
+    assert_eq!(signed_val.unwrap().byte_size, 8);
+
+    let tempo = parser.find_variable_by_name("gTempo");
+    assert!(tempo.is_some(), "Should find gTempo");
+    let tempo = tempo.unwrap();
+    assert_eq!(tempo.byte_size, 8);
+    assert!(matches!(tempo.type_kind, strobe::dwarf::TypeKind::Float));
+
+    // Verify address is non-zero (will be a static address)
+    assert!(counter.address > 0, "Variable should have a valid static address");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_dwarf_watch_expression_ptr_member() {
+    let dir = tempdir().unwrap();
+    let binary = create_c_test_binary_with_globals(dir.path());
+    let parser = strobe::dwarf::DwarfParser::parse(&binary).unwrap();
+
+    // "gPointPtr->x" should resolve to: deref gPointPtr, add offset of x, read i32
+    let recipe = parser.resolve_watch_expression("gPointPtr->x");
+    assert!(recipe.is_ok(), "Should resolve gPointPtr->x: {:?}", recipe);
+    let recipe = recipe.unwrap();
+    assert_eq!(recipe.label, "gPointPtr->x");
+    assert_eq!(recipe.deref_chain.len(), 1); // one dereference
+    assert_eq!(recipe.deref_chain[0], 0);    // x is at offset 0 in Point
+    assert_eq!(recipe.final_size, 4);        // int32_t = 4 bytes
+
+    // "gPointPtr->value" — double at offset in struct
+    let recipe2 = parser.resolve_watch_expression("gPointPtr->value");
+    assert!(recipe2.is_ok(), "Should resolve gPointPtr->value");
+    let recipe2 = recipe2.unwrap();
+    assert_eq!(recipe2.final_size, 8);       // double
+    assert!(matches!(recipe2.type_kind, strobe::dwarf::TypeKind::Float));
+
+    // Simple global (no ->) should also work
+    let recipe3 = parser.resolve_watch_expression("gCounter");
+    assert!(recipe3.is_ok());
+    let recipe3 = recipe3.unwrap();
+    assert!(recipe3.deref_chain.is_empty()); // direct read, no deref
+}
+
+#[test]
+fn test_watch_on_field_patterns() {
+    use strobe::mcp::{WatchTarget, WatchUpdate};
+
+    // Test that watch patterns are properly structured
+    let watch_with_on = WatchTarget {
+        variable: Some("gCounter".to_string()),
+        address: None,
+        type_hint: Some("int".to_string()),
+        label: Some("counter".to_string()),
+        expr: None,
+        on: Some(vec!["audio::process".to_string(), "midi::*".to_string()]),
+    };
+
+    // Verify patterns are stored correctly
+    assert_eq!(watch_with_on.on.as_ref().unwrap().len(), 2);
+    assert_eq!(watch_with_on.on.as_ref().unwrap()[0], "audio::process");
+    assert_eq!(watch_with_on.on.as_ref().unwrap()[1], "midi::*");
+
+    // Test watch without on field (global)
+    let global_watch = WatchTarget {
+        variable: Some("gTempo".to_string()),
+        address: None,
+        type_hint: Some("float".to_string()),
+        label: Some("tempo".to_string()),
+        expr: None,
+        on: None,
+    };
+
+    assert!(global_watch.on.is_none());
+
+    // Test WatchUpdate with mixed watches
+    let update = WatchUpdate {
+        add: Some(vec![watch_with_on.clone(), global_watch.clone()]),
+        remove: Some(vec!["old_watch".to_string()]),
+    };
+
+    assert_eq!(update.add.as_ref().unwrap().len(), 2);
+    assert_eq!(update.remove.as_ref().unwrap().len(), 1);
+}
+
+#[test]
+fn test_watch_pattern_matching_logic() {
+    // Test pattern matching logic that will be used in agent
+    // This verifies the pattern format before it reaches the agent
+
+    let test_cases = vec![
+        // (function_name, pattern, should_match)
+        ("audio::process", "audio::process", true),
+        ("audio::process", "audio::*", true),
+        ("audio::process::internal", "audio::*", false), // * doesn't cross ::
+        ("audio::process::internal", "audio::**", true),  // ** crosses ::
+        ("midi::noteOn", "midi::*", true),
+        ("midi::noteOn", "audio::*", false),
+        ("foo::bar::baz", "foo::**", true),
+        ("foo::bar::baz", "**::baz", true),
+        ("simple_func", "simple_func", true),
+        ("simple_func", "simple_*", true), // * matches remainder without ::
+        ("parseValue", "parse*", true),
+        ("parseValue", "validate*", false),
+    ];
+
+    for (func_name, pattern, expected) in test_cases {
+        let result = pattern_matches(func_name, pattern);
+        assert_eq!(
+            result, expected,
+            "Pattern '{}' vs function '{}' should be {}",
+            pattern, func_name, expected
+        );
+    }
+}
+
+// Helper function to test pattern matching logic
+// This mirrors the logic that will be used in the TypeScript agent
+fn pattern_matches(name: &str, pattern: &str) -> bool {
+    if name == pattern {
+        return true;
+    }
+
+    if pattern.contains('*') {
+        // Convert pattern to regex, handling wildcards carefully
+        let mut regex_pattern = pattern.to_string();
+
+        // Replace ** with a temporary marker (deep wildcard)
+        regex_pattern = regex_pattern.replace("**", "\x00DEEP\x00");
+
+        // Escape regex special chars (but not our markers or single *)
+        let chars_to_escape = ['\\', '.', '+', '?', '^', '$', '{', '}', '(', ')', '|', '[', ']'];
+        for ch in chars_to_escape {
+            if ch != '*' {
+                regex_pattern = regex_pattern.replace(ch, &format!("\\{}", ch));
+            }
+        }
+
+        // Now convert wildcards to regex
+        // * = match anything except :: (one or more chars, but stop at ::)
+        regex_pattern = regex_pattern.replace('*', "[^:]+");
+
+        // ** (deep) = match anything including :: (use marker we set earlier)
+        regex_pattern = regex_pattern.replace("\x00DEEP\x00", ".*");
+
+        let regex_pattern = format!("^{}$", regex_pattern);
+
+        if let Ok(re) = regex::Regex::new(&regex_pattern) {
+            return re.is_match(name);
+        }
+    }
+
+    false
 }
