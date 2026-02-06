@@ -190,7 +190,7 @@ impl Daemon {
             },
             McpTool {
                 name: "debug_trace".to_string(),
-                description: "Configure trace patterns. IMPORTANT: Call BEFORE debug_launch (without sessionId) to set which functions to trace — patterns are applied when the process spawns. Can also be called WITH sessionId to add/remove patterns on a running session.".to_string(),
+                description: "Configure trace patterns. Call BEFORE debug_launch (without sessionId) to set which functions to trace — patterns are applied when the process spawns. Can also be called WITH sessionId to add/remove patterns on a running session.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

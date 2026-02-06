@@ -8,6 +8,17 @@ Strobe is an LLM-native debugging infrastructure. An LLM connects via MCP, launc
 
 **Current phase:** 1a (Tracing Foundation)
 
+## Recommended Workflow
+
+Start with minimal observation and escalate only as needed:
+
+1. **Launch with no patterns** — `debug_launch` with no prior `debug_trace`. stdout/stderr are always captured.
+2. **Read output first** — `debug_query({ eventType: "stderr" })`. Crash messages, ASAN reports, assertion failures, and error logs are often sufficient.
+3. **Add targeted traces** — Only when output doesn't explain the issue. Use `debug_trace({ sessionId, add: [...] })` on the running session.
+4. **Narrow or widen** — Adjust patterns based on what you learn. No restart needed.
+
+This incremental approach is faster than guessing patterns upfront, avoids event noise, and mirrors how experienced developers use debuggers.
+
 ## Architecture
 
 ```
@@ -140,8 +151,11 @@ Glob-style matching on demangled function names:
 | `*::validate` | `auth::validate`, `form::validate` | `auth::deep::validate` |
 | `auth::**::validate` | `auth::validate`, `auth::user::validate` | `form::validate` |
 | `@usercode` | All functions with source in `projectRoot` | stdlib, dependencies |
+| `@file:foo.cpp` | All functions defined in files containing `foo.cpp` | Functions from other files |
 
 `*` matches any characters except `::`. `**` matches any characters including `::`.
+
+`@file:` matches by source file path substring — useful when you know which file has the bug but not the function names.
 
 ## Agent (Frida-injected TypeScript)
 
@@ -150,7 +164,7 @@ Injected into the target process before resume. Compiled from `agent/src/` to `a
 ### Messages (Rust → Agent)
 
 - `initialize { sessionId }` — set session context
-- `hooks { action: "add"|"remove", functions: FunctionTarget[] }` — update hooks
+- `hooks { action: "add"|"remove", functions: FunctionTarget[], imageBase?: string }` — update hooks (imageBase sent once for ASLR slide computation)
 
 ### Messages (Agent → Rust)
 
@@ -169,14 +183,15 @@ Injected into the target process before resume. Compiled from `agent/src/` to `a
 
 ### stdout/stderr Capture
 
-The agent intercepts the `write(2)` syscall to capture process output:
+Output is captured at the **Frida Device level**, not inside the agent:
 
-- Hooks `write()` via `Interceptor.attach` on fd 1 (stdout) and fd 2 (stderr)
-- Output events are sent through the same event pipeline as trace events
-- **Re-entrancy guard:** Prevents infinite recursion when Frida's `send()` itself calls `write()`
-- **Per-session limit:** 50MB of captured output per session; emits a truncation indicator when reached
-- **Large write handling:** Writes >1MB emit a `[strobe: write of N bytes truncated (>1MB)]` indicator
-- Text is read as UTF-8 (with fallback to C string)
+- Spawn uses `FRIDA_STDIO_PIPE` to redirect process stdout/stderr through Frida
+- The Device "output" GLib signal delivers data to the daemon's `raw_on_output` callback
+- Events are created with `EventType::Stdout` / `EventType::Stderr` and sent to the DB writer
+- **Works with ASAN/sanitizer binaries** — no agent-side `write(2)` hook needed
+- The agent also has a best-effort `write(2)` hook as a fallback (wrapped in try-catch, silently fails on ASAN binaries)
+
+This is the most important capture mechanism — crash reports, error logs, and ASAN output all flow through stderr and are often sufficient to diagnose issues without any trace patterns.
 
 ### Event Buffering
 
@@ -239,8 +254,20 @@ Uses `gimli` + `object` crates. Supports ELF and Mach-O binaries.
 
 - On macOS, checks for `.dSYM` bundles automatically
 - Extracts `DW_TAG_subprogram` entries: name, address range, source file, line number
+- Prefers `DW_AT_linkage_name` over `DW_AT_name` for fully qualified C++ names
+- Handles DWARF v4 (`Addr`) and DWARF v5 (`DebugAddrIndex`) address forms
 - Demangles Rust (`rustc-demangle`) and C++ (`cpp_demangle`) symbols
+- Extracts image base from `__TEXT` segment (Mach-O) for ASLR slide computation
 - DWARF parsers cached per binary path across sessions
+
+## ASLR Support
+
+macOS applies Address Space Layout Randomization (ASLR) to spawned processes. Function addresses in DWARF are static (pre-ASLR), but the agent needs runtime addresses.
+
+- The daemon extracts the image base from the binary's `__TEXT` segment via the `object` crate
+- On first `hooks` message, the agent computes `aslrSlide = Process.mainModule.base - imageBase`
+- All subsequent hook addresses are adjusted: `runtimeAddr = staticAddr + aslrSlide`
+- The slide is computed once and cached for the session lifetime
 
 ## Errors
 
@@ -259,6 +286,7 @@ Uses `gimli` + `object` crates. Supports ELF and Mach-O binaries.
 | Crate | Version | Purpose |
 |-------|---------|---------|
 | frida | 0.17 | Dynamic instrumentation (auto-download devkit) |
+| frida-sys | 0.17 | Raw FFI bindings (bypasses frida-rs Script bugs) |
 | gimli | 0.31 | DWARF parsing |
 | object | 0.36 | Binary format parsing |
 | rusqlite | 0.32 | SQLite |

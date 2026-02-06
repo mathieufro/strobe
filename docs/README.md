@@ -21,12 +21,13 @@ You: *edit, recompile, run*
 
 Strobe workflow:
 ```
-LLM: *launches app with tracing*
+LLM: *launches app — no tracing needed, stdout/stderr captured automatically*
 You: *click the button that causes the bug*
-LLM: *queries execution history, finds suspicious function*
-LLM: *adds deeper tracing on that module*
+LLM: *reads stderr — sees ASAN crash at lv_obj_style.c:632*
+LLM: *adds tracing on the suspicious module*
 You: *click the button again*
-LLM: "Found it - null pointer in buffer.data at render.rs:247. Here's the fix."
+LLM: *queries execution timeline, correlates traces with crash output*
+LLM: "Found it - memory pool exhaustion in ViewManager::setView(). Here's the fix."
 ```
 
 **No recompilation. No code changes. No manual log archaeology.**
@@ -41,9 +42,9 @@ LLM: "Found it - null pointer in buffer.data at render.rs:247. Here's the fix."
                            ▼ Frida (dynamic instrumentation)
 ┌─────────────────────────────────────────────────────────────┐
 │  Strobe Daemon                                               │
+│  - Captures process stdout/stderr automatically              │
 │  - Intercepts function calls (no code changes needed)        │
 │  - Captures arguments, return values, timing                 │
-│  - Captures process stdout/stderr into unified timeline      │
 │  - Stores execution history in SQLite                        │
 │  - LLM adjusts tracing scope at runtime                      │
 └─────────────────────────────────────────────────────────────┘
@@ -51,9 +52,9 @@ LLM: "Found it - null pointer in buffer.data at render.rs:247. Here's the fix."
                            ▼ MCP (Model Context Protocol)
 ┌─────────────────────────────────────────────────────────────┐
 │  LLM                                                         │
-│  - debug_trace: set patterns BEFORE launch, or adjust live  │
-│  - debug_launch: start app (applies patterns, captures I/O) │
-│  - debug_query: search traces + stdout/stderr timeline       │
+│  - debug_launch: start app (captures stdout/stderr)          │
+│  - debug_query: read output, search traces                   │
+│  - debug_trace: add patterns when you need deeper insight    │
 │  - debug_stop: end session and clean up                      │
 │  - debug_breakpoint: pause on conditions (Phase 2)           │
 │  - debug_inspect: examine state (Phase 2)                    │
@@ -62,21 +63,17 @@ LLM: "Found it - null pointer in buffer.data at render.rs:247. Here's the fix."
 
 ## Key Capabilities
 
-### Dynamic Tracing (No Restart Required)
+### Automatic Output Capture
 
-The LLM adjusts observation scope while your app runs. Add trace patterns for suspicious modules, increase serialization depth for complex structs, remove patterns when done - all without restarting. Uses glob syntax (`*` and `**`) familiar from shell and .gitignore.
+Process stdout/stderr are captured automatically on every launch — no configuration needed. This alone is often enough to diagnose crashes: ASAN output, assertion messages, error logs all appear in the unified timeline. Start here before adding any trace patterns.
 
-Traditional debuggers require restart to change what you observe. Strobe doesn't.
+### Incremental Tracing (No Restart Required)
+
+The LLM adjusts observation scope while your app runs. Start with zero trace patterns (just stdout/stderr). When output alone isn't enough, add targeted patterns for suspicious modules. Increase serialization depth for complex structs. Remove patterns when done. All without restarting. Uses glob syntax (`*` and `**`) familiar from shell and .gitignore.
 
 ### Crash Capture
 
-When your app crashes, Strobe intercepts the signal and captures:
-- Stack trace at crash point
-- Register state
-- Local variables in the crashing frame
-- Last N events leading to the crash
-
-The LLM gets a "black box recording" of exactly what happened.
+When your app crashes, Strobe captures the stderr output (ASAN reports, stack traces, assertion messages) into the event timeline. The LLM reads the crash output, then adds targeted tracing to understand the root cause.
 
 ### Searchable Execution History
 
@@ -92,15 +89,15 @@ First-class support for test-driven debugging. Run full suite with minimal traci
 
 LLM reruns just the failing test with targeted tracing, queries the captured events, finds root cause. No more running full suite repeatedly. No more guessing what to trace.
 
-## What Gets Traced
+## What Gets Captured
 
-**By default:** All functions in your code (source files in project directory).
+**Always:** Process stdout and stderr (captured at the Frida Device level, works with ASAN/sanitizer binaries).
 
-**Not traced:** Standard library, system calls, third-party dependencies.
+**On demand:** Function enter/exit events when trace patterns are added. Patterns match demangled function names using glob syntax, or source files using `@file:` prefix.
 
-This heuristic uses debug info (DWARF/PDB) to determine source file location. Functions from files outside your project are skipped.
+**Not traced by default:** Nothing. Tracing is opt-in. Start with output capture, add patterns incrementally as needed.
 
-The LLM can adjust this at runtime - broaden to include a dependency, narrow to focus on one module.
+The LLM can adjust tracing at runtime — broaden to include a dependency, narrow to focus on one module, or use `@usercode` to trace all project functions.
 
 ## Target Use Case
 

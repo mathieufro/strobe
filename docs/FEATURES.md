@@ -34,12 +34,11 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 - Parent event tracking for call hierarchy
 
 #### Process Output Capture
-- stdout/stderr captured automatically via `write(2)` syscall interception
+- stdout/stderr captured automatically via Frida's Device "output" signal (`FRIDA_STDIO_PIPE`)
+- Works reliably with ASAN/sanitizer-instrumented binaries (no agent-side hooks needed)
 - Output events interleaved chronologically in the unified event timeline
-- Re-entrancy guard prevents infinite recursion from Frida's own write calls
-- Per-session 50MB output capture limit with truncation indicator
-- Large writes (>1MB) emit a truncation notice instead of buffering
 - Queryable via `debug_query` with `eventType: "stdout"` or `"stderr"`
+- This is the primary debugging tool — often sufficient to diagnose crashes without any trace patterns
 
 #### Serialization (Fixed)
 - Primitives serialized directly
@@ -83,8 +82,8 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 | Timestamp | Yes | Nanoseconds since session start |
 | Thread ID | Yes | Basic support |
 | Call hierarchy | Yes | Parent event tracking |
-| Process stdout | Yes | Via write(2) interception |
-| Process stderr | Yes | Via write(2) interception |
+| Process stdout | Yes | Via Frida Device "output" signal |
+| Process stderr | Yes | Via Frida Device "output" signal |
 
 ### Platform Support (Phase 1a)
 
@@ -110,18 +109,36 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 | `SIP_BLOCKED` | Offer: copy to /tmp, codesign, or disable SIP |
 | `SESSION_EXISTS` | Call `debug_stop` first |
 
+### Recommended Workflow
+
+The most effective approach is **incremental observation** — start with nothing and add only what you need:
+
+1. **Launch with no patterns** — stdout/stderr are always captured
+2. **Read output first** — crash messages, ASAN reports, and error logs are often enough
+3. **Add targeted traces** — only when output alone doesn't explain the issue
+4. **Narrow or widen** — adjust patterns based on what you learn, no restart needed
+
+This is much faster than trying to guess the right trace patterns upfront, and avoids overwhelming the system with unnecessary events.
+
 ### Validation Criteria
 
-**Scenario: Targeted tracing workflow**
-1. LLM calls `debug_launch` with no tracing
-2. User reports bug: "crashes when I click submit"
-3. LLM calls `debug_trace({ add: ["submit::*", "form::validate"] })`
-4. User reproduces bug
-5. LLM calls `debug_query` to find suspicious return values
-6. LLM queries again with `verbose: true` for full arguments
-7. LLM identifies root cause
+**Scenario: Crash investigation (output-first)**
+1. LLM calls `debug_launch` with **no** trace patterns
+2. User triggers the crash
+3. LLM calls `debug_query({ eventType: "stderr" })` — sees ASAN crash report
+4. Crash report points to `lv_obj_style.c:632` via `KeyboardMappingSubView` constructor
+5. LLM reads the relevant source, identifies memory pool exhaustion
+6. LLM proposes fix — **no tracing was needed at all**
 
-**Success:** LLM can observe what functions were called, with what arguments, and what they returned—without any code changes to the target. Tracing is targeted, not "trace everything".
+**Scenario: Targeted tracing (when output isn't enough)**
+1. LLM launches with no patterns, reads output — no crash, but wrong behavior
+2. LLM calls `debug_trace({ sessionId, add: ["submit::*", "form::validate"] })`
+3. User reproduces the bug
+4. LLM calls `debug_query` to find suspicious return values
+5. LLM narrows further or queries with `verbose: true`
+6. LLM identifies root cause
+
+**Success:** LLM can observe what happened — starting from process output and escalating to function traces only when needed. No code changes. No restarts. No guesswork.
 
 ---
 
@@ -269,8 +286,8 @@ pub trait TestAdapter {
 
 | Context | Default Tracing | Rationale |
 |---------|-----------------|-----------|
-| `debug_launch` | User code | Broad observation for unknown bugs |
-| `debug_test` (full suite) | Minimal/none | Fast feedback, wait for failure |
+| `debug_launch` | None (stdout/stderr only) | Output is often enough; add patterns incrementally |
+| `debug_test` (full suite) | None | Fast feedback, wait for failure |
 | `debug_test` (rerun) | Suggested patterns | Stack trace tells us what to trace |
 
 ### Validation Criteria
