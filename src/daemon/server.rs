@@ -409,7 +409,7 @@ Validation Limits (enforced):
                     "type": "object",
                     "properties": {
                         "sessionId": { "type": "string" },
-                        "eventType": { "type": "string", "enum": ["function_enter", "function_exit", "stdout", "stderr"] },
+                        "eventType": { "type": "string", "enum": ["function_enter", "function_exit", "stdout", "stderr", "crash"] },
                         "function": {
                             "type": "object",
                             "properties": {
@@ -437,6 +437,20 @@ Validation Limits (enforced):
                             "properties": {
                                 "contains": { "type": "string" }
                             }
+                        },
+                        "timeFrom": {
+                            "description": "Filter from this time. Integer (absolute ns) or string (\"-5s\", \"-1m\", \"-500ms\")"
+                        },
+                        "timeTo": {
+                            "description": "Filter to this time. Integer (absolute ns) or string (\"-5s\", \"-1m\", \"-500ms\")"
+                        },
+                        "minDurationNs": {
+                            "type": "integer",
+                            "description": "Minimum function duration in nanoseconds (find slow functions)"
+                        },
+                        "pid": {
+                            "type": "integer",
+                            "description": "Filter by process ID (for multi-process sessions)"
                         },
                         "limit": { "type": "integer", "default": 50, "maximum": 500 },
                         "offset": { "type": "integer" },
@@ -729,15 +743,22 @@ Validation Limits (enforced):
                 }
 
                 // Update Frida hooks
-                let default_result = crate::frida_collector::HookResult {
-                    installed: 0, matched: 0, warnings: vec![],
-                };
-                let hook_result = self.session_manager.update_frida_patterns(
+                let hook_result = match self.session_manager.update_frida_patterns(
                     session_id,
                     req.add.as_deref(),
                     req.remove.as_deref(),
                     req.serialization_depth,
-                ).await.unwrap_or(default_result);
+                ).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::warn!("Failed to update Frida patterns for {}: {}", session_id, e);
+                        crate::frida_collector::HookResult {
+                            installed: 0,
+                            matched: 0,
+                            warnings: vec![format!("Hook installation failed: {}", e)],
+                        }
+                    }
+                };
 
                 self.session_manager.set_hook_count(session_id, hook_result.installed);
 
@@ -941,6 +962,31 @@ Validation Limits (enforced):
     }
 
     async fn tool_debug_query(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // Resolve a time value: integer (absolute ns) or string ("-5s", "-1m", "-500ms")
+        fn resolve_time_value(value: &serde_json::Value, latest_ns: i64) -> Option<i64> {
+            match value {
+                serde_json::Value::Number(n) => n.as_i64(),
+                serde_json::Value::String(s) => {
+                    let s = s.trim();
+                    if !s.starts_with('-') {
+                        return s.parse::<i64>().ok();
+                    }
+                    let (num_str, multiplier) = if s.ends_with("ms") {
+                        (&s[1..s.len()-2], 1_000_000i64)
+                    } else if s.ends_with('s') {
+                        (&s[1..s.len()-1], 1_000_000_000i64)
+                    } else if s.ends_with('m') {
+                        (&s[1..s.len()-1], 60_000_000_000i64)
+                    } else {
+                        return None;
+                    };
+                    let num: i64 = num_str.parse().ok()?;
+                    Some(latest_ns - num * multiplier)
+                }
+                _ => None,
+            }
+        }
+
         let req: DebugQueryRequest = serde_json::from_value(args.clone())?;
 
         // Verify session exists
@@ -950,6 +996,17 @@ Validation Limits (enforced):
         let limit = req.limit.unwrap_or(50).min(500);
         let offset = req.offset.unwrap_or(0);
 
+        // Resolve relative time values
+        let latest_ns = if req.time_from.is_some() || req.time_to.is_some() {
+            self.session_manager.db().get_latest_timestamp(&req.session_id)?
+        } else {
+            0
+        };
+        let timestamp_from_ns = req.time_from.as_ref()
+            .and_then(|v| resolve_time_value(v, latest_ns));
+        let timestamp_to_ns = req.time_to.as_ref()
+            .and_then(|v| resolve_time_value(v, latest_ns));
+
         let events = self.session_manager.db().query_events(&req.session_id, |mut q| {
             if let Some(ref et) = req.event_type {
                 q = q.event_type(match et {
@@ -957,6 +1014,7 @@ Validation Limits (enforced):
                     EventTypeFilter::FunctionExit => crate::db::EventType::FunctionExit,
                     EventTypeFilter::Stdout => crate::db::EventType::Stdout,
                     EventTypeFilter::Stderr => crate::db::EventType::Stderr,
+                    EventTypeFilter::Crash => crate::db::EventType::Crash,
                 });
             }
             if let Some(ref f) = req.function {
@@ -977,6 +1035,18 @@ Validation Limits (enforced):
                     q = q.thread_name_contains(contains);
                 }
             }
+            if let Some(from) = timestamp_from_ns {
+                q.timestamp_from_ns = Some(from);
+            }
+            if let Some(to) = timestamp_to_ns {
+                q.timestamp_to_ns = Some(to);
+            }
+            if let Some(dur) = req.min_duration_ns {
+                q.min_duration_ns = Some(dur);
+            }
+            if let Some(pid) = req.pid {
+                q.pid_equals = Some(pid);
+            }
             q.limit(limit).offset(offset)
         })?;
 
@@ -986,6 +1056,22 @@ Validation Limits (enforced):
         // Convert to appropriate format
         let verbose = req.verbose.unwrap_or(false);
         let event_values: Vec<serde_json::Value> = events.iter().map(|e| {
+            // Crash events have their own shape
+            if e.event_type == crate::db::EventType::Crash {
+                return serde_json::json!({
+                    "id": e.id,
+                    "timestamp_ns": e.timestamp_ns,
+                    "eventType": "crash",
+                    "pid": e.pid,
+                    "threadId": e.thread_id,
+                    "signal": e.signal,
+                    "faultAddress": e.fault_address,
+                    "registers": e.registers,
+                    "backtrace": e.backtrace,
+                    "locals": e.locals,
+                });
+            }
+
             // Output events have a different shape
             if e.event_type == crate::db::EventType::Stdout || e.event_type == crate::db::EventType::Stderr {
                 return serde_json::json!({
@@ -993,6 +1079,7 @@ Validation Limits (enforced):
                     "timestamp_ns": e.timestamp_ns,
                     "eventType": e.event_type.as_str(),
                     "threadId": e.thread_id,
+                    "pid": e.pid,
                     "text": e.text,
                 });
             }
@@ -1009,6 +1096,7 @@ Validation Limits (enforced):
                     "line": e.line_number,
                     "duration_ns": e.duration_ns,
                     "threadId": e.thread_id,
+                    "pid": e.pid,
                     "parentEventId": e.parent_event_id,
                     "arguments": e.arguments,
                     "returnValue": e.return_value,
@@ -1023,6 +1111,7 @@ Validation Limits (enforced):
                     "sourceFile": e.source_file,
                     "line": e.line_number,
                     "duration_ns": e.duration_ns,
+                    "pid": e.pid,
                     "returnType": e.return_value.as_ref()
                         .map(|v| match v {
                             serde_json::Value::Null => "null",
@@ -1038,10 +1127,12 @@ Validation Limits (enforced):
             }
         }).collect();
 
+        let pids = self.session_manager.get_all_pids(&req.session_id);
         let response = DebugQueryResponse {
             events: event_values,
             total_count,
             has_more,
+            pids: if pids.len() > 1 { Some(pids) } else { None },
         };
 
         Ok(serde_json::to_value(response)?)

@@ -56,8 +56,9 @@ LLM: "Found it - memory pool exhaustion in ViewManager::setView(). Here's the fi
 │  - debug_query: read output, search traces                   │
 │  - debug_trace: add patterns when you need deeper insight    │
 │  - debug_stop: end session and clean up                      │
-│  - debug_breakpoint: pause on conditions (Phase 2)           │
-│  - debug_inspect: examine state (Phase 2)                    │
+│  - debug_ui_tree: see the UI (Phase 4)                       │
+│  - debug_ui_action: interact with the UI (Phase 5)           │
+│  - debug_test_scenario: autonomous runtime tests (Phase 6)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -186,24 +187,35 @@ This is not for:
 **Validation:** Same debugging power, but humans can see what the LLM sees.
 
 ### Phase 4: UI Observation
-- Screenshots on demand
-- Accessibility tree for structured UI state
-- MCP tools: `debug_ui_state`
+- Unified UI tree: native accessibility (AXUIElement / AT-SPI2) + AI vision (YOLO + SigLIP for custom widgets)
+- On-demand computation (~30-60ms), compact tree format with stable element IDs
+- MCP tools: `debug_ui_tree`, `debug_ui_screenshot`
 
-**Validation:** LLM can see the current state of a GUI app and correlate visual state with execution traces.
+**Validation:** LLM sees native and custom-painted UI elements in one tree, describes the UI, correlates with traces.
 
 ### Phase 5: UI Interaction
-- Click, type, scroll, drag
-- Target elements by accessible name or coordinates
+- Intent-based actions: `click`, `set_value`, `type`, `select`, `drag`, `key`
+- VLM-powered motor layer: classifies unknown widgets, learns interaction model, caches profiles
 - MCP tools: `debug_ui_action`
 
-**Validation:** LLM can autonomously reproduce a bug by navigating the UI, without human assistance.
+**Validation:** LLM sets a JUCE knob value via intent — motor layer figures out the drag mechanics autonomously.
+
+### Phase 6: I/O Channels + Scenario Runner
+- Universal I/O channel abstraction: `InputChannel` / `OutputChannel` traits
+- Wraps existing capabilities (stdout/stderr, traces, UI) as channels
+- Scenario runner (`debug_test_scenario`): flat action list, on failure → process stays alive, LLM debugs
+- MCP tools: `debug_channel_send`, `debug_channel_query`, `debug_test_scenario`
+
+**Validation:** Autonomous synth test — UI knob + MIDI input + trace assertion in one scenario, no human in the loop.
+
+### Phase 7: Concrete I/O Channels
+- MIDI (CoreMIDI / ALSA), Audio (CoreAudio tap / JACK), Network (Frida socket intercept), File (FSEvents / inotify)
+- Each implements channel traits — automatically works with scenario runner
 
 ### Future Phases
-- **Phase 6: Advanced Threading Tools** - Lock tracing, deadlock detection, race condition hints
-- **Phase 7: Smart Test Integration** - Language-specific test setup skills, framework adapters (Google Test, Catch2, pytest, Jest)
-- **Phase 8: JavaScript/TypeScript** - Chrome DevTools Protocol collector for Node.js, browser apps, Electron
-- **Phase 9+:** Additional languages (Python, Go), Windows support, distributed tracing
+- **Phase 8: Advanced Threading Tools** - Lock tracing, deadlock detection, race condition hints
+- **Phase 9: Additional Languages & Runtimes** - JavaScript/TypeScript (CDP), Python, Go, Java/Kotlin
+- **Phase 10+:** Windows support, distributed tracing
 - **Commercial features:** CI/CD integration, auto-test generation, regression detection
 
 ## Architecture
@@ -274,13 +286,14 @@ dsymutil /path/to/binary
 
 ## Extensibility
 
-The architecture is designed so **anyone can add support for obscure languages or test frameworks** without understanding the whole system.
+The architecture is designed so **anyone can add support for new languages, I/O channels, or platform backends** without understanding the whole system.
 
-Two extension points:
+Three extension points:
 - **Collectors** (`Collector` trait) - Add language support
-- **Test Adapters** (`TestAdapter` trait) - Add test framework support
+- **I/O Channels** (`InputChannel`/`OutputChannel` traits) - Add app I/O (MIDI, serial, custom protocols)
+- **Platform Backends** (`UIObserver`, `UIInput`, `VisionPipeline` traits) - Add OS support
 
-Both emit to unified schemas. Contributors don't touch storage, queries, MCP, or VS Code.
+All emit to unified schemas. Contributors don't touch storage, queries, MCP, scenario runner, or VS Code.
 
 See [FEATURES.md](FEATURES.md#contributor-extensibility) for details.
 

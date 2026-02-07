@@ -6,7 +6,7 @@
 
 Strobe is an LLM-native debugging infrastructure. An LLM connects via MCP, launches a target binary with Frida instrumentation, adds/removes trace patterns at runtime, and queries captured events — all without restarting the process.
 
-**Current phase:** 1a (Tracing Foundation)
+**Current phase:** 1b (Advanced Runtime Control)
 
 ## Recommended Workflow
 

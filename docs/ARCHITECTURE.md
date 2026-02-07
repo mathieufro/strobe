@@ -127,16 +127,18 @@ The primary interface is MCP for LLMs. VS Code extension is for:
 Core functionality must work without VS Code.
 
 ### Contributor-Friendly Extensibility
-The architecture must be clean enough that **anyone can add support for an obscure language or test framework** without understanding the whole system.
+The architecture must be clean enough that **anyone can add support for an obscure language, I/O channel, or platform backend** without understanding the whole system.
 
-Two clear extension points:
+Three clear extension points:
 1. **Collectors** - Add language support by implementing one trait
-2. **Test Adapters** - Add test framework support by implementing one trait
+2. **I/O Channels** - Add app I/O support (MIDI, serial, custom protocols) by implementing `InputChannel`/`OutputChannel` traits
+3. **Platform Backends** - Add OS support by implementing `UIObserver`, `UIInput`, `VisionPipeline` traits
 
-Both emit to unified schemas. Contributors don't need to touch:
+All emit to unified schemas. Contributors don't need to touch:
 - Storage layer
 - Query engine
 - MCP interface
+- Scenario runner
 - VS Code extension
 
 See [Extensibility](#extensibility) section for exact interfaces.
@@ -234,7 +236,8 @@ Errors are opportunities for LLM-guided resolution:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     MCP Client (LLM)                             │
-│  debug_launch | debug_query | debug_trace | debug_breakpoint    │
+│  debug_launch | debug_query | debug_trace | debug_ui_tree       │
+│  debug_ui_action | debug_test_scenario | debug_channel_*        │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ MCP (JSON-RPC over stdio)
@@ -606,54 +609,106 @@ debug_continue({
 }) → { success: boolean }
 ```
 
-### debug_ui_state (Phase 4)
+### debug_ui_tree (Phase 4)
 
-Capture current UI state.
+Get the current unified UI tree (native accessibility + AI vision).
 
 ```typescript
-debug_ui_state({
+debug_ui_tree({
   sessionId: string,
-  screenshot?: boolean,        // Default true
-  accessibilityTree?: boolean  // Default true
+  verbose?: boolean              // Include bounding boxes (default false)
 }) → {
-  screenshot?: string,         // Base64 PNG
-  accessibilityTree?: UIElement
+  tree: string                   // Compact text format with stable element IDs
 }
+```
 
-// UIElement structure
-interface UIElement {
-  role: string,                // button, textfield, list, etc.
-  name?: string,               // Accessible name
-  value?: string,              // Current value (for inputs)
-  bounds: { x: number, y: number, width: number, height: number },
-  actions: string[],           // Available actions: click, type, scroll
-  children?: UIElement[]
+Computed on-demand (~30-60ms). Merges native accessibility (AXUIElement / AT-SPI2) with AI vision (YOLO + SigLIP for custom widgets). Returns compact format:
+```
+[window "My App" id=w1]
+  [button "Play" id=btn_play enabled]
+  [knob "Filter" value≈0.6 id=vk_3 source=vision]
+```
+
+### debug_ui_screenshot (Phase 4)
+
+Capture current screenshot.
+
+```typescript
+debug_ui_screenshot({
+  sessionId: string
+}) → {
+  screenshot: string             // Base64 PNG
 }
 ```
 
 ### debug_ui_action (Phase 5)
 
-Interact with the UI.
+Intent-based UI interaction. Motor layer handles widget-specific mechanics (VLM classification for unknown widgets, cached profiles for learned ones).
 
 ```typescript
 debug_ui_action({
   sessionId: string,
-  action: "click" | "type" | "scroll" | "drag" | "key",
-  target?: {
-    name?: string,             // By accessible name
-    coordinates?: { x: number, y: number }
-  },
-  // For type action:
-  value?: string,
-  // For scroll action:
-  direction?: "up" | "down" | "left" | "right",
-  amount?: number,             // Pixels
-  // For drag action:
-  from?: { x: number, y: number },
-  to?: { x: number, y: number },
-  // For key action:
-  key?: string                 // e.g., "Enter", "Ctrl+S"
+  action: string,                // "click", "set_value", "type", "select", "scroll", "drag", "key"
+  id?: string,                   // Target element by stable ID from tree
+  value?: number | string,       // For set_value, type
+  item?: string,                 // For select
+  count?: number,                // For click (double-click = 2)
+  direction?: string,            // For scroll
+  amount?: number,               // For scroll
+  from?: string,                 // For drag (element ID)
+  to?: string,                   // For drag (element ID)
+  key?: string,                  // For key
+  modifiers?: string[]           // For key (e.g., ["cmd", "shift"])
+}) → {
+  success: boolean,
+  element?: object               // Updated element state
+}
+```
+
+### debug_channel_send (Phase 6)
+
+Send stimulus to a non-UI I/O channel.
+
+```typescript
+debug_channel_send({
+  sessionId: string,
+  channel: string,               // e.g., "midi", "net:8080"
+  action: object                 // Channel-specific action
 }) → { success: boolean }
+```
+
+### debug_channel_query (Phase 6)
+
+Query captured output from any I/O channel.
+
+```typescript
+debug_channel_query({
+  sessionId: string,
+  channel: string,               // e.g., "midi", "audio"
+  filter?: object                // Channel-specific filter
+}) → {
+  events: object[]
+}
+```
+
+### debug_test_scenario (Phase 6)
+
+Run an autonomous test scenario. Flat action list executed sequentially. On failure, process stays alive and LLM can investigate.
+
+```typescript
+debug_test_scenario({
+  sessionId: string,
+  channels?: string[],           // Required channels (validated before run)
+  steps: Step[]                  // Array of do/wait/assert steps
+}) → {
+  success: boolean,
+  completed_steps: number,
+  total_steps: number,
+  // On failure:
+  failed_step?: number,
+  step?: object,                 // The failing step
+  actual?: string                // What was actually observed
+}
 ```
 
 ---
@@ -760,7 +815,7 @@ Frida agent adds memory overhead. Minimized by:
 
 ## Extensibility
 
-The architecture is designed for easy extension. Two clear interfaces:
+The architecture is designed for easy extension. Three clear interfaces:
 
 ### Adding a New Collector (Language Support)
 
@@ -768,22 +823,11 @@ Collectors handle runtime instrumentation. Each collector implements the `Collec
 
 ```rust
 pub trait Collector: Send + Sync {
-    /// Attach to a running process or spawn a new one
     fn attach(&mut self, target: &Target) -> Result<SessionId>;
-
-    /// Detach and cleanup
     fn detach(&mut self, session: SessionId) -> Result<()>;
-
-    /// Update tracing patterns at runtime
     fn set_trace_patterns(&mut self, session: SessionId, patterns: Vec<Pattern>) -> Result<()>;
-
-    /// Set a breakpoint (Phase 2+)
     fn set_breakpoint(&mut self, session: SessionId, bp: Breakpoint) -> Result<BreakpointId>;
-
-    /// Resume after breakpoint
     fn resume(&mut self, session: SessionId) -> Result<()>;
-
-    /// Receive events (called by collector manager)
     fn poll_events(&mut self, session: SessionId) -> Result<Vec<TraceEvent>>;
 }
 ```
@@ -801,44 +845,52 @@ pub trait Collector: Send + Sync {
 | CDP | JavaScript/TypeScript | WebSocket to Chrome DevTools |
 | Python | Python | `sys.settrace` or Frida |
 
+### Adding an I/O Channel (Phase 6+)
+
+I/O channels handle app input/output beyond function tracing. Each channel implements `InputChannel`, `OutputChannel`, or both:
+
+```rust
+pub trait InputChannel: Send + Sync {
+    fn name(&self) -> &str;
+    fn send(&self, action: ChannelAction) -> Result<ActionResult>;
+}
+
+pub trait OutputChannel: Send + Sync {
+    fn name(&self) -> &str;
+    fn start_capture(&self) -> Result<()>;
+    fn stop_capture(&self) -> Result<()>;
+    fn query(&self, filter: OutputFilter) -> Result<Vec<ChannelEvent>>;
+}
+```
+
+**To add a new I/O channel (e.g., serial, custom protocol):**
+1. Implement `InputChannel` and/or `OutputChannel` traits
+2. Register with channel registry
+3. Channel automatically works with `debug_channel_send`, `debug_channel_query`, and `debug_test_scenario`
+
+**Current/planned channels:**
+
+| Channel | Input | Output | Phase |
+|---------|-------|--------|-------|
+| `stdio` | stdin injection | stdout/stderr (existing) | 1a (wrapped in 6) |
+| `trace` | pattern management (existing) | function events (existing) | 1a (wrapped in 6) |
+| `ui` | CGEvent / XTest | AX + Vision | 4-5 |
+| `midi` | CoreMIDI / ALSA | CoreMIDI / ALSA | 7 |
+| `audio` | Virtual device | CoreAudio / JACK | 7 |
+| `net` | Socket | Frida intercept | 7 |
+| `file` | Filesystem ops | FSEvents / inotify | 7 |
+
 ### Adding a New Test Framework Adapter
 
 Test adapters parse framework output into our unified `TestFailure` schema:
 
 ```rust
 pub trait TestAdapter: Send + Sync {
-    /// Check if this adapter handles the given project
     fn detect(&self, project_path: &Path) -> Option<DetectedFramework>;
-
-    /// Get the command to run tests
     fn run_command(&self, config: &TestConfig) -> String;
-
-    /// Get the command to run a single test
     fn rerun_command(&self, test_name: &str) -> String;
-
-    /// Parse test output into unified schema
     fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult;
-
-    /// Extract trace hints from failure
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String>;
-}
-
-pub struct TestResult {
-    pub passed: u32,
-    pub failed: u32,
-    pub skipped: u32,
-    pub duration_ms: u64,
-    pub failures: Vec<TestFailure>,
-}
-
-pub struct TestFailure {
-    pub test: String,
-    pub file: String,
-    pub line: u32,
-    pub error: String,
-    pub stack_trace: Vec<String>,
-    pub suggested_trace: Vec<String>,  // From suggest_traces()
-    pub rerun_command: String,          // From rerun_command()
 }
 ```
 
@@ -913,69 +965,34 @@ This unified schema means the query engine, storage, and MCP interface don't car
 
 ---
 
-## Future: Smart Test Integration (Phase 6)
+## Future: I/O Channels & Scenario Runner (Phase 6-7)
 
-Language-specific test framework adapters that normalize output into our unified `TestFailure` schema.
+UI, MIDI, audio, network, files, stdout/stderr, and function traces are all unified as I/O channels. Each implements `InputChannel` (send stimulus) and/or `OutputChannel` (capture output). The scenario runner (`debug_test_scenario`) executes flat action lists across any combination of channels — enabling fully autonomous runtime testing.
 
-### Architecture
+See [specs/2026-02-07-ui-observation-interaction-io-channels.md](specs/2026-02-07-ui-observation-interaction-io-channels.md) for full design.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Test Framework Adapters                       │
-│                                                                  │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-│  │  Rust       │  │  C/C++      │  │  Python     │  ...        │
-│  │  cargo test │  │  gtest/catch│  │  pytest     │             │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
-│         │                │                │                      │
-│         └────────────────┼────────────────┘                      │
-│                          ▼                                       │
-│              ┌───────────────────────┐                          │
-│              │   Unified TestFailure │                          │
-│              │   Schema + Hints      │                          │
-│              └───────────────────────┘                          │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Channel Implementations (Phase 7)
 
-### Supported Frameworks
-
-| Language | Framework | Output Format | Notes |
-|----------|-----------|---------------|-------|
-| Rust | cargo test | `--format json` | Native JSON support |
-| C/C++ | Google Test | `--gtest_output=xml` | XML parsing required |
-| C/C++ | Catch2 | `-r xml` or `-r json` | JSON in v3+ |
-| C/C++ | CTest | `--output-json` | CMake integration |
-| Python | pytest | `--json-report` | Plugin required |
-| JS/TS | Jest | `--json` | Native JSON support |
-| Go | go test | `-json` | Native JSON support |
-
-### Setup Skill
-
-```typescript
-debug_setup_tests({
-  language?: string,     // Auto-detect from project files
-  framework?: string     // Preferred framework (optional)
-}) → {
-  detected: { language: string, framework: string },
-  steps: string[],       // Setup instructions
-  configChanges: Record<string, string>,
-  runCommand: string,
-  rerunTemplate: string  // e.g., "cargo test {name}"
-}
-```
-
-The setup skill examines project files (Cargo.toml, CMakeLists.txt, package.json, etc.) and provides configuration guidance.
+| Channel | Input | Output | Platform |
+|---------|-------|--------|----------|
+| `midi` | CoreMIDI / ALSA virtual port | CoreMIDI / ALSA capture | macOS + Linux |
+| `audio` | Virtual device | CoreAudio tap / JACK | macOS + Linux |
+| `net` | Socket from daemon | Frida socket intercept | Cross-platform |
+| `file` | Filesystem ops | FSEvents / inotify | macOS + Linux |
 
 ---
 
-## Future: CDP Collector (Phase 7+)
+## Future: Additional Languages (Phase 9)
 
-For JavaScript/TypeScript debugging via Chrome DevTools Protocol.
+### CDP Collector (JavaScript/TypeScript)
+
+Chrome DevTools Protocol for Node.js, browser apps, Electron.
 
 Will share:
 - Same MCP interface
 - Same SQLite storage
 - Same event schema
+- Same I/O channel model
 
 Different:
 - Uses CDP instead of Frida
@@ -983,3 +1000,9 @@ Different:
 - Native async/await tracing instead of function hooks
 
 The LLM uses the same tools regardless of whether target is native or JS.
+
+### Other Languages
+
+- Python (via sys.settrace or Frida)
+- Go (enhanced DWARF support, goroutine awareness)
+- Java/Kotlin (via ART hooks on Android)

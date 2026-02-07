@@ -56,6 +56,8 @@ pub struct SessionManager {
     event_limits: Arc<RwLock<HashMap<String, usize>>>,
     /// Frida spawner for managing instrumented processes (lazily initialized)
     frida_spawner: Arc<tokio::sync::RwLock<Option<FridaSpawner>>>,
+    /// Child PIDs per session (parent PID is in the Session struct)
+    child_pids: Arc<RwLock<HashMap<String, Vec<u32>>>>,
 }
 
 impl SessionManager {
@@ -73,6 +75,7 @@ impl SessionManager {
             watches: Arc::new(RwLock::new(HashMap::new())),
             event_limits: Arc::new(RwLock::new(HashMap::new())),
             frida_spawner: Arc::new(tokio::sync::RwLock::new(None)),
+            child_pids: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -147,8 +150,27 @@ impl SessionManager {
         self.hook_counts.write().unwrap().remove(id);
         self.watches.write().unwrap().remove(id);
         self.event_limits.write().unwrap().remove(id);
+        self.child_pids.write().unwrap().remove(id);
 
         Ok(count)
+    }
+
+    pub fn add_child_pid(&self, session_id: &str, pid: u32) {
+        self.child_pids.write().unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .push(pid);
+    }
+
+    pub fn get_all_pids(&self, session_id: &str) -> Vec<u32> {
+        let mut pids = vec![];
+        if let Ok(Some(session)) = self.get_session(session_id) {
+            pids.push(session.pid);
+        }
+        if let Some(children) = self.child_pids.read().unwrap().get(session_id) {
+            pids.extend(children);
+        }
+        pids
     }
 
     pub fn add_patterns(&self, session_id: &str, patterns: &[String]) -> Result<()> {
@@ -217,16 +239,21 @@ impl SessionManager {
 
     /// Get or start a background DWARF parse. Returns a handle immediately.
     /// If the binary was already parsed (or is being parsed), returns the cached handle.
+    /// Failed parses are evicted from cache so that retries (e.g. after dsymutil) work.
     pub fn get_or_start_dwarf_parse(&self, binary_path: &str) -> DwarfHandle {
         // Check cache first
         {
             let cache = self.dwarf_cache.read().unwrap();
             if let Some(handle) = cache.get(binary_path) {
-                return handle.clone();
+                // Only return cached handle if it's still pending or succeeded.
+                // Failed parses should be retried (e.g. dSYM may have been created since).
+                if !handle.is_failed() {
+                    return handle.clone();
+                }
             }
         }
 
-        // Start background parse and cache the handle
+        // Start background parse and cache the handle (evicts stale failed entry)
         let handle = DwarfHandle::spawn_parse(binary_path);
         self.dwarf_cache
             .write()
@@ -446,5 +473,63 @@ impl SessionManager {
             Ok(parser) => Ok(Some(parser)),
             Err(e) => Err(e),
         }
+    }
+
+    /// Resolve local variables for a crash event and update it in the DB.
+    pub async fn resolve_crash_locals(&self, session_id: &str, event_id: &str) -> Result<()> {
+        // Get the crash event
+        let events = self.db.query_events(session_id, |q| {
+            q.event_type(crate::db::EventType::Crash).limit(1)
+        })?;
+        let event = match events.first() {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+
+        // Get DWARF parser
+        let dwarf = match self.get_dwarf(session_id).await? {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        // Get crash PC from backtrace (first frame) or fault address
+        let crash_pc_str = event.backtrace.as_ref()
+            .and_then(|bt| bt.as_array())
+            .and_then(|frames| frames.first())
+            .and_then(|f| f.get("address"))
+            .and_then(|a| a.as_str())
+            .or(event.fault_address.as_deref());
+
+        let crash_pc = crash_pc_str
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+
+        if let Some(pc) = crash_pc {
+            if let Ok(locals_info) = dwarf.parse_locals_at_pc(pc) {
+                let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+
+                // Extract frame_memory and frame_base from the crash event's text field
+                // (stored by parse_event as JSON with frameMemory/frameBase keys)
+                let (frame_memory, frame_base) = event.text.as_ref()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                    .map(|v| {
+                        let fm = v.get("frameMemory").and_then(|f| f.as_str()).map(|s| s.to_string());
+                        let fb = v.get("frameBase").and_then(|f| f.as_str()).map(|s| s.to_string());
+                        (fm, fb)
+                    })
+                    .unwrap_or((None, None));
+
+                let locals = crate::dwarf::resolve_crash_locals(
+                    &locals_info,
+                    event.registers.as_ref().unwrap_or(&serde_json::Value::Null),
+                    frame_memory.as_deref(),
+                    frame_base.as_deref(),
+                    arch,
+                );
+                if !locals.is_empty() {
+                    self.db.update_event_locals(event_id, &serde_json::Value::Array(locals))?;
+                }
+            }
+        }
+        Ok(())
     }
 }

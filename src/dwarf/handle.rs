@@ -29,6 +29,15 @@ impl DwarfHandle {
         Self { rx }
     }
 
+    /// Check if this handle resolved to a failed parse.
+    /// Returns false if still pending or if parse succeeded.
+    pub fn is_failed(&self) -> bool {
+        match self.rx.borrow().as_ref() {
+            Some(Err(_)) => true,
+            _ => false, // None (pending) or Some(Ok(_)) (success)
+        }
+    }
+
     /// Wrap an already-parsed result (cache hit).
     pub fn ready(dwarf: Arc<DwarfParser>) -> Self {
         let (_, rx) = watch::channel(Some(Ok(dwarf)));
@@ -67,6 +76,7 @@ mod tests {
             variables_by_name: std::collections::HashMap::new(),
             struct_members: std::collections::HashMap::new(),
             image_base: 0x100000,
+            binary_path: None,
         })
     }
 

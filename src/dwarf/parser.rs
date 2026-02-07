@@ -7,7 +7,7 @@ use std::fs::File;
 use std::path::Path;
 use crate::{Error, Result};
 use crate::symbols::demangle_symbol;
-use super::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe};
+use super::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation};
 
 #[derive(Debug, Clone)]
 pub(crate) struct StructMember {
@@ -31,6 +31,8 @@ pub struct DwarfParser {
     /// The image base address from the Mach-O/ELF binary (e.g., __TEXT vmaddr).
     /// Used to compute offsets for ASLR adjustment at runtime.
     pub image_base: u64,
+    /// Path to the binary (or dSYM) for re-parsing on demand (e.g., crash locals)
+    pub(crate) binary_path: Option<std::path::PathBuf>,
 }
 
 impl DwarfParser {
@@ -192,6 +194,15 @@ impl DwarfParser {
                 .entry(var.name.clone())
                 .or_default()
                 .push(idx);
+            // Also index by short name (e.g. "G_TEMPO") for user-friendly lookup
+            if let Some(ref short) = var.short_name {
+                if short != &var.name {
+                    variables_by_name
+                        .entry(short.clone())
+                        .or_default()
+                        .push(idx);
+                }
+            }
         }
 
         Ok(Self {
@@ -201,6 +212,7 @@ impl DwarfParser {
             variables_by_name,
             struct_members: struct_members_map,
             image_base: 0, // Set by parse() from the actual binary
+            binary_path: Some(path.to_path_buf()),
         })
     }
 
@@ -333,7 +345,7 @@ impl DwarfParser {
         unit: &gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
     ) -> Result<Option<(VariableInfo, Option<Vec<StructMember>>)>> {
-        // Get name: prefer linkage_name over short name
+        // Get name: prefer linkage_name over short name for demangling
         let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
             .and_then(|v| dwarf.attr_string(unit, v).ok())
             .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
@@ -342,7 +354,7 @@ impl DwarfParser {
             .and_then(|v| dwarf.attr_string(unit, v).ok())
             .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
 
-        let name = match linkage_name.or(short_name) {
+        let name = match linkage_name.or(short_name.clone()) {
             Some(n) => n,
             None => return Ok(None),
         };
@@ -379,6 +391,7 @@ impl DwarfParser {
         Ok(Some((VariableInfo {
             name: demangled,
             name_raw,
+            short_name,
             address,
             byte_size,
             type_name,
@@ -469,6 +482,40 @@ impl DwarfParser {
                         _ => None,
                     })?;
                 Some((byte_size, TypeKind::Integer { signed: false }, Some("enum".to_string())))
+            }
+            gimli::DW_TAG_structure_type => {
+                // For single-field structs at offset 0 (Rust newtypes like AtomicU64,
+                // UnsafeCell<T>, etc.), follow through to the inner type.
+                // This lets us treat AtomicU64 → UnsafeCell<u64> → u64 as a plain u64.
+                let mut children = root.children();
+                let mut member_type_attr = None;
+                let mut member_count = 0u32;
+                while let Ok(Some(child)) = children.next() {
+                    if child.entry().tag() != gimli::DW_TAG_member {
+                        continue;
+                    }
+                    member_count += 1;
+                    if member_count > 1 { break; } // more than one member, not a newtype
+                    // Check offset is 0
+                    let offset_val = child.entry()
+                        .attr_value(gimli::DW_AT_data_member_location).ok().flatten()
+                        .and_then(|v| match v {
+                            gimli::AttributeValue::Udata(n) => Some(n),
+                            gimli::AttributeValue::Sdata(n) if n >= 0 => Some(n as u64),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    if offset_val == 0 {
+                        member_type_attr = child.entry()
+                            .attr_value(gimli::DW_AT_type).ok().flatten();
+                    }
+                }
+                if member_count == 1 {
+                    if let Some(inner) = member_type_attr {
+                        return Self::follow_type_chain(dwarf, unit, inner, depth + 1);
+                    }
+                }
+                None
             }
             _ => None,
         }
@@ -753,6 +800,139 @@ impl DwarfParser {
                     .is_some_and(|sf| sf.contains(file_pattern))
             })
             .collect()
+    }
+
+    /// Parse local variables for the function containing the given PC address.
+    /// Re-opens the DWARF file and does a targeted parse. Only called on crash (rare).
+    pub fn parse_locals_at_pc(&self, crash_pc: u64) -> Result<Vec<LocalVariableInfo>> {
+        let binary_path = self.binary_path.as_ref()
+            .ok_or_else(|| Error::Frida("No binary path for DWARF re-parse".into()))?;
+
+        let file = File::open(binary_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let object = object::File::parse(&*mmap)
+            .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
+
+        let endian = if object.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+
+        let load_section = |id: SectionId| -> std::result::Result<Cow<[u8]>, gimli::Error> {
+            let name = id.name();
+            let data = object.section_by_name(name)
+                .or_else(|| object.section_by_name(&name.replace(".debug_", "__debug_")))
+                .and_then(|section| section.data().ok())
+                .unwrap_or(&[]);
+            Ok(Cow::Borrowed(data))
+        };
+
+        let dwarf_cow = gimli::Dwarf::load(&load_section)
+            .map_err(|e| Error::Frida(format!("DWARF load: {}", e)))?;
+        #[allow(deprecated)]
+        let dwarf = dwarf_cow.borrow(|s| EndianSlice::new(s.as_ref(), endian));
+
+        let mut locals = Vec::new();
+
+        let mut units = dwarf.units();
+        while let Ok(Some(header)) = units.next() {
+            let unit = match dwarf.unit(header) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
+            let mut entries = unit.entries();
+            let mut in_target_func = false;
+            let mut target_depth: isize = 0;
+            let mut current_depth: isize = 0;
+
+            while let Ok(Some((delta, entry))) = entries.next_dfs() {
+                current_depth += delta;
+
+                // Left the target function
+                if in_target_func && current_depth <= target_depth {
+                    break;
+                }
+
+                match entry.tag() {
+                    gimli::DW_TAG_subprogram => {
+                        let low_pc = entry.attr_value(gimli::DW_AT_low_pc).ok().flatten()
+                            .and_then(|v| dwarf.attr_address(&unit, v).ok().flatten());
+                        let high_pc = entry.attr_value(gimli::DW_AT_high_pc).ok().flatten()
+                            .map(|v| match v {
+                                gimli::AttributeValue::Udata(offset) => low_pc.map(|lp| lp + offset),
+                                _ => dwarf.attr_address(&unit, v).ok().flatten(),
+                            })
+                            .flatten();
+
+                        if let (Some(lp), Some(hp)) = (low_pc, high_pc) {
+                            if crash_pc >= lp && crash_pc < hp {
+                                in_target_func = true;
+                                target_depth = current_depth;
+                            }
+                        }
+                    }
+                    gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter if in_target_func => {
+                        if let Some(local) = Self::parse_local_variable(&dwarf, &unit, entry) {
+                            locals.push(local);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !locals.is_empty() {
+                break;
+            }
+        }
+
+        Ok(locals)
+    }
+
+    fn parse_local_variable<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Option<LocalVariableInfo> {
+        let name = entry.attr_value(gimli::DW_AT_name).ok().flatten()
+            .and_then(|v| dwarf.attr_string(unit, v).ok())
+            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()))?;
+
+        // Parse location
+        let location = match entry.attr_value(gimli::DW_AT_location).ok().flatten() {
+            Some(gimli::AttributeValue::Exprloc(expr)) => {
+                let mut ops = expr.operations(unit.encoding());
+                match ops.next().ok().flatten() {
+                    Some(gimli::Operation::FrameOffset { offset }) => {
+                        LocalVarLocation::FrameBaseRelative(offset)
+                    }
+                    Some(gimli::Operation::Register { register }) => {
+                        LocalVarLocation::Register(register.0)
+                    }
+                    Some(gimli::Operation::RegisterOffset { register, offset, .. }) => {
+                        LocalVarLocation::RegisterOffset(register.0, offset)
+                    }
+                    Some(gimli::Operation::Address { address }) => {
+                        LocalVarLocation::Address(address)
+                    }
+                    _ => LocalVarLocation::Complex,
+                }
+            }
+            _ => LocalVarLocation::Complex,
+        };
+
+        // Get type info
+        let (byte_size, type_kind, type_name) = Self::resolve_type_info(dwarf, unit, entry)
+            .unwrap_or((0, TypeKind::Unknown, None));
+
+        Some(LocalVariableInfo {
+            name,
+            byte_size,
+            type_kind,
+            type_name,
+            location,
+        })
     }
 }
 

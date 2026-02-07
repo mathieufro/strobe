@@ -98,6 +98,40 @@ impl Database {
             Err(e) => return Err(e.into()),
         }
 
+        // Add pid column (idempotent for existing DBs)
+        match conn.execute("ALTER TABLE events ADD COLUMN pid INTEGER", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // Crash-related columns
+        match conn.execute("ALTER TABLE events ADD COLUMN signal TEXT", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+        match conn.execute("ALTER TABLE events ADD COLUMN fault_address TEXT", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+        match conn.execute("ALTER TABLE events ADD COLUMN registers JSON", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+        match conn.execute("ALTER TABLE events ADD COLUMN backtrace JSON", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+        match conn.execute("ALTER TABLE events ADD COLUMN locals JSON", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+
         // Create indexes
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_time ON events(session_id, timestamp_ns)",
@@ -113,6 +147,11 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_thread ON events(session_id, thread_id, timestamp_ns)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_pid ON events(session_id, pid)",
             [],
         )?;
 

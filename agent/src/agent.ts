@@ -119,6 +119,9 @@ class StrobeAgent {
       }
     }, 1000);
 
+    // Install crash/exception handler
+    this.installExceptionHandler();
+
     send({ type: 'initialized', sessionId });
   }
 
@@ -210,6 +213,105 @@ class StrobeAgent {
     return Date.now() * 1000000 - this.sessionStartNs;
   }
 
+  private installExceptionHandler(): void {
+    Process.setExceptionHandler((details) => {
+      const crashEvent = this.buildCrashEvent(details);
+      send({ type: 'events', events: [crashEvent] });
+
+      // Return false to let the OS handle the crash (terminate the process)
+      // The event will be flushed because send() is synchronous
+      return false;
+    });
+  }
+
+  private buildCrashEvent(details: ExceptionDetails): any {
+    const timestamp = this.getTimestampNs();
+    const eventId = `${this.sessionId}-crash-${Date.now()}`;
+
+    // Build stack trace using Thread.backtrace
+    let backtrace: any[] = [];
+    try {
+      const frames = Thread.backtrace(details.context, Backtracer.ACCURATE);
+      backtrace = frames.map((addr: NativePointer) => {
+        const sym = DebugSymbol.fromAddress(addr);
+        return {
+          address: addr.toString(),
+          moduleName: sym.moduleName,
+          name: sym.name,
+          fileName: sym.fileName,
+          lineNumber: sym.lineNumber,
+        };
+      });
+    } catch (e) {
+      // Backtrace may fail in some crash scenarios
+    }
+
+    // Capture register state from crash context
+    const registers: Record<string, string> = {};
+    const ctx = details.context as any;
+    // ARM64 registers
+    if (Process.arch === 'arm64') {
+      for (let i = 0; i <= 28; i++) {
+        const regName = `x${i}`;
+        if (ctx[regName]) registers[regName] = ctx[regName].toString();
+      }
+      if (ctx.fp) registers.fp = ctx.fp.toString();
+      if (ctx.lr) registers.lr = ctx.lr.toString();
+      if (ctx.sp) registers.sp = ctx.sp.toString();
+      if (ctx.pc) registers.pc = ctx.pc.toString();
+    }
+    // x86_64 registers
+    else if (Process.arch === 'x64') {
+      for (const reg of ['rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
+                         'r8','r9','r10','r11','r12','r13','r14','r15','rip']) {
+        if (ctx[reg]) registers[reg] = ctx[reg].toString();
+      }
+    }
+
+    // Read stack frame memory around frame pointer (for local variable resolution)
+    let frameMemory: string | null = null;
+    let frameBase: string | null = null;
+    try {
+      const fp = Process.arch === 'arm64' ? ctx.fp : ctx.rbp;
+      if (fp && !fp.isNull()) {
+        frameBase = fp.toString();
+        // Read 512 bytes below and 128 bytes above FP
+        const readBase = fp.sub(512);
+        const data = readBase.readByteArray(640);
+        if (data) {
+          frameMemory = _arrayBufferToHex(data);
+        }
+      }
+    } catch (e) {
+      // Frame memory read may fail
+    }
+
+    // Memory access details (for access violations)
+    let memoryAccess: any = undefined;
+    if (details.memory) {
+      memoryAccess = {
+        operation: details.memory.operation,
+        address: details.memory.address.toString(),
+      };
+    }
+
+    return {
+      id: eventId,
+      timestampNs: timestamp,
+      threadId: Process.getCurrentThreadId(),
+      threadName: null,
+      eventType: 'crash',
+      pid: Process.id,
+      signal: details.type,
+      faultAddress: details.address.toString(),
+      registers: registers,
+      backtrace: backtrace,
+      frameMemory: frameMemory,
+      frameBase: frameBase,
+      memoryAccess: memoryAccess,
+    };
+  }
+
   private installOutputCapture(): void {
     const self = this;
     const writePtr = Process.getModuleByName('libSystem.B.dylib').getExportByName('write');
@@ -297,6 +399,15 @@ class StrobeAgent {
       }
     });
   }
+}
+
+function _arrayBufferToHex(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
 }
 
 // Global agent instance

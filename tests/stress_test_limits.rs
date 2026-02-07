@@ -169,6 +169,12 @@ fn create_event(session_id: &str, seq: usize) -> Event {
         text: None,
         sampled: Some(false),
         watch_values: None,
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     }
 }
 

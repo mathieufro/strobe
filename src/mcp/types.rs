@@ -206,6 +206,7 @@ pub enum EventTypeFilter {
     FunctionExit,
     Stdout,
     Stderr,
+    Crash,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +260,14 @@ pub struct DebugQueryRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_name: Option<ThreadNameFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_from: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_duration_ns: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
@@ -272,6 +281,9 @@ pub struct DebugQueryResponse {
     pub events: Vec<serde_json::Value>,
     pub total_count: u64,
     pub has_more: bool,
+    /// All process IDs in this session (parent + children), only present when multiple
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids: Option<Vec<u32>>,
 }
 
 // ============ debug_stop ============

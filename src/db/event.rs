@@ -10,6 +10,7 @@ pub enum EventType {
     FunctionExit,
     Stdout,
     Stderr,
+    Crash,
 }
 
 impl EventType {
@@ -19,6 +20,7 @@ impl EventType {
             Self::FunctionExit => "function_exit",
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
+            Self::Crash => "crash",
         }
     }
 
@@ -28,6 +30,7 @@ impl EventType {
             "function_exit" => Some(Self::FunctionExit),
             "stdout" => Some(Self::Stdout),
             "stderr" => Some(Self::Stderr),
+            "crash" => Some(Self::Crash),
             _ => None,
         }
     }
@@ -52,6 +55,12 @@ pub struct Event {
     pub text: Option<String>,
     pub sampled: Option<bool>,
     pub watch_values: Option<serde_json::Value>,
+    pub pid: Option<u32>,
+    pub signal: Option<String>,
+    pub fault_address: Option<String>,
+    pub registers: Option<serde_json::Value>,
+    pub backtrace: Option<serde_json::Value>,
+    pub locals: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +109,10 @@ pub struct EventQuery {
     pub return_value_is_null: Option<bool>,
     pub thread_id_equals: Option<i64>,
     pub thread_name_contains: Option<String>,
+    pub pid_equals: Option<u32>,
+    pub timestamp_from_ns: Option<i64>,
+    pub timestamp_to_ns: Option<i64>,
+    pub min_duration_ns: Option<i64>,
     pub limit: u32,
     pub offset: u32,
 }
@@ -117,6 +130,10 @@ impl Default for EventQuery {
             return_value_is_null: None,
             thread_id_equals: None,
             thread_name_contains: None,
+            pid_equals: None,
+            timestamp_from_ns: None,
+            timestamp_to_ns: None,
+            min_duration_ns: None,
             limit: 50,
             offset: 0,
         }
@@ -176,8 +193,9 @@ impl Database {
         conn.execute(
             "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns, text, sampled, watch_values)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             arguments, return_value, duration_ns, text, sampled, watch_values, pid,
+             signal, fault_address, registers, backtrace, locals)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 event.id,
                 event.session_id,
@@ -196,6 +214,12 @@ impl Database {
                 event.text,
                 event.sampled,
                 event.watch_values.map(|v| v.to_string()),
+                event.pid.map(|p| p as i64),
+                event.signal,
+                event.fault_address,
+                event.registers.map(|v| v.to_string()),
+                event.backtrace.map(|v| v.to_string()),
+                event.locals.map(|v| v.to_string()),
             ],
         )?;
 
@@ -209,8 +233,9 @@ impl Database {
             conn.execute(
                 "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
                  event_type, function_name, function_name_raw, source_file, line_number,
-                 arguments, return_value, duration_ns, text, sampled, watch_values)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 arguments, return_value, duration_ns, text, sampled, watch_values, pid,
+                 signal, fault_address, registers, backtrace, locals)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     event.id,
                     event.session_id,
@@ -229,6 +254,12 @@ impl Database {
                     &event.text,
                     event.sampled,
                     event.watch_values.as_ref().map(|v| v.to_string()),
+                    event.pid.map(|p| p as i64),
+                    &event.signal,
+                    &event.fault_address,
+                    event.registers.as_ref().map(|v| v.to_string()),
+                    event.backtrace.as_ref().map(|v| v.to_string()),
+                    event.locals.as_ref().map(|v| v.to_string()),
                 ],
             )?;
         }
@@ -246,7 +277,8 @@ impl Database {
         let mut sql = String::from(
             "SELECT id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
-             arguments, return_value, duration_ns, text, sampled, watch_values
+             arguments, return_value, duration_ns, text, sampled, watch_values, pid,
+             signal, fault_address, registers, backtrace, locals
              FROM events WHERE session_id = ?"
         );
 
@@ -290,6 +322,24 @@ impl Database {
             params_vec.push(Box::new(format!("%{}%", escape_like_pattern(name))));
         }
 
+        if let Some(pid) = query.pid_equals {
+            sql.push_str(" AND pid = ?");
+            params_vec.push(Box::new(pid as i64));
+        }
+
+        if let Some(from) = query.timestamp_from_ns {
+            sql.push_str(" AND timestamp_ns >= ?");
+            params_vec.push(Box::new(from));
+        }
+        if let Some(to) = query.timestamp_to_ns {
+            sql.push_str(" AND timestamp_ns <= ?");
+            params_vec.push(Box::new(to));
+        }
+        if let Some(min_dur) = query.min_duration_ns {
+            sql.push_str(" AND duration_ns IS NOT NULL AND duration_ns >= ?");
+            params_vec.push(Box::new(min_dur));
+        }
+
         sql.push_str(" ORDER BY timestamp_ns ASC");
         sql.push_str(" LIMIT ? OFFSET ?");
         params_vec.push(Box::new(query.limit as i64));
@@ -330,6 +380,30 @@ impl Database {
                 _ => None,
             };
 
+            let registers_val = match row.get_ref(20)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Text(s) => {
+                    serde_json::from_str(std::str::from_utf8(s).unwrap_or("null")).ok()
+                }
+                _ => None,
+            };
+
+            let backtrace_val = match row.get_ref(21)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Text(s) => {
+                    serde_json::from_str(std::str::from_utf8(s).unwrap_or("null")).ok()
+                }
+                _ => None,
+            };
+
+            let locals_val = match row.get_ref(22)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Text(s) => {
+                    serde_json::from_str(std::str::from_utf8(s).unwrap_or("null")).ok()
+                }
+                _ => None,
+            };
+
             Ok(Event {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -348,10 +422,26 @@ impl Database {
                 text: row.get(14)?,
                 sampled: row.get(15)?,
                 watch_values: watch_vals,
+                pid: row.get::<_, Option<i64>>(17)?.map(|p| p as u32),
+                signal: row.get(18)?,
+                fault_address: row.get(19)?,
+                registers: registers_val,
+                backtrace: backtrace_val,
+                locals: locals_val,
             })
         })?;
 
         events.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_latest_timestamp(&self, session_id: &str) -> Result<i64> {
+        let conn = self.connection();
+        let ts: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(timestamp_ns), 0) FROM events WHERE session_id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(ts)
     }
 
     pub fn count_events(&self, session_id: &str) -> Result<u64> {
@@ -451,8 +541,9 @@ impl Database {
                 tx.execute(
                     "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
                      event_type, function_name, function_name_raw, source_file, line_number,
-                     arguments, return_value, duration_ns, text, sampled, watch_values)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     arguments, return_value, duration_ns, text, sampled, watch_values, pid,
+                     signal, fault_address, registers, backtrace, locals)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         &event.id,
                         &event.session_id,
@@ -471,6 +562,12 @@ impl Database {
                         &event.text,
                         event.sampled,
                         event.watch_values.as_ref().map(|v| v.to_string()),
+                        event.pid.map(|p| p as i64),
+                        &event.signal,
+                        &event.fault_address,
+                        event.registers.as_ref().map(|v| v.to_string()),
+                        event.backtrace.as_ref().map(|v| v.to_string()),
+                        event.locals.as_ref().map(|v| v.to_string()),
                     ],
                 )?;
                 stats.events_inserted += 1;
@@ -479,6 +576,15 @@ impl Database {
 
         tx.commit()?;
         Ok(stats)
+    }
+
+    pub fn update_event_locals(&self, event_id: &str, locals: &serde_json::Value) -> Result<()> {
+        let conn = self.connection();
+        conn.execute(
+            "UPDATE events SET locals = ? WHERE id = ?",
+            params![locals.to_string(), event_id],
+        )?;
+        Ok(())
     }
 }
 

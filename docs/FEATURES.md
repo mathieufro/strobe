@@ -380,101 +380,21 @@ Non-technical user can:
 
 ## Phase 4: UI Observation
 
-**Goal:** LLM can see the current state of GUI applications with zero-latency reads.
+**Goal:** LLM can see the current state of any GUI application — native widgets via accessibility APIs, custom-painted widgets via AI vision — with a single tool call.
 
-### Core Insight: Always-Hot Tree
+**Full spec:** [specs/2026-02-07-ui-observation-interaction-io-channels.md](specs/2026-02-07-ui-observation-interaction-io-channels.md)
 
-The traditional agent-UI loop is slow: agent requests tree → system computes tree → agent receives → agent decides → agent acts. Every step is a blocking round-trip. Strobe inverts this into a **push model**: the UI tree is continuously maintained in the background, always fresh, always ready. When the LLM calls `debug_ui_tree`, it reads from memory — sub-millisecond response, no computation.
+### How It Works
 
-This transforms a 4-step UI interaction from ~8s (4 round-trips with tree computation) to ~2s (4 instant reads + action execution). The difference between "painful" and "usable."
+The tree is computed on every `debug_ui_tree` call (~30-60ms). LLM token latency dominates — 60ms is invisible.
 
-### Architecture
+1. Screenshot (platform API) — ~10ms
+2. Perceptual hash — same as last? Reuse cached vision. Changed? Run YOLO + SigLIP — ~10ms
+3. Accessibility tree query (platform API) — ~5ms
+4. Merge AX nodes with vision boxes (IoU 0.5 matching) — ~1ms
+5. Assign stable IDs, project to compact format — ~2ms
 
-```
-┌─────────────────────────────────────────────────────┐
-│                  Always-Hot Tree                     │
-│                                                     │
-│  ┌──────────────┐    ┌──────────────┐               │
-│  │ AXUIElement   │    │ AI Vision    │               │
-│  │ (structured)  │    │ (screenshot) │               │
-│  └──────┬───────┘    └──────┬───────┘               │
-│         │                   │                        │
-│         └───────┬───────────┘                        │
-│                 ▼                                    │
-│        ┌────────────────┐                            │
-│        │  Unified Tree   │ ← in-memory, always fresh │
-│        │  (merged view)  │                            │
-│        └────────┬───────┘                            │
-│                 │                                    │
-│    ┌────────────┼────────────┐                       │
-│    ▼            ▼            ▼                       │
-│  MCP tool    MCP resource   Instrumentation          │
-│  (on-demand) (push/notify)  correlation              │
-└─────────────────────────────────────────────────────┘
-```
-
-**Background observer** runs on a dedicated thread:
-1. Polls native accessibility tree every 100-200ms
-2. Captures screenshot at same cadence (or on detected change)
-3. Runs AI vision pipeline on screenshot
-4. Merges both sources into unified tree
-5. Diffs against previous snapshot — marks changed regions
-6. Stores current tree in shared memory
-
-**The LLM sees one flat, compact tree** — it doesn't know or care whether an element came from AX or vision.
-
-### Features
-
-#### Screenshot Capture
-- Continuous background capture (100-200ms cadence)
-- On-demand high-resolution capture (PNG format)
-- Capture specific window or full screen
-- Change detection: skip AI pipeline if screenshot unchanged (perceptual hash)
-
-#### Native Accessibility Layer
-
-Native accessibility APIs provide structured, labeled elements — fast and reliable when available.
-
-- Structured representation of all UI elements
-- Element roles (button, textfield, list, menu, etc.)
-- Accessible names and values
-- Bounding boxes for element location
-- Available actions per element
-
-#### AI Vision Layer
-
-Native accessibility APIs (AXUIElement, AT-SPI2, UI Automation) only work when the application exposes proper accessibility info. Many native C++ apps — especially JUCE-based audio software with custom-painted UIs, OpenGL surfaces, or game engines — expose partial or empty trees.
-
-For these cases, Strobe runs a two-level AI vision pipeline on every captured screenshot:
-
-**Level 1: YOLO Detection (~5ms GPU, ~30ms CPU)**
-- OmniParser V2's fine-tuned YOLOv8 icon detection model (or YOLO11/YOLO26)
-- Detects all interactable elements as bounding boxes
-- Export to CoreML for Apple Silicon Neural Engine inference
-- No captioning overhead — detection only
-
-**Level 2: Element Classification**
-- *Known widgets* → SigLIP/CLIP zero-shot classification against a fixed label set (~2ms GPU)
-  - Labels: button, slider, knob, text field, dropdown, toggle, checkbox, menu, icon, label
-  - Returns: `{ bbox: [...], label: "slider", confidence: 0.94 }`
-- *Unknown/ambiguous elements* → FastVLM 0.5B short caption (~30-50ms on Neural Engine)
-  - Returns: `{ bbox: [...], caption: "circular knob showing value 42%" }`
-
-#### Tree Merge Strategy
-
-1. Query native accessibility tree (roles, names, actions, bounding boxes)
-2. Run YOLO detection on screenshot (bounding boxes)
-3. Match detected boxes to accessibility nodes by IoU overlap (threshold: 0.5)
-4. Unmatched boxes → classify with SigLIP, caption with FastVLM if ambiguous
-5. Produce unified tree: native nodes enriched with visual bounding boxes, plus AI-detected nodes for custom widgets
-6. Assign stable IDs to all elements (persistent across frames when possible)
-7. Mark elements with `source: "native" | "vision" | "merged"` for transparency
-
-**Target latency per frame:** <60ms total (native a11y + YOLO + SigLIP classification)
-
-#### Compact Tree Representation
-
-The tree must be small enough to fit in LLM context. Raw accessibility trees can have thousands of nodes. Strobe projects to a compact format:
+### Compact Tree Format
 
 ```
 [window "ERAE MK2 Simulator" id=w1]
@@ -490,280 +410,219 @@ The tree must be small enough to fit in LLM context. Raw accessibility trees can
       [item "Bass Heavy" id=pr_2]
 ```
 
-Key properties per element: **role**, **label**, **value**, **id** (stable), **enabled/disabled**, **loading** (dynamic state), **source** (native/vision). Bounding boxes omitted by default (available via verbose mode).
+### AI Vision Pipeline
 
-#### Dynamic State Detection
+For apps with no accessibility support (JUCE, OpenGL, game engines):
 
-Some UI elements are in transitional states (loading spinners, animations, progress bars). Strobe detects these via:
-
-- AX role `BusyIndicator` or `ProgressIndicator` → mark parent as `loading`
-- Tree region that changed in last N consecutive frames → mark as `dynamic`
-- Vision-detected spinning/pulsing elements (motion between consecutive screenshots)
-- App-specific hooks via Frida instrumentation (e.g., hook `setLoading(bool)` → annotate tree node)
-
-#### Instrumentation Correlation
-
-Strobe's unique advantage: it knows program internals, not just pixels.
-
-- Vision detects "knob at position (200, 300) with value ≈ 0.6"
-- Instrumentation detects `setFilterCutoff(0.6)` was called
-- → Strobe **knows** that visual knob = filter cutoff, with exact value from runtime
-- This feedback loop provides ground truth that pure vision approaches lack
-- Correlation stored in tree: `[knob "Filter Cutoff" value=0.6 linked=setFilterCutoff id=vk_3]`
-
-#### Models
-
-| Role | Model | Size | Latency | Hardware |
-|------|-------|------|---------|----------|
-| Detection | YOLOv8 (OmniParser weights) | ~6MB | ~5ms | CoreML / Neural Engine |
-| Classification | SigLIP 2 | ~400MB | ~2ms/crop | CoreML / GPU |
-| Captioning (fallback) | FastVLM 0.5B | ~500MB | ~30-50ms | CoreML / Neural Engine |
-| Captioning (full) | Florence-2 / OmniParser V2 | ~1.5GB | ~500ms | GPU (CUDA) |
-
-FastVLM (Apple, CVPR 2025) is the preferred captioning model — designed for Apple Silicon with CoreML export and 85x faster TTFT than comparable VLMs.
-
-### MCP Interface
-
-```
-debug_ui_tree(sessionId)
-  → Returns current unified tree (instant — reads from memory)
-  → Options: verbose (include bounding boxes), depth (max tree depth)
-
-debug_ui_screenshot(sessionId)
-  → Returns latest screenshot (PNG, already captured)
-  → Options: high_res (trigger fresh high-res capture)
-
-debug_ui_watch(sessionId, elementId)
-  → Subscribe to changes on a specific element
-  → Returns diff when element value/state changes
-```
+| Role | Model | Latency | Hardware |
+|------|-------|---------|----------|
+| Detection | YOLOv8 (OmniParser weights) | ~5ms | CoreML / Neural Engine |
+| Classification | SigLIP 2 | ~2ms/crop | CoreML / GPU |
+| Captioning | FastVLM 0.5B | ~30-50ms | CoreML / Neural Engine |
 
 ### Platform Support
 
 | Platform | Screenshot | Accessibility | AI Vision |
 |----------|-----------|---------------|-----------|
-| Linux (X11) | XGetImage | AT-SPI2 | YOLO + SigLIP (ONNX/TensorRT) |
-| macOS | CGWindowListCreateImage | AXUIElement | YOLO + SigLIP + FastVLM (CoreML) |
-| Windows | DXGI duplication | UI Automation | YOLO + SigLIP (ONNX/TensorRT) |
+| macOS | CGWindowListCreateImage | AXUIElement | CoreML |
+| Linux | XGetImage | AT-SPI2 | ONNX Runtime |
+
+### MCP Tools
+
+- `debug_ui_tree(sessionId)` → compact unified tree (~30-60ms)
+- `debug_ui_screenshot(sessionId)` → screenshot as PNG
 
 ### Validation Criteria
 
-LLM can observe GUI state with zero-latency reads:
-1. LLM launches GUI app via `debug_launch`
-2. LLM calls `debug_ui_tree` → gets unified tree **instantly** (no computation wait)
-3. LLM reads tree and describes what it sees ("Audio plugin with 3 knobs, a preset list loading, and Play/Stop buttons")
-4. LLM identifies custom-painted widgets missed by native accessibility (e.g. JUCE knobs detected by AI vision)
-5. LLM correlates UI element values with runtime function calls (knob value matches `setFilterCutoff(0.6)`)
-6. Tree updates in background — next `debug_ui_tree` call reflects new state without delay
+1. LLM launches ERAE simulator, calls `debug_ui_tree` → receives tree in ~60ms
+2. Tree contains native AX elements AND vision-detected knobs/custom widgets
+3. Stable IDs persist across consecutive calls
+4. LLM describes UI from tree alone
 
 ---
 
 ## Phase 5: UI Interaction
 
-**Goal:** LLM can control GUI applications through intent-based actions, with an intelligent action layer that handles complex motor plans.
+**Goal:** LLM can control GUI applications through intent-based actions, with a VLM-powered motor layer that learns how to interact with unknown widgets.
 
-This is a killer feature for autonomous debugging. The LLM doesn't just observe — it can reproduce bugs, test UI flows, and interact with complex custom widgets without human help.
+**Full spec:** [specs/2026-02-07-ui-observation-interaction-io-channels.md](specs/2026-02-07-ui-observation-interaction-io-channels.md)
 
-### Core Insight: Intent-Based Actions + Intelligent Motor Layer
+### Intent-Based Actions
 
-The LLM should express **what** it wants, not **how** to physically do it. "Set the filter cutoff knob to 0.8" is an intent. The motor layer figures out whether that means a vertical drag, circular drag, double-click-and-type, or scroll — based on the widget type and learned interaction model.
-
-```
-┌──────────────────────────────────────────────────┐
-│                  LLM Intent                       │
-│         "set_value(id=vk_3, value=0.8)"          │
-└──────────────────┬───────────────────────────────┘
-                   ▼
-┌──────────────────────────────────────────────────┐
-│            Intelligent Action Layer               │
-│                                                  │
-│  1. Look up element vk_3 in unified tree          │
-│  2. Determine widget type: knob (from vision)     │
-│  3. Select motor strategy: vertical drag          │
-│     (from widget profile or learned behavior)     │
-│  4. Calculate drag vector: center, current→target │
-│  5. Execute: mouseDown → mouseDrag → mouseUp     │
-│  6. Verify: re-read tree, check value changed     │
-│  7. Adjust if needed (closed-loop correction)     │
-└──────────────────┬───────────────────────────────┘
-                   ▼
-┌──────────────────────────────────────────────────┐
-│          Platform Input Layer (CGEvent)           │
-└──────────────────────────────────────────────────┘
-```
-
-### Features
-
-#### Intent-Based Action API
-
-The LLM uses high-level intents. Element targeting uses stable IDs from the unified tree (Phase 4).
+The LLM expresses **what** it wants. The motor layer figures out **how**.
 
 ```
 debug_ui_action(sessionId, action)
 
-Actions:
-  click(id="btn_play")                          → single click on element
-  click(id="btn_play", count=2)                 → double click
-  set_value(id="sld_vol", value=0.5)            → set slider/knob to value
-  type(id="txt_name", text="hello")             → type into field
-  type(text="hello")                            → type into focused element
-  select(id="lst_presets", item="Bass Heavy")   → select list item
+  click(id="btn_play")
+  set_value(id="sld_vol", value=0.5)
+  type(id="txt_name", text="hello")
+  select(id="lst_presets", item="Bass Heavy")
   scroll(id="lst_presets", direction="down", amount=3)
-  drag(from="track_1", to="slot_3")             → drag and drop
-  key(key="Enter")                              → press key
-  key(key="s", modifiers=["cmd"])               → keyboard shortcut
-  move_to(id="player", position={x:100, y:200}) → game character / spatial
+  drag(from="track_1", to="slot_3")
+  key(key="s", modifiers=["cmd"])
 ```
 
-The LLM never needs to know pixel coordinates, drag directions, or hold durations. It just says what it wants.
+### Motor Layer Strategy
 
-#### Intelligent Motor Layer
+1. **Native AX action** — if accessibility exposes increment/decrement, use it
+2. **VLM classification** — vision model looks at widget crop, predicts interaction type ("vertical-drag knob")
+3. **Execute + verify** — perform motor plan, re-read tree, check value changed
+4. **Cache profile** — learned interaction cached for instant reuse: `(app, role, label) → motor strategy`
 
-Different widgets require different physical interactions. The motor layer maps intents to motor plans:
+First interaction with unknown widget: ~300ms (VLM + execute + verify). Cached: ~50ms.
 
-**Widget Profiles** — known interaction models for common widget types:
+### Platform Support
 
-| Widget Type | Motor Strategy | Parameters |
-|-------------|---------------|------------|
-| Button | Click center of bbox | - |
-| Slider (horizontal) | Drag handle to proportional X | min/max position from bbox |
-| Slider (vertical) | Drag handle to proportional Y | min/max position from bbox |
-| Knob (vertical-drag) | Drag up/down from center | sensitivity from widget profile |
-| Knob (circular) | Drag in arc from current angle | center, radius, angle range |
-| Text field | Click to focus, then type | - |
-| Dropdown | Click to open, click item | - |
-| Toggle/Checkbox | Click center | - |
-| List item | Click, or double-click to activate | - |
-
-**Profile sources** (in priority order):
-1. **Native accessibility actions** — if AX says "increment/decrement" exists, use that
-2. **Known toolkit profiles** — JUCE knobs use vertical drag, Unity sliders use horizontal drag, etc.
-3. **Learned behavior** — probe the widget: small drag, observe value change, infer interaction model
-4. **Fallback** — try vertical drag (most common for knobs), then circular, then click-and-type
-
-**Probing** (for unknown widgets):
-1. Record current value from tree
-2. Execute small test interaction (5px vertical drag from center)
-3. Re-read tree, check if value changed
-4. If yes → learned the interaction model (direction, sensitivity)
-5. If no → try next strategy (horizontal drag, circular, etc.)
-6. Cache learned profile for this widget type
-
-#### Closed-Loop Verification
-
-Every action is verified:
-1. Execute motor plan
-2. Wait for tree update (background observer captures new state)
-3. Compare element value to expected result
-4. If mismatch → adjust and retry (up to 3 attempts)
-5. Report success/failure to LLM
-
-This is where **instrumentation correlation** (Phase 4) shines: Strobe doesn't just check pixels — it can verify that `setFilterCutoff()` was actually called with the expected value.
-
-#### Complex Interaction Sequences
-
-Some interactions require coordinated multi-step motor plans:
-
-- **Game character movement**: Hold WASD keys for duration, or click-to-move path
-- **Drawing/painting**: Bezier curve mouse paths with pressure (if supported)
-- **Multi-touch gestures**: Pinch, rotate, swipe (via accessibility actions or simulated touch events)
-- **Menu navigation**: Click menu → wait for submenu → click item (with timing)
-- **Drag-and-drop with scroll**: Drag to edge → auto-scroll → drop at target
-
-These are composed from primitive motor actions but require timing, sequencing, and state awareness.
-
-#### Platform Input Primitives
-
-Low-level input injection, used by the motor layer (not directly by the LLM):
-
-| Primitive | macOS | Linux (X11) | Windows |
-|-----------|-------|-------------|---------|
-| Mouse move | CGEvent | XTest | SendInput |
-| Mouse click | CGEvent | XTest | SendInput |
-| Mouse drag | CGEvent sequence | XTest sequence | SendInput sequence |
-| Key press | CGEvent | XTest | SendInput |
-| Key hold/release | CGEvent | XTest | SendInput |
-| Scroll | CGEvent | XTest | SendInput |
-
-### MCP Interface
-
-```
-debug_ui_action(sessionId, action)
-  → Executes intent-based action
-  → Returns: { success: bool, element: updated_state, verified: bool }
-
-debug_ui_action_batch(sessionId, actions[])
-  → Execute sequence of actions with inter-action delays
-  → Returns: per-action results
-
-debug_ui_probe(sessionId, elementId)
-  → Probe an unknown widget to learn its interaction model
-  → Returns: { widgetType, motorStrategy, sensitivity }
-```
+| Platform | Input | Vision Motor |
+|----------|-------|-------------|
+| macOS | CGEvent | CoreML (FastVLM) |
+| Linux | XTest | ONNX Runtime |
 
 ### Validation Criteria
 
-**Fully autonomous bug reproduction with complex UI:**
-1. User: "There's a bug when I set filter cutoff above 0.9 and then switch presets"
-2. LLM launches app via `debug_launch`
-3. LLM reads `debug_ui_tree` → sees knobs (vision-detected), preset list (native AX)
-4. LLM: `set_value(id="vk_3", value=0.95)` → motor layer drags knob, verifies via instrumentation
-5. LLM: `select(id="lst_presets", item="Bass Heavy")` → clicks list item
-6. LLM reads `debug_ui_tree` → sees the bug (UI glitch, wrong values)
-7. LLM correlates with function traces → identifies root cause in preset loading code
+1. `set_value` on a JUCE knob → VLM classifies → drags → verifies → cached
+2. Second call to same knob type uses cached profile (no VLM)
+3. Clicks, text input, list selection all work via intent API
 
-**No human touched the app. LLM handled knob rotation, list selection, and bug correlation autonomously.**
+---
 
-**Game/spatial interaction:**
-1. LLM launches game, reads tree
-2. LLM: `move_to(id="player", position={x:100, y:200})` → motor layer holds WASD keys
-3. LLM: `click(id="door")` → opens door
-4. LLM reads tree → verifies new room loaded
-5. LLM traces `loadLevel()` → confirms correct level transition
+## Phase 6: I/O Channel Abstraction + Scenario Runner
+
+**Goal:** Unify all app I/O under a common channel model. Introduce the scenario runner for autonomous runtime testing.
+
+**Full spec:** [specs/2026-02-07-ui-observation-interaction-io-channels.md](specs/2026-02-07-ui-observation-interaction-io-channels.md)
+
+### Core Insight
+
+UI is just one I/O channel. MIDI, audio, network, files, stdout/stderr, and function traces are all I/O channels. Each can send stimuli and/or capture observations. A JUCE synth test and a headless Rust API test use the same scenario format — just different channels.
+
+### Channel Traits
+
+```rust
+trait InputChannel: Send + Sync {
+    fn name(&self) -> &str;                                    // "ui", "midi", "net:8080"
+    fn send(&self, action: ChannelAction) -> Result<ActionResult>;
+}
+
+trait OutputChannel: Send + Sync {
+    fn name(&self) -> &str;
+    fn start_capture(&self) -> Result<()>;
+    fn stop_capture(&self) -> Result<()>;
+    fn query(&self, filter: OutputFilter) -> Result<Vec<ChannelEvent>>;
+}
+```
+
+### Channel Registry
+
+Channels are registered explicitly on launch or mid-session:
+
+```
+debug_launch(command, channels: ["ui", "midi"])
+debug_channel_add(sessionId, "net:8080")
+```
+
+Existing capabilities (stdout/stderr, function traces) are wrapped as channels automatically — always present.
+
+### Scenario Runner
+
+Flat action list. Executes sequentially. On failure: **stops, returns error, process stays alive**. The LLM takes over as debugger with full tool access.
+
+```json
+{
+  "channels": ["ui", "midi"],
+  "steps": [
+    {"do": "ui.set_value", "id": "knob_release", "value": 0.0},
+    {"do": "midi.send", "type": "noteOn", "note": 60, "velocity": 100},
+    {"wait": 100},
+    {"do": "midi.send", "type": "noteOff", "note": 60},
+    {"wait": 500},
+    {"assert": "trace", "fn": "Voice::free", "called": true}
+  ]
+}
+```
+
+Failure returns minimal context (step number, expected vs actual, session ID). The LLM pulls what it needs via `debug_ui_tree`, `debug_query`, etc.
+
+### MCP Tools
+
+- `debug_channel_add(sessionId, channel)` → register channel on running session
+- `debug_channel_list(sessionId)` → list active channels
+- `debug_channel_send(sessionId, channel, action)` → send stimulus to any non-UI channel
+- `debug_channel_query(sessionId, channel, filter?)` → query captured output
+- `debug_test_scenario(sessionId, scenario)` → execute scenario, return pass/fail
+
+### Validation Criteria
+
+1. ERAE synth scenario: UI knob + MIDI input + trace assertion — all in one scenario
+2. Headless API scenario: HTTP request + trace assertion — same format, no UI
+3. Failure mid-scenario → LLM receives error → investigates with existing tools → process still alive
+
+---
+
+## Phase 7: Concrete I/O Channels
+
+**Goal:** Implement the most important non-UI I/O channels. Each is a self-contained implementation of the channel traits.
+
+**Full spec:** [specs/2026-02-07-ui-observation-interaction-io-channels.md](specs/2026-02-07-ui-observation-interaction-io-channels.md)
+
+### MIDI Channel
+
+Send MIDI to the target app, capture MIDI output. Virtual MIDI port strategy.
+
+| Platform | API |
+|----------|-----|
+| macOS | CoreMIDI virtual port |
+| Linux | ALSA sequencer virtual port |
+
+### Audio Channel
+
+Inject audio, capture output, compute metrics (RMS, peak, FFT).
+
+| Platform | Capture | Injection |
+|----------|---------|-----------|
+| macOS | CoreAudio process tap (macOS 14.2+) | Virtual audio device |
+| Linux | PipeWire / JACK | JACK client connection |
+
+### Network Channel
+
+Send packets/requests, capture outgoing traffic via Frida socket intercept (cross-platform).
+
+### File Channel
+
+Write/delete files, watch for app file changes via FSEvents (macOS) / inotify (Linux).
+
+### Channel Summary
+
+| Channel | Input | Output | Complexity |
+|---------|-------|--------|-----------|
+| `ui` | CGEvent / XTest | AX + Vision | High (Phase 4-5) |
+| `midi` | CoreMIDI / ALSA | CoreMIDI / ALSA | Medium |
+| `audio` | Virtual device | CoreAudio / JACK | Medium |
+| `net` | Socket from daemon | Frida intercept | Medium |
+| `file` | Filesystem ops | FSEvents / inotify | Low |
+| `trace` | *(existing)* | *(existing)* | Already done |
+| `stdio` | stdin injection | *(existing)* | Already done |
+
+### Validation Criteria
+
+1. MIDI: send noteOn to ERAE → capture MIDI output → assert correct response
+2. Audio: inject tone → capture output → assert RMS above threshold
+3. Full scenario: UI + MIDI + audio + trace in one test
 
 ---
 
 ## Future Phases
 
-### Phase 6: Advanced Threading Tools
+### Phase 8: Advanced Threading Tools
 - Lock acquisition tracing
 - Deadlock detection
 - Spinlock detection
 - Thread timeline visualization
 - Race condition hints
 
-### Phase 7: Smart Test Integration
-- Language-specific test setup skills
-- Auto-detect project type and configure testing
-- Adapters to normalize test framework output
-- MCP tool: `debug_setup_tests`
-
-**Supported frameworks:**
-
-| Language | Framework | Output Parsing | Run Command | Rerun Single |
-|----------|-----------|----------------|-------------|--------------|
-| Rust | cargo test | `--format json` | `cargo test` | `cargo test {name}` |
-| C/C++ | Google Test | XML output | `./test_binary` | `./test_binary --gtest_filter={name}` |
-| C/C++ | Catch2 | XML/JSON output | `./test_binary` | `./test_binary "{name}"` |
-| C/C++ | CTest | JSON output | `ctest` | `ctest -R {name}` |
-| Python | pytest | `--json` | `pytest` | `pytest {file}::{name}` |
-| JS/TS | Jest | `--json` | `npm test` | `npm test -- -t {name}` |
-| Go | go test | `-json` | `go test ./...` | `go test -run {name}` |
-
-**The setup skill provides:**
-- Auto-detection of language and framework from project files
-- Step-by-step setup instructions
-- Required config file changes
-- Run command and output format info
-
-**Adapter architecture:** Test frameworks output their native format → Strobe adapter parses it → Unified TestFailure schema for `debug_test`
-
-### Phase 8: JavaScript/TypeScript (CDP)
-- Chrome DevTools Protocol collector
-- Debug Node.js, browser apps, Electron
-- Same MCP interface, different backend
-
-### Phase 9: Additional Languages
+### Phase 9: Additional Languages & Runtimes
+- JavaScript/TypeScript via Chrome DevTools Protocol (Node.js, browser, Electron)
 - Python (via sys.settrace or Frida)
 - Go (enhanced DWARF support, goroutine awareness)
 - Java/Kotlin (via ART hooks on Android)
@@ -772,7 +631,7 @@ debug_ui_probe(sessionId, elementId)
 - Frida works on Windows
 - PDB parsing for symbols
 - Named pipes for daemon communication
-- Windows-specific UI capture
+- Windows-specific UI capture (DXGI + UI Automation)
 
 ### Phase 11: Distributed Tracing
 - Follow requests across services
@@ -788,7 +647,7 @@ debug_ui_probe(sessionId, elementId)
 
 ## Contributor Extensibility
 
-The architecture is designed so **anyone can add support for obscure languages or test frameworks** without understanding the whole codebase.
+The architecture is designed so **anyone can add support for new languages, I/O channels, or platform backends** without understanding the whole codebase.
 
 ### Adding Language Support
 
@@ -800,26 +659,32 @@ Implement the `Collector` trait:
 
 Emit events conforming to the unified `TraceEvent` schema, and the rest of the system (storage, queries, MCP) works automatically.
 
-### Adding Test Framework Support
+### Adding I/O Channels
 
-Implement the `TestAdapter` trait:
-- `detect` - Check if this adapter handles the project
-- `run_command` - Get command to run tests
-- `rerun_command` - Get command to run single test
-- `parse_output` - Parse framework output into unified schema
-- `suggest_traces` - Extract trace hints from failures
+Implement `InputChannel`, `OutputChannel`, or both:
+- `InputChannel::send(action)` - Send stimulus to target app
+- `OutputChannel::start_capture()` / `stop_capture()` - Control recording
+- `OutputChannel::query(filter)` - Query captured events
 
-Parse your framework's output into our unified `TestFailure` schema, and `debug_test` works with it.
+The channel automatically works with `debug_channel_send`, `debug_channel_query`, and the scenario runner (`debug_test_scenario`). Examples: MIDI, audio, serial, custom protocol.
+
+### Adding Platform Backends
+
+Implement platform traits for a new OS:
+- `UIObserver` - Screenshot + accessibility tree (e.g., UI Automation for Windows)
+- `UIInput` - Mouse/keyboard injection (e.g., SendInput for Windows)
+- `VisionPipeline` - AI model inference (e.g., DirectML for Windows)
 
 ### What Contributors Don't Touch
 
 - SQLite storage layer
 - Query engine
 - MCP protocol handling
+- Scenario runner logic
 - VS Code extension
 - Frida agent (unless adding native support)
 
-Clean interfaces = more contributors = more languages supported.
+Clean interfaces = more contributors = more capabilities.
 
 ---
 
@@ -832,7 +697,7 @@ Clean interfaces = more contributors = more languages supported.
 | User code tracing (default) | 5-15% CPU |
 | Full tracing (all functions) | 20-40% CPU |
 | Breakpoints only (no tracing) | < 1% CPU |
-| UI capture (on-demand) | ~50ms per capture |
+| UI tree (on-demand) | ~30-60ms per call |
 
 ### Throughput
 

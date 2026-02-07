@@ -247,6 +247,12 @@ unsafe extern "C" fn raw_on_output(
         text: Some(text),
         sampled: None,
         watch_values: None,
+        pid: Some(ctx.pid),
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     };
 
     let _ = ctx.event_tx.try_send(event);
@@ -453,6 +459,19 @@ struct WorkerSession {
     pid: u32,
 }
 
+/// Raw C callback for Frida's Device "spawn-added" signal.
+/// Notifies the worker loop about new child processes spawned via fork/exec.
+unsafe extern "C" fn raw_on_spawn_added(
+    _device: *mut frida_sys::_FridaDevice,
+    spawn: *mut frida_sys::_FridaSpawn,
+    user_data: *mut c_void,
+) {
+    let tx = &*(user_data as *const std::sync::mpsc::Sender<u32>);
+    let child_pid = frida_sys::frida_spawn_get_pid(spawn);
+    tracing::info!("Spawn signal: child PID {}", child_pid);
+    let _ = tx.send(child_pid);
+}
+
 /// Frida worker that runs on a dedicated thread
 fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
     use frida::{Frida, DeviceManager, DeviceType, SpawnOptions, SpawnStdio};
@@ -494,7 +513,53 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
         );
     }
 
-    while let Ok(cmd) = cmd_rx.recv() {
+    // Enable spawn gating to intercept child processes (fork/exec)
+    let (spawn_tx, spawn_rx) = std::sync::mpsc::channel::<u32>();
+    unsafe {
+        let device_ptr = device_raw_ptr(&device);
+        let mut error: *mut frida_sys::GError = std::ptr::null_mut();
+        frida_sys::frida_device_enable_spawn_gating_sync(
+            device_ptr,
+            std::ptr::null_mut(), // cancellable
+            &mut error,
+        );
+        if !error.is_null() {
+            let err_msg = CStr::from_ptr((*error).message).to_str().unwrap_or("?");
+            tracing::warn!("Failed to enable spawn gating: {}", err_msg);
+            frida_sys::g_error_free(error);
+        } else {
+            tracing::info!("Spawn gating enabled — will intercept child processes");
+
+            // Register "spawn-added" signal handler
+            let signal_name = CString::new("spawn-added").unwrap();
+            let tx_ptr = Box::into_raw(Box::new(spawn_tx.clone()));
+            let callback = Some(std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(),
+            >(raw_on_spawn_added as *mut c_void));
+            frida_sys::g_signal_connect_data(
+                device_ptr as *mut _,
+                signal_name.as_ptr(),
+                callback,
+                tx_ptr as *mut c_void,
+                None,
+                0,
+            );
+        }
+    }
+
+    loop {
+        // Check for spawn notifications (non-blocking)
+        while let Ok(child_pid) = spawn_rx.try_recv() {
+            handle_child_spawn(&mut device, child_pid, &sessions, &output_registry);
+        }
+
+        // Wait for commands with timeout so we periodically check for spawns
+        let cmd = match cmd_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(cmd) => cmd,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match cmd {
             FridaCommand::Spawn {
                 session_id,
@@ -778,6 +843,21 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                     let session = sessions.get_mut(&session_id)
                         .ok_or_else(|| crate::Error::SessionNotFound(session_id.clone()))?;
 
+                    // Check if process is still alive before attempting to post
+                    let is_alive = unsafe {
+                        libc::kill(session.pid as i32, 0) == 0
+                    };
+                    if !is_alive {
+                        return Err(crate::Error::WatchFailed(
+                            format!("Process {} is no longer running", session.pid)
+                        ));
+                    }
+
+                    tracing::info!(
+                        "SetWatches for session {}: {} watches, PID {} alive",
+                        session_id, watches.len(), session.pid
+                    );
+
                     // Set up signal to wait for confirmation
                     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
                     {
@@ -803,6 +883,7 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                         "watches": watch_list,
                     });
 
+                    tracing::debug!("Posting watches message to agent");
                     unsafe {
                         post_message_raw(session.script_ptr, &serde_json::to_string(&watches_msg).unwrap())
                             .map_err(|e| crate::Error::WatchFailed(format!("Failed to send watches: {}", e)))?;
@@ -815,8 +896,19 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                             Ok(count)
                         }
                         Err(_) => {
-                            tracing::warn!("Timeout waiting for watch confirmation");
-                            Err(crate::Error::WatchFailed("Timeout waiting for watch confirmation".into()))
+                            // Check if process died during the wait
+                            let still_alive = unsafe {
+                                libc::kill(session.pid as i32, 0) == 0
+                            };
+                            if !still_alive {
+                                tracing::warn!("Watch confirmation timeout — process {} is dead", session.pid);
+                                Err(crate::Error::WatchFailed(
+                                    format!("Process {} terminated before watches could be confirmed", session.pid)
+                                ))
+                            } else {
+                                tracing::warn!("Timeout waiting for watch confirmation (process {} still alive)", session.pid);
+                                Err(crate::Error::WatchFailed("Timeout waiting for watch confirmation".into()))
+                            }
                         }
                     }
                 })();
@@ -829,24 +921,32 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                 response,
             } => {
                 if let Some(session) = sessions.remove(&session_id) {
-                    // Remove from output registry
+                    // Remove all PIDs for this session from output registry and kill them
                     if let Ok(mut reg) = output_registry.lock() {
-                        reg.remove(&session.pid);
+                        let pids_to_remove: Vec<u32> = reg.iter()
+                            .filter(|(_, ctx)| ctx.session_id == session_id)
+                            .map(|(&pid, _)| pid)
+                            .collect();
+                        for pid in &pids_to_remove {
+                            reg.remove(pid);
+                        }
+                        // Kill all associated processes (parent + children)
+                        for pid in pids_to_remove {
+                            let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                            if is_alive {
+                                tracing::info!("Killing process {} for session {}", pid, session_id);
+                                device.kill(pid)
+                                    .unwrap_or_else(|e| tracing::warn!("Failed to kill PID {}: {:?}", pid, e));
+                            }
+                        }
                     }
 
-                    // Check if process is still alive before trying to kill
-                    // Using libc::kill(pid, 0) to check existence without sending signal
-                    let is_alive = unsafe {
-                        libc::kill(session.pid as i32, 0) == 0
-                    };
-
+                    // Also ensure the parent process is killed if not in registry
+                    let is_alive = unsafe { libc::kill(session.pid as i32, 0) == 0 };
                     if is_alive {
-                        // Kill the traced process
-                        tracing::info!("Killing process {} for session {}", session.pid, session_id);
+                        tracing::info!("Killing parent process {} for session {}", session.pid, session_id);
                         device.kill(session.pid)
                             .unwrap_or_else(|e| tracing::warn!("Failed to kill PID {}: {:?}", session.pid, e));
-                    } else {
-                        tracing::info!("Process {} already dead for session {}", session.pid, session_id);
                     }
                 }
                 let _ = response.send(Ok(()));
@@ -855,14 +955,156 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
     }
 }
 
+/// Handle a child process spawned via fork/exec.
+/// Attaches Frida to the child, loads the agent, and registers it for output capture.
+fn handle_child_spawn(
+    device: &mut frida::Device,
+    child_pid: u32,
+    sessions: &HashMap<String, WorkerSession>,
+    output_registry: &OutputRegistry,
+) {
+    // Find which session this child belongs to by checking the output registry
+    // for any registered PID whose session is active
+    let parent_info = {
+        let reg = match output_registry.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("Failed to lock output registry for child {}", child_pid);
+                let _ = device.resume(child_pid);
+                return;
+            }
+        };
+        // Find an active session to associate the child with
+        reg.values()
+            .find(|ctx| sessions.contains_key(&ctx.session_id))
+            .map(|ctx| (ctx.session_id.clone(), ctx.event_tx.clone(), ctx.start_ns))
+    };
+
+    let (session_id, event_tx, start_ns) = match parent_info {
+        Some(info) => info,
+        None => {
+            tracing::debug!("No active session for child PID {}, resuming without attaching", child_pid);
+            let _ = device.resume(child_pid);
+            return;
+        }
+    };
+
+    tracing::info!("Attaching to child process {} (session: {})", child_pid, session_id);
+
+    // Register output context for the child
+    let output_ctx = Arc::new(OutputContext {
+        pid: child_pid,
+        session_id: session_id.clone(),
+        event_tx: event_tx.clone(),
+        event_counter: AtomicU64::new(0),
+        start_ns,
+    });
+    if let Ok(mut reg) = output_registry.lock() {
+        reg.insert(child_pid, output_ctx);
+    }
+
+    // Attach to child
+    match device.attach(child_pid) {
+        Ok(frida_session) => {
+            let raw_session = unsafe { session_raw_ptr(&frida_session) };
+            std::mem::forget(frida_session);
+
+            // Create and load agent script in child
+            match unsafe { create_script_raw(raw_session, AGENT_CODE) } {
+                Ok(script_ptr) => {
+                    let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
+                    let handler = AgentMessageHandler {
+                        event_tx: event_tx.clone(),
+                        session_id: session_id.clone(),
+                        hooks_ready: hooks_ready.clone(),
+                    };
+                    unsafe {
+                        let _ = register_handler_raw(script_ptr, handler);
+                        if let Err(e) = load_script_raw(script_ptr) {
+                            tracing::error!("Failed to load script in child {}: {}", child_pid, e);
+                            let _ = device.resume(child_pid);
+                            return;
+                        }
+                    }
+
+                    // Initialize agent in child
+                    let init_msg = serde_json::json!({
+                        "type": "initialize",
+                        "sessionId": session_id,
+                    });
+                    unsafe {
+                        let _ = post_message_raw(script_ptr, &serde_json::to_string(&init_msg).unwrap());
+                    }
+
+                    tracing::info!("Agent loaded in child process {}", child_pid);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create script in child {}: {}", child_pid, e);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to attach to child {}: {}", child_pid, e);
+        }
+    }
+
+    // Resume the child process
+    let _ = device.resume(child_pid);
+}
+
 fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
     let event_type = match json.get("eventType")?.as_str()? {
         "function_enter" => EventType::FunctionEnter,
         "function_exit" => EventType::FunctionExit,
         "stdout" => EventType::Stdout,
         "stderr" => EventType::Stderr,
+        "crash" => EventType::Crash,
         _ => return None,
     };
+
+    let pid = json.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+
+    if event_type == EventType::Crash {
+        return Some(Event {
+            id: json.get("id").and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}-crash-{}", session_id, chrono::Utc::now().timestamp_millis())),
+            session_id: session_id.to_string(),
+            timestamp_ns: json.get("timestampNs")?.as_i64()?,
+            thread_id: json.get("threadId")?.as_i64()?,
+            thread_name: None,
+            parent_event_id: None,
+            event_type,
+            function_name: String::new(),
+            function_name_raw: None,
+            source_file: None,
+            line_number: None,
+            arguments: None,
+            return_value: None,
+            duration_ns: None,
+            // Store frameMemory/frameBase in text as JSON for later local variable resolution
+            text: {
+                let fm = json.get("frameMemory");
+                let fb = json.get("frameBase");
+                if fm.is_some() || fb.is_some() {
+                    Some(serde_json::json!({
+                        "frameMemory": fm,
+                        "frameBase": fb,
+                    }).to_string())
+                } else {
+                    None
+                }
+            },
+            sampled: None,
+            watch_values: None,
+            pid,
+            signal: json.get("signal").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            fault_address: json.get("faultAddress").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            registers: json.get("registers").cloned(),
+            backtrace: json.get("backtrace").cloned(),
+            locals: None,
+        });
+    }
 
     if event_type == EventType::Stdout || event_type == EventType::Stderr {
         return Some(Event {
@@ -883,6 +1125,12 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             text: json.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
             sampled: None,
             watch_values: None,
+            pid,
+            signal: None,
+            fault_address: None,
+            registers: None,
+            backtrace: None,
+            locals: None,
         });
     }
 
@@ -904,6 +1152,12 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         text: None,
         sampled: json.get("sampled").and_then(|v| v.as_bool()),
         watch_values: json.get("watchValues").cloned(),
+        pid,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     })
 }
 

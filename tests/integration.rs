@@ -1,37 +1,22 @@
 use std::collections::{HashMap, HashSet};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 use tempfile::tempdir;
 
-// Test helper to create a simple test binary
-#[cfg(target_os = "linux")]
-fn create_test_binary(dir: &std::path::Path) -> PathBuf {
-    let src = r#"
-        fn process(x: i32) -> i32 {
-            x * 2
-        }
-
-        fn main() {
-            let result = process(21);
-            println!("Result: {}", result);
-        }
-    "#;
-
-    let src_path = dir.join("test.rs");
-    std::fs::write(&src_path, src).unwrap();
-
-    let out_path = dir.join("test_binary");
-
-    // Compile with debug info
-    let status = std::process::Command::new("rustc")
-        .args(["-g", "-o"])
-        .arg(&out_path)
-        .arg(&src_path)
-        .status()
-        .expect("Failed to compile test binary");
-
-    assert!(status.success(), "Test binary compilation failed");
-    out_path
+/// Get the stress_tester binary path (pre-built Rust binary with dSYM).
+/// Returns None if the binary or dSYM doesn't exist.
+fn stress_tester_binary() -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/stress_test_phase1b/target/debug/stress_tester");
+    let dsym = path.with_extension("dSYM");
+    if path.exists() && dsym.exists() {
+        Some(path)
+    } else {
+        eprintln!(
+            "WARN: stress_tester binary or dSYM not found. Run:\n  \
+             cd tests/stress_test_phase1b && cargo build && dsymutil target/debug/stress_tester"
+        );
+        None
+    }
 }
 
 #[test]
@@ -70,6 +55,12 @@ fn test_database_roundtrip() {
         text: None,
         sampled: None,
         watch_values: None,
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     }).unwrap();
 
     // Query
@@ -141,6 +132,12 @@ fn test_event_with_watch_values() {
         text: None,
         sampled: None,
         watch_values: Some(serde_json::json!({"gClock": 48291, "tempo": 120.5})),
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     };
     db.insert_event(event).unwrap();
 
@@ -151,35 +148,108 @@ fn test_event_with_watch_values() {
 }
 
 #[test]
-fn test_pattern_matching() {
+fn test_pattern_matching_real_rust_names() {
     use strobe::dwarf::PatternMatcher;
 
+    // Basic patterns still work
     let m = PatternMatcher::new("foo::*");
     assert!(m.matches("foo::bar"));
     assert!(!m.matches("foo::bar::baz"));
-
     let m2 = PatternMatcher::new("foo::**");
     assert!(m2.matches("foo::bar::baz"));
+
+    // Real Rust demangled names from stress_tester (with hash suffix)
+    let rust_name = "stress_tester::midi::process_note_on::h7c4d62da364e13f0";
+
+    // Exact module::* should NOT match (3 levels deep)
+    let m = PatternMatcher::new("stress_tester::*");
+    assert!(!m.matches(rust_name), "* should not cross :: boundaries");
+
+    // Deep glob should match
+    let m = PatternMatcher::new("stress_tester::**");
+    assert!(m.matches(rust_name), "** should match through all :: levels");
+
+    // Suffix wildcards
+    let m = PatternMatcher::new("**::process_note_on**");
+    assert!(m.matches(rust_name), "**::name** should match anywhere");
+
+    // Module-level wildcards
+    let m = PatternMatcher::new("stress_tester::midi::*");
+    assert!(!m.matches(rust_name), "midi::* shouldn't match because of hash suffix after another ::");
+
+    let m = PatternMatcher::new("stress_tester::midi::**");
+    assert!(m.matches(rust_name), "midi::** should match through hash suffix");
 }
 
 #[test]
-fn test_symbol_demangling() {
-    let rust_mangled = "_ZN4test7example17h1234567890abcdefE";
-    let demangled = strobe::symbols::demangle_symbol(rust_mangled);
-    assert!(demangled.contains("test::example"));
+fn test_symbol_demangling_real_rust_symbols() {
+    // Real mangled symbols from the stress_tester binary (via nm)
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "_ZN13stress_tester4midi15process_note_on17h7c4d62da364e13f0E",
+            "stress_tester::midi::process_note_on",
+        ),
+        (
+            "_ZN13stress_tester5audio20process_audio_buffer17h1e1f7984b2d2cfcaE",
+            "stress_tester::audio::process_audio_buffer",
+        ),
+        (
+            "_ZN13stress_tester4midi22generate_midi_sequence17h77a24745e78bf175E",
+            "stress_tester::midi::generate_midi_sequence",
+        ),
+        (
+            "_ZN13stress_tester4midi22process_control_change17h72b697f824ed75aaE",
+            "stress_tester::midi::process_control_change",
+        ),
+    ];
+
+    for (mangled, expected_prefix) in cases {
+        let demangled = strobe::symbols::demangle_symbol(mangled);
+        assert!(demangled.contains(expected_prefix),
+            "Demangling '{}' should contain '{}', got '{}'", mangled, expected_prefix, demangled);
+        // Demangled name should NOT still look mangled
+        assert!(!demangled.starts_with("_ZN"),
+            "Demangled '{}' should not start with _ZN", demangled);
+    }
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn test_dwarf_parsing() {
-    let dir = tempdir().unwrap();
-    let binary = create_test_binary(dir.path());
+fn test_dwarf_parsing_real_binary() {
+    let binary = match stress_tester_binary() {
+        Some(b) => b,
+        None => return,
+    };
 
     let parser = strobe::dwarf::DwarfParser::parse(&binary).unwrap();
 
-    // Should find our test functions
-    let main_funcs = parser.find_by_name("main");
-    assert!(!main_funcs.is_empty(), "Should find main function");
+    // Should find many functions (stress_tester + stdlib)
+    assert!(parser.functions.len() > 10,
+        "Should find substantial functions, got {}", parser.functions.len());
+
+    // Verify key Rust functions are found with correct demangled names
+    let note_on = parser.find_by_pattern("**::process_note_on**");
+    assert!(!note_on.is_empty(), "Should find process_note_on");
+    assert!(note_on[0].name.contains("stress_tester::midi::process_note_on"),
+        "Name should be fully qualified Rust path, got: {}", note_on[0].name);
+
+    let audio = parser.find_by_pattern("**::process_audio_buffer**");
+    assert!(!audio.is_empty(), "Should find process_audio_buffer");
+
+    let midi_gen = parser.find_by_pattern("**::generate_midi_sequence**");
+    assert!(!midi_gen.is_empty(), "Should find generate_midi_sequence");
+
+    // Verify source file info is present
+    assert!(note_on[0].source_file.is_some(), "Should have source file");
+    assert!(note_on[0].source_file.as_ref().unwrap().contains("main.rs"),
+        "Source file should be main.rs");
+
+    // Verify line numbers
+    assert!(note_on[0].line_number.is_some(), "Should have line number");
+
+    // Verify raw mangled names are preserved
+    assert!(note_on[0].name_raw.is_some(), "Should preserve raw mangled name");
+    assert!(note_on[0].name_raw.as_ref().unwrap().starts_with("_ZN"),
+        "Raw name should be Itanium-mangled Rust symbol");
 }
 
 #[test]
@@ -280,6 +350,12 @@ fn test_output_event_insertion_and_query() {
         text: Some("Hello from stdout\n".to_string()),
         sampled: None,
         watch_values: None,
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     }).unwrap();
 
     // Insert stderr event
@@ -301,6 +377,12 @@ fn test_output_event_insertion_and_query() {
         text: Some("Error: something went wrong\n".to_string()),
         sampled: None,
         watch_values: None,
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     }).unwrap();
 
     // Query all - should return both in timestamp order
@@ -344,6 +426,12 @@ fn test_mixed_event_types_in_unified_timeline() {
         text: None,
         sampled: None,
         watch_values: None,
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     }).unwrap();
 
     // Insert stdout (between function enter and exit)
@@ -365,6 +453,12 @@ fn test_mixed_event_types_in_unified_timeline() {
         text: Some("Running...\n".to_string()),
         sampled: None,
         watch_values: None,
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     }).unwrap();
 
     // Insert function exit
@@ -386,6 +480,12 @@ fn test_mixed_event_types_in_unified_timeline() {
         text: None,
         sampled: None,
         watch_values: None,
+        pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
     }).unwrap();
 
     // Query all — should return 3 events in chronological order
@@ -440,6 +540,12 @@ fn test_batch_insert_with_output_events() {
             text: None,
             sampled: None,
             watch_values: None,
+            pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
         },
         strobe::db::Event {
             id: "batch-2".to_string(),
@@ -459,6 +565,12 @@ fn test_batch_insert_with_output_events() {
             text: Some("batch output line\n".to_string()),
             sampled: None,
             watch_values: None,
+            pid: None,
+        signal: None,
+        fault_address: None,
+        registers: None,
+        backtrace: None,
+        locals: None,
         },
     ];
 
@@ -697,73 +809,83 @@ fn test_watch_on_field_patterns() {
 }
 
 #[test]
-fn test_watch_pattern_matching_logic() {
-    // Test pattern matching logic that will be used in agent
-    // This verifies the pattern format before it reaches the agent
+fn test_watch_pattern_matching_with_real_names() {
+    // Test pattern matching against REAL Rust demangled function names
+    // from the stress_tester binary, not synthetic toy names.
+    use strobe::dwarf::PatternMatcher;
 
-    let test_cases = vec![
-        // (function_name, pattern, should_match)
-        ("audio::process", "audio::process", true),
-        ("audio::process", "audio::*", true),
-        ("audio::process::internal", "audio::*", false), // * doesn't cross ::
-        ("audio::process::internal", "audio::**", true),  // ** crosses ::
-        ("midi::noteOn", "midi::*", true),
-        ("midi::noteOn", "audio::*", false),
-        ("foo::bar::baz", "foo::**", true),
-        ("foo::bar::baz", "**::baz", true),
-        ("simple_func", "simple_func", true),
-        ("simple_func", "simple_*", true), // * matches remainder without ::
-        ("parseValue", "parse*", true),
-        ("parseValue", "validate*", false),
+    let real_names = vec![
+        "stress_tester::audio::process_audio_buffer::h1e1f7984b2d2cfca",
+        "stress_tester::audio::generate_sine_buffer::hdeadbeef12345678",
+        "stress_tester::audio::apply_effect_chain::habcdef0123456789",
+        "stress_tester::midi::process_note_on::h7c4d62da364e13f0",
+        "stress_tester::midi::process_control_change::h72b697f824ed75aa",
+        "stress_tester::midi::generate_midi_sequence::h77a24745e78bf175",
+        "stress_tester::engine::Engine::update_global_state::hfedcba9876543210",
     ];
 
-    for (func_name, pattern, expected) in test_cases {
-        let result = pattern_matches(func_name, pattern);
-        assert_eq!(
-            result, expected,
-            "Pattern '{}' vs function '{}' should be {}",
-            pattern, func_name, expected
+    let test_cases: Vec<(&str, Vec<usize>)> = vec![
+        ("stress_tester::audio::**", vec![0, 1, 2]),
+        ("stress_tester::midi::**", vec![3, 4, 5]),
+        ("**::process_note_on**", vec![3]),
+        ("**::process_audio_buffer**", vec![0]),
+        ("stress_tester::*", vec![]),
+        ("stress_tester::midi::process_note_on::h7c4d62da364e13f0", vec![3]),
+    ];
+
+    for (pattern, expected_indices) in test_cases {
+        let matcher = PatternMatcher::new(pattern);
+        let matched: Vec<usize> = real_names.iter().enumerate()
+            .filter(|(_, name)| matcher.matches(name))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(matched, expected_indices,
+            "Pattern '{}' matched wrong functions.\n  Expected: {:?}\n  Got: {:?}",
+            pattern,
+            expected_indices.iter().map(|&i| real_names[i]).collect::<Vec<_>>(),
+            matched.iter().map(|&i| real_names[i]).collect::<Vec<_>>(),
         );
     }
 }
 
-// Helper function to test pattern matching logic
-// This mirrors the logic that will be used in the TypeScript agent
-fn pattern_matches(name: &str, pattern: &str) -> bool {
-    if name == pattern {
-        return true;
-    }
+#[test]
+fn test_pattern_matching_end_to_end_with_real_dwarf() {
+    // End-to-end: parse real binary DWARF, then match patterns against it.
+    // This is THE test that would have caught the runtime hooking bug.
+    let binary = match stress_tester_binary() {
+        Some(b) => b,
+        None => return,
+    };
 
-    if pattern.contains('*') {
-        // Convert pattern to regex, handling wildcards carefully
-        let mut regex_pattern = pattern.to_string();
+    let parser = strobe::dwarf::DwarfParser::parse(&binary).unwrap();
 
-        // Replace ** with a temporary marker (deep wildcard)
-        regex_pattern = regex_pattern.replace("**", "\x00DEEP\x00");
+    let patterns_and_expected: Vec<(&str, bool)> = vec![
+        ("**::process_note_on**", true),
+        ("**::process_audio_buffer**", true),
+        ("**::generate_midi_sequence**", true),
+        ("**::process_control_change**", true),
+        ("stress_tester::midi::**", true),
+        ("stress_tester::audio::**", true),
+        ("nonexistent::function", false),
+    ];
 
-        // Escape regex special chars (but not our markers or single *)
-        let chars_to_escape = ['\\', '.', '+', '?', '^', '$', '{', '}', '(', ')', '|', '[', ']'];
-        for ch in chars_to_escape {
-            if ch != '*' {
-                regex_pattern = regex_pattern.replace(ch, &format!("\\{}", ch));
-            }
-        }
-
-        // Now convert wildcards to regex
-        // * = match anything except :: (one or more chars, but stop at ::)
-        regex_pattern = regex_pattern.replace('*', "[^:]+");
-
-        // ** (deep) = match anything including :: (use marker we set earlier)
-        regex_pattern = regex_pattern.replace("\x00DEEP\x00", ".*");
-
-        let regex_pattern = format!("^{}$", regex_pattern);
-
-        if let Ok(re) = regex::Regex::new(&regex_pattern) {
-            return re.is_match(name);
+    for (pattern, should_match) in patterns_and_expected {
+        let matches = parser.find_by_pattern(pattern);
+        if should_match {
+            assert!(!matches.is_empty(),
+                "Pattern '{}' should match at least one function in stress_tester", pattern);
+        } else {
+            assert!(matches.is_empty(),
+                "Pattern '{}' should NOT match any function", pattern);
         }
     }
 
-    false
+    // @file: pattern should work
+    let file_matches = parser.find_by_source_file("main.rs");
+    assert!(!file_matches.is_empty(),
+        "@file:main.rs should match functions in stress_tester");
+    assert!(file_matches.len() >= 5,
+        "Should find multiple functions in main.rs, got {}", file_matches.len());
 }
 
 // Test for hook count accumulation bug fix

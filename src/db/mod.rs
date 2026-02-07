@@ -82,6 +82,12 @@ mod tests {
             text: None,
             sampled: None,
             watch_values: None,
+            pid: None,
+            signal: None,
+            fault_address: None,
+            registers: None,
+            backtrace: None,
+            locals: None,
         }).unwrap();
 
         db.insert_event(Event {
@@ -102,6 +108,12 @@ mod tests {
             text: None,
             sampled: None,
             watch_values: None,
+            pid: None,
+            signal: None,
+            fault_address: None,
+            registers: None,
+            backtrace: None,
+            locals: None,
         }).unwrap();
 
         // Query by function name
