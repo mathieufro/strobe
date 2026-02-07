@@ -303,6 +303,52 @@ pub struct DebugStopResponse {
     pub events_collected: u64,
 }
 
+// ============ debug_test ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugTestRequest {
+    pub project_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<crate::test::adapter::TestLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_patterns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watches: Option<WatchUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugTestResponse {
+    pub framework: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::test::adapter::TestSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub failures: Vec<crate::test::adapter::TestFailure>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub stuck: Vec<crate::test::adapter::StuckTest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_tests: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<crate::test::adapter::ProjectInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
 // ============ Errors ============
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

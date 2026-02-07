@@ -490,6 +490,32 @@ Validation Limits (enforced):
                     "required": ["sessionId"]
                 }),
             },
+            McpTool {
+                name: "debug_test".to_string(),
+                description: "Run tests and get structured results. Auto-detects the test framework. If no tests exist, returns project info and suggests test setup. Use this instead of running test commands via bash — it provides machine-readable output, stuck detection, and failure analysis.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "projectRoot": { "type": "string", "description": "Project root for adapter detection" },
+                        "framework": { "type": "string", "description": "Override auto-detection: \"cargo\", \"catch2\"" },
+                        "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
+                        "test": { "type": "string", "description": "Run a single test by name" },
+                        "command": { "type": "string", "description": "Test binary path (required for compiled test frameworks like Catch2)" },
+                        "tracePatterns": { "type": "array", "items": { "type": "string" }, "description": "Presence triggers Frida instrumented path" },
+                        "watches": {
+                            "type": "object",
+                            "description": "Watch variables during test (triggers Frida path)",
+                            "properties": {
+                                "add": { "type": "array", "items": { "type": "object" } },
+                                "remove": { "type": "array", "items": { "type": "string" } }
+                            }
+                        },
+                        "env": { "type": "object", "description": "Additional environment variables" },
+                        "timeout": { "type": "integer", "description": "Hard timeout in ms (default varies by level)" }
+                    },
+                    "required": ["projectRoot"]
+                }),
+            },
         ];
 
         let response = McpToolsListResponse { tools };
@@ -506,6 +532,7 @@ Validation Limits (enforced):
             "debug_stop" => self.tool_debug_stop(&call.arguments).await,
             "debug_list_sessions" => self.tool_debug_list_sessions().await,
             "debug_delete_session" => self.tool_debug_delete_session(&call.arguments).await,
+            "debug_test" => self.tool_debug_test(&call.arguments, connection_id).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -1218,6 +1245,70 @@ Validation Limits (enforced):
             "success": true,
             "deletedSessionId": req.session_id,
         }))
+    }
+
+    async fn tool_debug_test(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
+        let project_root = std::path::Path::new(&req.project_root);
+
+        let runner = crate::test::TestRunner::new();
+        let env = req.env.unwrap_or_default();
+
+        let level = req.level;
+
+        // Determine execution path: Frida or direct
+        let has_instrumentation = req.trace_patterns.is_some() || req.watches.is_some();
+
+        let run_result = if has_instrumentation {
+            // Frida path
+            let trace_patterns = req.trace_patterns.unwrap_or_default();
+            runner.run_instrumented(
+                project_root,
+                req.framework.as_deref(),
+                req.test.as_deref(),
+                req.command.as_deref(),
+                &env,
+                req.timeout,
+                &self.session_manager,
+                &trace_patterns,
+                req.watches.as_ref(),
+                connection_id,
+            ).await?
+        } else {
+            // Fast path — direct subprocess
+            runner.run(
+                project_root,
+                req.framework.as_deref(),
+                level,
+                req.test.as_deref(),
+                req.command.as_deref(),
+                &env,
+                req.timeout,
+            ).await?
+        };
+
+        // Write details file
+        let details_path = crate::test::output::write_details(
+            &run_result.framework,
+            &run_result.result,
+            &run_result.raw_stdout,
+            &run_result.raw_stderr,
+        ).ok();
+
+        // Build response
+        let response = crate::mcp::DebugTestResponse {
+            framework: run_result.framework,
+            summary: Some(run_result.result.summary),
+            failures: run_result.result.failures,
+            stuck: run_result.result.stuck,
+            session_id: run_result.session_id,
+            details: details_path,
+            no_tests: None,
+            project: None,
+            hint: None,
+        };
+
+        Ok(serde_json::to_value(response)?)
     }
 }
 

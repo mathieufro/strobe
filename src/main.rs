@@ -14,8 +14,11 @@ async fn main() -> Result<()> {
         Some("mcp") => {
             strobe::mcp::stdio_proxy().await
         }
+        Some("install") => {
+            strobe::install::install()
+        }
         _ => {
-            eprintln!("Usage: strobe <daemon|mcp>");
+            eprintln!("Usage: strobe <daemon|mcp|install>");
             std::process::exit(1);
         }
     }

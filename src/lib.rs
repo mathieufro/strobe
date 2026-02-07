@@ -3,7 +3,9 @@ pub mod db;
 pub mod dwarf;
 pub mod error;
 pub mod frida_collector;
+pub mod install;
 pub mod mcp;
 pub mod symbols;
+pub mod test;
 
 pub use error::{Error, Result};
