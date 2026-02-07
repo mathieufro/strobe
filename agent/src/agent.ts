@@ -218,8 +218,12 @@ class StrobeAgent {
       const crashEvent = this.buildCrashEvent(details);
       send({ type: 'events', events: [crashEvent] });
 
+      // send() queues the message for GLib main loop delivery to the host.
+      // Sleep the crashing thread to give GLib time to flush before the OS
+      // terminates the process when we return false.
+      Thread.sleep(0.1);
+
       // Return false to let the OS handle the crash (terminate the process)
-      // The event will be flushed because send() is synchronous
       return false;
     });
   }

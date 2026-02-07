@@ -74,7 +74,8 @@ mod tests {
             functions_by_name: std::collections::HashMap::new(),
             variables: vec![],
             variables_by_name: std::collections::HashMap::new(),
-            struct_members: std::collections::HashMap::new(),
+            struct_members: std::sync::Mutex::new(std::collections::HashMap::new()),
+            lazy_struct_info: std::collections::HashMap::new(),
             image_base: 0x100000,
             binary_path: None,
         })

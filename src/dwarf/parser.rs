@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use crate::{Error, Result};
+use std::sync::Mutex;
+use rayon::prelude::*;
 use crate::symbols::demangle_symbol;
 use super::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation};
 
@@ -25,9 +27,12 @@ pub struct DwarfParser {
     pub(crate) functions_by_name: HashMap<String, Vec<usize>>,
     pub variables: Vec<VariableInfo>,
     pub(crate) variables_by_name: HashMap<String, Vec<usize>>,
-    /// Struct member layouts for pointer-type global variables.
-    /// Key: variable name → members of the pointed-to struct.
-    pub(crate) struct_members: HashMap<String, Vec<StructMember>>,
+    /// Cache of lazily-resolved struct member layouts for pointer variables.
+    /// Populated on-demand when resolve_watch_expression encounters `->` syntax.
+    pub(crate) struct_members: Mutex<HashMap<String, Vec<StructMember>>>,
+    /// Stored DWARF offsets for pointer variables, enabling lazy struct member resolution.
+    /// Maps variable name to (CU section offset, type DIE unit offset).
+    pub(crate) lazy_struct_info: HashMap<String, (usize, usize)>,
     /// The image base address from the Mach-O/ELF binary (e.g., __TEXT vmaddr).
     /// Used to compute offsets for ASLR adjustment at runtime.
     pub image_base: u64,
@@ -115,11 +120,9 @@ impl DwarfParser {
 
         let load_section = |id: SectionId| -> std::result::Result<Cow<[u8]>, gimli::Error> {
             let name = id.name();
-            // Try both ELF and Mach-O section names
             let data = object
                 .section_by_name(name)
                 .or_else(|| {
-                    // Mach-O uses __debug_* instead of .debug_*
                     let macho_name = name.replace(".debug_", "__debug_");
                     object.section_by_name(&macho_name)
                 })
@@ -135,47 +138,76 @@ impl DwarfParser {
             EndianSlice::new(section.as_ref(), endian)
         });
 
+        // Collect all compilation unit headers for parallel processing
+        let mut headers = Vec::new();
+        let mut units_iter = dwarf.units();
+        while let Ok(Some(header)) = units_iter.next() {
+            headers.push(header);
+        }
+
+        // Parse each compilation unit in parallel
+        let results: Vec<_> = headers
+            .into_par_iter()
+            .filter_map(|header| {
+                let unit = dwarf.unit(header).ok()?;
+                let cu_offset = match unit.header.offset() {
+                    gimli::UnitSectionOffset::DebugInfoOffset(o) => o.0,
+                    gimli::UnitSectionOffset::DebugTypesOffset(o) => o.0,
+                };
+                let mut functions = Vec::new();
+                let mut variables = Vec::new();
+                let mut lazy_infos: Vec<(String, usize, usize)> = Vec::new();
+
+                let mut entries = unit.entries();
+                let mut in_subprogram = false;
+                let mut subprogram_depth: isize = 0;
+                let mut current_depth: isize = 0;
+
+                while let Ok(Some((delta, entry))) = entries.next_dfs() {
+                    current_depth += delta;
+
+                    if in_subprogram && current_depth <= subprogram_depth {
+                        in_subprogram = false;
+                    }
+
+                    match entry.tag() {
+                        gimli::DW_TAG_subprogram => {
+                            in_subprogram = true;
+                            subprogram_depth = current_depth;
+                            if let Ok(Some(func)) = Self::parse_function(&dwarf, &unit, entry) {
+                                functions.push(func);
+                            }
+                        }
+                        gimli::DW_TAG_variable if !in_subprogram => {
+                            if let Ok(Some(var)) = Self::parse_variable(&dwarf, &unit, entry) {
+                                // For pointer variables, store type offset for lazy struct resolution
+                                if matches!(var.type_kind, TypeKind::Pointer) {
+                                    if let Some(gimli::AttributeValue::UnitRef(type_off)) =
+                                        entry.attr_value(gimli::DW_AT_type).ok().flatten()
+                                    {
+                                        lazy_infos.push((var.name.clone(), cu_offset, type_off.0));
+                                    }
+                                }
+                                variables.push(var);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                Some((functions, variables, lazy_infos))
+            })
+            .collect();
+
+        // Merge results from all CUs
         let mut functions = Vec::new();
         let mut variables = Vec::new();
-        let mut struct_members_map: HashMap<String, Vec<StructMember>> = HashMap::new();
-
-        // Iterate through compilation units
-        let mut units = dwarf.units();
-        while let Ok(Some(header)) = units.next() {
-            let unit = dwarf.unit(header)
-                .map_err(|e| Error::Frida(format!("Failed to parse unit: {}", e)))?;
-
-            let mut entries = unit.entries();
-            let mut in_subprogram = false;
-            let mut subprogram_depth: isize = 0;
-            let mut current_depth: isize = 0;
-
-            while let Ok(Some((delta, entry))) = entries.next_dfs() {
-                current_depth += delta;
-
-                // Track whether we're inside a function (to skip local variables)
-                if in_subprogram && current_depth <= subprogram_depth {
-                    in_subprogram = false;
-                }
-
-                match entry.tag() {
-                    gimli::DW_TAG_subprogram => {
-                        in_subprogram = true;
-                        subprogram_depth = current_depth;
-                        if let Some(func) = Self::parse_function(&dwarf, &unit, entry)? {
-                            functions.push(func);
-                        }
-                    }
-                    gimli::DW_TAG_variable if !in_subprogram => {
-                        if let Some((var, members)) = Self::parse_variable(&dwarf, &unit, entry)? {
-                            if let Some(members) = members {
-                                struct_members_map.insert(var.name.clone(), members);
-                            }
-                            variables.push(var);
-                        }
-                    }
-                    _ => {}
-                }
+        let mut lazy_struct_info = HashMap::new();
+        for (funcs, vars, infos) in results {
+            functions.extend(funcs);
+            variables.extend(vars);
+            for (name, cu_off, type_off) in infos {
+                lazy_struct_info.insert(name, (cu_off, type_off));
             }
         }
 
@@ -194,7 +226,6 @@ impl DwarfParser {
                 .entry(var.name.clone())
                 .or_default()
                 .push(idx);
-            // Also index by short name (e.g. "G_TEMPO") for user-friendly lookup
             if let Some(ref short) = var.short_name {
                 if short != &var.name {
                     variables_by_name
@@ -210,7 +241,8 @@ impl DwarfParser {
             functions_by_name,
             variables,
             variables_by_name,
-            struct_members: struct_members_map,
+            struct_members: Mutex::new(HashMap::new()),
+            lazy_struct_info,
             image_base: 0, // Set by parse() from the actual binary
             binary_path: Some(path.to_path_buf()),
         })
@@ -338,13 +370,13 @@ impl DwarfParser {
         }))
     }
 
-    /// Parse a global variable. Returns (VariableInfo, Option<struct members>) —
-    /// struct members are present when the variable is a pointer to a struct.
+    /// Parse a global variable. Struct members for pointer variables are resolved
+    /// lazily when resolve_watch_expression encounters `->` syntax.
     fn parse_variable<R: gimli::Reader>(
         dwarf: &gimli::Dwarf<R>,
         unit: &gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
-    ) -> Result<Option<(VariableInfo, Option<Vec<StructMember>>)>> {
+    ) -> Result<Option<VariableInfo>> {
         // Get name: prefer linkage_name over short name for demangling
         let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
             .and_then(|v| dwarf.attr_string(unit, v).ok())
@@ -374,13 +406,6 @@ impl DwarfParser {
             return Ok(None);
         }
 
-        // For pointer variables, try to parse the pointed-to struct members
-        let struct_members = if matches!(type_kind, TypeKind::Pointer) {
-            Self::parse_pointed_struct_members(dwarf, unit, entry)
-        } else {
-            None
-        };
-
         // Get source file
         let source_file = Self::parse_source_file(dwarf, unit, entry);
 
@@ -388,7 +413,7 @@ impl DwarfParser {
         let demangled = demangle_symbol(&name);
         let name_raw = if name != demangled { Some(name) } else { None };
 
-        Ok(Some((VariableInfo {
+        Ok(Some(VariableInfo {
             name: demangled,
             name_raw,
             short_name,
@@ -397,7 +422,7 @@ impl DwarfParser {
             type_name,
             type_kind,
             source_file,
-        }, struct_members)))
+        }))
     }
 
     fn parse_variable_address<R: gimli::Reader>(
@@ -550,35 +575,6 @@ impl DwarfParser {
         }
     }
 
-    /// For a pointer-type variable, follow the type chain to find the pointed-to struct
-    /// and parse its member layout.
-    fn parse_pointed_struct_members<R: gimli::Reader>(
-        dwarf: &gimli::Dwarf<R>,
-        unit: &gimli::Unit<R>,
-        entry: &gimli::DebuggingInformationEntry<R>,
-    ) -> Option<Vec<StructMember>> {
-        // Get the type attribute (should be a pointer type)
-        let type_attr = entry.attr_value(gimli::DW_AT_type).ok()??;
-        let ptr_offset = match type_attr {
-            gimli::AttributeValue::UnitRef(o) => o,
-            _ => return None,
-        };
-
-        // Navigate to the pointer type DIE
-        let mut ptr_tree = unit.entries_tree(Some(ptr_offset)).ok()?;
-        let ptr_root = ptr_tree.root().ok()?;
-        let ptr_entry = ptr_root.entry();
-
-        // Must be a pointer type
-        if ptr_entry.tag() != gimli::DW_TAG_pointer_type {
-            return None;
-        }
-
-        // Get the pointed-to type
-        let pointee_attr = ptr_entry.attr_value(gimli::DW_AT_type).ok()??;
-        Self::parse_struct_members_from_type(dwarf, unit, pointee_attr, 0)
-    }
-
     /// Follow type chain (through typedefs, const, volatile) to find a struct/class
     /// and parse its members.
     fn parse_struct_members_from_type<R: gimli::Reader>(
@@ -675,6 +671,79 @@ impl DwarfParser {
         }
     }
 
+    /// Lazily resolve and cache struct members for a pointer variable.
+    /// Uses stored CU/type offsets to jump directly to the right DWARF location.
+    fn lazy_resolve_struct_members(&self, var_name: &str) -> Result<()> {
+        // Check cache first
+        {
+            let cache = self.struct_members.lock().unwrap();
+            if cache.contains_key(var_name) {
+                return Ok(());
+            }
+        }
+
+        let &(cu_offset, type_die_offset) = self.lazy_struct_info.get(var_name)
+            .ok_or_else(|| Error::Frida(format!(
+                "No type info stored for pointer variable '{}'", var_name
+            )))?;
+
+        let binary_path = self.binary_path.as_ref()
+            .ok_or_else(|| Error::Frida("No binary path for lazy struct member resolution".into()))?;
+
+        let file = File::open(binary_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let object = object::File::parse(&*mmap)
+            .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
+
+        let endian = if object.is_little_endian() { RunTimeEndian::Little } else { RunTimeEndian::Big };
+
+        let load_section = |id: SectionId| -> std::result::Result<Cow<[u8]>, gimli::Error> {
+            let name = id.name();
+            let data = object.section_by_name(name)
+                .or_else(|| object.section_by_name(&name.replace(".debug_", "__debug_")))
+                .and_then(|section| section.data().ok())
+                .unwrap_or(&[]);
+            Ok(Cow::Borrowed(data))
+        };
+
+        let dwarf_cow = gimli::Dwarf::load(&load_section)
+            .map_err(|e| Error::Frida(format!("DWARF load: {}", e)))?;
+        let dwarf = dwarf_cow.borrow(|s| EndianSlice::new(s.as_ref(), endian));
+
+        // Jump directly to the right CU using stored offset
+        let header = dwarf.debug_info.header_from_offset(gimli::DebugInfoOffset(cu_offset))
+            .map_err(|e| Error::Frida(format!("Failed to find CU at offset {}: {}", cu_offset, e)))?;
+        let unit = dwarf.unit(header)
+            .map_err(|e| Error::Frida(format!("Failed to parse CU: {}", e)))?;
+
+        // Navigate to the pointer type DIE using stored offset
+        let ptr_offset = gimli::UnitOffset(type_die_offset);
+        let mut ptr_tree = unit.entries_tree(Some(ptr_offset))
+            .map_err(|e| Error::Frida(format!("Failed to find type DIE: {}", e)))?;
+        let ptr_root = ptr_tree.root()
+            .map_err(|e| Error::Frida(format!("Failed to read type DIE: {}", e)))?;
+        let ptr_entry = ptr_root.entry();
+
+        if ptr_entry.tag() != gimli::DW_TAG_pointer_type {
+            return Err(Error::Frida(format!(
+                "Type for '{}' is not a pointer type (tag: {:?})", var_name, ptr_entry.tag()
+            )));
+        }
+
+        let pointee_attr = ptr_entry.attr_value(gimli::DW_AT_type)
+            .map_err(|e| Error::Frida(format!("Failed to get pointee type: {}", e)))?
+            .ok_or_else(|| Error::Frida("Pointer type has no pointee type".into()))?;
+
+        let members = Self::parse_struct_members_from_type(&dwarf, &unit, pointee_attr, 0)
+            .ok_or_else(|| Error::Frida(format!(
+                "No struct members found for pointee of '{}'", var_name
+            )))?;
+
+        let mut cache = self.struct_members.lock().unwrap();
+        cache.insert(var_name.to_string(), members);
+        Ok(())
+    }
+
     pub fn resolve_watch_expression(&self, expr: &str) -> Result<WatchRecipe> {
         if !expr.contains("->") {
             // Simple variable — direct read
@@ -714,8 +783,12 @@ impl DwarfParser {
         member_path: &[&str],
         full_expr: &str,
     ) -> Result<WatchRecipe> {
+        // Lazily resolve struct members for this variable
+        self.lazy_resolve_struct_members(&root_var.name)?;
+
+        let cache = self.struct_members.lock().unwrap();
         let mut deref_chain = Vec::new();
-        let mut current_members = self.struct_members.get(&root_var.name)
+        let mut current_members = cache.get(&root_var.name)
             .ok_or_else(|| Error::Frida(format!(
                 "No struct info for pointer '{}'", root_var.name
             )))?;
