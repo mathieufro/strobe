@@ -39,6 +39,9 @@ pub struct Session {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub status: SessionStatus,
+    pub retained: bool,
+    pub retained_at: Option<i64>,
+    pub size_bytes: Option<i64>,
 }
 
 impl Database {
@@ -81,13 +84,16 @@ impl Database {
             started_at,
             ended_at: None,
             status: SessionStatus::Running,
+            retained: false,
+            retained_at: None,
+            size_bytes: None,
         })
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
-            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status
+            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
              FROM sessions WHERE id = ?"
         )?;
 
@@ -100,6 +106,9 @@ impl Database {
                 started_at: row.get(4)?,
                 ended_at: row.get(5)?,
                 status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
+                retained_at: row.get(7).ok().flatten(),
+                size_bytes: row.get(8).ok().flatten(),
             })
         });
 
@@ -113,7 +122,7 @@ impl Database {
     pub fn get_running_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
-            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status
+            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
              FROM sessions WHERE status = 'running'"
         )?;
 
@@ -126,6 +135,9 @@ impl Database {
                 started_at: row.get(4)?,
                 ended_at: row.get(5)?,
                 status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
+                retained_at: row.get(7).ok().flatten(),
+                size_bytes: row.get(8).ok().flatten(),
             })
         })?.collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -135,7 +147,7 @@ impl Database {
     pub fn get_session_by_binary(&self, binary_path: &str) -> Result<Option<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
-            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status
+            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
              FROM sessions WHERE binary_path = ? AND status = 'running'"
         )?;
 
@@ -148,6 +160,9 @@ impl Database {
                 started_at: row.get(4)?,
                 ended_at: row.get(5)?,
                 status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
+                retained_at: row.get(7).ok().flatten(),
+                size_bytes: row.get(8).ok().flatten(),
             })
         });
 
@@ -192,5 +207,94 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count as u64)
+    }
+
+    pub fn mark_session_retained(&self, id: &str) -> Result<()> {
+        let conn = self.connection();
+        let retained_at = chrono::Utc::now().timestamp();
+
+        // Calculate session size
+        let size: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(id) + LENGTH(session_id) + LENGTH(COALESCE(function_name,'')) + LENGTH(COALESCE(arguments,'')) + LENGTH(COALESCE(return_value,'')) + LENGTH(COALESCE(text,'')) + 100), 0) FROM events WHERE session_id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+
+        conn.execute(
+            "UPDATE sessions SET retained_at = ?, size_bytes = ? WHERE id = ?",
+            params![retained_at, size, id],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn list_retained_sessions(&self) -> Result<Vec<Session>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
+             FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at DESC"
+        )?;
+
+        let sessions = stmt.query_map([], |row| {
+            Ok(Session {
+                id: row.get(0)?,
+                binary_path: row.get(1)?,
+                project_root: row.get(2)?,
+                pid: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
+                retained_at: row.get(7).ok().flatten(),
+                size_bytes: row.get(8).ok().flatten(),
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(sessions)
+    }
+
+    /// Enforce 10GB global size limit by deleting oldest retained sessions
+    pub fn enforce_global_size_limit(&self) -> Result<u64> {
+        const MAX_TOTAL_BYTES: i64 = 10 * 1024 * 1024 * 1024; // 10GB
+
+        let total = self.calculate_total_size()?;
+        if total <= MAX_TOTAL_BYTES {
+            return Ok(0);
+        }
+
+        let conn = self.connection();
+        let mut deleted = 0u64;
+
+        // Delete oldest retained sessions until under limit
+        let mut stmt = conn.prepare(
+            "SELECT id, COALESCE(size_bytes, 0) FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at ASC"
+        )?;
+
+        let sessions: Vec<(String, i64)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut remaining = total;
+        for (session_id, size) in sessions {
+            if remaining <= MAX_TOTAL_BYTES {
+                break;
+            }
+            self.delete_session(&session_id)?;
+            remaining -= size;
+            deleted += 1;
+        }
+
+        Ok(deleted)
+    }
+
+    pub fn calculate_total_size(&self) -> Result<i64> {
+        let conn = self.connection();
+        let size: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM sessions WHERE retained_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(size)
     }
 }

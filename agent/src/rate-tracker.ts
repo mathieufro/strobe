@@ -73,7 +73,9 @@ export class RateTracker {
                     // Disable sampling
                     this.samplingEnabled.delete(funcId);
                     this.onSamplingChange(funcId, false, 1.0);
-                    // Logging happens in daemon via sampling_state_change message
+
+                    const funcName = this.funcNames.get(funcId) || `func_${funcId}`;
+                    send({ type: 'log', message: `[RateTracker] Function cooled down: ${funcName} (${Math.round(rate)} calls/sec) - full capture resumed` });
                 }
             }
         }

@@ -99,11 +99,186 @@ fn test_validation_prevents_extreme_event_limits() {
         remove: None,
         watches: None,
         event_limit: Some(100_000_000),
+        serialization_depth: None,
     };
 
     let result = req.validate();
     assert!(result.is_err(), "Validation should reject 100M event limit");
     assert!(result.unwrap_err().to_string().contains("10000000"));
+}
+
+// ============ Serialization Depth Stress Validation ============
+
+/// Validate serialization depth rejects extreme values under stress-like parameters
+#[test]
+fn test_validation_prevents_extreme_serialization_depth() {
+    use strobe::mcp::DebugTraceRequest;
+
+    // Try depth 0 (below minimum)
+    let req = DebugTraceRequest {
+        session_id: Some("stress-test".to_string()),
+        add: Some(vec!["audio::*".to_string(), "midi::*".to_string()]),
+        remove: None,
+        watches: None,
+        event_limit: Some(500_000),
+        serialization_depth: Some(0),
+    };
+    assert!(req.validate().is_err(), "Depth 0 should be rejected");
+
+    // Try depth 100 (way above maximum)
+    let req = DebugTraceRequest {
+        session_id: Some("stress-test".to_string()),
+        add: Some(vec!["audio::*".to_string()]),
+        remove: None,
+        watches: None,
+        event_limit: Some(1_000_000),
+        serialization_depth: Some(100),
+    };
+    let err = req.validate().unwrap_err();
+    assert!(err.to_string().contains("serialization_depth must be between 1 and 10"));
+}
+
+/// Validate serialization depth works correctly combined with all other stress parameters
+#[test]
+fn test_serialization_depth_with_full_stress_params() {
+    use strobe::mcp::{DebugTraceRequest, WatchTarget, WatchUpdate};
+
+    // Full stress configuration: patterns + watches + event limit + serialization depth
+    let req = DebugTraceRequest {
+        session_id: Some("stress-session".to_string()),
+        add: Some(vec![
+            "audio::process_audio_buffer".to_string(),
+            "audio::apply_effect_chain".to_string(),
+            "midi::process_note_on".to_string(),
+            "midi::process_control_change".to_string(),
+            "engine::*".to_string(),
+        ]),
+        remove: None,
+        watches: Some(WatchUpdate {
+            add: Some(vec![
+                WatchTarget {
+                    variable: Some("G_TEMPO".to_string()),
+                    address: None,
+                    type_hint: None,
+                    label: Some("tempo".to_string()),
+                    expr: None,
+                    on: Some(vec!["audio::process_audio_buffer".to_string()]),
+                },
+                WatchTarget {
+                    variable: Some("G_MIDI_NOTE_ON_COUNT".to_string()),
+                    address: None,
+                    type_hint: None,
+                    label: Some("midi_notes".to_string()),
+                    expr: None,
+                    on: Some(vec!["audio::*".to_string()]),
+                },
+                WatchTarget {
+                    variable: Some("G_SAMPLE_RATE".to_string()),
+                    address: None,
+                    type_hint: None,
+                    label: Some("sample_rate".to_string()),
+                    expr: None,
+                    on: Some(vec!["midi::process_note_on".to_string()]),
+                },
+                WatchTarget {
+                    variable: Some("G_PARAMETER_UPDATES".to_string()),
+                    address: None,
+                    type_hint: None,
+                    label: Some("param_updates".to_string()),
+                    expr: None,
+                    on: None, // global watch
+                },
+            ]),
+            remove: None,
+        }),
+        event_limit: Some(500_000),
+        serialization_depth: Some(5), // Deep enough for EffectChain recursive struct
+    };
+
+    assert!(req.validate().is_ok(), "Full stress config should validate");
+}
+
+/// Validate that invalid depth fails even when other stress params are valid
+#[test]
+fn test_serialization_depth_invalid_with_valid_stress_params() {
+    use strobe::mcp::{DebugTraceRequest, WatchTarget, WatchUpdate};
+
+    let req = DebugTraceRequest {
+        session_id: Some("stress-session".to_string()),
+        add: Some(vec!["audio::*".to_string(), "midi::*".to_string()]),
+        remove: None,
+        watches: Some(WatchUpdate {
+            add: Some(vec![WatchTarget {
+                variable: Some("G_TEMPO".to_string()),
+                address: None,
+                type_hint: None,
+                label: Some("tempo".to_string()),
+                expr: None,
+                on: Some(vec!["audio::*".to_string()]),
+            }]),
+            remove: None,
+        }),
+        event_limit: Some(200_000),
+        serialization_depth: Some(11), // Just above max
+    };
+
+    assert!(req.validate().is_err(), "Depth 11 should fail even with valid watches/limits");
+}
+
+/// Validate serialization depth JSON roundtrip in stress-like MCP messages
+#[test]
+fn test_serialization_depth_mcp_json_stress() {
+    use strobe::mcp::DebugTraceRequest;
+
+    // Simulate full MCP message with serializationDepth (camelCase from client)
+    let json = r#"{
+        "sessionId": "stress-123",
+        "add": ["audio::process_audio_buffer", "audio::apply_effect_chain", "midi::*"],
+        "serializationDepth": 5,
+        "eventLimit": 500000
+    }"#;
+
+    let req: DebugTraceRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(req.serialization_depth, Some(5));
+    assert_eq!(req.event_limit, Some(500_000));
+    assert_eq!(req.add.as_ref().unwrap().len(), 3);
+    assert!(req.validate().is_ok());
+
+    // Roundtrip: serialize back and verify camelCase field names
+    let re_serialized = serde_json::to_string(&req).unwrap();
+    assert!(re_serialized.contains("serializationDepth"));
+    assert!(re_serialized.contains(":5") || re_serialized.contains(": 5"));
+
+    // MCP message without serializationDepth (should default to None)
+    let json_no_depth = r#"{"sessionId": "stress-456", "add": ["audio::*"]}"#;
+    let req2: DebugTraceRequest = serde_json::from_str(json_no_depth).unwrap();
+    assert_eq!(req2.serialization_depth, None);
+    assert!(req2.validate().is_ok());
+}
+
+/// Validate all boundary values for serialization depth
+#[test]
+fn test_serialization_depth_boundary_stress() {
+    use strobe::mcp::DebugTraceRequest;
+
+    let make_req = |depth: u32| DebugTraceRequest {
+        session_id: Some("stress".to_string()),
+        add: Some(vec!["audio::*".to_string(), "midi::*".to_string(), "engine::*".to_string()]),
+        remove: None,
+        watches: None,
+        event_limit: Some(1_000_000),
+        serialization_depth: Some(depth),
+    };
+
+    // All valid values pass
+    for depth in 1..=10 {
+        assert!(make_req(depth).validate().is_ok(), "depth={} should pass", depth);
+    }
+
+    // Invalid values fail
+    for depth in [0, 11, 50, 100, 255, u32::MAX] {
+        assert!(make_req(depth).validate().is_err(), "depth={} should fail", depth);
+    }
 }
 
 /// Documentation: Manual Stress Test Procedure
@@ -122,20 +297,21 @@ fn test_validation_prevents_extreme_event_limits() {
 ///      projectRoot: "/path/to/strobe"
 ///    })
 ///
-/// 4. Add trace patterns for multiple namespaces with contextual watches:
+/// 4. Add trace patterns with serialization depth and contextual watches:
 ///    debug_trace({
 ///      sessionId: "<session-id>",
 ///      add: ["audio::process_audio_buffer", "audio::apply_effect_chain",
 ///            "midi::process_note_on", "midi::process_control_change",
 ///            "engine::*"],
+///      serializationDepth: 5,  // Deep enough for EffectChain (recursive depth 5)
 ///      watches: {
 ///        add: [
-///          // Cross-module contextual watches (THIS IS THE KEY FEATURE):
+///          // Cross-module contextual watches:
 ///          { variable: "G_TEMPO", on: ["audio::process_audio_buffer"] },
 ///          { variable: "G_MIDI_NOTE_ON_COUNT", on: ["audio::process_audio_buffer"] },
 ///          { variable: "G_SAMPLE_RATE", on: ["midi::process_note_on"] },
 ///          { variable: "G_AUDIO_BUFFER_COUNT", on: ["midi::process_note_on"] },
-///          // Global watches (captured during all traced functions):
+///          // Global watches:
 ///          { variable: "G_PARAMETER_UPDATES" }
 ///        ]
 ///      }
@@ -143,28 +319,35 @@ fn test_validation_prevents_extreme_event_limits() {
 ///
 /// 5. Wait for execution to complete (30 seconds)
 ///
-/// 6. Query events by thread:
+/// 6. Query events with verbose output (includes serialized arguments):
 ///    debug_query({
 ///      sessionId: "<session-id>",
-///      thread_name_contains: "audio",
-///      limit: 100
+///      function: { contains: "apply_effect_chain" },
+///      verbose: true,
+///      limit: 20
 ///    })
 ///
-/// 7. Query watch variable changes:
-///    debug_query({
+/// 7. Verify serialization depth behavior:
+///    - Arguments should show structured data up to depth 5
+///    - EffectChain recursive pointers resolved through linked list
+///    - Circular references detected and reported as "<circular ref to 0x...>"
+///    - Depth exceeded shown as "<max depth 5 reached>"
+///    - AudioBuffer struct members visible: sample_count, channel_count, etc.
+///
+/// 8. Test with different depths for comparison:
+///    debug_trace({
 ///      sessionId: "<session-id>",
-///      eventType: "watch_change",
-///      limit: 50
+///      serializationDepth: 2  // Shallow - only top-level struct visible
 ///    })
 ///
 /// Expected Observations:
 /// - audio::process_audio_buffer should be HOT (>10k calls/sec), trigger sampling
 /// - audio::apply_effect_chain called recursively (depth 5)
 /// - Multiple thread names visible: audio-0, audio-1, audio-2, audio-3, midi-processor, automation, stats
-/// - **CONTEXTUAL WATCHES**: G_TEMPO captured only during audio::process_audio_buffer, NOT during midi::*
-/// - **CONTEXTUAL WATCHES**: G_AUDIO_BUFFER_COUNT captured only during midi::process_note_on, NOT during audio::*
+/// - **SERIALIZATION DEPTH**: Arguments show structured data, not raw hex pointers
+/// - **CIRCULAR REFS**: Recursive EffectChain stops at circular reference or max depth
+/// - **CONTEXTUAL WATCHES**: G_TEMPO captured only during audio::process_audio_buffer
 /// - **CROSS-MODULE READS**: Audio threads reading MIDI state (G_TEMPO, G_MIDI_NOTE_ON_COUNT)
-/// - **CROSS-MODULE READS**: MIDI thread reading audio state (G_SAMPLE_RATE, G_AUDIO_BUFFER_COUNT)
 /// - Deep struct serialization in EffectChain and AudioBuffer arguments
 /// - MIDI events appear in bursts (realistic pattern)
 /// - No crashes or hangs under sustained load
@@ -174,6 +357,7 @@ fn test_validation_prevents_extreme_event_limits() {
 /// - Broad namespace: ["audio::*", "midi::*"] - tests pattern matching
 /// - File-based: ["@file:main.rs"] - tests file pattern matching
 /// - Wildcard: ["*::process*"] - tests cross-namespace wildcards
+/// - Varying depth: serializationDepth 1 vs 3 vs 10 for performance comparison
 #[test]
 fn test_stress_documentation_exists() {
     // This test exists to document the manual stress testing procedure above

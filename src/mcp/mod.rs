@@ -39,6 +39,7 @@ mod tests {
             }),
             source_file: None,
             return_value: None,
+            thread_name: None,
             limit: Some(100),
             offset: None,
             verbose: Some(true),

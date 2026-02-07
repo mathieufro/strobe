@@ -6,6 +6,7 @@ interface HookInstruction {
   functions: FunctionTarget[];
   imageBase?: string;
   mode?: HookMode;
+  serializationDepth?: number;
 }
 
 interface FunctionTarget {
@@ -104,6 +105,10 @@ class StrobeAgent {
       }
     );
 
+    // Wire rate tracker into the CModule tracer drain loop
+    const tracker = this.rateTracker;
+    this.hookInstaller.setRateCheck((funcId: number) => tracker.recordCall(funcId));
+
     // Periodically send sampling stats
     setInterval(() => {
       if (this.rateTracker) {
@@ -124,6 +129,11 @@ class StrobeAgent {
         send({ type: 'log', message: `Setting imageBase=${message.imageBase}` });
         this.hookInstaller.setImageBase(message.imageBase);
         send({ type: 'log', message: `ASLR slide computed` });
+      }
+
+      // Set serialization depth if provided
+      if (message.serializationDepth) {
+        this.hookInstaller.setSerializationDepth(message.serializationDepth);
       }
 
       const mode: HookMode = message.mode || 'full';

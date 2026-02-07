@@ -12,6 +12,7 @@ use super::SessionManager;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60); // 30 minutes
 const MAX_SESSIONS_PER_CONNECTION: usize = 10;
+const MAX_TOTAL_SESSIONS: usize = 50;
 
 pub struct Daemon {
     socket_path: PathBuf,
@@ -368,6 +369,7 @@ Validation Limits (enforced):
                         "add": { "type": "array", "items": { "type": "string" }, "description": "Patterns to start tracing (e.g. \"mymodule::*\", \"*::init\", \"@usercode\")" },
                         "remove": { "type": "array", "items": { "type": "string" }, "description": "Patterns to stop tracing" },
                         "eventLimit": { "type": "integer", "description": "Maximum events to keep for this session (default: 200,000). Oldest events are deleted when limit is reached. Use higher limits (500k-1M) for audio/DSP debugging." },
+                        "serializationDepth": { "type": "integer", "description": "Maximum depth for recursive argument serialization (default: 3, max: 10)", "minimum": 1, "maximum": 10 },
                         "watches": {
                             "type": "object",
                             "description": "Watch global/static variables during function execution (requires debug symbols)",
@@ -430,6 +432,12 @@ Validation Limits (enforced):
                                 "isNull": { "type": "boolean" }
                             }
                         },
+                        "threadName": {
+                            "type": "object",
+                            "properties": {
+                                "contains": { "type": "string" }
+                            }
+                        },
                         "limit": { "type": "integer", "default": 50, "maximum": 500 },
                         "offset": { "type": "integer" },
                         "verbose": { "type": "boolean", "default": false }
@@ -440,6 +448,26 @@ Validation Limits (enforced):
             McpTool {
                 name: "debug_stop".to_string(),
                 description: "Stop a debug session and clean up resources".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "retain": { "type": "boolean", "description": "Retain session data for post-mortem debugging (default: false)" }
+                    },
+                    "required": ["sessionId"]
+                }),
+            },
+            McpTool {
+                name: "debug_list_sessions".to_string(),
+                description: "List all retained debug sessions".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                }),
+            },
+            McpTool {
+                name: "debug_delete_session".to_string(),
+                description: "Delete a retained session and its data".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -462,6 +490,8 @@ Validation Limits (enforced):
             "debug_trace" => self.tool_debug_trace(&call.arguments, connection_id).await,
             "debug_query" => self.tool_debug_query(&call.arguments).await,
             "debug_stop" => self.tool_debug_stop(&call.arguments).await,
+            "debug_list_sessions" => self.tool_debug_list_sessions().await,
+            "debug_delete_session" => self.tool_debug_delete_session(&call.arguments).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -514,6 +544,18 @@ Validation Limits (enforced):
 
     async fn tool_debug_launch(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let req: DebugLaunchRequest = serde_json::from_value(args.clone())?;
+
+        // Enforce global session limit
+        {
+            let sessions = self.connection_sessions.read().await;
+            let total_count: usize = sessions.values().map(|v| v.len()).sum();
+            if total_count >= MAX_TOTAL_SESSIONS {
+                return Err(crate::Error::Frida(format!(
+                    "Global session limit reached ({} total sessions across all connections). Stop existing sessions first.",
+                    MAX_TOTAL_SESSIONS
+                )));
+            }
+        }
 
         // Enforce per-connection session limit
         {
@@ -596,7 +638,7 @@ Validation Limits (enforced):
             let sm = Arc::clone(&self.session_manager);
             let sid = session_id.clone();
             tokio::spawn(async move {
-                match sm.update_frida_patterns(&sid, Some(&pending_patterns), None).await {
+                match sm.update_frida_patterns(&sid, Some(&pending_patterns), None, None).await {
                     Ok(result) => {
                         tracing::info!("Deferred hooks installed for {}: {} hooked ({} matched)", sid, result.installed, result.matched);
                         if !result.warnings.is_empty() {
@@ -694,6 +736,7 @@ Validation Limits (enforced):
                     session_id,
                     req.add.as_deref(),
                     req.remove.as_deref(),
+                    req.serialization_depth,
                 ).await.unwrap_or(default_result);
 
                 self.session_manager.set_hook_count(session_id, hook_result.installed);
@@ -702,13 +745,10 @@ Validation Limits (enforced):
                 const MAX_EVENT_LIMIT: usize = 10_000_000; // 10M hard cap
 
                 if let Some(limit) = req.event_limit {
-                    if limit == 0 {
-                        return Err(crate::Error::Frida("Event limit must be > 0".into()));
-                    }
-                    if limit > MAX_EVENT_LIMIT {
+                    if limit == 0 || limit > MAX_EVENT_LIMIT {
                         return Err(crate::Error::Frida(format!(
-                            "Event limit {} exceeds maximum allowed ({})",
-                            limit, MAX_EVENT_LIMIT
+                            "Event limit must be between 1 and {}",
+                            MAX_EVENT_LIMIT
                         )));
                     }
                     self.session_manager.set_event_limit(session_id, limit);
@@ -727,15 +767,19 @@ Validation Limits (enforced):
                             let mut frida_watches = vec![];
                             let mut state_watches = vec![];
 
-                            const MAX_WATCH_EXPR_LEN: usize = 256;
-                            const MAX_DEREF_DEPTH: usize = 4;
-                            const MAX_WATCHES_PER_SESSION: usize = 32;
+                            use crate::mcp::{MAX_WATCH_EXPRESSION_LENGTH as MAX_WATCH_EXPR_LEN, MAX_WATCH_EXPRESSION_DEPTH as MAX_DEREF_DEPTH, MAX_WATCHES_PER_SESSION};
+
+                            // Get existing watches to check cumulative limit
+                            let existing_watches = self.session_manager.get_watches(session_id);
 
                             for watch_target in add_watches {
-                                // Check watch count limit
-                                if frida_watches.len() >= MAX_WATCHES_PER_SESSION {
+                                // Check cumulative watch count limit (existing + new)
+                                let total_watch_count = existing_watches.len() + frida_watches.len();
+                                if total_watch_count >= MAX_WATCHES_PER_SESSION {
                                     watch_warnings.push(format!(
-                                        "Watch limit reached ({} max). Additional watches ignored.",
+                                        "Watch limit reached ({} existing + {} new >= {} max). Additional watches ignored.",
+                                        existing_watches.len(),
+                                        frida_watches.len(),
                                         MAX_WATCHES_PER_SESSION
                                     ));
                                     break;
@@ -775,7 +819,6 @@ Validation Limits (enforced):
                                 // Pass pattern strings to agent for runtime matching
                                 // Agent will match these patterns against installed hook names
                                 // and build the funcId set dynamically
-                                let on_func_ids: Option<Vec<u32>> = None; // Not used anymore
                                 let on_patterns = watch_target.on.clone();
 
                                 let label = watch_target.label.as_ref().unwrap_or(&recipe.label).clone();
@@ -797,7 +840,6 @@ Validation Limits (enforced):
                                     deref_depth: recipe.deref_chain.len() as u8,
                                     deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
                                     type_name: recipe.type_name.clone(),
-                                    on_func_ids: on_func_ids.clone(),
                                     on_patterns: on_patterns.clone(),
                                 });
 
@@ -831,6 +873,31 @@ Validation Limits (enforced):
                                 self.session_manager.set_watches(session_id, state_watches);
                             }
                         }
+                    }
+
+                    // Handle watch removal
+                    if let Some(ref remove_labels) = watch_update.remove {
+                        // Remove watches from session state
+                        let remaining_watches = self.session_manager.remove_watches(session_id, remove_labels);
+
+                        // Send updated watch list to Frida agent
+                        let frida_watches: Vec<crate::frida_collector::WatchTarget> = remaining_watches.iter().map(|w| {
+                            crate::frida_collector::WatchTarget {
+                                label: w.label.clone(),
+                                address: w.address,
+                                size: w.size,
+                                type_kind_str: w.type_kind_str.clone(),
+                                deref_depth: w.deref_depth,
+                                deref_offset: w.deref_offset,
+                                type_name: w.type_name.clone(),
+                                on_patterns: w.on_patterns.clone(),
+                            }
+                        }).collect();
+
+                        // Update agent with remaining watches (empty list if all removed)
+                        self.session_manager.update_frida_watches(session_id, frida_watches).await?;
+
+                        watch_warnings.push(format!("Removed {} watch(es)", remove_labels.len()));
                     }
                 }
 
@@ -903,6 +970,11 @@ Validation Limits (enforced):
             if let Some(ref sf) = req.source_file {
                 if let Some(ref contains) = sf.contains {
                     q = q.source_file_contains(contains);
+                }
+            }
+            if let Some(ref tn) = req.thread_name {
+                if let Some(ref contains) = tn.contains {
+                    q = q.thread_name_contains(contains);
                 }
             }
             q.limit(limit).offset(offset)
@@ -987,6 +1059,16 @@ Validation Limits (enforced):
 
         let events_collected = self.session_manager.stop_session(&req.session_id)?;
 
+        // Mark session as retained if requested
+        if req.retain.unwrap_or(false) {
+            self.session_manager.db().mark_session_retained(&req.session_id)?;
+            // Enforce global size limit
+            let deleted = self.session_manager.db().enforce_global_size_limit()?;
+            if deleted > 0 {
+                tracing::info!("Deleted {} old retained sessions to enforce 10GB limit", deleted);
+            }
+        }
+
         // Remove from connection tracking so disconnect cleanup doesn't try to stop it again
         {
             let mut sessions = self.connection_sessions.write().await;
@@ -1001,6 +1083,50 @@ Validation Limits (enforced):
         };
 
         Ok(serde_json::to_value(response)?)
+    }
+
+    async fn tool_debug_list_sessions(&self) -> Result<serde_json::Value> {
+        let sessions = self.session_manager.db().list_retained_sessions()?;
+
+        let session_list: Vec<serde_json::Value> = sessions.iter().map(|s| {
+            serde_json::json!({
+                "sessionId": s.id,
+                "binaryPath": s.binary_path,
+                "pid": s.pid,
+                "startedAt": s.started_at,
+                "endedAt": s.ended_at,
+                "status": s.status.as_str(),
+                "retainedAt": s.retained_at,
+                "sizeBytes": s.size_bytes,
+            })
+        }).collect();
+
+        Ok(serde_json::json!({
+            "sessions": session_list,
+            "totalSize": self.session_manager.db().calculate_total_size()?,
+        }))
+    }
+
+    async fn tool_debug_delete_session(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: DebugStopRequest = serde_json::from_value(args.clone())?;
+
+        // Verify session exists and is retained
+        let session = self.session_manager.get_session(&req.session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
+
+        if !session.retained {
+            return Err(crate::Error::Frida(
+                format!("Session {} is not retained and cannot be manually deleted", req.session_id)
+            ));
+        }
+
+        // Delete the session
+        self.session_manager.db().delete_session(&req.session_id)?;
+
+        Ok(serde_json::json!({
+            "success": true,
+            "deletedSessionId": req.session_id,
+        }))
     }
 }
 

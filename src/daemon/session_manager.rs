@@ -362,6 +362,7 @@ impl SessionManager {
         session_id: &str,
         add: Option<&[String]>,
         remove: Option<&[String]>,
+        serialization_depth: Option<u32>,
     ) -> Result<HookResult> {
         let mut guard = self.frida_spawner.write().await;
         let spawner = match guard.as_mut() {
@@ -370,7 +371,7 @@ impl SessionManager {
         };
 
         if let Some(patterns) = add {
-            return spawner.add_patterns(session_id, patterns).await;
+            return spawner.add_patterns(session_id, patterns, serialization_depth).await;
         }
 
         if let Some(patterns) = remove {
@@ -410,6 +411,17 @@ impl SessionManager {
             .write()
             .unwrap()
             .insert(session_id.to_string(), watches);
+    }
+
+    /// Remove watches by label, returning the remaining watches
+    pub fn remove_watches(&self, session_id: &str, labels: &[String]) -> Vec<ActiveWatchState> {
+        let mut watches_map = self.watches.write().unwrap();
+        if let Some(watches) = watches_map.get_mut(session_id) {
+            watches.retain(|w| !labels.contains(&w.label));
+            watches.clone()
+        } else {
+            vec![]
+        }
     }
 
     /// Get active watches for a session

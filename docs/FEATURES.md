@@ -149,10 +149,12 @@ This is much faster than trying to guess the right trace patterns upfront, and a
 ### Features
 
 #### Configurable Serialization Depth
-- Adjust depth per trace pattern via `debug_trace`
-- `depth: 2` for nested struct inspection
-- Cycle detection with `<circular ref>` markers
-- Per-pattern depth overrides
+- `serializationDepth` parameter in `debug_trace` (1-10, default: 3)
+- Recursive object inspection via `ObjectSerializer` — follows pointers, serializes structs/arrays
+- Circular reference detection with `<circular ref to 0x...>` markers
+- Depth limiting with `<max depth N reached>` markers
+- Arrays capped at 100 elements
+- Flow: API → daemon → spawner → agent (via hooks message)
 
 #### Multi-Threading Support
 - Thread name capture (when available)
@@ -378,91 +380,346 @@ Non-technical user can:
 
 ## Phase 4: UI Observation
 
-**Goal:** LLM can see the current state of GUI applications.
+**Goal:** LLM can see the current state of GUI applications with zero-latency reads.
+
+### Core Insight: Always-Hot Tree
+
+The traditional agent-UI loop is slow: agent requests tree → system computes tree → agent receives → agent decides → agent acts. Every step is a blocking round-trip. Strobe inverts this into a **push model**: the UI tree is continuously maintained in the background, always fresh, always ready. When the LLM calls `debug_ui_tree`, it reads from memory — sub-millisecond response, no computation.
+
+This transforms a 4-step UI interaction from ~8s (4 round-trips with tree computation) to ~2s (4 instant reads + action execution). The difference between "painful" and "usable."
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Always-Hot Tree                     │
+│                                                     │
+│  ┌──────────────┐    ┌──────────────┐               │
+│  │ AXUIElement   │    │ AI Vision    │               │
+│  │ (structured)  │    │ (screenshot) │               │
+│  └──────┬───────┘    └──────┬───────┘               │
+│         │                   │                        │
+│         └───────┬───────────┘                        │
+│                 ▼                                    │
+│        ┌────────────────┐                            │
+│        │  Unified Tree   │ ← in-memory, always fresh │
+│        │  (merged view)  │                            │
+│        └────────┬───────┘                            │
+│                 │                                    │
+│    ┌────────────┼────────────┐                       │
+│    ▼            ▼            ▼                       │
+│  MCP tool    MCP resource   Instrumentation          │
+│  (on-demand) (push/notify)  correlation              │
+└─────────────────────────────────────────────────────┘
+```
+
+**Background observer** runs on a dedicated thread:
+1. Polls native accessibility tree every 100-200ms
+2. Captures screenshot at same cadence (or on detected change)
+3. Runs AI vision pipeline on screenshot
+4. Merges both sources into unified tree
+5. Diffs against previous snapshot — marks changed regions
+6. Stores current tree in shared memory
+
+**The LLM sees one flat, compact tree** — it doesn't know or care whether an element came from AX or vision.
 
 ### Features
 
 #### Screenshot Capture
-- Capture on demand (PNG format)
-- Configurable resolution
+- Continuous background capture (100-200ms cadence)
+- On-demand high-resolution capture (PNG format)
 - Capture specific window or full screen
+- Change detection: skip AI pipeline if screenshot unchanged (perceptual hash)
 
-#### Accessibility Tree
+#### Native Accessibility Layer
+
+Native accessibility APIs provide structured, labeled elements — fast and reliable when available.
+
 - Structured representation of all UI elements
 - Element roles (button, textfield, list, menu, etc.)
 - Accessible names and values
 - Bounding boxes for element location
 - Available actions per element
 
-The accessibility tree is critical - it gives the LLM a semantic understanding of the UI, not just pixels.
+#### AI Vision Layer
+
+Native accessibility APIs (AXUIElement, AT-SPI2, UI Automation) only work when the application exposes proper accessibility info. Many native C++ apps — especially JUCE-based audio software with custom-painted UIs, OpenGL surfaces, or game engines — expose partial or empty trees.
+
+For these cases, Strobe runs a two-level AI vision pipeline on every captured screenshot:
+
+**Level 1: YOLO Detection (~5ms GPU, ~30ms CPU)**
+- OmniParser V2's fine-tuned YOLOv8 icon detection model (or YOLO11/YOLO26)
+- Detects all interactable elements as bounding boxes
+- Export to CoreML for Apple Silicon Neural Engine inference
+- No captioning overhead — detection only
+
+**Level 2: Element Classification**
+- *Known widgets* → SigLIP/CLIP zero-shot classification against a fixed label set (~2ms GPU)
+  - Labels: button, slider, knob, text field, dropdown, toggle, checkbox, menu, icon, label
+  - Returns: `{ bbox: [...], label: "slider", confidence: 0.94 }`
+- *Unknown/ambiguous elements* → FastVLM 0.5B short caption (~30-50ms on Neural Engine)
+  - Returns: `{ bbox: [...], caption: "circular knob showing value 42%" }`
+
+#### Tree Merge Strategy
+
+1. Query native accessibility tree (roles, names, actions, bounding boxes)
+2. Run YOLO detection on screenshot (bounding boxes)
+3. Match detected boxes to accessibility nodes by IoU overlap (threshold: 0.5)
+4. Unmatched boxes → classify with SigLIP, caption with FastVLM if ambiguous
+5. Produce unified tree: native nodes enriched with visual bounding boxes, plus AI-detected nodes for custom widgets
+6. Assign stable IDs to all elements (persistent across frames when possible)
+7. Mark elements with `source: "native" | "vision" | "merged"` for transparency
+
+**Target latency per frame:** <60ms total (native a11y + YOLO + SigLIP classification)
+
+#### Compact Tree Representation
+
+The tree must be small enough to fit in LLM context. Raw accessibility trees can have thousands of nodes. Strobe projects to a compact format:
+
+```
+[window "ERAE MK2 Simulator" id=w1]
+  [toolbar id=tb1]
+    [button "Play" id=btn_play enabled]
+    [button "Stop" id=btn_stop disabled]
+    [slider "Volume" value=0.75 id=sld_vol]
+  [panel "Main" id=p1]
+    [knob "Filter Cutoff" value≈0.6 id=vk_3 source=vision]
+    [knob "Resonance" value≈0.3 id=vk_4 source=vision]
+    [list "Presets" id=lst_presets loading]
+      [item "Default" id=pr_1]
+      [item "Bass Heavy" id=pr_2]
+```
+
+Key properties per element: **role**, **label**, **value**, **id** (stable), **enabled/disabled**, **loading** (dynamic state), **source** (native/vision). Bounding boxes omitted by default (available via verbose mode).
+
+#### Dynamic State Detection
+
+Some UI elements are in transitional states (loading spinners, animations, progress bars). Strobe detects these via:
+
+- AX role `BusyIndicator` or `ProgressIndicator` → mark parent as `loading`
+- Tree region that changed in last N consecutive frames → mark as `dynamic`
+- Vision-detected spinning/pulsing elements (motion between consecutive screenshots)
+- App-specific hooks via Frida instrumentation (e.g., hook `setLoading(bool)` → annotate tree node)
+
+#### Instrumentation Correlation
+
+Strobe's unique advantage: it knows program internals, not just pixels.
+
+- Vision detects "knob at position (200, 300) with value ≈ 0.6"
+- Instrumentation detects `setFilterCutoff(0.6)` was called
+- → Strobe **knows** that visual knob = filter cutoff, with exact value from runtime
+- This feedback loop provides ground truth that pure vision approaches lack
+- Correlation stored in tree: `[knob "Filter Cutoff" value=0.6 linked=setFilterCutoff id=vk_3]`
+
+#### Models
+
+| Role | Model | Size | Latency | Hardware |
+|------|-------|------|---------|----------|
+| Detection | YOLOv8 (OmniParser weights) | ~6MB | ~5ms | CoreML / Neural Engine |
+| Classification | SigLIP 2 | ~400MB | ~2ms/crop | CoreML / GPU |
+| Captioning (fallback) | FastVLM 0.5B | ~500MB | ~30-50ms | CoreML / Neural Engine |
+| Captioning (full) | Florence-2 / OmniParser V2 | ~1.5GB | ~500ms | GPU (CUDA) |
+
+FastVLM (Apple, CVPR 2025) is the preferred captioning model — designed for Apple Silicon with CoreML export and 85x faster TTFT than comparable VLMs.
+
+### MCP Interface
+
+```
+debug_ui_tree(sessionId)
+  → Returns current unified tree (instant — reads from memory)
+  → Options: verbose (include bounding boxes), depth (max tree depth)
+
+debug_ui_screenshot(sessionId)
+  → Returns latest screenshot (PNG, already captured)
+  → Options: high_res (trigger fresh high-res capture)
+
+debug_ui_watch(sessionId, elementId)
+  → Subscribe to changes on a specific element
+  → Returns diff when element value/state changes
+```
 
 ### Platform Support
 
-| Platform | Screenshot | Accessibility |
-|----------|-----------|---------------|
-| Linux (X11) | XGetImage | AT-SPI2 |
-| macOS | CGWindowListCreateImage | AXUIElement |
-| Windows | DXGI duplication | UI Automation |
+| Platform | Screenshot | Accessibility | AI Vision |
+|----------|-----------|---------------|-----------|
+| Linux (X11) | XGetImage | AT-SPI2 | YOLO + SigLIP (ONNX/TensorRT) |
+| macOS | CGWindowListCreateImage | AXUIElement | YOLO + SigLIP + FastVLM (CoreML) |
+| Windows | DXGI duplication | UI Automation | YOLO + SigLIP (ONNX/TensorRT) |
 
 ### Validation Criteria
 
-LLM can observe GUI state:
-1. LLM launches GUI app
-2. LLM captures screenshot + accessibility tree
-3. LLM describes what it sees ("Login form with username/password fields and Submit button")
-4. LLM correlates UI state with execution traces
+LLM can observe GUI state with zero-latency reads:
+1. LLM launches GUI app via `debug_launch`
+2. LLM calls `debug_ui_tree` → gets unified tree **instantly** (no computation wait)
+3. LLM reads tree and describes what it sees ("Audio plugin with 3 knobs, a preset list loading, and Play/Stop buttons")
+4. LLM identifies custom-painted widgets missed by native accessibility (e.g. JUCE knobs detected by AI vision)
+5. LLM correlates UI element values with runtime function calls (knob value matches `setFilterCutoff(0.6)`)
+6. Tree updates in background — next `debug_ui_tree` call reflects new state without delay
 
 ---
 
 ## Phase 5: UI Interaction
 
-**Goal:** LLM can control GUI applications autonomously.
+**Goal:** LLM can control GUI applications through intent-based actions, with an intelligent action layer that handles complex motor plans.
 
-This is a killer feature for autonomous debugging. The LLM doesn't just observe - it can reproduce bugs without human help.
+This is a killer feature for autonomous debugging. The LLM doesn't just observe — it can reproduce bugs, test UI flows, and interact with complex custom widgets without human help.
+
+### Core Insight: Intent-Based Actions + Intelligent Motor Layer
+
+The LLM should express **what** it wants, not **how** to physically do it. "Set the filter cutoff knob to 0.8" is an intent. The motor layer figures out whether that means a vertical drag, circular drag, double-click-and-type, or scroll — based on the widget type and learned interaction model.
+
+```
+┌──────────────────────────────────────────────────┐
+│                  LLM Intent                       │
+│         "set_value(id=vk_3, value=0.8)"          │
+└──────────────────┬───────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────┐
+│            Intelligent Action Layer               │
+│                                                  │
+│  1. Look up element vk_3 in unified tree          │
+│  2. Determine widget type: knob (from vision)     │
+│  3. Select motor strategy: vertical drag          │
+│     (from widget profile or learned behavior)     │
+│  4. Calculate drag vector: center, current→target │
+│  5. Execute: mouseDown → mouseDrag → mouseUp     │
+│  6. Verify: re-read tree, check value changed     │
+│  7. Adjust if needed (closed-loop correction)     │
+└──────────────────┬───────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────┐
+│          Platform Input Layer (CGEvent)           │
+└──────────────────────────────────────────────────┘
+```
 
 ### Features
 
-#### Click
-- Target by accessible name or coordinates
-- Single click, double click
+#### Intent-Based Action API
 
-#### Type
-- Type text into focused element or targeted field
-- Supports Unicode
+The LLM uses high-level intents. Element targeting uses stable IDs from the unified tree (Phase 4).
 
-#### Scroll
-- Scroll by direction and pixel amount
-- Target specific scrollable containers
+```
+debug_ui_action(sessionId, action)
 
-#### Drag
-- Drag from one coordinate to another
-- For sliders, reordering, etc.
+Actions:
+  click(id="btn_play")                          → single click on element
+  click(id="btn_play", count=2)                 → double click
+  set_value(id="sld_vol", value=0.5)            → set slider/knob to value
+  type(id="txt_name", text="hello")             → type into field
+  type(text="hello")                            → type into focused element
+  select(id="lst_presets", item="Bass Heavy")   → select list item
+  scroll(id="lst_presets", direction="down", amount=3)
+  drag(from="track_1", to="slot_3")             → drag and drop
+  key(key="Enter")                              → press key
+  key(key="s", modifiers=["cmd"])               → keyboard shortcut
+  move_to(id="player", position={x:100, y:200}) → game character / spatial
+```
 
-#### Key Press
-- Single keys or modifier combinations (Ctrl+S, Alt+Tab)
-- Special keys (Enter, Escape, arrows)
+The LLM never needs to know pixel coordinates, drag directions, or hold durations. It just says what it wants.
 
-### Platform Support
+#### Intelligent Motor Layer
 
-| Platform | Click | Type | Scroll | Drag | Keys |
-|----------|-------|------|--------|------|------|
-| Linux (X11) | XTest | XTest | XTest | XTest | XTest |
-| macOS | CGEvent | CGEvent | CGEvent | CGEvent | CGEvent |
-| Windows | SendInput | SendInput | SendInput | SendInput | SendInput |
+Different widgets require different physical interactions. The motor layer maps intents to motor plans:
+
+**Widget Profiles** — known interaction models for common widget types:
+
+| Widget Type | Motor Strategy | Parameters |
+|-------------|---------------|------------|
+| Button | Click center of bbox | - |
+| Slider (horizontal) | Drag handle to proportional X | min/max position from bbox |
+| Slider (vertical) | Drag handle to proportional Y | min/max position from bbox |
+| Knob (vertical-drag) | Drag up/down from center | sensitivity from widget profile |
+| Knob (circular) | Drag in arc from current angle | center, radius, angle range |
+| Text field | Click to focus, then type | - |
+| Dropdown | Click to open, click item | - |
+| Toggle/Checkbox | Click center | - |
+| List item | Click, or double-click to activate | - |
+
+**Profile sources** (in priority order):
+1. **Native accessibility actions** — if AX says "increment/decrement" exists, use that
+2. **Known toolkit profiles** — JUCE knobs use vertical drag, Unity sliders use horizontal drag, etc.
+3. **Learned behavior** — probe the widget: small drag, observe value change, infer interaction model
+4. **Fallback** — try vertical drag (most common for knobs), then circular, then click-and-type
+
+**Probing** (for unknown widgets):
+1. Record current value from tree
+2. Execute small test interaction (5px vertical drag from center)
+3. Re-read tree, check if value changed
+4. If yes → learned the interaction model (direction, sensitivity)
+5. If no → try next strategy (horizontal drag, circular, etc.)
+6. Cache learned profile for this widget type
+
+#### Closed-Loop Verification
+
+Every action is verified:
+1. Execute motor plan
+2. Wait for tree update (background observer captures new state)
+3. Compare element value to expected result
+4. If mismatch → adjust and retry (up to 3 attempts)
+5. Report success/failure to LLM
+
+This is where **instrumentation correlation** (Phase 4) shines: Strobe doesn't just check pixels — it can verify that `setFilterCutoff()` was actually called with the expected value.
+
+#### Complex Interaction Sequences
+
+Some interactions require coordinated multi-step motor plans:
+
+- **Game character movement**: Hold WASD keys for duration, or click-to-move path
+- **Drawing/painting**: Bezier curve mouse paths with pressure (if supported)
+- **Multi-touch gestures**: Pinch, rotate, swipe (via accessibility actions or simulated touch events)
+- **Menu navigation**: Click menu → wait for submenu → click item (with timing)
+- **Drag-and-drop with scroll**: Drag to edge → auto-scroll → drop at target
+
+These are composed from primitive motor actions but require timing, sequencing, and state awareness.
+
+#### Platform Input Primitives
+
+Low-level input injection, used by the motor layer (not directly by the LLM):
+
+| Primitive | macOS | Linux (X11) | Windows |
+|-----------|-------|-------------|---------|
+| Mouse move | CGEvent | XTest | SendInput |
+| Mouse click | CGEvent | XTest | SendInput |
+| Mouse drag | CGEvent sequence | XTest sequence | SendInput sequence |
+| Key press | CGEvent | XTest | SendInput |
+| Key hold/release | CGEvent | XTest | SendInput |
+| Scroll | CGEvent | XTest | SendInput |
+
+### MCP Interface
+
+```
+debug_ui_action(sessionId, action)
+  → Executes intent-based action
+  → Returns: { success: bool, element: updated_state, verified: bool }
+
+debug_ui_action_batch(sessionId, actions[])
+  → Execute sequence of actions with inter-action delays
+  → Returns: per-action results
+
+debug_ui_probe(sessionId, elementId)
+  → Probe an unknown widget to learn its interaction model
+  → Returns: { widgetType, motorStrategy, sensitivity }
+```
 
 ### Validation Criteria
 
-Fully autonomous bug reproduction:
-1. User: "There's a bug when I log in and go to Settings"
-2. LLM launches app
-3. LLM captures UI, sees login screen
-4. LLM types username/password, clicks Login
-5. LLM captures UI, sees dashboard
-6. LLM clicks Settings
-7. LLM captures UI, sees the bug
-8. LLM correlates with traces, identifies root cause
+**Fully autonomous bug reproduction with complex UI:**
+1. User: "There's a bug when I set filter cutoff above 0.9 and then switch presets"
+2. LLM launches app via `debug_launch`
+3. LLM reads `debug_ui_tree` → sees knobs (vision-detected), preset list (native AX)
+4. LLM: `set_value(id="vk_3", value=0.95)` → motor layer drags knob, verifies via instrumentation
+5. LLM: `select(id="lst_presets", item="Bass Heavy")` → clicks list item
+6. LLM reads `debug_ui_tree` → sees the bug (UI glitch, wrong values)
+7. LLM correlates with function traces → identifies root cause in preset loading code
 
-**No human touched the app. LLM did everything.**
+**No human touched the app. LLM handled knob rotation, list selection, and bug correlation autonomously.**
+
+**Game/spatial interaction:**
+1. LLM launches game, reads tree
+2. LLM: `move_to(id="player", position={x:100, y:200})` → motor layer holds WASD keys
+3. LLM: `click(id="door")` → opens door
+4. LLM reads tree → verifies new room loaded
+5. LLM traces `loadLevel()` → confirms correct level transition
 
 ---
 

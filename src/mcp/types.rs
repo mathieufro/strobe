@@ -45,6 +45,9 @@ pub struct DebugTraceRequest {
     /// Maximum events to keep for this session (default: 200,000)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_limit: Option<usize>,
+    /// Maximum depth for recursive argument serialization (default: 3, max: 10)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serialization_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,8 +117,8 @@ pub struct DebugTraceResponse {
 // Validation limits
 pub const MAX_EVENT_LIMIT: usize = 10_000_000;
 pub const MAX_WATCHES_PER_SESSION: usize = 32;
-pub const MAX_WATCH_EXPRESSION_LENGTH: usize = 1024;
-pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 10;
+pub const MAX_WATCH_EXPRESSION_LENGTH: usize = 256;
+pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 4;
 
 impl DebugTraceRequest {
     /// Validate request parameters against limits
@@ -125,6 +128,15 @@ impl DebugTraceRequest {
             if limit > MAX_EVENT_LIMIT {
                 return Err(crate::Error::ValidationError(
                     format!("event_limit ({}) exceeds maximum of {}", limit, MAX_EVENT_LIMIT)
+                ));
+            }
+        }
+
+        // Validate serialization depth
+        if let Some(depth) = self.serialization_depth {
+            if depth < 1 || depth > 10 {
+                return Err(crate::Error::ValidationError(
+                    "serialization_depth must be between 1 and 10".to_string()
                 ));
             }
         }
@@ -227,6 +239,13 @@ pub struct ReturnValueFilter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ThreadNameFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DebugQueryRequest {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +256,8 @@ pub struct DebugQueryRequest {
     pub source_file: Option<SourceFileFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_value: Option<ReturnValueFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_name: Option<ThreadNameFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,6 +280,8 @@ pub struct DebugQueryResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DebugStopRequest {
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retain: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

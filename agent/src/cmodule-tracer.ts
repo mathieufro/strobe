@@ -7,11 +7,16 @@
  * daemon via send().
  */
 
+import { ObjectSerializer, TypeInfo } from './object-serializer.js';
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 export type HookMode = 'full' | 'light';
+
+/** Callback for per-function rate checking. Returns true if the event should be recorded. */
+export type RateCheckFn = (funcId: number) => boolean;
 
 export interface FunctionTarget {
   address: string;
@@ -26,6 +31,7 @@ interface TraceEvent {
   sessionId: string;
   timestampNs: number;
   threadId: number;
+  threadName?: string | null;
   parentEventId: string | null;
   eventType: 'function_enter' | 'function_exit';
   functionName: string;
@@ -290,6 +296,15 @@ export class CModuleTracer {
     onFuncIds: Set<number>;
   }> = [];
 
+  // Object serializer for deep argument inspection
+  private objectSerializer: ObjectSerializer | null = null;
+
+  // Rate check callback for hot function detection
+  private rateCheck: RateCheckFn | null = null;
+
+  // Thread name cache: threadId -> name
+  private threadNames: Map<number, string | null> = new Map();
+
   constructor(onEvents: (events: any[]) => void) {
     this.onEvents = onEvents;
 
@@ -369,6 +384,15 @@ export class CModuleTracer {
 
   setSessionId(sessionId: string): void {
     this.sessionId = sessionId;
+  }
+
+  setSerializationDepth(depth: number): void {
+    const clamped = Math.max(1, Math.min(depth, 10));
+    this.objectSerializer = new ObjectSerializer(clamped);
+  }
+
+  setRateCheck(fn: RateCheckFn): void {
+    this.rateCheck = fn;
   }
 
   installHook(func: FunctionTarget, mode: HookMode = 'full'): boolean {
@@ -631,6 +655,28 @@ export class CModuleTracer {
       const func = this.funcRegistry.get(funcId);
       if (!func) continue;
 
+      // Hot function detection: check if this call should be recorded
+      if (this.rateCheck) {
+        const shouldRecord = this.rateCheck(funcId);
+        if (!shouldRecord) continue;
+      }
+
+      // Resolve thread name (cached)
+      let threadName: string | null | undefined;
+      if (this.threadNames.has(threadId)) {
+        threadName = this.threadNames.get(threadId);
+      } else {
+        try {
+          const found = Process.enumerateThreads()
+            .find(t => t.id === threadId)?.name || null;
+          this.threadNames.set(threadId, found);
+          threadName = found;
+        } catch {
+          threadName = null;
+          this.threadNames.set(threadId, null);
+        }
+      }
+
       const eventId = this.generateEventId();
       const timestampNs = Math.round(timestamp * this.ticksToNs);
 
@@ -659,16 +705,14 @@ export class CModuleTracer {
           sessionId: this.sessionId,
           timestampNs,
           threadId,
+          threadName,
           parentEventId,
           eventType: 'function_enter',
           functionName: func.name,
           functionNameRaw: func.nameRaw,
           sourceFile: func.sourceFile,
           lineNumber: func.lineNumber,
-          arguments: [
-            '0x' + arg0.toString(16),
-            '0x' + arg1.toString(16),
-          ],
+          arguments: this.serializeArguments(arg0, arg1),
         };
         if (sampled) event.sampled = true;
 
@@ -720,6 +764,7 @@ export class CModuleTracer {
           sessionId: this.sessionId,
           timestampNs,
           threadId,
+          threadName,
           parentEventId,
           eventType: 'function_exit',
           functionName: func.name,
@@ -803,6 +848,31 @@ export class CModuleTracer {
       return n;
     }
     return raw.toNumber();
+  }
+
+  private serializeArguments(arg0: UInt64, arg1: UInt64): string[] {
+    if (!this.objectSerializer) {
+      return ['0x' + arg0.toString(16), '0x' + arg1.toString(16)];
+    }
+
+    const results: string[] = [];
+    for (const rawArg of [arg0, arg1]) {
+      const addr = ptr(rawArg.toString());
+      // Without DWARF type info for arguments, treat as generic pointer
+      const typeInfo: TypeInfo = {
+        typeKind: 'pointer',
+        byteSize: 8,
+        typeName: 'void*',
+      };
+      try {
+        const serialized = this.objectSerializer.serialize(addr, typeInfo);
+        results.push(typeof serialized === 'string' ? serialized : JSON.stringify(serialized));
+      } catch (e) {
+        results.push('0x' + rawArg.toString(16));
+      }
+      this.objectSerializer.reset();
+    }
+    return results;
   }
 
   private generateEventId(): string {

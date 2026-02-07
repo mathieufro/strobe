@@ -1,4 +1,4 @@
-import { CModuleTracer, HookMode } from './cmodule-tracer.js';
+import { CModuleTracer, HookMode, type RateCheckFn } from './cmodule-tracer.js';
 
 interface FunctionTarget {
   address: string;
@@ -39,6 +39,14 @@ export class HookInstaller {
 
   removeAll(): void {
     this.tracer.removeAll();
+  }
+
+  setSerializationDepth(depth: number): void {
+    this.tracer.setSerializationDepth(depth);
+  }
+
+  setRateCheck(fn: RateCheckFn): void {
+    this.tracer.setRateCheck(fn);
   }
 
   updateWatches(watches: Parameters<CModuleTracer['updateWatches']>[0]): void {

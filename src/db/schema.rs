@@ -86,6 +86,18 @@ impl Database {
             Err(e) => return Err(e.into()),
         }
 
+        // Add retention columns to sessions (idempotent for existing DBs)
+        match conn.execute("ALTER TABLE sessions ADD COLUMN retained_at INTEGER", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+        match conn.execute("ALTER TABLE sessions ADD COLUMN size_bytes INTEGER", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+
         // Create indexes
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_time ON events(session_id, timestamp_ns)",

@@ -394,6 +394,7 @@ enum FridaCommand {
         functions: Vec<FunctionTarget>,
         image_base: u64,
         mode: HookMode,
+        serialization_depth: Option<u32>,
         response: oneshot::Sender<Result<u32>>,
     },
     RemovePatterns {
@@ -421,7 +422,6 @@ pub struct WatchTarget {
     pub deref_depth: u8,
     pub deref_offset: u64,
     pub type_name: Option<String>,
-    pub on_func_ids: Option<Vec<u32>>,
     pub on_patterns: Option<Vec<String>>,
 }
 
@@ -673,6 +673,7 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                 functions,
                 image_base,
                 mode,
+                serialization_depth,
                 response,
             } => {
                 tracing::info!("AddPatterns: {} functions ({:?} mode) for session {}", functions.len(), mode, session_id);
@@ -704,13 +705,16 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                         HookMode::Light => "light",
                     };
 
-                    let hooks_msg = serde_json::json!({
+                    let mut hooks_msg = serde_json::json!({
                         "type": "hooks",
                         "action": "add",
                         "functions": func_list,
                         "imageBase": format!("0x{:x}", image_base),
                         "mode": mode_str,
                     });
+                    if let Some(depth) = serialization_depth {
+                        hooks_msg["serializationDepth"] = serde_json::json!(depth);
+                    }
 
                     unsafe {
                         post_message_raw(session.script_ptr, &serde_json::to_string(&hooks_msg).unwrap())
@@ -790,7 +794,6 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                             "derefDepth": w.deref_depth,
                             "derefOffset": w.deref_offset,
                             "typeName": w.type_name,
-                            "onFuncIds": w.on_func_ids,
                             "onPatterns": w.on_patterns,
                         })
                     }).collect();
@@ -996,7 +999,7 @@ impl FridaSpawner {
         Ok(pid)
     }
 
-    pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String]) -> Result<HookResult> {
+    pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String], serialization_depth: Option<u32>) -> Result<HookResult> {
         let session = self.sessions.get_mut(session_id)
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
@@ -1044,9 +1047,11 @@ impl FridaSpawner {
         let image_base = session.image_base;
         let mut total_hooks = 0u32;
 
-        // Send full-mode chunks
+        // Send full-mode chunks (pass serialization_depth only on first chunk)
+        let mut depth_sent = false;
         for chunk in full_funcs.chunks(CHUNK_SIZE) {
-            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Full).await {
+            let depth = if !depth_sent { depth_sent = true; serialization_depth } else { None };
+            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Full, depth).await {
                 Ok(count) => total_hooks += count,
                 Err(e) => {
                     warnings.push(format!("Hook installation error: {}", e));
@@ -1057,7 +1062,8 @@ impl FridaSpawner {
 
         // Send light-mode chunks
         for chunk in light_funcs.chunks(CHUNK_SIZE) {
-            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Light).await {
+            let depth = if !depth_sent { depth_sent = true; serialization_depth } else { None };
+            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Light, depth).await {
                 Ok(count) => total_hooks += count,
                 Err(e) => {
                     warnings.push(format!("Hook installation error: {}", e));
@@ -1075,6 +1081,7 @@ impl FridaSpawner {
         functions: Vec<FunctionTarget>,
         image_base: u64,
         mode: HookMode,
+        serialization_depth: Option<u32>,
     ) -> Result<u32> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -1083,6 +1090,7 @@ impl FridaSpawner {
             functions,
             image_base,
             mode,
+            serialization_depth,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Worker thread died".to_string()))?;
 

@@ -153,12 +153,20 @@ impl EventQuery {
         self.offset = n;
         self
     }
+
+    pub fn thread_name_contains(mut self, s: &str) -> Self {
+        self.thread_name_contains = Some(s.to_string());
+        self
+    }
 }
 
 fn escape_like_pattern(s: &str) -> String {
-    s.replace('\\', "\\\\")
-     .replace('%', "\\%")
-     .replace('_', "\\_")
+    s.chars()
+        .filter(|c| *c != '\0')
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 impl Database {
@@ -283,7 +291,9 @@ impl Database {
         }
 
         sql.push_str(" ORDER BY timestamp_ns ASC");
-        sql.push_str(&format!(" LIMIT {} OFFSET {}", query.limit, query.offset));
+        sql.push_str(" LIMIT ? OFFSET ?");
+        params_vec.push(Box::new(query.limit as i64));
+        params_vec.push(Box::new(query.offset as i64));
 
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
