@@ -242,66 +242,173 @@ Query with `eventType: "crash"` to retrieve full crash context.
 
 ## Phase 1d: Test Instrumentation
 
-**Goal:** First-class TDD workflow. Run tests, get structured failures with hints, rerun with targeted tracing.
+**Goal:** Universal, machine-readable test output for any language/framework. First-class TDD workflow where the LLM never wastes turns re-running tests to understand failures. Smart stuck detection catches deadlocks and infinite loops in ~8 seconds.
+
+**Full spec:** [specs/2026-02-07-phase-1d-test-instrumentation.md](specs/2026-02-07-phase-1d-test-instrumentation.md)
 
 ### Features
 
-#### Run Test Suite
-- Execute test command (e.g., `cargo test`)
-- Minimal/no tracing for fast feedback
-- Parse structured output
+#### Backend-Agnostic Test Adapter Architecture
 
-#### Structured Failure Output
-On test failure, return:
-- Test name, file, line number
-- Error message
-- Stack trace
-- **Suggested trace patterns** (extracted from stack, rule-based)
-- **Rerun command** for single test
+Pluggable adapter system where each adapter owns the full lifecycle: detection, command construction, output parsing, rerun commands, trace suggestions, and language-aware stack capture.
 
-#### Test Adapter Trait
 ```rust
-pub trait TestAdapter {
-    fn detect(&self, project: &Path) -> Option<Framework>;
-    fn run_command(&self, config: &TestConfig) -> String;
-    fn rerun_command(&self, test: &str) -> String;
-    fn parse_output(&self, stdout: &str, stderr: &str) -> TestResult;
+pub trait TestAdapter: Send + Sync {
+    fn detect(&self, project_root: &Path) -> u8;  // 0-100 confidence
+    fn name(&self) -> &str;
+    fn suite_command(&self, project_root: &Path, level: Option<TestLevel>, env: &HashMap<String, String>) -> TestCommand;
+    fn single_test_command(&self, project_root: &Path, test_name: &str) -> TestCommand;
+    fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult;
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String>;
+    fn capture_stacks(&self, pid: u32) -> Vec<ThreadStack>;
 }
 ```
 
-#### cargo test Adapter (Rust)
-- Detect via `Cargo.toml`
-- Use `--format json` for structured output
-- Parse JSON for failures
-- Extract module names from stack for trace hints
+Auto-detection from `projectRoot` (highest confidence wins), with explicit `framework` override as escape hatch. Falls back to `GenericAdapter` (runs command as-is, returns raw output).
 
-#### Rerun with Tracing
-- Run single test with trace patterns
-- Capture events around failure
-- Query to find root cause
+#### Smart Execution Path Switching
+
+Single `debug_test` tool, two paths chosen automatically:
+
+| Condition | Path | Overhead |
+|-----------|------|----------|
+| No `tracePatterns` or `watches` | Direct subprocess | None |
+| `tracePatterns` or `watches` present | Frida (via `debug_launch`) | ~1s |
+
+The LLM doesn't need to know which path is used — the tool returns the same structured format either way (plus `sessionId` on the Frida path for `debug_query`).
+
+#### Test Levels
+
+Explicit `level` parameter filters which tests to run and calibrates hard timeouts:
+
+| Level | Cargo | Catch2 | Hard Timeout |
+|-------|-------|--------|-------------|
+| `unit` | `cargo test --lib` | `--tag [unit]` | 30s |
+| `integration` | `cargo test --test '*'` | `--tag [integration]` | 120s |
+| `e2e` | `cargo test --test 'e2e*'` | `--tag [e2e]` | 300s |
+| omitted | all tests | all tags | 120s |
+
+#### Universal Structured Output
+
+Every adapter normalizes output into the same format — the LLM never parses raw terminal output:
+
+```json
+{
+  "framework": "cargo",
+  "summary": { "passed": 58, "failed": 2, "skipped": 1, "duration_ms": 2280 },
+  "failures": [{
+    "name": "parser::tests::test_empty_input",
+    "file": "src/parser.rs",
+    "line": 142,
+    "message": "assertion `left == right` failed...",
+    "suggested_traces": ["parser::parse", "parser::handle_empty"]
+  }],
+  "details": "/tmp/strobe/tests/abc123-2026-02-07.json"
+}
+```
+
+Minimal response for the context window. Full details (all test names, per-test stdout/stderr, raw framework output) written to temp file — LLM reads it only when needed.
+
+#### Smart Stuck Detection
+
+Multi-signal detector catches deadlocks and infinite loops in ~8 seconds, regardless of test level:
+
+| Signal | Method | Interval |
+|--------|--------|----------|
+| Output silence | Track last stdout/stderr timestamp | Continuous |
+| CPU delta | Sample process CPU time | Every 2s |
+| Stack comparison | Compare thread stacks across samples | Triggered at ~6s |
+
+**Decision matrix:**
+
+| Output | CPU | Stacks | Verdict |
+|--------|-----|--------|---------|
+| Silent | 0% | Same | **Deadlock** — capture stacks, kill, report |
+| Silent | 100% | Same | **Infinite loop** — capture stacks, kill, report |
+| Silent | 100% | Different | Legit work — wait for hard timeout |
+| Active | Any | — | Not stuck |
+
+Stack capture is language-aware (part of adapter trait): native languages use OS-level sampling, VM languages use runtime-specific tools (jstack, py-spy, etc.).
+
+Before killing, captures full thread backtraces so the LLM sees the deadlock graph directly:
+
+```json
+{
+  "stuck": [{
+    "name": "test_concurrent_access",
+    "diagnosis": "Deadlock: 0% CPU, identical stacks across 3 samples",
+    "threads": [
+      { "name": "thread-1", "stack": ["Mutex::lock (mutex.rs:45)", "db::connect (db.rs:12)"] },
+      { "name": "thread-2", "stack": ["Mutex::lock (mutex.rs:45)", "db::migrate (db.rs:88)"] }
+    ]
+  }]
+}
+```
+
+#### Built-in Adapters
+
+**CargoTestAdapter** — Auto-detected via `Cargo.toml`. Uses `--format json` for structured output. Extracts module paths from test names for trace suggestions.
+
+**Catch2Adapter** — Detected by probing binary with `--list-tests`. Uses `--reporter xml`. Requires `command` parameter (compiled binary path).
+
+**GenericAdapter** — Always available as fallback. Runs command as-is, applies regex heuristics for common patterns.
+
+#### Proactive TDD Onboarding
+
+When no tests exist, the tool returns project info instead of failing:
+
+```json
+{
+  "no_tests": true,
+  "project": { "language": "rust", "build_system": "cargo" },
+  "hint": "No tests found. Cargo projects support inline #[test] functions and a tests/ directory."
+}
+```
+
+Ships with a TDD skill that instructs the LLM to guide users toward test-first debugging when they report bugs without existing tests.
+
+#### Auto-Installation
+
+`strobe install` detects the user's coding agent (Claude Code, OpenCode, Codex) and installs MCP config + skills automatically.
 
 #### MCP Tools
-- `debug_test` - Run tests, get structured results
+- `debug_test` — Run tests, get structured results, auto-detect framework, smart stuck detection
 
 ### Context-Aware Tracing Defaults
 
 | Context | Default Tracing | Rationale |
 |---------|-----------------|-----------|
 | `debug_launch` | None (stdout/stderr only) | Output is often enough; add patterns incrementally |
-| `debug_test` (full suite) | None | Fast feedback, wait for failure |
-| `debug_test` (rerun) | Suggested patterns | Stack trace tells us what to trace |
+| `debug_test` (full suite) | None | Fast feedback via direct subprocess |
+| `debug_test` (rerun) | Suggested patterns | Stack trace tells us what to trace; uses Frida path |
 
 ### Validation Criteria
 
-**Scenario: TDD debugging workflow**
-1. LLM runs `debug_test({ command: "cargo test" })`
-2. Test fails, LLM receives structured failure with hints
-3. LLM runs `debug_test({ command: "cargo test", test: "test_name", tracePatterns: hints })`
-4. LLM queries trace events around the failure
-5. LLM identifies root cause
+**Scenario A: Fast structured feedback**
+1. LLM calls `debug_test({ projectRoot: "/path/to/project" })`
+2. Cargo adapter auto-detected, runs `cargo test --format json`
+3. Response: structured summary with failures, file:line, messages, suggested traces
+4. LLM fixes code, reruns — no turns wasted parsing output
 
-**Success:** No full suite reruns. No guessing what to trace. Failure tells LLM exactly where to look.
+**Scenario B: Stuck test detection**
+1. LLM runs integration tests, one test deadlocks
+2. Stuck detector: silence + 0% CPU + identical stacks → confirmed in ~8s
+3. Thread backtrace captured before kill
+4. LLM sees deadlock graph, identifies lock ordering issue immediately
+
+**Scenario C: Instrumented rerun**
+1. LLM gets failure with `suggested_traces`
+2. LLM calls `debug_test({ test: "test_name", tracePatterns: suggested_traces })`
+3. Frida path activates, response includes `sessionId`
+4. LLM calls `debug_query` to inspect trace events, finds root cause
+
+**Scenario D: Vibe coder onboarding**
+1. User says "I have a bug in the parser"
+2. LLM calls `debug_test` → `no_tests: true`
+3. LLM suggests creating a test that reproduces the bug first
+4. User now has a regression test they didn't know they needed
+
+**Success:** Universal structured output. No test framework lock-in. Stuck tests caught in seconds, not minutes. LLM never re-runs tests just to understand what failed.
 
 ---
 

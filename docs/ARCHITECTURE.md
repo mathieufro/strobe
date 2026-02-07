@@ -440,58 +440,69 @@ debug_stop({
 
 ### debug_test (Phase 1d)
 
-Run tests with optional tracing. Core feature for TDD workflows.
+Run tests with universal structured output. Auto-detects framework, smart stuck detection, automatic switching between direct subprocess (fast) and Frida (instrumented) paths.
 
 ```typescript
 debug_test({
-  command: string,             // e.g., "cargo test", "pytest", "npm test"
-  test?: string,               // Specific test to run (for rerun)
-  suite?: string,              // Specific suite/file
-  tracePatterns?: string[],    // Patterns to trace (default: minimal)
-  cwd?: string,
-  env?: Record<string, string>
+  projectRoot: string,          // Required. Used for adapter detection
+  framework?: string,           // Override: "cargo", "catch2"
+  level?: "unit" | "integration" | "e2e",  // Filter test level
+  test?: string,                // Run single test by name
+  command?: string,             // Binary path (required for Catch2)
+  tracePatterns?: string[],     // Presence triggers Frida path
+  watches?: Watch[],            // Presence triggers Frida path
+  env?: Record<string, string>,
+  timeout?: number              // Hard timeout ms (default per level)
 }) → {
-  passed: number,
-  failed: number,
-  skipped: number,
-  duration_ms: number,
-  failures: TestFailure[],
-  // If tracePatterns provided:
-  sessionId?: string,          // For querying trace events
-  events?: TraceEvent[]        // Captured events (if tracing enabled)
+  framework: string,
+  summary: { passed, failed, skipped, stuck?, duration_ms },
+  failures?: TestFailure[],
+  stuck?: StuckTest[],          // Deadlocks/infinite loops caught by detector
+  sessionId?: string,           // Present on Frida path (for debug_query)
+  details: string,              // Path to full details temp file
+  // When no tests exist:
+  no_tests?: boolean,
+  project?: { language, build_system },
+  hint?: string
 }
 
 interface TestFailure {
-  test: string,                // Test name
-  file: string,                // File path
-  line: number,
-  error: string,               // Error message
-  stackTrace: string[],        // Call stack
-  // Rule-based hints (no AI needed):
-  suggestedTrace: string[],    // Patterns extracted from stack trace
-  rerunCommand: string         // Command to rerun just this test
+  name: string,
+  file?: string,
+  line?: number,
+  message: string,
+  suggested_traces: string[]
+}
+
+interface StuckTest {
+  name: string,
+  elapsed_ms: number,
+  diagnosis: string,            // "Deadlock: 0% CPU, identical stacks"
+  threads: { name: string, stack: string[] }[],
+  suggested_traces: string[]
 }
 ```
 
 **Typical TDD workflow:**
 
 ```typescript
-// 1. Run full suite (minimal tracing)
-const result = await debug_test({ command: "cargo test" });
-// → 47 passed, 2 failed
+// 1. Run full suite (direct subprocess, fast)
+const result = await debug_test({ projectRoot: "/path/to/project" });
+// → Adapter auto-detected, 47 passed, 2 failed
 
-// 2. LLM sees failure, uses hints to rerun with tracing
+// 2. LLM sees failure, reruns with tracing (Frida path, automatic)
 const traced = await debug_test({
-  command: "cargo test",
-  test: result.failures[0].test,
-  tracePatterns: result.failures[0].suggestedTrace
+  projectRoot: "/path/to/project",
+  test: result.failures[0].name,
+  tracePatterns: result.failures[0].suggested_traces
 });
-// → Same failure, but now we have trace events
+// → Same failure, but now we have a sessionId
 
-// 3. LLM queries the events
+// 3. LLM queries the trace events
 const events = await debug_query({
   sessionId: traced.sessionId,
-  function: { contains: "validate" }
+  function: { contains: "validate" },
+  verbose: true
 });
 // → Found the bug
 ```
@@ -882,35 +893,57 @@ pub trait OutputChannel: Send + Sync {
 
 ### Adding a New Test Framework Adapter
 
-Test adapters parse framework output into our unified `TestFailure` schema:
+Test adapters own the full lifecycle: detection, command construction, output parsing, rerun commands, trace suggestions, and language-aware stack capture. Each adapter normalizes its framework's output into a universal structured format.
 
 ```rust
 pub trait TestAdapter: Send + Sync {
-    fn detect(&self, project_path: &Path) -> Option<DetectedFramework>;
-    fn run_command(&self, config: &TestConfig) -> String;
-    fn rerun_command(&self, test_name: &str) -> String;
+    /// Scan projectRoot for signals. Returns 0-100 confidence. Highest wins.
+    fn detect(&self, project_root: &Path) -> u8;
+
+    /// Human-readable name: "cargo", "catch2", "generic"
+    fn name(&self) -> &str;
+
+    /// Build command for running tests. `level` filters to unit/integration/e2e.
+    fn suite_command(&self, project_root: &Path, level: Option<TestLevel>, env: &HashMap<String, String>) -> TestCommand;
+
+    /// Build command for running a single test by name.
+    fn single_test_command(&self, project_root: &Path, test_name: &str) -> TestCommand;
+
+    /// Parse raw stdout + stderr into structured results.
     fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult;
+
+    /// Given a failure, suggest trace patterns for instrumented rerun.
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String>;
+
+    /// Capture thread stacks for stuck detection. Language-aware.
+    fn capture_stacks(&self, pid: u32) -> Vec<ThreadStack>;
 }
 ```
 
 **To add a new test framework:**
 1. Implement `TestAdapter` trait
-2. Add detection logic (look for config files, etc.)
-3. Implement output parsing (JSON/XML/text)
-4. Register with `TestAdapterRegistry`
+2. Add detection logic (`detect()` returns confidence 0-100, highest wins)
+3. Implement command construction for suite + single test + test levels
+4. Implement output parsing (JSON/XML/text → universal `TestResult`)
+5. Implement `capture_stacks` using the best method for the language runtime
+6. The adapter is auto-discovered — no registration needed
 
-**Current/planned adapters:**
+**Built-in adapters:**
 
-| Framework | Language | Detection | Output Format |
+| Framework | Language | Detection | Output Format | Stack Capture |
+|-----------|----------|-----------|---------------|---------------|
+| cargo test | Rust | `Cargo.toml` (confidence 90) | JSON (`--format json`) | OS-level (native) |
+| Catch2 | C/C++ | `--list-tests` probe (confidence 85) | XML (`--reporter xml`) | OS-level (native) |
+| Generic | Any | Always (confidence 1, fallback) | Regex heuristics | OS-level best-effort |
+
+**Future adapters (community contributions):**
+
+| Framework | Language | Detection | Stack Capture |
 |-----------|----------|-----------|---------------|
-| cargo test | Rust | `Cargo.toml` | JSON (`--format json`) |
-| Google Test | C/C++ | `gtest` in CMakeLists | XML |
-| Catch2 | C/C++ | `catch.hpp` includes | XML/JSON |
-| CTest | C/C++ | `CMakeLists.txt` | JSON |
-| pytest | Python | `pytest.ini`, `pyproject.toml` | JSON (plugin) |
-| Jest | JS/TS | `jest.config.*` | JSON |
-| go test | Go | `go.mod` | JSON (`-json`) |
+| pytest | Python | `pytest.ini`, `pyproject.toml` | `py-spy dump --pid` |
+| Jest/Vitest | JS/TS | `jest.config.*`, `vitest.config.*` | SIGUSR1 + inspector |
+| go test | Go | `go.mod` | SIGABRT → goroutine dump |
+| Google Test | C/C++ | `gtest` in CMakeLists | OS-level (native) |
 
 ### Event Schema (Shared by All Collectors)
 

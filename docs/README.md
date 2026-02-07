@@ -55,6 +55,7 @@ LLM: "Found it - memory pool exhaustion in ViewManager::setView(). Here's the fi
 │  - debug_launch: start app (captures stdout/stderr)          │
 │  - debug_query: read output, search traces                   │
 │  - debug_trace: add patterns when you need deeper insight    │
+│  - debug_test: run tests, get structured results (Phase 1d)  │
 │  - debug_stop: end session and clean up                      │
 │  - debug_ui_tree: see the UI (Phase 4)                       │
 │  - debug_ui_action: interact with the UI (Phase 5)           │
@@ -105,9 +106,9 @@ Pause only when it matters. Set conditions on field values, hit counts. The LLM 
 
 ### Test Instrumentation (TDD Workflow)
 
-First-class support for test-driven debugging. Run full suite with minimal tracing for fast feedback. On failure, receive structured results with rule-based hints: suggested trace patterns extracted from stack traces, single-test rerun commands.
+Universal, machine-readable test output for any framework. `debug_test` auto-detects the test framework (cargo, Catch2, or custom), runs tests via direct subprocess for speed, and returns structured results: failures with file:line, error messages, and suggested trace patterns.
 
-LLM reruns just the failing test with targeted tracing, queries the captured events, finds root cause. No more running full suite repeatedly. No more guessing what to trace.
+On failure, the LLM reruns a single test with tracing (Frida path activates automatically). Smart stuck detection catches deadlocks and infinite loops in ~8 seconds via multi-signal analysis (CPU + stack sampling), captures thread backtraces before killing, so the LLM sees the deadlock graph directly. No more waiting 10 minutes for a stuck test to timeout.
 
 ## What Gets Captured
 
@@ -162,13 +163,17 @@ This is not for:
 **Validation:** App crashes → LLM gets full context. App forks → events tracked across processes.
 
 ### Phase 1d: Test Instrumentation
-- `debug_test` tool for TDD workflow
-- Test adapter trait for extensibility
-- cargo test adapter (Rust)
-- Structured failures with rule-based trace hints
-- Single-test rerun with targeted tracing
+- `debug_test` tool with universal structured output for any test framework
+- Backend-agnostic `TestAdapter` trait: detection, command construction, parsing, trace suggestions, stack capture
+- Built-in adapters: cargo test (Rust), Catch2 (C/C++), Generic fallback
+- Smart stuck detection: multi-signal (output silence + CPU delta + stack sampling), catches deadlocks/infinite loops in ~8s
+- Thread backtrace capture before killing stuck tests — LLM sees deadlock graph directly
+- Automatic path switching: direct subprocess (fast) vs Frida (instrumented) based on whether tracing requested
+- Test levels (`unit`, `integration`, `e2e`) with per-level hard timeouts
+- Proactive TDD onboarding: detects missing tests, ships skill to guide vibe coders
+- `strobe install`: auto-detects coding agent (Claude Code, OpenCode, Codex), installs MCP + skills
 
-**Validation:** Test fails → rerun with suggested traces → find root cause. No full suite reruns.
+**Validation:** Universal structured output. Stuck tests caught in seconds. LLM never re-runs tests just to parse output.
 
 ### Phase 2: Active Debugging
 - Conditional breakpoints

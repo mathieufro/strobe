@@ -6,7 +6,7 @@
 
 Strobe is an LLM-native debugging infrastructure. An LLM connects via MCP, launches a target binary with Frida instrumentation, adds/removes trace patterns at runtime, and queries captured events — all without restarting the process.
 
-**Current phase:** 1b (Advanced Runtime Control)
+**Current phase:** 1d (Test Instrumentation)
 
 ## Recommended Workflow
 
@@ -139,6 +139,67 @@ Response:
 ```
 
 **Verbose format** adds: `functionRaw`, `threadId`, `parentEventId`, `arguments`, `returnValue`
+
+### debug_test
+
+Run tests with universal structured output. Auto-detects framework from `projectRoot`. Two execution paths chosen automatically: direct subprocess (fast, no overhead) when no instrumentation requested, Frida path when `tracePatterns` or `watches` present.
+
+**Full spec:** [specs/2026-02-07-phase-1d-test-instrumentation.md](../specs/2026-02-07-phase-1d-test-instrumentation.md)
+
+```
+Request:
+  projectRoot: string       # Required. Used for adapter detection
+  framework?: string        # Override auto-detection: "cargo", "catch2"
+  level?: string            # "unit", "integration", "e2e". Omit for all.
+  test?: string             # Run a single test by name
+  command?: string          # Test binary path (required for compiled frameworks like Catch2)
+  tracePatterns?: string[]  # Presence triggers Frida path
+  watches?: Watch[]         # Presence triggers Frida path
+  env?: {[key]: string}     # Additional environment variables
+  timeout?: number          # Hard timeout in ms (default per level: unit=30s, integration=120s, e2e=300s)
+
+Response:
+  framework: string                # Detected adapter name
+  summary: {
+    passed: number
+    failed: number
+    skipped: number
+    stuck?: number                 # Tests killed by stuck detector
+    duration_ms: number
+  }
+  failures?: TestFailure[]
+  stuck?: StuckTest[]              # Tests detected as stuck (deadlock/infinite loop)
+  sessionId?: string               # Present when Frida path used (for debug_query)
+  details: string                  # Path to full details file in /tmp/strobe/tests/
+  no_tests?: boolean               # True when no tests found
+  project?: { language, build_system, test_files }  # When no_tests is true
+  hint?: string                    # Guidance when no tests found
+```
+
+**TestFailure:**
+```
+  name: string                     # Test name
+  file?: string                    # Source file path
+  line?: number                    # Line number
+  message: string                  # Error/assertion message
+  suggested_traces: string[]       # Patterns extracted from failure context
+```
+
+**StuckTest:**
+```
+  name: string                     # Test name
+  elapsed_ms: number
+  diagnosis: string                # "Deadlock: 0% CPU, identical stacks" / "Infinite loop: 100% CPU, identical stacks"
+  threads: [{
+    name: string
+    stack: string[]                # Thread backtrace captured before kill
+  }]
+  suggested_traces: string[]
+```
+
+**Stuck detection** runs in parallel with the test subprocess. Multi-signal: output silence + CPU delta sampling (every 2s) + stack comparison (triggered at ~6s). Confirms stuck in ~8s regardless of test level. Captures thread backtraces before killing.
+
+**Adapter detection:** Auto-detect from `projectRoot` (Cargo.toml → cargo, binary probe → Catch2). Explicit `framework` override. Falls back to GenericAdapter (raw output, no structured parsing).
 
 ### debug_stop
 
