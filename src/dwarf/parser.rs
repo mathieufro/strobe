@@ -131,7 +131,7 @@ impl DwarfParser {
             Ok(Cow::Borrowed(data))
         };
 
-        let dwarf_cow = gimli::Dwarf::load(&load_section)
+        let dwarf_cow = gimli::DwarfSections::load(&load_section)
             .map_err(|e| Error::Frida(format!("Failed to load DWARF: {}", e)))?;
 
         let dwarf = dwarf_cow.borrow(|section| {
@@ -706,7 +706,7 @@ impl DwarfParser {
             Ok(Cow::Borrowed(data))
         };
 
-        let dwarf_cow = gimli::Dwarf::load(&load_section)
+        let dwarf_cow = gimli::DwarfSections::load(&load_section)
             .map_err(|e| Error::Frida(format!("DWARF load: {}", e)))?;
         let dwarf = dwarf_cow.borrow(|s| EndianSlice::new(s.as_ref(), endian));
 

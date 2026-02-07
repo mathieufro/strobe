@@ -278,6 +278,30 @@ fn get_attr(e: &quick_xml::events::BytesStart, name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Parse a single line of Catch2 XML output and update progress incrementally.
+/// Heuristic: detects TestCase name and OverallResult success/failure tags.
+pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>) {
+    let trimmed = line.trim();
+    if trimmed.contains("<TestCase") {
+        if let Some(start) = trimmed.find("name=\"") {
+            let after = &trimmed[start + 6..];
+            if let Some(end) = after.find('"') {
+                let mut p = progress.lock().unwrap();
+                p.current_test = Some(after[..end].to_string());
+            }
+        }
+    }
+    if trimmed.contains("<OverallResult") && trimmed.contains("success=") {
+        let mut p = progress.lock().unwrap();
+        if trimmed.contains("success=\"true\"") {
+            p.passed += 1;
+        } else if trimmed.contains("success=\"false\"") {
+            p.failed += 1;
+        }
+        p.current_test = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

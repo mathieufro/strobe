@@ -172,7 +172,7 @@ impl Database {
         Ok(count > 0)
     }
 
-    pub(crate) fn connection(&self) -> std::sync::MutexGuard<Connection> {
+    pub(crate) fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
     }
 }

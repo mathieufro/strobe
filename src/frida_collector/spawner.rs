@@ -388,7 +388,6 @@ enum FridaCommand {
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
-        project_root: String,
         env: Option<HashMap<String, String>>,
         initial_functions: Vec<FunctionTarget>,
         image_base: u64,
@@ -566,7 +565,6 @@ fn frida_worker(cmd_rx: std::sync::mpsc::Receiver<FridaCommand>) {
                 command,
                 args,
                 cwd,
-                project_root: _,
                 env,
                 initial_functions,
                 image_base,
@@ -1178,8 +1176,6 @@ fn resolve_pattern<'a>(
 
 /// Session state on the main thread
 pub struct FridaSession {
-    pub pid: u32,
-    pub binary_path: String,
     pub project_root: String,
     hook_manager: HookManager,
     dwarf_handle: DwarfHandle,
@@ -1228,7 +1224,6 @@ impl FridaSpawner {
             command: command.to_string(),
             args: args.to_vec(),
             cwd: cwd.map(|s| s.to_string()),
-            project_root: project_root.to_string(),
             env: env.cloned(),
             initial_functions: Vec::new(),
             image_base,
@@ -1240,8 +1235,6 @@ impl FridaSpawner {
             .map_err(|_| crate::Error::Frida("Worker response lost".to_string()))??;
 
         let session = FridaSession {
-            pid,
-            binary_path: command.to_string(),
             project_root: project_root.to_string(),
             hook_manager: HookManager::new(),
             dwarf_handle,

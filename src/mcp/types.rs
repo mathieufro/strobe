@@ -349,6 +349,48 @@ pub struct DebugTestResponse {
     pub hint: Option<String>,
 }
 
+// ============ debug_test (async start response) ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugTestStartResponse {
+    pub test_run_id: String,
+    pub status: String,
+    pub framework: String,
+}
+
+// ============ debug_test_status ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugTestStatusRequest {
+    pub test_run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugTestStatusResponse {
+    pub test_run_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TestProgressSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestProgressSnapshot {
+    pub elapsed_ms: u64,
+    pub passed: u32,
+    pub failed: u32,
+    pub skipped: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_test: Option<String>,
+}
+
 // ============ Errors ============
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -362,6 +404,7 @@ pub enum ErrorCode {
     FridaAttachFailed,
     InvalidPattern,
     WatchFailed,
+    TestRunNotFound,
     ValidationError,
 }
 
@@ -383,6 +426,7 @@ impl From<crate::Error> for McpError {
             crate::Error::InvalidPattern { .. } => ErrorCode::InvalidPattern,
             crate::Error::WatchFailed(_) => ErrorCode::WatchFailed,
             crate::Error::ValidationError(_) => ErrorCode::ValidationError,
+            crate::Error::TestRunNotFound(_) => ErrorCode::TestRunNotFound,
             _ => ErrorCode::FridaAttachFailed, // Generic fallback
         };
 

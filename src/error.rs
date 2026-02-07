@@ -29,6 +29,9 @@ pub enum Error {
     #[error("VALIDATION_ERROR: {0}")]
     ValidationError(String),
 
+    #[error("TEST_RUN_NOT_FOUND: No test run found with ID '{0}'.")]
+    TestRunNotFound(String),
+
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 

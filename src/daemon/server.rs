@@ -23,6 +23,8 @@ pub struct Daemon {
     pending_patterns: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Sessions owned by each connection (for cleanup on disconnect)
     connection_sessions: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// Active and recently-completed test runs, keyed by testRunId
+    test_runs: Arc<tokio::sync::RwLock<HashMap<String, crate::test::TestRun>>>,
 }
 
 impl Daemon {
@@ -52,6 +54,7 @@ impl Daemon {
             last_activity: Arc::new(RwLock::new(Instant::now())),
             pending_patterns: Arc::new(RwLock::new(HashMap::new())),
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
+            test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         });
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -233,90 +236,59 @@ impl Daemon {
     }
 
     fn debugging_instructions() -> &'static str {
-        r#"Strobe is a dynamic instrumentation tool. You launch programs, observe their runtime behavior (stdout/stderr, function calls, arguments, return values), and stop them — all without modifying source code or recompiling. Observation is non-intrusive and adjustable at runtime.
+        r#"Strobe is a dynamic instrumentation tool. Launch programs, observe runtime behavior (stdout/stderr, function calls, arguments, return values), and stop them — no recompilation needed.
 
-## Mindset
+## Workflow
 
-You have full control over the program lifecycle. You launch it, observe its behavior, and stop it. The behavior you want to observe may happen on startup, or it may require an external trigger — a user action, a network event, a specific input. Your role is to set up observation, let the behavior occur, then analyze what happened. Work backwards from the symptom to the root cause. Read the code, form a hypothesis, then use Strobe to confirm or refute it.
+1. Read code, form hypothesis about expected runtime behavior
+2. `debug_launch` with NO prior `debug_trace` — stdout/stderr always captured automatically
+3. Check output first — `debug_query({ eventType: "stderr" })` then stdout. Crashes, ASAN, assertions often suffice.
+4. Trace only if needed — `debug_trace({ sessionId, add: [...] })` on the running session. Do not restart.
+5. Iterate — narrow or widen patterns based on results. Session stays alive.
 
-## The Observation Loop
+If behavior requires user action (button press, network event), tell the user what to trigger.
 
-1. Understand the goal — Read the code around the area of interest. Form a hypothesis about what should happen at runtime.
-2. Launch with no tracing — Call debug_launch with no prior debug_trace. stdout/stderr are always captured automatically.
-3. Let the behavior occur — If the behavior requires a user action or external event, tell the user what to trigger. Be specific.
-4. Read output first — debug_query({ eventType: "stderr" }) then stdout. Crash reports, ASAN output, assertion failures, error logs are often the complete answer.
-5. Instrument only if needed — If output doesn't explain the issue, add targeted trace patterns on the running session with debug_trace({ sessionId, add: [...] }). Start small and specific. Do not restart.
-6. Iterate — Narrow or widen patterns based on what you learn. Remove noisy patterns, add specific ones. The session stays alive.
+## Patterns
 
-## Hook Limits
+- `foo::bar` — exact | `foo::*` — direct children | `foo::**` — all descendants
+- `*::validate` — named function, one level | `@file:parser.cpp` — by source file
+- `*` stops at `::`, `**` crosses it. Start with 1-3 specific patterns, widen incrementally.
 
-Each Interceptor.attach() rewrites a function's prologue in memory. This is fast for small numbers but destabilizes the process at scale. Practical limits:
+## Limits
 
-- Under 50 hooks: fast install (~5s), rock solid — aim for this
-- 50-100 hooks: install ~10s, stable
-- 100+ hooks: crash risk increases, especially with hot functions
-- Hard cap: 100 hooks per debug_trace call. Patterns exceeding this are truncated with a warning.
+- Aim for <50 hooks (fast, stable). 100+ risks crashes. Hard cap: 100 per debug_trace call.
+- Default 200k events/session (FIFO). Adjust via `eventLimit`. Use 500k for audio/DSP; avoid 1M+.
 
-ALWAYS start with the narrowest pattern that covers your hypothesis. You can widen later — you cannot un-crash a process.
+## Watches
 
-## Pattern Syntax
+Read globals during function execution (requires DWARF symbols).
+- `{ variable: \"gCounter\" }` or `{ variable: \"gClock->counter\" }` — named variables
+- `{ address: \"0x1234\", type: \"f64\", label: \"tempo\" }` — raw address
+- `{ expr: \"ptr(0x5678).readU32()\", label: \"custom\" }` — JS expression
+- Scope to functions: `{ variable: \"gTempo\", on: [\"audio::process\"] }` (supports `*`/`**` wildcards)
+- Max 32 watches; 4 native CModule for best perf.
 
-- `foo::bar` — exact function match (1 hook)
-- `foo::*` — all direct functions in foo, not nested
-- `foo::**` — all functions under foo, any depth
-- `*::validate` — any function named "validate", one level deep
-- `@file:parser.cpp` — all functions in files matching "parser.cpp"
+## Queries
 
-`*` does not cross `::` boundaries. Use `**` for deep matching.
+- eventType: `stderr`/`stdout` (always captured), `function_enter`/`function_exit` (when tracing)
+- Filters: `function: { contains: \"parse\" }`, `sourceFile: { contains: \"auth\" }`, `verbose: true`
+- Default 50 events. Paginate with `offset`. Check `hasMore`.
 
-Best strategy: start with 1-3 exact function names or a very specific `@file:` pattern. Add more patterns incrementally as you learn from the first round of events.
+## Mistakes to Avoid
 
-## Event Storage Limits
+- Do NOT trace before launch or use `@usercode` — always check stderr first
+- Do NOT use broad `@file:` patterns (`@file:src`). Be specific: `@file:parser.cpp`
+- If hookedFunctions: 0 → check for missing .dSYM, inline functions, or try `@file:` patterns
+- If hook limit warnings appear, narrow patterns — do NOT retry the same broad pattern
 
-- **Default: 200,000 events per session** — Oldest events are automatically deleted when limit is reached (FIFO)
-- Adjust with debug_trace({ sessionId, eventLimit: N }) on a running session
-- Performance guidelines:
-  - 200k: Fast queries (<10ms), small DB (~56MB) — good for most use cases
-  - 500k: Moderate queries (~28ms), medium DB (~140MB) — use for audio/DSP debugging
-  - 1M+: Slow queries (>300ms), large DB (>280MB) — avoid unless necessary
-- Cleanup happens asynchronously and never blocks event generation
+## Running Tests
 
-## Watching Variables
-
-Read global/static variable values during function execution. Requires debug symbols (DWARF).
-
-- Variable syntax: `gCounter`, `gClock->counter` (pointer dereferencing)
-- Raw address: `{ address: \"0x1234\", type: \"f64\", label: \"tempo\" }`
-- JS expressions: `{ expr: \"ptr(0x5678).readU32()\", label: \"custom\" }`
-- Max 32 watches per session (4 native CModule watches for best performance, unlimited JS expression watches)
-- **Contextual filtering with `on` field:**
-  - Scope watches to specific functions: `{ variable: \"gTempo\", on: [\"audio::process\"] }`
-  - Supports wildcards: `*` (shallow, stops at ::), `**` (deep, crosses ::)
-  - Examples: `[\"NoteOn\"]`, `[\"audio::*\"]`, `[\"juce::**\"]`
-  - If `on` is omitted, watch is global (captured on all traced functions)
-
-## Query Tips
-
-- eventType "stderr" / "stdout" — program output (always captured)
-- eventType "function_enter" / "function_exit" — trace events (only when patterns are set)
-- function: { contains: "parse" } — search by function name substring
-- sourceFile: { contains: "auth" } — search by source file
-- verbose: true — includes arguments, return values, raw symbol names
-- Default limit is 50 events. Use offset to paginate. Check hasMore.
-
-## Common Mistakes
-
-- Do NOT set trace patterns before launch unless you already know exactly what to trace. Launch clean, read output first.
-- Do NOT use @usercode. It hooks all project functions and will overwhelm the target.
-- Do NOT use broad `@file:` patterns that match many source files. Be specific: `@file:parser.cpp` not `@file:src`.
-- Do NOT restart the session to add traces. Use debug_trace with sessionId on the running session.
-- Always check stderr before instrumenting — the answer is often already there.
-- If debug_trace returns warnings about hook limits, narrow your patterns. Do NOT retry the same broad pattern.
-- If hookedFunctions is 0 on a running session (mode: "runtime"), DO NOT blindly try more patterns. Check the status message for guidance:
-  1. Verify debug symbols exist (check for .dSYM on macOS, separate debug info on Linux)
-  2. Functions may be inline/constexpr (won't appear in binary)
-  3. Try @file:filename.cpp patterns to match by source file instead
-  4. Use 'nm' tool to verify actual symbol names in binary"#
+ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
+`debug_test` returns immediately with a `testRunId`. Poll `debug_test_status(testRunId)` every ~5s for progress.
+- While running: `{ status: \"running\", progress: { elapsedMs, passed, failed, skipped, currentTest } }`
+- When done: `{ status: \"completed\", result: { framework, summary, failures, stuck, ... } }`
+- Rust: provide `projectRoot` | C++: provide `command` (test binary path)
+- Add `tracePatterns` for Frida instrumentation alongside results"#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
@@ -492,7 +464,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Run tests and get structured results. Auto-detects the test framework. If no tests exist, returns project info and suggests test setup. Use this instead of running test commands via bash — it provides machine-readable output, stuck detection, and failure analysis.".to_string(),
+                description: "Start a test run asynchronously. Returns a testRunId immediately — poll debug_test_status for progress and results. Auto-detects test framework (Cargo/Catch2). Use this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -516,6 +488,17 @@ Validation Limits (enforced):
                     "required": ["projectRoot"]
                 }),
             },
+            McpTool {
+                name: "debug_test_status".to_string(),
+                description: "Query the status of a running test. Returns progress (elapsed_ms, passed/failed/skipped, current test name) while running, or full results when complete. Poll every ~5 seconds after calling debug_test.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "testRunId": { "type": "string", "description": "Test run ID returned by debug_test" }
+                    },
+                    "required": ["testRunId"]
+                }),
+            },
         ];
 
         let response = McpToolsListResponse { tools };
@@ -533,6 +516,7 @@ Validation Limits (enforced):
             "debug_list_sessions" => self.tool_debug_list_sessions().await,
             "debug_delete_session" => self.tool_debug_delete_session(&call.arguments).await,
             "debug_test" => self.tool_debug_test(&call.arguments, connection_id).await,
+            "debug_test_status" => self.tool_debug_test_status(&call.arguments).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -1248,67 +1232,198 @@ Validation Limits (enforced):
     }
 
     async fn tool_debug_test(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+        // Cleanup stale runs
+        self.cleanup_stale_test_runs().await;
+
         let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
-        let project_root = std::path::Path::new(&req.project_root);
 
+        // Detect framework name for the start response
         let runner = crate::test::TestRunner::new();
-        let env = req.env.unwrap_or_default();
+        let project_root_path = std::path::Path::new(&req.project_root);
+        let framework_name = runner.detect_adapter(
+            project_root_path,
+            req.framework.as_deref(),
+            req.command.as_deref(),
+        ).name().to_string();
 
-        let level = req.level;
+        // Create shared progress tracker
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test::TestProgress::new()));
+        let test_run_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-        // Determine execution path: Frida or direct
-        let has_instrumentation = req.trace_patterns.is_some() || req.watches.is_some();
+        // Clone everything needed for the spawned task
+        let progress_clone = std::sync::Arc::clone(&progress);
+        let session_manager = std::sync::Arc::clone(&self.session_manager);
+        let connection_id_owned = connection_id.to_string();
+        let run_id = test_run_id.clone();
+        let test_runs = std::sync::Arc::clone(&self.test_runs);
+        let req_clone = req.clone();
 
-        let run_result = if has_instrumentation {
-            // Frida path
-            let trace_patterns = req.trace_patterns.unwrap_or_default();
-            runner.run_instrumented(
-                project_root,
-                req.framework.as_deref(),
-                req.test.as_deref(),
-                req.command.as_deref(),
-                &env,
-                req.timeout,
-                &self.session_manager,
-                &trace_patterns,
-                req.watches.as_ref(),
-                connection_id,
-            ).await?
-        } else {
-            // Fast path — direct subprocess
-            runner.run(
-                project_root,
-                req.framework.as_deref(),
-                level,
-                req.test.as_deref(),
-                req.command.as_deref(),
-                &env,
-                req.timeout,
-            ).await?
-        };
+        // Insert Running state BEFORE spawning to avoid race where task
+        // completes before the entry exists in the map.
+        {
+            let mut runs = self.test_runs.write().await;
+            runs.insert(test_run_id.clone(), crate::test::TestRun {
+                id: test_run_id.clone(),
+                state: crate::test::TestRunState::Running { progress },
+                fetched: false,
+            });
+        }
 
-        // Write details file
-        let details_path = crate::test::output::write_details(
-            &run_result.framework,
-            &run_result.result,
-            &run_result.raw_stdout,
-            &run_result.raw_stderr,
-        ).ok();
+        tokio::spawn(async move {
+            let runner = crate::test::TestRunner::new();
+            let env = req_clone.env.unwrap_or_default();
+            let has_instrumentation = req_clone.trace_patterns.is_some() || req_clone.watches.is_some();
+            let project_root = std::path::PathBuf::from(&req_clone.project_root);
 
-        // Build response
-        let response = crate::mcp::DebugTestResponse {
-            framework: run_result.framework,
-            summary: Some(run_result.result.summary),
-            failures: run_result.result.failures,
-            stuck: run_result.result.stuck,
-            session_id: run_result.session_id,
-            details: details_path,
-            no_tests: None,
-            project: None,
-            hint: None,
+            let run_result = if has_instrumentation {
+                let trace_patterns = req_clone.trace_patterns.unwrap_or_default();
+                runner.run_instrumented(
+                    &project_root,
+                    req_clone.framework.as_deref(),
+                    req_clone.test.as_deref(),
+                    req_clone.command.as_deref(),
+                    &env,
+                    req_clone.timeout,
+                    &session_manager,
+                    &trace_patterns,
+                    req_clone.watches.as_ref(),
+                    &connection_id_owned,
+                    Some(progress_clone),
+                ).await
+            } else {
+                runner.run(
+                    &project_root,
+                    req_clone.framework.as_deref(),
+                    req_clone.level,
+                    req_clone.test.as_deref(),
+                    req_clone.command.as_deref(),
+                    &env,
+                    req_clone.timeout,
+                    Some(progress_clone),
+                ).await
+            };
+
+            // Transition state
+            let new_state = match run_result {
+                Ok(run_result) => {
+                    let details_path = crate::test::output::write_details(
+                        &run_result.framework,
+                        &run_result.result,
+                        &run_result.raw_stdout,
+                        &run_result.raw_stderr,
+                    ).ok();
+
+                    let response = crate::mcp::DebugTestResponse {
+                        framework: run_result.framework,
+                        summary: Some(run_result.result.summary),
+                        failures: run_result.result.failures,
+                        stuck: run_result.result.stuck,
+                        session_id: run_result.session_id,
+                        details: details_path,
+                        no_tests: None,
+                        project: None,
+                        hint: None,
+                    };
+
+                    match serde_json::to_value(response) {
+                        Ok(v) => crate::test::TestRunState::Completed {
+                            response: v,
+                            completed_at: std::time::Instant::now(),
+                        },
+                        Err(e) => crate::test::TestRunState::Failed {
+                            error: format!("Failed to serialize result: {}", e),
+                            completed_at: std::time::Instant::now(),
+                        },
+                    }
+                }
+                Err(e) => crate::test::TestRunState::Failed {
+                    error: e.to_string(),
+                    completed_at: std::time::Instant::now(),
+                },
+            };
+
+            let mut runs = test_runs.write().await;
+            if let Some(test_run) = runs.get_mut(&run_id) {
+                test_run.state = new_state;
+            }
+        });
+
+        let response = crate::mcp::DebugTestStartResponse {
+            test_run_id,
+            status: "running".to_string(),
+            framework: framework_name,
         };
 
         Ok(serde_json::to_value(response)?)
+    }
+
+    async fn tool_debug_test_status(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugTestStatusRequest = serde_json::from_value(args.clone())?;
+
+        let mut runs = self.test_runs.write().await;
+        let test_run = runs.get_mut(&req.test_run_id)
+            .ok_or_else(|| crate::Error::TestRunNotFound(req.test_run_id.clone()))?;
+
+        let response = match &test_run.state {
+            crate::test::TestRunState::Running { progress, .. } => {
+                let p = progress.lock().unwrap();
+                crate::mcp::DebugTestStatusResponse {
+                    test_run_id: req.test_run_id,
+                    status: "running".to_string(),
+                    progress: Some(crate::mcp::TestProgressSnapshot {
+                        elapsed_ms: p.elapsed_ms(),
+                        passed: p.passed,
+                        failed: p.failed,
+                        skipped: p.skipped,
+                        current_test: p.current_test.clone(),
+                    }),
+                    result: None,
+                    error: None,
+                }
+            }
+            crate::test::TestRunState::Completed { response, .. } => {
+                test_run.fetched = true;
+                crate::mcp::DebugTestStatusResponse {
+                    test_run_id: req.test_run_id,
+                    status: "completed".to_string(),
+                    progress: None,
+                    result: Some(response.clone()),
+                    error: None,
+                }
+            }
+            crate::test::TestRunState::Failed { error, .. } => {
+                test_run.fetched = true;
+                crate::mcp::DebugTestStatusResponse {
+                    test_run_id: req.test_run_id,
+                    status: "failed".to_string(),
+                    progress: None,
+                    result: None,
+                    error: Some(error.clone()),
+                }
+            }
+        };
+
+        Ok(serde_json::to_value(response)?)
+    }
+
+    async fn cleanup_stale_test_runs(&self) {
+        let mut runs = self.test_runs.write().await;
+        let now = std::time::Instant::now();
+        runs.retain(|_id, run| {
+            match &run.state {
+                crate::test::TestRunState::Running { .. } => true,
+                crate::test::TestRunState::Completed { completed_at, .. }
+                | crate::test::TestRunState::Failed { completed_at, .. } => {
+                    if run.fetched && now.duration_since(*completed_at) > std::time::Duration::from_secs(300) {
+                        false
+                    } else if now.duration_since(*completed_at) > std::time::Duration::from_secs(1800) {
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -1330,6 +1445,7 @@ mod tests {
             last_activity: Arc::new(RwLock::new(Instant::now())),
             pending_patterns: Arc::new(RwLock::new(HashMap::new())),
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
+            test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         };
 
         (daemon, dir)

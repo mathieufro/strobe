@@ -152,18 +152,11 @@ impl TestAdapter for CargoTestAdapter {
                     });
                 }
                 ("suite", "ok") | ("suite", "failed") => {
+                    // Only accumulate duration from suite summaries.
+                    // Pass/fail/skip counts come from individual test events above,
+                    // since multi-target runs emit multiple suite summaries.
                     let exec_time = v.get("exec_time").and_then(|t| t.as_f64()).unwrap_or(0.0);
-                    duration_ms = (exec_time * 1000.0) as u64;
-
-                    if let Some(p) = v.get("passed").and_then(|n| n.as_u64()) {
-                        passed = p as u32;
-                    }
-                    if let Some(f) = v.get("failed").and_then(|n| n.as_u64()) {
-                        failed = f as u32;
-                    }
-                    if let Some(i) = v.get("ignored").and_then(|n| n.as_u64()) {
-                        skipped = i as u32;
-                    }
+                    duration_ms += (exec_time * 1000.0) as u64;
                 }
                 _ => {}
             }
@@ -325,6 +318,39 @@ fn capture_stacks_linux(pid: u32) -> Vec<ThreadStack> {
     }
 
     threads
+}
+
+/// Parse a single Cargo JSON line and update progress incrementally.
+pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
+    let mut p = progress.lock().unwrap();
+    match (event_type, event) {
+        ("test", "started") => {
+            p.current_test = v.get("name").and_then(|n| n.as_str()).map(String::from);
+        }
+        ("test", "ok") => {
+            p.passed += 1;
+            p.current_test = None;
+        }
+        ("test", "failed") => {
+            p.failed += 1;
+            p.current_test = None;
+        }
+        ("test", "ignored") => {
+            p.skipped += 1;
+            p.current_test = None;
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

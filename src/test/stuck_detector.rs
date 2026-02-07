@@ -46,8 +46,8 @@ impl StuckDetector {
                 });
             }
 
-            // CPU time sampling
-            let cpu_ns = get_process_cpu_ns(self.pid);
+            // CPU time sampling — includes child processes (e.g. cargo → rustc)
+            let cpu_ns = get_process_tree_cpu_ns(self.pid);
 
             if let Some(prev) = prev_cpu_ns {
                 let delta = cpu_ns.saturating_sub(prev);
@@ -100,6 +100,104 @@ impl StuckDetector {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
+}
+
+/// Get cumulative CPU time (user + system) for a process and all its descendants.
+/// This is critical for processes like `cargo` that delegate work to child processes
+/// (rustc, linker, etc.) — the parent may show 0% CPU while children do real work.
+pub fn get_process_tree_cpu_ns(pid: u32) -> u64 {
+    let mut total = get_process_cpu_ns(pid);
+    for child_pid in get_child_pids(pid) {
+        // Recurse into children (handles cargo → rustc → cc, etc.)
+        total += get_process_tree_cpu_ns(child_pid);
+    }
+    total
+}
+
+/// Get direct child PIDs of a process.
+fn get_child_pids(pid: u32) -> Vec<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        get_child_pids_macos(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        get_child_pids_linux(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        vec![]
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn get_child_pids_macos(pid: u32) -> Vec<u32> {
+    extern "C" {
+        fn proc_listchildpids(ppid: i32, buffer: *mut libc::c_void, buffersize: i32) -> i32;
+    }
+
+    unsafe {
+        // First call with null to get count
+        let count = proc_listchildpids(pid as i32, std::ptr::null_mut(), 0);
+        if count <= 0 {
+            return vec![];
+        }
+
+        let mut pids = vec![0i32; count as usize];
+        let buf_size = (count as usize * std::mem::size_of::<i32>()) as i32;
+        let actual = proc_listchildpids(
+            pid as i32,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            buf_size,
+        );
+        if actual <= 0 {
+            return vec![];
+        }
+
+        let n = actual as usize / std::mem::size_of::<i32>();
+        pids.truncate(n);
+        pids.into_iter().filter(|&p| p > 0).map(|p| p as u32).collect()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_child_pids_linux(pid: u32) -> Vec<u32> {
+    // Read /proc/<pid>/task/<pid>/children if available (requires CONFIG_PROC_CHILDREN)
+    let children_path = format!("/proc/{}/task/{}/children", pid, pid);
+    if let Ok(content) = std::fs::read_to_string(&children_path) {
+        return content
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect();
+    }
+
+    // Fallback: scan /proc for processes whose ppid matches
+    let mut children = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Ok(child_pid) = name.to_string_lossy().parse::<u32>() {
+                let stat_path = format!("/proc/{}/stat", child_pid);
+                if let Ok(stat) = std::fs::read_to_string(&stat_path) {
+                    // Field 4 (0-indexed: 3) is ppid
+                    // But need to skip past comm field which can contain spaces/parens
+                    if let Some(after_comm) = stat.rfind(')') {
+                        let fields: Vec<&str> = stat[after_comm + 1..].split_whitespace().collect();
+                        // fields[1] is ppid (after state which is fields[0])
+                        if fields.len() > 1 {
+                            if let Ok(ppid) = fields[1].parse::<u32>() {
+                                if ppid == pid {
+                                    children.push(child_pid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    children
 }
 
 /// Get cumulative CPU time (user + system) for a process in nanoseconds.

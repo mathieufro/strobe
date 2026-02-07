@@ -7,7 +7,9 @@ pub mod output;
 
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::io::AsyncReadExt;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::pin;
 
 use adapter::*;
@@ -15,6 +17,58 @@ use cargo_adapter::CargoTestAdapter;
 use catch2_adapter::Catch2Adapter;
 use generic_adapter::GenericAdapter;
 use stuck_detector::StuckDetector;
+
+/// Live progress state for an in-flight test run, updated incrementally.
+#[derive(Debug, Clone)]
+pub struct TestProgress {
+    pub passed: u32,
+    pub failed: u32,
+    pub skipped: u32,
+    pub current_test: Option<String>,
+    pub started_at: Instant,
+}
+
+impl TestProgress {
+    pub fn new() -> Self {
+        Self {
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            current_test: None,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+}
+
+/// State of a tracked test run stored in daemon.
+pub enum TestRunState {
+    /// Test is still running.
+    Running {
+        progress: Arc<Mutex<TestProgress>>,
+    },
+    /// Test completed with results (pre-serialized DebugTestResponse).
+    Completed {
+        response: serde_json::Value,
+        completed_at: Instant,
+    },
+    /// Test run failed before producing results.
+    Failed {
+        error: String,
+        completed_at: Instant,
+    },
+}
+
+/// A tracked test run in the daemon.
+pub struct TestRun {
+    pub id: String,
+    pub state: TestRunState,
+    /// Whether results have been fetched (eligible for cleanup).
+    pub fetched: bool,
+}
 
 pub struct TestRunner {
     adapters: Vec<Box<dyn TestAdapter>>,
@@ -32,7 +86,7 @@ impl TestRunner {
     }
 
     /// Detect the best adapter for this project.
-    fn detect_adapter(
+    pub fn detect_adapter(
         &self,
         project_root: &Path,
         framework: Option<&str>,
@@ -73,6 +127,7 @@ impl TestRunner {
         command: Option<&str>,
         env: &HashMap<String, String>,
         timeout: Option<u64>,
+        progress: Option<Arc<Mutex<TestProgress>>>,
     ) -> crate::Result<TestRunResult> {
         let adapter = self.detect_adapter(project_root, framework, command);
         let framework_name = adapter.name().to_string();
@@ -92,10 +147,14 @@ impl TestRunner {
 
         let hard_timeout = timeout.unwrap_or_else(|| adapter.default_timeout(level));
 
+        // Merge user env with adapter env (user env takes precedence)
+        let mut combined_env = test_cmd.env.clone();
+        combined_env.extend(env.clone());
+
         // Spawn subprocess
         let mut child = tokio::process::Command::new(&test_cmd.program)
             .args(&test_cmd.args)
-            .envs(&test_cmd.env)
+            .envs(&combined_env)
             .current_dir(project_root)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -111,13 +170,34 @@ impl TestRunner {
         let detector_handle = tokio::spawn(async move { detector.run().await });
 
         // Capture stdout and stderr
-        let mut child_stdout = child.stdout.take();
+        let child_stdout = child.stdout.take();
         let mut child_stderr = child.stderr.take();
+
+        // Select the right progress updater based on adapter
+        let progress_fn: Option<fn(&str, &Arc<Mutex<TestProgress>>)> = match framework_name.as_str() {
+            "cargo" => Some(cargo_adapter::update_progress),
+            "catch2" => Some(catch2_adapter::update_progress),
+            _ => None,
+        };
 
         let stdout_task = tokio::spawn(async move {
             let mut buf = String::new();
-            if let Some(ref mut stdout) = child_stdout {
-                let _ = stdout.read_to_string(&mut buf).await;
+            if let Some(stdout) = child_stdout {
+                let mut reader = tokio::io::BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if let (Some(f), Some(ref p)) = (progress_fn, &progress) {
+                                f(&line, p);
+                            }
+                            buf.push_str(&line);
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
             buf
         });
@@ -253,6 +333,7 @@ impl TestRunner {
         trace_patterns: &[String],
         _watches: Option<&crate::mcp::WatchUpdate>,
         _connection_id: &str,
+        _progress: Option<Arc<Mutex<TestProgress>>>,
     ) -> crate::Result<TestRunResult> {
         let adapter = self.detect_adapter(project_root, framework, command);
         let framework_name = adapter.name().to_string();
