@@ -341,7 +341,7 @@ Read globals during function execution (requires DWARF symbols).
 ## Running Tests
 
 ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
-`debug_test` returns immediately with a `testRunId`. Poll `debug_test_status(testRunId)` every ~5s for progress.
+`debug_test` returns immediately with a `testRunId`. Poll `debug_test_status(testRunId)` for progress. IMPORTANT: Each status response includes `retryInMs` — wait that many milliseconds before polling again. During compilation this is 10s; during test execution 5s.
 - While running: `{ status: \"running\", progress: { elapsedMs, passed, failed, skipped, currentTest } }`
 - When done: `{ status: \"completed\", result: { framework, summary, failures, stuck, ... } }`
 - Rust: provide `projectRoot` | C++: provide `command` (test binary path)
@@ -547,7 +547,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test_status".to_string(),
-                description: "Query the status of a running test. Returns progress (elapsed_ms, passed/failed/skipped, current test name) while running, or full results when complete. Poll every ~5 seconds after calling debug_test.".to_string(),
+                description: "Query the status of a running test. Returns progress (elapsed_ms, passed/failed/skipped, phase, current test name) while running, or full results when complete. IMPORTANT: Use the retryInMs field from the response to determine how long to wait before the next poll — do NOT poll more frequently than indicated.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1424,6 +1424,18 @@ Validation Limits (enforced):
         let response = match &test_run.state {
             crate::test::TestRunState::Running { progress, .. } => {
                 let p = progress.lock().unwrap();
+                let phase_str = match p.phase {
+                    crate::test::TestPhase::Compiling => "compiling",
+                    crate::test::TestPhase::Running => "running",
+                    crate::test::TestPhase::SuitesFinished => "suites_finished",
+                };
+                // Suggest longer poll intervals during compilation (nothing to report),
+                // shorter once tests are actively running
+                let retry_in_ms = match p.phase {
+                    crate::test::TestPhase::Compiling => 10_000,
+                    crate::test::TestPhase::Running => 5_000,
+                    crate::test::TestPhase::SuitesFinished => 5_000,
+                };
                 crate::mcp::DebugTestStatusResponse {
                     test_run_id: req.test_run_id,
                     status: "running".to_string(),
@@ -1433,9 +1445,11 @@ Validation Limits (enforced):
                         failed: p.failed,
                         skipped: p.skipped,
                         current_test: p.current_test.clone(),
+                        phase: Some(phase_str.to_string()),
                     }),
                     result: None,
                     error: None,
+                    retry_in_ms: Some(retry_in_ms),
                 }
             }
             crate::test::TestRunState::Completed { response, .. } => {
@@ -1446,6 +1460,7 @@ Validation Limits (enforced):
                     progress: None,
                     result: Some(response.clone()),
                     error: None,
+                    retry_in_ms: None,
                 }
             }
             crate::test::TestRunState::Failed { error, .. } => {
@@ -1456,6 +1471,7 @@ Validation Limits (enforced):
                     progress: None,
                     result: None,
                     error: Some(error.clone()),
+                    retry_in_ms: None,
                 }
             }
         };

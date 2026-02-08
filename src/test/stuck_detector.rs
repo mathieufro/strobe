@@ -1,4 +1,7 @@
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use super::TestProgress;
 
 /// Result of stuck detection analysis.
 pub struct StuckInfo {
@@ -11,14 +14,33 @@ pub struct StuckInfo {
 /// Runs in parallel with test subprocess, monitors:
 /// 1. CPU time delta (every 2s)
 /// 2. Stack sampling (triggered when suspicious)
+///
+/// When shared progress is available, the detector skips stuck diagnosis
+/// if all test suites have already finished (process is just cleaning up).
 pub struct StuckDetector {
     pid: u32,
     hard_timeout_ms: u64,
+    progress: Option<Arc<Mutex<TestProgress>>>,
 }
 
 impl StuckDetector {
     pub fn new(pid: u32, hard_timeout_ms: u64) -> Self {
-        Self { pid, hard_timeout_ms }
+        Self { pid, hard_timeout_ms, progress: None }
+    }
+
+    pub fn with_progress(mut self, progress: Arc<Mutex<TestProgress>>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Check if test suites have finished (process is just exiting, not stuck).
+    fn suites_finished(&self) -> bool {
+        if let Some(ref p) = self.progress {
+            let guard = p.lock().unwrap();
+            guard.phase == super::TestPhase::SuitesFinished
+        } else {
+            false
+        }
     }
 
     /// Run the detection loop. Returns Some(StuckInfo) if stuck, None if process exits first.
@@ -39,6 +61,10 @@ impl StuckDetector {
             // Check hard timeout
             let elapsed = start.elapsed();
             if elapsed.as_millis() as u64 >= self.hard_timeout_ms {
+                // Even on hard timeout, if suites finished, it's not stuck
+                if self.suites_finished() {
+                    return None;
+                }
                 return Some(StuckInfo {
                     elapsed_ms: elapsed.as_millis() as u64,
                     diagnosis: "Hard timeout reached".to_string(),
@@ -54,12 +80,20 @@ impl StuckDetector {
                 let sample_interval_ns = 2_000_000_000u64; // 2 seconds
 
                 if delta == 0 {
-                    // CPU idle — potential deadlock
-                    zero_delta_count += 1;
-                    constant_high_count = 0;
+                    // CPU idle — but if suites already finished, the process is
+                    // just winding down (e.g. cargo waiting for child reap). Not stuck.
+                    if self.suites_finished() {
+                        // Reset and keep waiting for clean exit
+                        suspicious_since = None;
+                        zero_delta_count = 0;
+                    } else {
+                        // Potential deadlock
+                        zero_delta_count += 1;
+                        constant_high_count = 0;
 
-                    if suspicious_since.is_none() {
-                        suspicious_since = Some(Instant::now());
+                        if suspicious_since.is_none() {
+                            suspicious_since = Some(Instant::now());
+                        }
                     }
                 } else if delta > sample_interval_ns * 80 / 100 {
                     // CPU near 100% — potential infinite loop

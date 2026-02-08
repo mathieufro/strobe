@@ -378,6 +378,9 @@ pub struct DebugTestStatusResponse {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Suggested delay in ms before next poll. Saves tokens by avoiding excessive polling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_in_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +392,9 @@ pub struct TestProgressSnapshot {
     pub skipped: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_test: Option<String>,
+    /// Current phase: "compiling", "running", or "suites_finished"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 // ============ Errors ============

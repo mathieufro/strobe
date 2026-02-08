@@ -18,6 +18,17 @@ use catch2_adapter::Catch2Adapter;
 use generic_adapter::GenericAdapter;
 use stuck_detector::StuckDetector;
 
+/// Phase of a test run lifecycle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestPhase {
+    /// Building/compiling (no test output yet)
+    Compiling,
+    /// Tests are executing
+    Running,
+    /// All test suites have reported final results
+    SuitesFinished,
+}
+
 /// Live progress state for an in-flight test run, updated incrementally.
 #[derive(Debug, Clone)]
 pub struct TestProgress {
@@ -26,6 +37,7 @@ pub struct TestProgress {
     pub skipped: u32,
     pub current_test: Option<String>,
     pub started_at: Instant,
+    pub phase: TestPhase,
 }
 
 impl TestProgress {
@@ -36,6 +48,7 @@ impl TestProgress {
             skipped: 0,
             current_test: None,
             started_at: Instant::now(),
+            phase: TestPhase::Compiling,
         }
     }
 
@@ -165,8 +178,11 @@ impl TestRunner {
 
         let pid = child.id().unwrap_or(0);
 
-        // Run stuck detector in parallel
-        let detector = StuckDetector::new(pid, hard_timeout);
+        // Run stuck detector in parallel (shares progress to avoid false positives)
+        let mut detector = StuckDetector::new(pid, hard_timeout);
+        if let Some(ref p) = progress {
+            detector = detector.with_progress(Arc::clone(p));
+        }
         let detector_handle = tokio::spawn(async move { detector.run().await });
 
         // Capture stdout and stderr
@@ -180,6 +196,7 @@ impl TestRunner {
             _ => None,
         };
 
+        let stdout_progress = progress.clone();
         let stdout_task = tokio::spawn(async move {
             let mut buf = String::new();
             if let Some(stdout) = child_stdout {
@@ -190,7 +207,7 @@ impl TestRunner {
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(_) => {
-                            if let (Some(f), Some(ref p)) = (progress_fn, &progress) {
+                            if let (Some(f), Some(ref p)) = (progress_fn, &stdout_progress) {
                                 f(&line, p);
                             }
                             buf.push_str(&line);
@@ -198,6 +215,11 @@ impl TestRunner {
                         Err(_) => break,
                     }
                 }
+            }
+            // stdout closed — all test output consumed, suites are finished
+            if let Some(ref p) = stdout_progress {
+                let mut guard = p.lock().unwrap();
+                guard.phase = TestPhase::SuitesFinished;
             }
             buf
         });

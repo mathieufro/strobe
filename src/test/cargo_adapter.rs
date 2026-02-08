@@ -334,7 +334,18 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
     let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
     let mut p = progress.lock().unwrap();
     match (event_type, event) {
+        ("suite", "started") => {
+            // First suite started means compilation is done, tests are running
+            if p.phase == super::TestPhase::Compiling {
+                p.phase = super::TestPhase::Running;
+            }
+        }
+        ("suite", "ok") | ("suite", "failed") => {
+            // Suite finished — but more suites may follow (multi-target runs).
+            // We'll mark SuitesFinished; if another suite starts, Running resumes.
+        }
         ("test", "started") => {
+            p.phase = super::TestPhase::Running;
             p.current_test = v.get("name").and_then(|n| n.as_str()).map(String::from);
         }
         ("test", "ok") => {
