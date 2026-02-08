@@ -23,6 +23,18 @@ pub struct ActiveWatchState {
     pub expr: Option<String>,
 }
 
+/// Check if a process is alive. Returns true if the process exists,
+/// even if we lack permission to signal it (EPERM).
+fn is_process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result == 0 {
+        return true; // Process exists and we can signal it
+    }
+    // Check errno: EPERM means alive but no permission, ESRCH means dead
+    let err = std::io::Error::last_os_error();
+    matches!(err.raw_os_error(), Some(libc::EPERM))
+}
+
 pub struct SessionManager {
     db: Database,
     /// Active trace patterns per session
@@ -39,6 +51,8 @@ pub struct SessionManager {
     frida_spawner: Arc<tokio::sync::RwLock<Option<FridaSpawner>>>,
     /// Child PIDs per session (parent PID is in the Session struct)
     child_pids: Arc<RwLock<HashMap<String, Vec<u32>>>>,
+    /// Cancellation tokens for database writer tasks per session
+    writer_cancel_tokens: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
 }
 
 impl SessionManager {
@@ -57,6 +71,7 @@ impl SessionManager {
             event_limits: Arc::new(RwLock::new(HashMap::new())),
             frida_spawner: Arc::new(tokio::sync::RwLock::new(None)),
             child_pids: Arc::new(RwLock::new(HashMap::new())),
+            writer_cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -92,7 +107,7 @@ impl SessionManager {
         // Clean up stale sessions on the same binary (dead process still marked Running)
         if let Some(existing) = self.db.get_session_by_binary(binary_path)? {
             if existing.status == SessionStatus::Running {
-                let pid_alive = unsafe { libc::kill(existing.pid as i32, 0) } == 0;
+                let pid_alive = is_process_alive(existing.pid);
                 if !pid_alive {
                     tracing::warn!("Session {} has dead PID {}, marking as stopped", existing.id, existing.pid);
                     self.db.update_session_status(&existing.id, SessionStatus::Stopped)?;
@@ -105,11 +120,11 @@ impl SessionManager {
         let session = self.db.create_session(id, binary_path, project_root, pid)?;
 
         // Initialize pattern storage, watches, and event limit
-        self.patterns.write().unwrap().insert(id.to_string(), Vec::new());
-        self.hook_counts.write().unwrap().insert(id.to_string(), 0);
-        self.watches.write().unwrap().insert(id.to_string(), Vec::new());
+        self.patterns.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), Vec::new());
+        self.hook_counts.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), 0);
+        self.watches.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), Vec::new());
         let settings = crate::config::resolve(Some(std::path::Path::new(project_root)));
-        self.event_limits.write().unwrap().insert(id.to_string(), settings.events_max_per_session);
+        self.event_limits.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), settings.events_max_per_session);
 
         Ok(session)
     }
@@ -124,20 +139,26 @@ impl SessionManager {
 
     pub fn stop_session(&self, id: &str) -> Result<u64> {
         let count = self.db.count_session_events(id)?;
+
+        // Signal database writer task to flush and exit
+        if let Some(cancel_tx) = self.writer_cancel_tokens.write().unwrap_or_else(|e| e.into_inner()).remove(id) {
+            let _ = cancel_tx.send(true);
+        }
+
         self.db.delete_session(id)?;
 
         // Clean up in-memory state
-        self.patterns.write().unwrap().remove(id);
-        self.hook_counts.write().unwrap().remove(id);
-        self.watches.write().unwrap().remove(id);
-        self.event_limits.write().unwrap().remove(id);
-        self.child_pids.write().unwrap().remove(id);
+        self.patterns.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.hook_counts.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.watches.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.event_limits.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.child_pids.write().unwrap_or_else(|e| e.into_inner()).remove(id);
 
         Ok(count)
     }
 
     pub fn add_child_pid(&self, session_id: &str, pid: u32) {
-        self.child_pids.write().unwrap()
+        self.child_pids.write().unwrap_or_else(|e| e.into_inner())
             .entry(session_id.to_string())
             .or_default()
             .push(pid);
@@ -148,14 +169,14 @@ impl SessionManager {
         if let Ok(Some(session)) = self.get_session(session_id) {
             pids.push(session.pid);
         }
-        if let Some(children) = self.child_pids.read().unwrap().get(session_id) {
+        if let Some(children) = self.child_pids.read().unwrap_or_else(|e| e.into_inner()).get(session_id) {
             pids.extend(children);
         }
         pids
     }
 
     pub fn add_patterns(&self, session_id: &str, patterns: &[String]) -> Result<()> {
-        let mut all_patterns = self.patterns.write().unwrap();
+        let mut all_patterns = self.patterns.write().unwrap_or_else(|e| e.into_inner());
         let session_patterns = all_patterns
             .entry(session_id.to_string())
             .or_default();
@@ -170,7 +191,7 @@ impl SessionManager {
     }
 
     pub fn remove_patterns(&self, session_id: &str, patterns: &[String]) -> Result<()> {
-        let mut all_patterns = self.patterns.write().unwrap();
+        let mut all_patterns = self.patterns.write().unwrap_or_else(|e| e.into_inner());
         if let Some(session_patterns) = all_patterns.get_mut(session_id) {
             session_patterns.retain(|p| !patterns.contains(p));
         }
@@ -222,25 +243,35 @@ impl SessionManager {
     /// If the binary was already parsed (or is being parsed), returns the cached handle.
     /// Failed parses are evicted from cache so that retries (e.g. after dsymutil) work.
     pub fn get_or_start_dwarf_parse(&self, binary_path: &str) -> DwarfHandle {
-        // Check cache first
+        // Include mtime in cache key so rebuilds invalidate the cache
+        let mtime = std::fs::metadata(binary_path)
+            .and_then(|m| m.modified())
+            .ok();
+        let cache_key = match mtime {
+            Some(t) => format!("{}@{}", binary_path, t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+            None => binary_path.to_string(),
+        };
+
+        // Fast path: read lock only
         {
-            let cache = self.dwarf_cache.read().unwrap();
-            if let Some(handle) = cache.get(binary_path) {
-                // Only return cached handle if it's still pending or succeeded.
-                // Failed parses should be retried (e.g. dSYM may have been created since).
+            let cache = self.dwarf_cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(handle) = cache.get(&cache_key) {
                 if !handle.is_failed() {
                     return handle.clone();
                 }
             }
         }
 
-        // Start background parse and cache the handle (evicts stale failed entry)
-        let handle = DwarfHandle::spawn_parse(binary_path);
-        self.dwarf_cache
-            .write()
-            .unwrap()
-            .insert(binary_path.to_string(), handle.clone());
+        // Slow path: write lock with double-check
+        let mut cache = self.dwarf_cache.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = cache.get(&cache_key) {
+            if !handle.is_failed() {
+                return handle.clone();
+            }
+        }
 
+        let handle = DwarfHandle::spawn_parse(binary_path);
+        cache.insert(cache_key, handle.clone());
         handle
     }
 
@@ -271,6 +302,9 @@ impl SessionManager {
         // Spawn database writer task with automatic event limit enforcement
         let db = self.db.clone();
         let event_limits = Arc::clone(&self.event_limits);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        self.writer_cancel_tokens.write().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string(), cancel_tx);
+
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(100);
             let mut cached_limit = crate::config::StrobeSettings::default().events_max_per_session;
@@ -285,7 +319,7 @@ impl SessionManager {
                             // Refresh cached limit every 10 batches to reduce lock contention
                             if batches_since_refresh >= 10 {
                                 let session_id = &batch[0].session_id;
-                                cached_limit = event_limits.read().unwrap()
+                                cached_limit = event_limits.read().unwrap_or_else(|e| e.into_inner())
                                     .get(session_id)
                                     .copied()
                                     .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session);
@@ -317,7 +351,7 @@ impl SessionManager {
                             // Refresh cached limit every 10 batches to reduce lock contention
                             if batches_since_refresh >= 10 {
                                 let session_id = &batch[0].session_id;
-                                cached_limit = event_limits.read().unwrap()
+                                cached_limit = event_limits.read().unwrap_or_else(|e| e.into_inner())
                                     .get(session_id)
                                     .copied()
                                     .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session);
@@ -343,6 +377,15 @@ impl SessionManager {
                             }
                             batch.clear();
                         }
+                    }
+                    _ = cancel_rx.changed() => {
+                        // Cancellation requested — flush remaining events and exit
+                        if !batch.is_empty() {
+                            let max_events = cached_limit;
+                            let _ = db.insert_events_with_limit(&batch, max_events);
+                            batch.clear();
+                        }
+                        break;
                     }
                 }
             }
@@ -423,7 +466,7 @@ impl SessionManager {
 
     /// Remove watches by label, returning the remaining watches
     pub fn remove_watches(&self, session_id: &str, labels: &[String]) -> Vec<ActiveWatchState> {
-        let mut watches_map = self.watches.write().unwrap();
+        let mut watches_map = self.watches.write().unwrap_or_else(|e| e.into_inner());
         if let Some(watches) = watches_map.get_mut(session_id) {
             watches.retain(|w| !labels.contains(&w.label));
             watches.clone()

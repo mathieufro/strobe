@@ -6,5 +6,5 @@
 *.db-shm
 .strobe/
 tests/**/target/
+tests/**/build/
 tests/**/*.dSYM/
-tests/stress_test_phase1c/stress_test_phase1c

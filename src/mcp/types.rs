@@ -15,6 +15,22 @@ pub struct DebugLaunchRequest {
     pub env: Option<std::collections::HashMap<String, String>>,
 }
 
+impl DebugLaunchRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.command.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "command must not be empty".to_string()
+            ));
+        }
+        if self.project_root.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "projectRoot must not be empty".to_string()
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugLaunchResponse {

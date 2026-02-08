@@ -403,8 +403,10 @@ export class CModuleTracer {
 
     const funcId = this.nextFuncId++;
 
-    // Issue 4: funcId << 1 overflows signed 32-bit at 2^30
-    if (funcId >= (1 << 30)) {
+    // funcId << 1 must not overflow signed 32-bit.
+    // JS << operates on int32, so (funcId << 1) overflows sign bit at 2^30.
+    // Guard at 2^29 to ensure (funcId << 1) | 1 stays positive.
+    if (funcId >= (1 << 29)) {
       return false;
     }
 
@@ -615,6 +617,12 @@ export class CModuleTracer {
   private drain(): void {
     // Issue 2: bail if sessionId not yet set (setSessionId() hasn't been called)
     if (!this.sessionId) return;
+
+    // Periodic cleanup: clear thread stacks every 50k events to prevent
+    // unbounded growth from missed function exits (exception unwinding, ring overflow)
+    if (this.eventIdCounter % 50000 === 0) {
+      this.threadStacks.clear();
+    }
 
     const writeIdx = this.writeIdxPtr.readU32();
     const readIdx  = this.readIdxPtr.readU32();
@@ -876,6 +884,7 @@ export class CModuleTracer {
   }
 
   private generateEventId(): string {
-    return `${this.sessionId}-${++this.eventIdCounter}`;
+    const sid = this.sessionId || 'uninitialized';
+    return `${sid}-${++this.eventIdCounter}`;
   }
 }

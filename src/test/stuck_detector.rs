@@ -59,7 +59,10 @@ impl StuckDetector {
         let mut prev_test: Option<String> = None;
 
         loop {
-            let alive = unsafe { libc::kill(self.pid as i32, 0) } == 0;
+            let alive = {
+                let r = unsafe { libc::kill(self.pid as i32, 0) };
+                r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            };
             if !alive {
                 return; // Process exited
             }
@@ -177,14 +180,20 @@ impl StuckDetector {
     async fn confirm_with_stacks(&self, diagnosis_type: &str) -> Option<String> {
         let pid = self.pid;
 
-        let stacks1 = tokio::task::spawn_blocking(move || {
-            super::cargo_adapter::capture_native_stacks(pid)
-        }).await.unwrap_or_default();
+        let stacks1 = tokio::time::timeout(
+            Duration::from_secs(8),
+            tokio::task::spawn_blocking(move || {
+                super::cargo_adapter::capture_native_stacks(pid)
+            })
+        ).await.ok().and_then(|r| r.ok()).unwrap_or_default();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Check if process exited or suites finished during wait
-        let alive = unsafe { libc::kill(self.pid as i32, 0) } == 0;
+        let alive = {
+                let r = unsafe { libc::kill(self.pid as i32, 0) };
+                r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            };
         if !alive {
             return None;
         }
@@ -192,9 +201,12 @@ impl StuckDetector {
             return None;
         }
 
-        let stacks2 = tokio::task::spawn_blocking(move || {
-            super::cargo_adapter::capture_native_stacks(pid)
-        }).await.unwrap_or_default();
+        let stacks2 = tokio::time::timeout(
+            Duration::from_secs(8),
+            tokio::task::spawn_blocking(move || {
+                super::cargo_adapter::capture_native_stacks(pid)
+            })
+        ).await.ok().and_then(|r| r.ok()).unwrap_or_default();
 
         if stacks_match(&stacks1, &stacks2) {
             let diagnosis = match diagnosis_type {

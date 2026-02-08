@@ -1,7 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use super::adapter::*;
 use super::cargo_adapter::capture_native_stacks;
+
+static FAIL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(?:FAIL|FAILED|ERROR|FAILURE)[:\s]+(.+?)(?:\s+at\s+)?(\S+?):(\d+)"
+    ).expect("Invalid failure regex pattern")
+});
 
 pub struct GenericAdapter;
 
@@ -45,22 +52,16 @@ impl TestAdapter for GenericAdapter {
         let mut failures = Vec::new();
 
         // Heuristic: look for FAIL patterns with file:line
-        let fail_re = regex::Regex::new(
-            r"(?i)(?:FAIL|FAILED|ERROR|FAILURE)[:\s]+(.+?)(?:\s+at\s+)?(\S+?):(\d+)"
-        ).ok();
-
-        if let Some(re) = &fail_re {
-            for cap in re.captures_iter(&combined) {
-                failures.push(TestFailure {
-                    name: cap.get(1).map(|m| m.as_str().trim().to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    file: cap.get(2).map(|m| m.as_str().to_string()),
-                    line: cap.get(3).and_then(|m| m.as_str().parse().ok()),
-                    message: cap.get(0).map(|m| m.as_str().to_string()).unwrap_or_default(),
-                    rerun: None,
-                    suggested_traces: vec![],
-                });
-            }
+        for cap in FAIL_RE.captures_iter(&combined) {
+            failures.push(TestFailure {
+                name: cap.get(1).map(|m| m.as_str().trim().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                file: cap.get(2).map(|m| m.as_str().to_string()),
+                line: cap.get(3).and_then(|m| m.as_str().parse().ok()),
+                message: cap.get(0).map(|m| m.as_str().to_string()).unwrap_or_default(),
+                rerun: None,
+                suggested_traces: vec![],
+            });
         }
 
         // If no regex failures found but exit code is non-zero, add generic failure

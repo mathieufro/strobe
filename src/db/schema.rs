@@ -14,7 +14,7 @@ impl Database {
         // Enable WAL mode for concurrent access
         // Use query_row to handle PRAGMA that returns a value
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.execute("PRAGMA synchronous=NORMAL", [])?;
+        conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -170,6 +170,11 @@ impl Database {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_pid ON events(session_id, pid)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_type ON events(session_id, event_type, timestamp_ns)",
             [],
         )?;
 

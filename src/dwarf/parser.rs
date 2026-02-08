@@ -392,7 +392,7 @@ impl DwarfParser {
         };
 
         // Get location — only accept simple DW_OP_addr (fixed address globals)
-        let address = match Self::parse_variable_address(unit, entry) {
+        let address = match Self::parse_variable_address(dwarf, unit, entry) {
             Some(addr) => addr,
             None => return Ok(None),
         };
@@ -426,6 +426,7 @@ impl DwarfParser {
     }
 
     fn parse_variable_address<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
         unit: &gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
     ) -> Option<u64> {
@@ -435,6 +436,10 @@ impl DwarfParser {
                 let mut ops = expr.operations(unit.encoding());
                 match ops.next().ok()? {
                     Some(gimli::Operation::Address { address }) => Some(address),
+                    // DWARF v5: indexed address via DW_OP_addrx
+                    Some(gimli::Operation::AddressIndex { index }) => {
+                        dwarf.address(unit, index).ok()
+                    }
                     _ => None,
                 }
             }
@@ -1022,6 +1027,14 @@ impl PatternMatcher {
     }
 
     pub fn matches(&self, name: &str) -> bool {
+        // Strip C++ parameter signature before matching.
+        // e.g. "timing::fast()" → "timing::fast"
+        // e.g. "audio::process_buffer(audio::AudioBuffer*)" → "audio::process_buffer"
+        // This ensures patterns like "timing::fast" and "audio::*" work with demangled C++ names.
+        let name = match name.find('(') {
+            Some(idx) => &name[..idx],
+            None => name,
+        };
         Self::glob_match(&self.pattern, name)
     }
 
@@ -1140,5 +1153,87 @@ mod pattern_tests {
         assert!(m.matches("auth::validate"));
         assert!(m.matches("auth::user::validate"));
         assert!(m.matches("auth::user::session::validate"));
+    }
+
+    #[test]
+    fn test_pattern_matching_real_rust_names() {
+        let rust_name = "stress_tester::midi::process_note_on::h7c4d62da364e13f0";
+
+        let m = PatternMatcher::new("stress_tester::*");
+        assert!(!m.matches(rust_name), "* should not cross :: boundaries");
+
+        let m = PatternMatcher::new("stress_tester::**");
+        assert!(m.matches(rust_name), "** should match through all :: levels");
+
+        let m = PatternMatcher::new("**::process_note_on**");
+        assert!(m.matches(rust_name), "**::name** should match anywhere");
+
+        let m = PatternMatcher::new("stress_tester::midi::*");
+        assert!(!m.matches(rust_name), "midi::* shouldn't match because of hash suffix");
+
+        let m = PatternMatcher::new("stress_tester::midi::**");
+        assert!(m.matches(rust_name), "midi::** should match through hash suffix");
+    }
+
+    #[test]
+    fn test_cpp_demangled_names() {
+        // C++ demangled names include parameter signatures — pattern matching
+        // should strip them so users don't need to spell out parameter types.
+
+        // Exact match strips ()
+        let m = PatternMatcher::new("timing::fast");
+        assert!(m.matches("timing::fast()"), "Should match through ()");
+
+        // Exact match strips full parameter signature
+        let m = PatternMatcher::new("audio::process_buffer");
+        assert!(
+            m.matches("audio::process_buffer(audio::AudioBuffer*)"),
+            "Should match through (qualified::params)"
+        );
+
+        // Wildcard * should match C++ names after stripping params
+        let m = PatternMatcher::new("audio::*");
+        assert!(m.matches("audio::process_buffer(audio::AudioBuffer*)"));
+        assert!(m.matches("audio::generate_sine(float)"));
+        assert!(m.matches("audio::apply_effect(audio::AudioBuffer*, float)"));
+
+        // Wildcard ** should match nested C++ names
+        let m = PatternMatcher::new("midi::**");
+        assert!(m.matches("midi::note_on(unsigned char, unsigned char)"));
+
+        // Plain names without parens still work
+        let m = PatternMatcher::new("timing::fast");
+        assert!(m.matches("timing::fast"));
+    }
+
+    #[test]
+    fn test_watch_pattern_matching_with_real_names() {
+        let real_names = vec![
+            "stress_tester::audio::process_audio_buffer::h1e1f7984b2d2cfca",
+            "stress_tester::audio::generate_sine_buffer::hdeadbeef12345678",
+            "stress_tester::audio::apply_effect_chain::habcdef0123456789",
+            "stress_tester::midi::process_note_on::h7c4d62da364e13f0",
+            "stress_tester::midi::process_control_change::h72b697f824ed75aa",
+            "stress_tester::midi::generate_midi_sequence::h77a24745e78bf175",
+            "stress_tester::engine::Engine::update_global_state::hfedcba9876543210",
+        ];
+
+        let test_cases: Vec<(&str, Vec<usize>)> = vec![
+            ("stress_tester::audio::**", vec![0, 1, 2]),
+            ("stress_tester::midi::**", vec![3, 4, 5]),
+            ("**::process_note_on**", vec![3]),
+            ("**::process_audio_buffer**", vec![0]),
+            ("stress_tester::*", vec![]),
+        ];
+
+        for (pattern, expected_indices) in test_cases {
+            let matcher = PatternMatcher::new(pattern);
+            let matched: Vec<usize> = real_names.iter().enumerate()
+                .filter(|(_, name)| matcher.matches(name))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(matched, expected_indices,
+                "Pattern '{}' matched wrong functions", pattern);
+        }
     }
 }

@@ -116,6 +116,10 @@ export class ObjectSerializer {
 
   private serializePointer(addr: NativePointer, typeInfo: TypeInfo): SerializedValue {
     try {
+      // Check 8-byte alignment to prevent SIGBUS on ARM64
+      if (addr.and(ptr(7)).toInt32() !== 0) {
+        return `<unaligned ptr at ${addr}>`;
+      }
       const ptrValue = addr.readU64();
       if (ptrValue.toNumber() === 0) {
         return 'nullptr';

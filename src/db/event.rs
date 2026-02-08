@@ -166,6 +166,12 @@ impl EventQuery {
         self
     }
 
+    /// Internal limit without the 500-event MCP cap. Used for test output collection.
+    pub(crate) fn limit_uncapped(mut self, n: u32) -> Self {
+        self.limit = n;
+        self
+    }
+
     pub fn offset(mut self, n: u32) -> Self {
         self.offset = n;
         self
@@ -411,7 +417,7 @@ impl Database {
                 thread_id: row.get(3)?,
                 thread_name: row.get(4)?,
                 parent_event_id: row.get(5)?,
-                event_type: EventType::from_str(&event_type_str).unwrap(),
+                event_type: EventType::from_str(&event_type_str).unwrap_or(EventType::FunctionEnter),
                 function_name: row.get(7)?,
                 function_name_raw: row.get(8)?,
                 source_file: row.get(9)?,

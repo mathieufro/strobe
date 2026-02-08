@@ -367,6 +367,7 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
             // completed. If another suite starts, ("suite", "started") won't
             // regress this since it only transitions from Compiling.
             p.phase = super::TestPhase::SuitesFinished;
+            p.current_test = None;
         }
         ("test", "started") => {
             p.phase = super::TestPhase::Running;
@@ -375,17 +376,15 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
         }
         ("test", "ok") => {
             p.passed += 1;
-            p.current_test = None;
+            // Keep current_test visible (shows last-run test); clear elapsed timer
             p.current_test_started_at = None;
         }
         ("test", "failed") => {
             p.failed += 1;
-            p.current_test = None;
             p.current_test_started_at = None;
         }
         ("test", "ignored") => {
             p.skipped += 1;
-            p.current_test = None;
             p.current_test_started_at = None;
         }
         _ => {}

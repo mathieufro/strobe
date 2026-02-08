@@ -230,7 +230,7 @@ class StrobeAgent {
 
   private buildCrashEvent(details: ExceptionDetails): any {
     const timestamp = this.getTimestampNs();
-    const eventId = `${this.sessionId}-crash-${Date.now()}`;
+    const eventId = `${this.sessionId || 'uninitialized'}-crash-${Date.now()}`;
 
     // Build stack trace using Thread.backtrace
     let backtrace: any[] = [];
@@ -321,6 +321,11 @@ class StrobeAgent {
     const writePtr = Process.getModuleByName('libSystem.B.dylib').getExportByName('write');
     if (!writePtr) return;
 
+    // Note: inOutputCapture is a process-global flag, not thread-local.
+    // In multi-threaded targets, two threads calling write() simultaneously
+    // can race on this flag. In practice, Frida's GIL serializes JS execution,
+    // and the Device-level output capture (raw_on_output) serves as fallback.
+    // The write hook is best-effort for additional capture fidelity.
     Interceptor.attach(writePtr, {
       onEnter(args) {
         // Re-entrancy guard: skip if we're already inside an intercepted write
@@ -426,6 +431,10 @@ recv('initialize', (message: { sessionId: string }) => {
   agent.initialize(message.sessionId);
 });
 
+// Frida's recv() is one-shot: must re-register before processing to avoid
+// losing messages sent during processing. Message ordering is guaranteed
+// by Frida's single-threaded JS execution model. If handleMessage() throws,
+// the re-registration has already happened so subsequent messages are safe.
 function onHooksMessage(message: HookInstruction): void {
   // Re-register BEFORE processing — recv() is one-shot in Frida.
   // Without this, only the first hooks message is ever received.

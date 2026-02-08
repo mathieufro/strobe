@@ -249,7 +249,10 @@ impl TestRunner {
         let start = std::time::Instant::now();
 
         loop {
-            let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+            let alive = {
+                let r = unsafe { libc::kill(pid as i32, 0) };
+                r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            };
             if !alive {
                 break;
             }
@@ -296,11 +299,11 @@ impl TestRunner {
 
         // Query ALL stdout/stderr from DB
         let stdout_events = session_manager.db().query_events(session_id, |q| {
-            q.event_type(crate::db::EventType::Stdout).limit(10000)
+            q.event_type(crate::db::EventType::Stdout).limit_uncapped(50000)
         }).unwrap_or_default();
 
         let stderr_events = session_manager.db().query_events(session_id, |q| {
-            q.event_type(crate::db::EventType::Stderr).limit(10000)
+            q.event_type(crate::db::EventType::Stderr).limit_uncapped(50000)
         }).unwrap_or_default();
 
         let stdout_buf: String = stdout_events.iter()
@@ -312,12 +315,24 @@ impl TestRunner {
             .collect::<Vec<_>>()
             .join("");
 
-        let exit_code = session_manager.get_session(session_id)?
-            .map(|s| match s.status {
-                crate::db::SessionStatus::Stopped => 0,
-                _ => -1,
-            })
-            .unwrap_or(-1);
+        // Get exit code: try waitpid for real exit code, fall back to test results
+        let exit_code = {
+            let mut status: i32 = 0;
+            let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            if result > 0 {
+                if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    -1
+                }
+            } else {
+                // Already reaped or not our child — infer from test results
+                let p = progress.lock().unwrap();
+                if p.failed > 0 { 1 } else { 0 }
+            }
+        };
 
         let mut result = adapter.parse_output(&stdout_buf, &stderr_buf, exit_code);
 

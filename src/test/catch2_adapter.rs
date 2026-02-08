@@ -293,6 +293,10 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
             let after = &trimmed[start + 6..];
             if let Some(end) = after.find('"') {
                 let mut p = progress.lock().unwrap();
+                // Transition to Running on first test case
+                if p.phase == super::TestPhase::Compiling {
+                    p.phase = super::TestPhase::Running;
+                }
                 p.current_test = Some(after[..end].to_string());
                 p.current_test_started_at = Some(std::time::Instant::now());
             }
@@ -305,12 +309,13 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
         } else if trimmed.contains("success=\"false\"") {
             p.failed += 1;
         }
-        p.current_test = None;
+        // Keep current_test visible (shows last-run test); clear elapsed timer
         p.current_test_started_at = None;
     }
     if trimmed.contains("</Catch2TestRun>") {
         let mut p = progress.lock().unwrap();
         p.phase = super::TestPhase::SuitesFinished;
+        p.current_test = None;
     }
 }
 

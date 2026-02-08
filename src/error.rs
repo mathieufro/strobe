@@ -46,3 +46,23 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_types() {
+        let err = Error::NoDebugSymbols;
+        assert!(err.to_string().contains("NO_DEBUG_SYMBOLS"));
+
+        let err = Error::SessionNotFound("test".to_string());
+        assert!(err.to_string().contains("test"));
+
+        let err = Error::InvalidPattern {
+            pattern: "**".to_string(),
+            reason: "bad pattern".to_string(),
+        };
+        assert!(err.to_string().contains("**"));
+    }
+}

@@ -92,6 +92,9 @@ unsafe fn create_script_raw(
 ) -> std::result::Result<*mut frida_sys::_FridaScript, String> {
     let source_cstr = CString::new(source).map_err(|e| format!("CString error: {}", e))?;
     let opt = frida_sys::frida_script_options_new();
+    if opt.is_null() {
+        return Err("Failed to create script options".to_string());
+    }
     let mut error: *mut frida_sys::GError = std::ptr::null_mut();
 
     let script_ptr = frida_sys::frida_session_create_script_sync(
@@ -121,6 +124,13 @@ unsafe fn create_script_raw(
     Ok(script_ptr)
 }
 
+/// C callback to free the AgentMessageHandler when the signal is disconnected.
+unsafe extern "C" fn destroy_handler(data: *mut c_void, _closure: *mut frida_sys::_GClosure) {
+    if !data.is_null() {
+        let _ = Box::from_raw(data as *mut AgentMessageHandler);
+    }
+}
+
 /// Register message handler on a raw script pointer.
 unsafe fn register_handler_raw(
     script_ptr: *mut frida_sys::_FridaScript,
@@ -139,7 +149,7 @@ unsafe fn register_handler_raw(
         signal_name.as_ptr(),
         callback,
         handler_ptr as *mut c_void,
-        None,
+        Some(destroy_handler),
         0,
     );
 
@@ -476,6 +486,13 @@ unsafe extern "C" fn raw_on_spawn_added(
     let _ = tx.send(child_pid);
 }
 
+/// C callback to free the spawn_tx Sender when the signal is disconnected.
+unsafe extern "C" fn destroy_spawn_tx(data: *mut c_void, _closure: *mut frida_sys::_GClosure) {
+    if !data.is_null() {
+        let _ = Box::from_raw(data as *mut std::sync::mpsc::Sender<u32>);
+    }
+}
+
 /// Coordinator thread: handles device-level operations (spawn, kill, child processes).
 /// Per-session script operations are delegated to dedicated session_worker threads.
 fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
@@ -541,7 +558,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                 signal_name.as_ptr(),
                 callback,
                 tx_ptr as *mut c_void,
-                None,
+                Some(destroy_spawn_tx),
                 0,
             );
         }
@@ -747,6 +764,19 @@ fn session_worker(
 
             SessionCommand::Shutdown => {
                 tracing::info!("Session worker {} shutting down", session_id);
+                // Unload and unref the script to prevent memory leaks
+                unsafe {
+                    let mut error: *mut frida_sys::GError = std::ptr::null_mut();
+                    frida_sys::frida_script_unload_sync(
+                        raw_ptr,
+                        std::ptr::null_mut(),
+                        &mut error,
+                    );
+                    if !error.is_null() {
+                        frida_sys::g_error_free(error);
+                    }
+                    frida_sys::frida_unref(raw_ptr as *mut c_void);
+                }
                 break;
             }
         }
@@ -811,7 +841,9 @@ fn handle_add_patterns(
         }
         Err(_) => {
             tracing::warn!("Timed out waiting for hooks confirmation ({}s)", TIMEOUT_PER_CHUNK_SECS);
-            Ok(0)
+            Err(crate::Error::Frida(
+                format!("Agent did not respond within {}s — hooks may not be installed", TIMEOUT_PER_CHUNK_SECS)
+            ))
         }
     }
 }

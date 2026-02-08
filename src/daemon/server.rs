@@ -648,8 +648,25 @@ Validation Limits (enforced):
 
     async fn tool_debug_launch(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let req: DebugLaunchRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        // Validate paths: reject path traversal attempts
+        if req.command.contains("..") {
+            return Err(crate::Error::ValidationError(
+                "command path must not contain '..' components".to_string()
+            ));
+        }
+        if req.project_root.contains("..") {
+            return Err(crate::Error::ValidationError(
+                "projectRoot must not contain '..' components".to_string()
+            ));
+        }
 
         // Enforce global session limit
+        // Note: There's a small TOCTOU window between this check and the session
+        // registration below. This is acceptable because MCP processes requests
+        // serially per connection, making true concurrent launches impossible
+        // from a single client.
         {
             let sessions = self.connection_sessions.read().await;
             let total_count: usize = sessions.values().map(|v| v.len()).sum();

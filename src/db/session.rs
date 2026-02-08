@@ -105,7 +105,7 @@ impl Database {
                 pid: row.get(3)?,
                 started_at: row.get(4)?,
                 ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
                 retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
                 retained_at: row.get(7).ok().flatten(),
                 size_bytes: row.get(8).ok().flatten(),
@@ -134,7 +134,7 @@ impl Database {
                 pid: row.get(3)?,
                 started_at: row.get(4)?,
                 ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
                 retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
                 retained_at: row.get(7).ok().flatten(),
                 size_bytes: row.get(8).ok().flatten(),
@@ -159,7 +159,7 @@ impl Database {
                 pid: row.get(3)?,
                 started_at: row.get(4)?,
                 ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
                 retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
                 retained_at: row.get(7).ok().flatten(),
                 size_bytes: row.get(8).ok().flatten(),
@@ -173,9 +173,27 @@ impl Database {
         }
     }
 
-    pub fn update_session_status(&self, id: &str, status: SessionStatus) -> Result<()> {
+    pub fn update_session_status(&self, id: &str, new_status: SessionStatus) -> Result<()> {
         let conn = self.connection();
-        let ended_at = if status != SessionStatus::Running {
+
+        // Validate transition: Stopped is a terminal state
+        let current: Option<String> = conn.query_row(
+            "SELECT status FROM sessions WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        ).ok();
+
+        if let Some(ref current_str) = current {
+            if current_str == "stopped" && new_status != SessionStatus::Stopped {
+                tracing::warn!(
+                    "Ignoring invalid transition from stopped to {} for session {}",
+                    new_status.as_str(), id
+                );
+                return Ok(());
+            }
+        }
+
+        let ended_at = if new_status != SessionStatus::Running {
             Some(chrono::Utc::now().timestamp())
         } else {
             None
@@ -183,7 +201,7 @@ impl Database {
 
         conn.execute(
             "UPDATE sessions SET status = ?, ended_at = ? WHERE id = ?",
-            params![status.as_str(), ended_at, id],
+            params![new_status.as_str(), ended_at, id],
         )?;
 
         Ok(())
@@ -243,7 +261,7 @@ impl Database {
                 pid: row.get(3)?,
                 started_at: row.get(4)?,
                 ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap(),
+                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
                 retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
                 retained_at: row.get(7).ok().flatten(),
                 size_bytes: row.get(8).ok().flatten(),
