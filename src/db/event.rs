@@ -11,6 +11,7 @@ pub enum EventType {
     Stdout,
     Stderr,
     Crash,
+    VariableSnapshot,
 }
 
 impl EventType {
@@ -21,6 +22,7 @@ impl EventType {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
             Self::Crash => "crash",
+            Self::VariableSnapshot => "variable_snapshot",
         }
     }
 
@@ -31,6 +33,7 @@ impl EventType {
             "stdout" => Some(Self::Stdout),
             "stderr" => Some(Self::Stderr),
             "crash" => Some(Self::Crash),
+            "variable_snapshot" => Some(Self::VariableSnapshot),
             _ => None,
         }
     }

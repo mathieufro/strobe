@@ -810,6 +810,47 @@ impl DwarfParser {
         })
     }
 
+    /// Convert cached StructMembers to flat field recipes for the agent.
+    /// This is a pure transformation — no DWARF re-parsing needed.
+    pub(crate) fn struct_members_to_recipes(members: &[StructMember], depth: usize) -> Vec<super::StructFieldRecipe> {
+        members.iter().map(|m| {
+            let is_struct_field = !matches!(m.type_kind, TypeKind::Integer { .. } | TypeKind::Float | TypeKind::Pointer);
+            let is_truncated = is_struct_field && depth <= 1;
+
+            super::StructFieldRecipe {
+                name: m.name.clone(),
+                offset: m.offset,
+                size: m.byte_size,
+                type_kind: m.type_kind.clone(),
+                type_name: m.type_name.clone(),
+                is_truncated_struct: is_truncated,
+            }
+        }).collect()
+    }
+
+    /// Resolve a variable to a read recipe, optionally expanding struct fields.
+    /// Returns the WatchRecipe for the variable plus optional struct field recipes.
+    pub fn resolve_read_target(
+        &self,
+        variable: &str,
+        depth: u32,
+    ) -> Result<(WatchRecipe, Option<Vec<super::StructFieldRecipe>>)> {
+        let recipe = self.resolve_watch_expression(variable)?;
+
+        // For pointer variables with no deref chain (bare pointer), expand struct if depth > 0
+        if matches!(recipe.type_kind, TypeKind::Pointer) && recipe.deref_chain.is_empty() {
+            if self.lazy_resolve_struct_members(variable).is_ok() {
+                let cache = self.struct_members.lock().unwrap();
+                if let Some(members) = cache.get(variable) {
+                    let field_recipes = Self::struct_members_to_recipes(members, depth as usize);
+                    return Ok((recipe, Some(field_recipes)));
+                }
+            }
+        }
+
+        Ok((recipe, None))
+    }
+
     pub fn find_variable_by_name(&self, name: &str) -> Option<&VariableInfo> {
         self.variables_by_name
             .get(name)
@@ -1188,5 +1229,44 @@ mod pattern_tests {
             assert_eq!(matched, expected_indices,
                 "Pattern '{}' matched wrong functions", pattern);
         }
+    }
+}
+
+#[cfg(test)]
+mod struct_expansion_tests {
+    use super::*;
+    use crate::dwarf::TypeKind;
+
+    #[test]
+    fn test_expand_struct_from_members() {
+        let members = vec![
+            StructMember {
+                name: "size".to_string(),
+                offset: 0,
+                byte_size: 4,
+                type_kind: TypeKind::Integer { signed: false },
+                type_name: Some("uint32_t".to_string()),
+                is_pointer: false,
+                pointed_struct_members: None,
+            },
+            StructMember {
+                name: "data".to_string(),
+                offset: 8,
+                byte_size: 8,
+                type_kind: TypeKind::Pointer,
+                type_name: Some("pointer".to_string()),
+                is_pointer: true,
+                pointed_struct_members: None,
+            },
+        ];
+
+        let recipes = DwarfParser::struct_members_to_recipes(&members, 1);
+        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes[0].name, "size");
+        assert_eq!(recipes[0].offset, 0);
+        assert_eq!(recipes[0].size, 4);
+        assert_eq!(recipes[1].name, "data");
+        assert_eq!(recipes[1].offset, 8);
+        assert!(!recipes[0].is_truncated_struct);
     }
 }

@@ -383,6 +383,10 @@ export class CModuleTracer {
     this.imageBaseSet = true;
   }
 
+  getSlide(): NativePointer {
+    return this.aslrSlide;
+  }
+
   setSessionId(sessionId: string): void {
     this.sessionId = sessionId;
   }

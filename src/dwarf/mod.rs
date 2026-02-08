@@ -3,7 +3,7 @@ mod function;
 mod handle;
 
 pub use parser::DwarfParser;
-pub use function::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation};
+pub use function::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation, StructFieldRecipe};
 pub use handle::DwarfHandle;
 
 // Re-export PatternMatcher for integration tests

@@ -70,6 +70,19 @@ pub enum LocalVarLocation {
     Complex,
 }
 
+/// A flat recipe for reading a struct field at runtime.
+/// Used by debug_read to send field layouts to the agent.
+#[derive(Debug, Clone)]
+pub struct StructFieldRecipe {
+    pub name: String,
+    pub offset: u64,
+    pub size: u8,
+    pub type_kind: TypeKind,
+    pub type_name: Option<String>,
+    /// True if this field is itself a struct beyond the depth limit
+    pub is_truncated_struct: bool,
+}
+
 impl FunctionInfo {
     pub fn contains_address(&self, addr: u64) -> bool {
         addr >= self.low_pc && addr < self.high_pc

@@ -197,6 +197,7 @@ pub enum EventTypeFilter {
     Stdout,
     Stderr,
     Crash,
+    VariableSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +292,183 @@ pub struct DebugStopRequest {
 pub struct DebugStopResponse {
     pub success: bool,
     pub events_collected: u64,
+}
+
+// ============ debug_read ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadTarget {
+    /// DWARF variable name or pointer chain (e.g. "gClock->counter")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
+    /// Raw hex address (e.g. "0x7ff800")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Size in bytes (required for raw address reads)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    /// Type hint for raw address reads: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer/bytes
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PollConfig {
+    pub interval_ms: u32,
+    pub duration_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugReadRequest {
+    pub session_id: String,
+    pub targets: Vec<ReadTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollConfig>,
+}
+
+// Validation limits for debug_read
+pub const MAX_READ_TARGETS: usize = 16;
+pub const MAX_READ_DEPTH: u32 = 5;
+pub const MIN_POLL_INTERVAL_MS: u32 = 50;
+pub const MAX_POLL_INTERVAL_MS: u32 = 5000;
+pub const MIN_POLL_DURATION_MS: u32 = 100;
+pub const MAX_POLL_DURATION_MS: u32 = 30000;
+pub const MAX_RAW_READ_SIZE: u32 = 65536;
+const VALID_TYPE_HINTS: &[&str] = &[
+    "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
+    "f32", "f64", "pointer", "bytes",
+];
+
+impl DebugReadRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.targets.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "targets must not be empty".to_string()
+            ));
+        }
+        if self.targets.len() > MAX_READ_TARGETS {
+            return Err(crate::Error::ValidationError(
+                format!("Too many targets ({}, max {})", self.targets.len(), MAX_READ_TARGETS)
+            ));
+        }
+        if let Some(depth) = self.depth {
+            if depth < 1 || depth > MAX_READ_DEPTH {
+                return Err(crate::Error::ValidationError(
+                    format!("depth must be between 1 and {}", MAX_READ_DEPTH)
+                ));
+            }
+        }
+        if let Some(ref poll) = self.poll {
+            if poll.interval_ms < MIN_POLL_INTERVAL_MS || poll.interval_ms > MAX_POLL_INTERVAL_MS {
+                return Err(crate::Error::ValidationError(
+                    format!("poll.intervalMs must be between {} and {}", MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS)
+                ));
+            }
+            if poll.duration_ms < MIN_POLL_DURATION_MS || poll.duration_ms > MAX_POLL_DURATION_MS {
+                return Err(crate::Error::ValidationError(
+                    format!("poll.durationMs must be between {} and {}", MIN_POLL_DURATION_MS, MAX_POLL_DURATION_MS)
+                ));
+            }
+        }
+        for target in &self.targets {
+            if target.variable.is_none() && target.address.is_none() {
+                return Err(crate::Error::ValidationError(
+                    "Each target must have either 'variable' or 'address'".to_string()
+                ));
+            }
+            if target.address.is_some() {
+                if target.size.is_none() || target.type_hint.is_none() {
+                    return Err(crate::Error::ValidationError(
+                        "Raw address targets require 'size' and 'type'".to_string()
+                    ));
+                }
+                if let Some(size) = target.size {
+                    if size == 0 || size > MAX_RAW_READ_SIZE {
+                        return Err(crate::Error::ValidationError(
+                            format!("size must be between 1 and {}", MAX_RAW_READ_SIZE)
+                        ));
+                    }
+                }
+                if let Some(ref type_hint) = target.type_hint {
+                    if !VALID_TYPE_HINTS.contains(&type_hint.as_str()) {
+                        return Err(crate::Error::ValidationError(
+                            format!("Invalid type '{}'. Valid: {}", type_hint, VALID_TYPE_HINTS.join(", "))
+                        ));
+                    }
+                }
+            }
+            if let Some(ref var) = target.variable {
+                validate_watch_field(var, "variable")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A single read result in the debug_read response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResult {
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// File path for bytes-type reads
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Hex preview for bytes-type reads
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+impl Default for ReadResult {
+    fn default() -> Self {
+        Self {
+            target: String::new(),
+            address: None,
+            type_name: None,
+            value: None,
+            size: None,
+            fields: None,
+            error: None,
+            file: None,
+            preview: None,
+        }
+    }
+}
+
+/// Response for one-shot debug_read
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugReadResponse {
+    pub results: Vec<ReadResult>,
+}
+
+/// Response for poll-mode debug_read
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugReadPollResponse {
+    pub polling: bool,
+    pub variable_count: usize,
+    pub interval_ms: u32,
+    pub duration_ms: u32,
+    pub expected_samples: u32,
+    pub event_type: String,
+    pub hint: String,
 }
 
 // ============ debug_test ============
@@ -420,6 +598,7 @@ pub enum ErrorCode {
     WatchFailed,
     TestRunNotFound,
     ValidationError,
+    ReadFailed,
     InternalError,
 }
 
@@ -442,6 +621,7 @@ impl From<crate::Error> for McpError {
             crate::Error::WatchFailed(_) => ErrorCode::WatchFailed,
             crate::Error::ValidationError(_) => ErrorCode::ValidationError,
             crate::Error::TestRunNotFound(_) => ErrorCode::TestRunNotFound,
+            crate::Error::ReadFailed(_) => ErrorCode::ReadFailed,
             _ => ErrorCode::InternalError,
         };
 
@@ -449,5 +629,105 @@ impl From<crate::Error> for McpError {
             code,
             message: err.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_read_request_validation_empty_targets() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_too_many_targets() {
+        let targets: Vec<ReadTarget> = (0..17).map(|i| ReadTarget {
+            variable: Some(format!("var{}", i)),
+            address: None,
+            size: None,
+            type_hint: None,
+        }).collect();
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets,
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_valid() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None,
+                size: None,
+                type_hint: None,
+            }],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_poll_limits() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None,
+                size: None,
+                type_hint: None,
+            }],
+            depth: None,
+            poll: Some(PollConfig {
+                interval_ms: 10,  // below min 50
+                duration_ms: 2000,
+            }),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_depth_limits() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None,
+                size: None,
+                type_hint: None,
+            }],
+            depth: Some(10),  // above max 5
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_raw_address_requires_size_and_type() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: None,
+                address: Some("0x7ff800".to_string()),
+                size: None,  // missing
+                type_hint: None,  // missing
+            }],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_err());
     }
 }

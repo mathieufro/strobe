@@ -42,6 +42,32 @@ interface CrashEvent {
   memoryAccess?: { operation: string; address: string };
 }
 
+interface ReadRecipe {
+  label: string;
+  address: string;  // hex
+  size: number;
+  typeKind: string;  // "int", "uint", "float", "pointer", "bytes"
+  derefDepth: number;
+  derefOffset: number;
+  struct?: boolean;
+  fields?: Array<{
+    name: string;
+    offset: number;
+    size: number;
+    typeKind: string;
+    typeName?: string;
+    isTruncatedStruct?: boolean;
+  }>;
+}
+
+interface ReadMemoryMessage {
+  recipes: ReadRecipe[];
+  poll?: {
+    intervalMs: number;
+    durationMs: number;
+  };
+}
+
 interface WatchInstruction {
   watches: Array<{
     address: string;
@@ -344,6 +370,144 @@ class StrobeAgent {
     };
   }
 
+  handleReadMemory(message: ReadMemoryMessage): void {
+    const slide = this.tracer.getSlide();
+
+    if (message.poll) {
+      this.startReadPoll(message.recipes, slide, message.poll);
+      return;
+    }
+
+    // One-shot mode: read all targets, send response
+    const results = message.recipes.map(recipe => this.readSingleTarget(recipe, slide));
+    send({ type: 'read_response', results });
+  }
+
+  private readSingleTarget(recipe: ReadRecipe, slide: NativePointer): any {
+    try {
+      const baseAddr = ptr(recipe.address).add(slide);
+
+      // Handle struct reads
+      if (recipe.struct && recipe.fields) {
+        const structPtr = baseAddr.readPointer();
+        if (structPtr.isNull()) {
+          return { label: recipe.label, error: `Null pointer at ${recipe.label}` };
+        }
+        const fields: Record<string, any> = {};
+        for (const field of recipe.fields) {
+          if (field.isTruncatedStruct) {
+            fields[field.name] = '<struct>';
+            continue;
+          }
+          try {
+            const fieldAddr = structPtr.add(field.offset);
+            fields[field.name] = this.readTypedValue(fieldAddr, field.size, field.typeKind);
+          } catch (e: any) {
+            fields[field.name] = `<error: ${e.message}>`;
+          }
+        }
+        return { label: recipe.label, fields };
+      }
+
+      // Handle deref chain (e.g. gClock->counter)
+      if (recipe.derefDepth > 0) {
+        const ptrVal = baseAddr.readPointer();
+        if (ptrVal.isNull()) {
+          return { label: recipe.label, error: `Null pointer at ${recipe.label.split('->')[0]}` };
+        }
+        const finalAddr = ptrVal.add(recipe.derefOffset);
+        const value = this.readTypedValue(finalAddr, recipe.size, recipe.typeKind);
+        return { label: recipe.label, value };
+      }
+
+      // Simple direct read
+      if (recipe.typeKind === 'bytes') {
+        const bytes = baseAddr.readByteArray(recipe.size);
+        if (!bytes) return { label: recipe.label, error: 'Failed to read bytes' };
+        return { label: recipe.label, value: _arrayBufferToHex(bytes), isBytes: true };
+      }
+
+      const value = this.readTypedValue(baseAddr, recipe.size, recipe.typeKind);
+      return { label: recipe.label, value };
+    } catch (e: any) {
+      return { label: recipe.label, error: `Address not readable: ${e.message}` };
+    }
+  }
+
+  private readTypedValue(addr: NativePointer, size: number, typeKind: string): any {
+    const range = Process.findRangeByAddress(addr);
+    if (!range || !range.protection.includes('r')) {
+      throw new Error(`Address ${addr} not readable`);
+    }
+
+    switch (typeKind) {
+      case 'float':
+        return size === 4 ? addr.readFloat() : addr.readDouble();
+      case 'int':
+        switch (size) {
+          case 1: return addr.readS8();
+          case 2: return addr.readS16();
+          case 4: return addr.readS32();
+          case 8: return addr.readS64().toNumber();
+          default: return addr.readS32();
+        }
+      case 'uint':
+        switch (size) {
+          case 1: return addr.readU8();
+          case 2: return addr.readU16();
+          case 4: return addr.readU32();
+          case 8: return addr.readU64().toNumber();
+          default: return addr.readU32();
+        }
+      case 'pointer':
+        return addr.readPointer().toString();
+      default:
+        return addr.readU64().toNumber();
+    }
+  }
+
+  private startReadPoll(
+    recipes: ReadRecipe[],
+    slide: NativePointer,
+    poll: { intervalMs: number; durationMs: number }
+  ): void {
+    const startTime = Date.now();
+    let sampleCount = 0;
+
+    const timer = setInterval(() => {
+      const elapsed = Date.now() - startTime;
+      if (elapsed >= poll.durationMs) {
+        clearInterval(timer);
+        send({ type: 'poll_complete', sampleCount });
+        return;
+      }
+
+      const data: Record<string, any> = {};
+      for (const recipe of recipes) {
+        const result = this.readSingleTarget(recipe, slide);
+        if (result.error) {
+          data[recipe.label] = `<error: ${result.error}>`;
+        } else if (result.fields) {
+          data[recipe.label] = result.fields;
+        } else {
+          data[recipe.label] = result.value;
+        }
+      }
+
+      sampleCount++;
+      send({
+        type: 'events',
+        events: [{
+          id: `${this.sessionId}-snap-${sampleCount}`,
+          timestampNs: this.getTimestampNs(),
+          threadId: Process.getCurrentThreadId(),
+          eventType: 'variable_snapshot',
+          data,
+        }],
+      });
+    }, poll.intervalMs);
+  }
+
   private installOutputCapture(): void {
     const self = this;
     const writePtr = Process.getModuleByName('libSystem.B.dylib').getExportByName('write');
@@ -456,6 +620,12 @@ function onWatchesMessage(message: WatchInstruction): void {
   agent.handleWatches(message);
 }
 recv('watches', onWatchesMessage);
+
+function onReadMemoryMessage(message: ReadMemoryMessage): void {
+  recv('read_memory', onReadMemoryMessage);
+  agent.handleReadMemory(message);
+}
+recv('read_memory', onReadMemoryMessage);
 
 // Export for potential direct usage
 (globalThis as any).strobeAgent = agent;

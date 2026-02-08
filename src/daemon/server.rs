@@ -46,6 +46,17 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
         });
     }
 
+    if event.event_type == crate::db::EventType::VariableSnapshot {
+        return serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": "variable_snapshot",
+            "threadId": event.thread_id,
+            "pid": event.pid,
+            "data": event.arguments,
+        });
+    }
+
     if event.event_type == crate::db::EventType::Stdout || event.event_type == crate::db::EventType::Stderr {
         return serde_json::json!({
             "id": event.id,
@@ -97,6 +108,17 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
             "watchValues": event.watch_values,
         })
     }
+}
+
+fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            let end = (i + 2).min(hex.len());
+            u8::from_str_radix(&hex[i..end], 16)
+                .map_err(|e| format!("Invalid hex: {}", e))
+        })
+        .collect()
 }
 
 fn hook_status_message(installed: u32, matched: u32, patterns_empty: bool) -> String {
@@ -452,7 +474,16 @@ When you see a warning:
 
 ### Quick Reference
 - Rust: provide `projectRoot` | C++: provide `command` (test binary path)
-- Add `tracePatterns` to trace from the start (optional — can add later via `debug_trace`)"#
+- Add `tracePatterns` to trace from the start (optional — can add later via `debug_trace`)
+
+## Live Memory Reads
+
+Read variables from a running process without setting up traces:
+- `debug_read({ sessionId, targets: [{ variable: \"gTempo\" }] })` — read a global
+- `debug_read({ sessionId, targets: [{ variable: \"gClock->counter\" }] })` — follow pointer chain
+- `debug_read({ sessionId, targets: [...], depth: 2 })` — expand struct fields
+- `debug_read({ sessionId, targets: [...], poll: { intervalMs: 100, durationMs: 2000 } })` — sample over time
+- Poll results: `debug_query({ eventType: \"variable_snapshot\" })`"#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
@@ -661,6 +692,38 @@ Validation Limits (enforced):
                     "required": ["testRunId"]
                 }),
             },
+            McpTool {
+                name: "debug_read".to_string(),
+                description: "Read memory from a running process. Supports DWARF-resolved variables, pointer chains, struct expansion, raw addresses, and polling mode for timeline integration.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "variable": { "type": "string", "description": "Variable name or pointer chain (e.g. 'gClock->counter')" },
+                                    "address": { "type": "string", "description": "Hex address for raw memory reads" },
+                                    "size": { "type": "integer", "description": "Size in bytes (required for raw address)" },
+                                    "type": { "type": "string", "description": "Type: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer/bytes" }
+                                }
+                            },
+                            "description": "1-16 read targets"
+                        },
+                        "depth": { "type": "integer", "description": "Struct traversal depth (default 1, max 5)", "minimum": 1, "maximum": 5 },
+                        "poll": {
+                            "type": "object",
+                            "properties": {
+                                "intervalMs": { "type": "integer", "description": "Poll interval in ms (50-5000)", "minimum": 50, "maximum": 5000 },
+                                "durationMs": { "type": "integer", "description": "Poll duration in ms (100-30000)", "minimum": 100, "maximum": 30000 }
+                            }
+                        }
+                    },
+                    "required": ["sessionId", "targets"]
+                }),
+            },
         ];
 
         let response = McpToolsListResponse { tools };
@@ -679,6 +742,7 @@ Validation Limits (enforced):
             "debug_delete_session" => self.tool_debug_delete_session(&call.arguments).await,
             "debug_test" => self.tool_debug_test(&call.arguments, connection_id).await,
             "debug_test_status" => self.tool_debug_test_status(&call.arguments).await,
+            "debug_read" => self.tool_debug_read(&call.arguments).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -1201,6 +1265,7 @@ Validation Limits (enforced):
                     EventTypeFilter::Stdout => crate::db::EventType::Stdout,
                     EventTypeFilter::Stderr => crate::db::EventType::Stderr,
                     EventTypeFilter::Crash => crate::db::EventType::Crash,
+                    EventTypeFilter::VariableSnapshot => crate::db::EventType::VariableSnapshot,
                 });
             }
             if let Some(ref f) = req.function {
@@ -1254,6 +1319,199 @@ Validation Limits (enforced):
         };
 
         Ok(serde_json::to_value(response)?)
+    }
+
+    async fn tool_debug_read(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        use crate::mcp::*;
+
+        let req: DebugReadRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        // Verify session exists and is running
+        let session = self.require_session(&req.session_id)?;
+        if session.status != crate::db::SessionStatus::Running {
+            return Err(crate::Error::ReadFailed(
+                "Process exited — session still queryable but reads unavailable".to_string()
+            ));
+        }
+
+        let depth = req.depth.unwrap_or(1);
+
+        // Build read recipes from targets
+        let mut recipes: Vec<serde_json::Value> = Vec::new();
+        let mut response_results: Vec<ReadResult> = Vec::new();
+
+        // Get DWARF parser for variable resolution
+        let dwarf = self.session_manager.get_dwarf(&req.session_id).await?;
+
+        for target in &req.targets {
+            if let Some(ref var_name) = target.variable {
+                // DWARF-resolved variable
+                let dwarf_ref = match dwarf.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        response_results.push(ReadResult {
+                            target: var_name.clone(),
+                            error: Some("No debug symbols available".to_string()),
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+                };
+
+                match dwarf_ref.resolve_read_target(var_name, depth) {
+                    Ok((recipe, struct_fields)) => {
+                        let type_kind_str = match recipe.type_kind {
+                            crate::dwarf::TypeKind::Integer { signed } => {
+                                if signed { "int" } else { "uint" }
+                            }
+                            crate::dwarf::TypeKind::Float => "float",
+                            crate::dwarf::TypeKind::Pointer => "pointer",
+                            crate::dwarf::TypeKind::Unknown => "uint",
+                        };
+
+                        let mut recipe_json = serde_json::json!({
+                            "label": var_name,
+                            "address": format!("0x{:x}", recipe.base_address),
+                            "size": recipe.final_size,
+                            "typeKind": type_kind_str,
+                            "derefDepth": recipe.deref_chain.len(),
+                            "derefOffset": recipe.deref_chain.first().copied().unwrap_or(0),
+                        });
+
+                        // Add struct fields if expanded
+                        if let Some(fields) = struct_fields {
+                            recipe_json["struct"] = serde_json::json!(true);
+                            let fields_json: Vec<serde_json::Value> = fields.iter().map(|f| {
+                                let tk = match f.type_kind {
+                                    crate::dwarf::TypeKind::Integer { signed } => {
+                                        if signed { "int" } else { "uint" }
+                                    }
+                                    crate::dwarf::TypeKind::Float => "float",
+                                    crate::dwarf::TypeKind::Pointer => "pointer",
+                                    crate::dwarf::TypeKind::Unknown => "uint",
+                                };
+                                serde_json::json!({
+                                    "name": f.name,
+                                    "offset": f.offset,
+                                    "size": f.size,
+                                    "typeKind": tk,
+                                    "typeName": f.type_name,
+                                    "isTruncatedStruct": f.is_truncated_struct,
+                                })
+                            }).collect();
+                            recipe_json["fields"] = serde_json::json!(fields_json);
+                        }
+
+                        recipes.push(recipe_json);
+                    }
+                    Err(e) => {
+                        response_results.push(ReadResult {
+                            target: var_name.clone(),
+                            error: Some(e.to_string()),
+                            ..Default::default()
+                        });
+                    }
+                }
+            } else if let Some(ref addr) = target.address {
+                // Raw address read
+                let size = target.size.unwrap_or(4);
+                let type_hint = target.type_hint.clone().unwrap_or_else(|| "bytes".to_string());
+
+                recipes.push(serde_json::json!({
+                    "label": addr,
+                    "address": addr,
+                    "size": size,
+                    "typeKind": type_hint,
+                    "derefDepth": 0,
+                    "derefOffset": 0,
+                }));
+            }
+        }
+
+        if recipes.is_empty() && !response_results.is_empty() {
+            // All targets had errors — return immediately
+            return Ok(serde_json::to_value(DebugReadResponse {
+                results: response_results,
+            })?);
+        }
+
+        // Build the message to send to agent
+        let mut msg = serde_json::json!({
+            "type": "read_memory",
+            "recipes": recipes,
+        });
+
+        if let Some(ref poll) = req.poll {
+            msg["poll"] = serde_json::json!({
+                "intervalMs": poll.interval_ms,
+                "durationMs": poll.duration_ms,
+            });
+        }
+
+        let msg_str = serde_json::to_string(&msg)?;
+
+        // Send to agent via session manager
+        let agent_response = self.session_manager.read_memory(&req.session_id, msg_str).await?;
+
+        // Handle poll mode
+        if req.poll.is_some() {
+            let poll = req.poll.as_ref().unwrap();
+            let expected = poll.duration_ms / poll.interval_ms;
+            let response = DebugReadPollResponse {
+                polling: true,
+                variable_count: recipes.len(),
+                interval_ms: poll.interval_ms,
+                duration_ms: poll.duration_ms,
+                expected_samples: expected,
+                event_type: "variable_snapshot".to_string(),
+                hint: "Use debug_query({ eventType: 'variable_snapshot' }) to see results".to_string(),
+            };
+            return Ok(serde_json::to_value(response)?);
+        }
+
+        // Handle one-shot response — merge agent results with any pre-computed errors
+        if let Some(results) = agent_response.get("results").and_then(|v| v.as_array()) {
+            for result in results {
+                let label = result.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let mut read_result = ReadResult {
+                    target: label.to_string(),
+                    ..Default::default()
+                };
+
+                if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+                    read_result.error = Some(err.to_string());
+                } else if let Some(fields) = result.get("fields") {
+                    read_result.fields = Some(fields.clone());
+                } else if let Some(value) = result.get("value") {
+                    // Handle bytes type: write to file
+                    if result.get("isBytes").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        if let Some(hex) = value.as_str() {
+                            let dir = "/tmp/strobe/reads";
+                            let _ = std::fs::create_dir_all(dir);
+                            let filename = format!("{}-{}.bin", req.session_id, chrono::Utc::now().timestamp());
+                            let filepath = format!("{}/{}", dir, filename);
+                            if let Ok(bytes) = hex_to_bytes(hex) {
+                                let _ = std::fs::write(&filepath, &bytes);
+                                read_result.file = Some(filepath);
+                                let preview_bytes = &bytes[..bytes.len().min(32)];
+                                read_result.preview = Some(
+                                    preview_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+                                );
+                            }
+                        }
+                    } else {
+                        read_result.value = Some(value.clone());
+                    }
+                }
+
+                response_results.push(read_result);
+            }
+        }
+
+        Ok(serde_json::to_value(DebugReadResponse {
+            results: response_results,
+        })?)
     }
 
     async fn tool_debug_stop(&self, args: &serde_json::Value) -> Result<serde_json::Value> {

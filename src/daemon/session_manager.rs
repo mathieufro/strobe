@@ -412,6 +412,19 @@ impl SessionManager {
         spawner.set_watches(session_id, watches).await
     }
 
+    /// Send a read_memory command to the Frida agent and return the response.
+    pub async fn read_memory(
+        &self,
+        session_id: &str,
+        recipes_json: String,
+    ) -> Result<serde_json::Value> {
+        let guard = self.frida_spawner.read().await;
+        let spawner = guard.as_ref()
+            .ok_or_else(|| crate::Error::Frida("No Frida spawner available".to_string()))?;
+
+        spawner.read_memory(session_id, recipes_json).await
+    }
+
     /// Stop Frida session
     pub async fn stop_frida(&self, session_id: &str) -> Result<()> {
         let mut guard = self.frida_spawner.write().await;

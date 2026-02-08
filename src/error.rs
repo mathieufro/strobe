@@ -29,6 +29,9 @@ pub enum Error {
     #[error("VALIDATION_ERROR: {0}")]
     ValidationError(String),
 
+    #[error("READ_FAILED: {0}")]
+    ReadFailed(String),
+
     #[error("TEST_RUN_NOT_FOUND: No test run found with ID '{0}'.")]
     TestRunNotFound(String),
 

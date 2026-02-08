@@ -265,6 +265,7 @@ const AGENT_CODE: &str = include_str!("../../agent/dist/agent.js");
 /// Channel for the worker to wait on agent responses (e.g., hooks_updated).
 /// The message handler sends on this when it receives a hooks_updated message.
 type HooksReadySignal = Arc<Mutex<Option<std::sync::mpsc::Sender<u64>>>>;
+type ReadResponseSignal = Arc<Mutex<Option<std::sync::mpsc::Sender<serde_json::Value>>>>;
 
 /// Signal the worker that hooks or watches are ready.
 fn signal_ready(hooks_ready: &HooksReadySignal, label: &str, session_id: &str, payload: &serde_json::Value) {
@@ -283,6 +284,7 @@ struct AgentMessageHandler {
     event_tx: mpsc::Sender<Event>,
     session_id: String,
     hooks_ready: HooksReadySignal,
+    read_response: ReadResponseSignal,
 }
 
 impl AgentMessageHandler {
@@ -344,6 +346,16 @@ impl AgentMessageHandler {
                     tracing::debug!("[{}] Sampling stats: {} functions being sampled", self.session_id, sampling_count);
                 }
             }
+            "read_response" => {
+                if let Ok(mut guard) = self.read_response.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(payload.clone());
+                    }
+                }
+            }
+            "poll_complete" => {
+                tracing::info!("Poll complete for session {}", self.session_id);
+            }
             _ => {
                 tracing::debug!("Unknown message type from agent: {}", msg_type);
             }
@@ -377,6 +389,7 @@ struct SpawnResult {
     pid: u32,
     script_ptr: SendScriptPtr,
     hooks_ready: HooksReadySignal,
+    read_response: ReadResponseSignal,
 }
 
 /// Commands for the coordinator thread (device-level operations).
@@ -412,6 +425,10 @@ enum SessionCommand {
     SetWatches {
         watches: Vec<WatchTarget>,
         response: oneshot::Sender<Result<()>>,
+    },
+    ReadMemory {
+        recipes_json: String,
+        response: oneshot::Sender<Result<serde_json::Value>>,
     },
     Shutdown,
 }
@@ -630,11 +647,13 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     let t = std::time::Instant::now();
 
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
+                    let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
 
                     let handler = AgentMessageHandler {
                         event_tx: event_tx.clone(),
                         session_id: session_id.clone(),
                         hooks_ready: hooks_ready.clone(),
+                        read_response: read_response.clone(),
                     };
 
                     unsafe { register_handler_raw(script_ptr, handler) };
@@ -663,6 +682,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         pid,
                         script_ptr: SendScriptPtr(script_ptr),
                         hooks_ready,
+                        read_response,
                     })
                 })();
 
@@ -703,6 +723,7 @@ fn session_worker(
     session_id: String,
     script_ptr: SendScriptPtr,
     hooks_ready: HooksReadySignal,
+    read_response: ReadResponseSignal,
     pid: u32,
     cmd_rx: std::sync::mpsc::Receiver<SessionCommand>,
 ) {
@@ -733,6 +754,11 @@ fn session_worker(
 
             SessionCommand::SetWatches { watches, response } => {
                 let result = handle_set_watches(raw_ptr, &hooks_ready, &session_id, pid, &watches);
+                let _ = response.send(result);
+            }
+
+            SessionCommand::ReadMemory { recipes_json, response } => {
+                let result = handle_read_memory(raw_ptr, &read_response, &recipes_json);
                 let _ = response.send(result);
             }
 
@@ -915,6 +941,42 @@ fn handle_set_watches(
     }
 }
 
+/// Handle ReadMemory on a session worker thread.
+fn handle_read_memory(
+    script_ptr: *mut frida_sys::_FridaScript,
+    read_response: &ReadResponseSignal,
+    recipes_json: &str,
+) -> Result<serde_json::Value> {
+    let msg: serde_json::Value = serde_json::from_str(recipes_json)
+        .map_err(|e| crate::Error::Frida(format!("Invalid recipes JSON: {}", e)))?;
+
+    if msg.get("poll").is_some() {
+        // Poll mode — send message, return immediately (events stream through normal pipeline)
+        unsafe {
+            post_message_raw(script_ptr, recipes_json)
+                .map_err(|e| crate::Error::Frida(format!("Failed to send read_memory: {}", e)))?;
+        }
+        return Ok(serde_json::json!({ "polling": true }));
+    }
+
+    // One-shot: arm the response channel, send message, wait
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+    {
+        let mut guard = read_response.lock().unwrap();
+        *guard = Some(signal_tx);
+    }
+
+    unsafe {
+        post_message_raw(script_ptr, recipes_json)
+            .map_err(|e| crate::Error::Frida(format!("Failed to send read_memory: {}", e)))?;
+    }
+
+    match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(response) => Ok(response),
+        Err(_) => Err(crate::Error::Frida("Memory read timed out (5s)".to_string())),
+    }
+}
+
 /// Handle a child process spawned via fork/exec.
 /// Attaches Frida to the child, loads the agent, and registers it for output capture.
 fn handle_child_spawn(
@@ -971,10 +1033,12 @@ fn handle_child_spawn(
             match unsafe { create_script_raw(raw_session, AGENT_CODE) } {
                 Ok(script_ptr) => {
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
+                    let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
                     let handler = AgentMessageHandler {
                         event_tx: event_tx.clone(),
                         session_id: session_id.clone(),
                         hooks_ready: hooks_ready.clone(),
+                        read_response: read_response.clone(),
                     };
                     unsafe {
                         register_handler_raw(script_ptr, handler);
@@ -1017,10 +1081,26 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         "stdout" => EventType::Stdout,
         "stderr" => EventType::Stderr,
         "crash" => EventType::Crash,
+        "variable_snapshot" => EventType::VariableSnapshot,
         _ => return None,
     };
 
     let pid = json.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+
+    if event_type == EventType::VariableSnapshot {
+        return Some(Event {
+            id: json.get("id").and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}-snap-{}", session_id, chrono::Utc::now().timestamp_millis())),
+            session_id: session_id.to_string(),
+            timestamp_ns: json.get("timestampNs")?.as_i64()?,
+            thread_id: json.get("threadId")?.as_i64()?,
+            event_type,
+            arguments: json.get("data").cloned(),
+            pid,
+            ..Event::default()
+        });
+    }
 
     if event_type == EventType::Crash {
         return Some(Event {
@@ -1167,7 +1247,7 @@ impl FridaSpawner {
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let sid = session_id.to_string();
         thread::spawn(move || {
-            session_worker(sid, spawn_result.script_ptr, spawn_result.hooks_ready, pid, session_rx);
+            session_worker(sid, spawn_result.script_ptr, spawn_result.hooks_ready, spawn_result.read_response, pid, session_rx);
         });
         self.session_workers.insert(session_id.to_string(), session_tx);
 
@@ -1302,6 +1382,21 @@ impl FridaSpawner {
 
         worker_tx.send(SessionCommand::RemovePatterns {
             functions,
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
+
+    pub async fn read_memory(&self, session_id: &str, recipes_json: String) -> Result<serde_json::Value> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let worker_tx = self.session_workers.get(session_id)
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        worker_tx.send(SessionCommand::ReadMemory {
+            recipes_json,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
 
@@ -1553,10 +1648,12 @@ mod tests {
     fn make_handler() -> (AgentMessageHandler, mpsc::Receiver<Event>, HooksReadySignal) {
         let (event_tx, event_rx) = mpsc::channel(1000);
         let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
+        let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
         let handler = AgentMessageHandler {
             event_tx,
             session_id: "test-session".to_string(),
             hooks_ready: hooks_ready.clone(),
+            read_response,
         };
         (handler, event_rx, hooks_ready)
     }
