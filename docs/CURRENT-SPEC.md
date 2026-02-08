@@ -6,7 +6,7 @@
 
 Strobe is an LLM-native debugging infrastructure. An LLM connects via MCP, launches a target binary with Frida instrumentation, adds/removes trace patterns at runtime, and queries captured events — all without restarting the process.
 
-**Current phase:** 1d (Test Instrumentation)
+**Current phase:** 1e (Live Memory Reads — planned)
 
 ## Recommended Workflow
 
@@ -33,6 +33,7 @@ strobe daemon       ← long-running, idle-shuts after 30min
   ├─ SessionManager ← manages sessions, DWARF cache, pattern state
   ├─ Frida worker   ← dedicated thread (lazily initialized), spawns/instruments processes
   │   └─ Agent.js   ← injected TypeScript, hooks functions via Interceptor
+  ├─ TestRunner     ← async test execution with framework adapters
   └─ SQLite         ← ~/.strobe/strobe.db (WAL mode)
 ```
 
@@ -41,6 +42,7 @@ strobe daemon       ← long-running, idle-shuts after 30min
 ```
 strobe daemon   # Start daemon on Unix socket
 strobe mcp      # Stdio proxy for MCP clients (auto-starts daemon)
+strobe install  # Auto-detect coding agent, install MCP config + skills
 ```
 
 ### Daemon
@@ -50,6 +52,34 @@ strobe mcp      # Stdio proxy for MCP clients (auto-starts daemon)
 - **Database:** `~/.strobe/strobe.db`
 - **Idle timeout:** 30 minutes
 - **Protocol:** JSON-RPC 2.0, line-delimited, MCP protocol version `2024-11-05`
+
+## Configuration
+
+Hierarchical file-based settings with JSON files:
+
+**Hierarchy** (later overrides earlier):
+1. Built-in defaults
+2. Global: `~/.strobe/settings.json`
+3. Project: `<projectRoot>/.strobe/settings.json`
+
+```json
+{
+  "events.maxPerSession": 500000,
+  "test.statusRetryMs": 3000
+}
+```
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `events.maxPerSession` | number | 200,000 | 1 - 10,000,000 | Per-session event limit (FIFO buffer) |
+| `test.statusRetryMs` | number | 5,000 | 500 - 60,000 | Base polling delay for `debug_test_status` |
+
+**Event limit guidance:**
+- 200k: Default — fast queries (<10ms), ~56MB DB
+- 500k: Audio/DSP debugging — moderate queries (~28ms), ~140MB DB
+- 1M+: Avoid unless necessary — slow queries (>300ms), >280MB DB
+
+Settings are re-read on every tool call (no caching). Invalid values fall back to defaults with a warning.
 
 ## MCP Tools
 
@@ -66,140 +96,218 @@ Request:
   env?: {[key]: string}    # Environment variables
 
 Response:
-  session_id: string               # Human-readable: "myapp-2026-02-05-14h32"
+  sessionId: string                # Human-readable: "myapp-2026-02-05-14h32"
   pid: number
-  pending_patterns_applied?: number  # Count of pre-staged patterns (if any)
-  next_steps?: string              # Recommended next action (e.g., "Query stderr/stdout first")
+  pendingPatternsApplied?: number  # Count of pre-staged patterns (if any)
+  nextSteps?: string               # Recommended next action (e.g., "Query stderr/stdout first")
 ```
 
 Session IDs get numeric suffixes on collision (`myapp-2026-02-05-14h32-2`).
 
-The `next_steps` field provides workflow guidance, encouraging the observation loop: check output before adding trace patterns.
+The `nextSteps` field provides workflow guidance, encouraging the observation loop: check output before adding trace patterns.
 
 ### debug_trace
 
-Add or remove trace patterns. **Recommended workflow:** Launch clean → check stderr/stdout → add patterns only if needed.
+Add or remove trace patterns and watch variables. **Recommended workflow:** Launch clean → check stderr/stdout → add patterns only if needed.
 
 Works in two modes:
 
-**Pending mode** (no `session_id`): Stages patterns for next launch (advanced usage). Patterns persist until explicitly removed.
+**Pending mode** (no `sessionId`): Stages patterns for next launch (advanced usage). Patterns persist until explicitly removed.
 
-**Runtime mode** (with `session_id`): Modifies hooks on running process (recommended). No restart required.
+**Runtime mode** (with `sessionId`): Modifies hooks on running process (recommended). No restart required.
 
 ```
 Request:
-  session_id?: string      # Omit for pending patterns, provide for runtime
-  add?: string[]           # Patterns to add
-  remove?: string[]        # Patterns to remove
+  sessionId?: string              # Omit for pending patterns, provide for runtime
+  add?: string[]                  # Patterns to add
+  remove?: string[]               # Patterns to remove
+  serializationDepth?: number     # Max depth for recursive argument serialization (default: 3, max: 10)
+  projectRoot?: string            # Root directory for settings resolution
+  watches?: {
+    add?: WatchTarget[]           # Watches to add (max 32 per session)
+    remove?: string[]             # Labels of watches to remove
+  }
 
 Response:
-  mode: string                   # "pending" or "runtime"
-  active_patterns: string[]      # Current trace patterns
-  hooked_functions: number       # Actual hooks installed (0 if pending or no matches)
-  matched_functions?: number     # If different from hooked (e.g., crash during install)
-  status?: string                # Contextual guidance based on current state
+  mode: string                    # "pending" or "runtime"
+  activePatterns: string[]        # Current trace patterns
+  hookedFunctions: number         # Actual hooks installed (0 if pending or no matches)
+  matchedFunctions?: number       # If different from hooked (e.g., crash during install)
+  activeWatches: ActiveWatch[]    # Currently active watches
+  warnings: string[]              # Hook installation warnings
+  eventLimit: number              # Current per-session event limit (from settings)
+  status?: string                 # Contextual guidance based on current state
 ```
 
+**WatchTarget:**
+```
+  variable?: string       # Variable name or pointer chain: "gTempo", "gClock->counter"
+  address?: string        # Hex address for raw memory: "0x10000a3c0"
+  type?: string           # Type hint: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer
+  label?: string          # Display label (auto-generated from variable/address if omitted)
+  expr?: string           # JavaScript expression: "ptr(0x5678).readU32()"
+  on?: string[]           # Function patterns to scope this watch (supports * and **)
+```
+
+**Watch scoping (`on` field):**
+```
+{ variable: "gTempo", on: ["audio::process"] }    // Only during audio::process
+{ variable: "gClock", on: ["midi::*"] }            // Any direct child of midi::
+{ variable: "gState", on: ["juce::**"] }           // Any descendant of juce::
+```
+
+Watch values appear in the `watchValues` field of function_enter/function_exit events (visible with `verbose: true`).
+
+**Limits:** Max 32 watches per session. Expression/variable max 256 chars, max 4 dereference levels (`a->b->c->d`).
+
 **Status messages** provide actionable guidance:
-- When `hooked_functions: 0` on runtime mode, explains possible causes (inline functions, missing symbols, etc.)
+- When `hookedFunctions: 0` on runtime mode, explains possible causes (inline functions, missing symbols, etc.)
 - When hooks succeed, provides stability guidance (e.g., "Under 50 hooks - excellent stability")
 - In pending mode, reminds about recommended workflow (launch clean first)
 
 ### debug_query
 
-Query the unified execution timeline: function traces AND process stdout/stderr. Returns events in chronological order. Filter by eventType to get only traces or only output.
+Query the unified execution timeline: function traces, process stdout/stderr, crash events, and variable snapshots. Returns events in chronological order.
 
 ```
 Request:
-  session_id: string       # Required
-  event_type?: "function_enter" | "function_exit" | "stdout" | "stderr"
+  sessionId: string              # Required
+  eventType?: "function_enter" | "function_exit" | "stdout" | "stderr" | "crash" | "variable_snapshot"
   function?:
     equals?: string
     contains?: string
-    matches?: string       # Regex
-  source_file?:
+    matches?: string             # Regex
+  sourceFile?:
     equals?: string
     contains?: string
-  return_value?:
+  returnValue?:
     equals?: any
-    is_null?: boolean
-  limit?: number           # Default 50, max 500
-  offset?: number          # Default 0
-  verbose?: boolean        # Default false
+    isNull?: boolean
+  threadName?:
+    contains?: string
+  timeFrom?: number | string     # Absolute ns or relative: "-5s", "-1m", "-500ms"
+  timeTo?: number | string       # Absolute ns or relative
+  minDurationNs?: number         # Find slow functions
+  pid?: number                   # Filter by process ID (multi-process sessions)
+  limit?: number                 # Default 50, max 500
+  offset?: number                # Default 0
+  verbose?: boolean              # Default false
 
 Response:
   events: Event[]
-  total_count: number
-  has_more: boolean
+  totalCount: number
+  hasMore: boolean
+  pids?: number[]                # All PIDs in session (only present when multiple)
 ```
 
 **Summary format** (default):
 ```json
-{ "id", "timestamp_ns", "function", "sourceFile", "line", "duration_ns", "returnType" }
+{ "id", "timestampNs", "function", "sourceFile", "line", "durationNs", "returnType" }
 ```
 
-**Verbose format** adds: `functionRaw`, `threadId`, `parentEventId`, `arguments`, `returnValue`
+**Verbose format** adds: `functionRaw`, `threadId`, `threadName`, `pid`, `parentEventId`, `arguments`, `returnValue`, `watchValues`, `sampled`
 
 ### debug_test
 
-Run tests with universal structured output. Auto-detects framework from `projectRoot`. Two execution paths chosen automatically: direct subprocess (fast, no overhead) when no instrumentation requested, Frida path when `tracePatterns` or `watches` present.
+Start a test run asynchronously. Returns a `testRunId` immediately — poll `debug_test_status` for progress and results. Auto-detects framework from `projectRoot`.
 
-**Full spec:** [specs/2026-02-07-phase-1d-test-instrumentation.md](../specs/2026-02-07-phase-1d-test-instrumentation.md)
+**Always use this tool** instead of running test commands via bash. Tests run inside Frida when tracing is requested, allowing patterns to be added at any time without restarting.
 
 ```
 Request:
-  projectRoot: string       # Required. Used for adapter detection
-  framework?: string        # Override auto-detection: "cargo", "catch2"
-  level?: string            # "unit", "integration", "e2e". Omit for all.
-  test?: string             # Run a single test by name
-  command?: string          # Test binary path (required for compiled frameworks like Catch2)
-  tracePatterns?: string[]  # Presence triggers Frida path
-  watches?: Watch[]         # Presence triggers Frida path
-  env?: {[key]: string}     # Additional environment variables
-  timeout?: number          # Hard timeout in ms (default per level: unit=30s, integration=120s, e2e=300s)
+  projectRoot: string            # Required. Used for adapter detection
+  framework?: string             # Override auto-detection: "cargo", "catch2"
+  level?: string                 # "unit", "integration", "e2e". Omit for all.
+  test?: string                  # Run single test by name (substring match)
+  command?: string               # Test binary path (required for Catch2)
+  tracePatterns?: string[]       # Presence triggers Frida path
+  watches?: WatchUpdate          # Presence triggers Frida path
+  env?: {[key]: string}          # Additional environment variables
 
-Response:
-  framework: string                # Detected adapter name
-  summary: {
+Response (immediate):
+  testRunId: string              # UUID for polling via debug_test_status
+  status: "running"
+  framework: string              # Detected adapter: "Cargo", "Catch2", "Generic"
+```
+
+**Adapter detection:** Cargo.toml → cargo (confidence 90), binary probe → Catch2 (confidence 85), Generic fallback (confidence 1). Explicit `framework` override as escape hatch.
+
+**Two execution paths** chosen automatically:
+- No `tracePatterns`/`watches` → direct subprocess (no overhead)
+- `tracePatterns`/`watches` present → Frida path (~1s overhead), response includes `sessionId`
+
+### debug_test_status
+
+Query the status of a running test. **Blocks up to 15 seconds** waiting for completion before returning progress — safe to call immediately after each response.
+
+```
+Request:
+  testRunId: string
+
+Response (while running):
+  testRunId: string
+  status: "running"
+  sessionId?: string                    # Frida session ID (use with debug_trace/debug_stop)
+  progress: {
+    elapsedMs: number
     passed: number
     failed: number
     skipped: number
-    stuck?: number                 # Tests killed by stuck detector
-    duration_ms: number
+    currentTest?: string                # Name of currently executing test
+    currentTestElapsedMs?: number       # How long current test has been running
+    currentTestBaselineMs?: number      # Historical avg duration (last 10 runs)
+    phase?: "compiling" | "running" | "suites_finished"
+    warnings: StuckWarning[]            # Stuck detection warnings
   }
-  failures?: TestFailure[]
-  stuck?: StuckTest[]              # Tests detected as stuck (deadlock/infinite loop)
-  sessionId?: string               # Present when Frida path used (for debug_query)
-  details: string                  # Path to full details file in /tmp/strobe/tests/
-  no_tests?: boolean               # True when no tests found
-  project?: { language, build_system, test_files }  # When no_tests is true
-  hint?: string                    # Guidance when no tests found
+
+Response (completed):
+  testRunId: string
+  status: "completed"
+  sessionId?: string
+  result: {
+    framework: string
+    summary: { passed, failed, skipped, stuck?, durationMs }
+    failures: TestFailure[]
+    stuck: StuckTest[]
+    details?: string                    # Path to full details file in /tmp/strobe/tests/
+    noTests?: boolean
+    project?: { language, buildSystem, testFiles }
+    hint?: string                       # Guidance when no tests found
+  }
+
+Response (failed):
+  testRunId: string
+  status: "failed"
+  error: string
 ```
 
 **TestFailure:**
 ```
-  name: string                     # Test name
-  file?: string                    # Source file path
-  line?: number                    # Line number
-  message: string                  # Error/assertion message
-  suggested_traces: string[]       # Patterns extracted from failure context
+  name: string
+  file?: string
+  line?: number
+  message: string
+  suggestedTraces: string[]
 ```
 
 **StuckTest:**
 ```
-  name: string                     # Test name
-  elapsed_ms: number
-  diagnosis: string                # "Deadlock: 0% CPU, identical stacks" / "Infinite loop: 100% CPU, identical stacks"
-  threads: [{
-    name: string
-    stack: string[]                # Thread backtrace captured before kill
-  }]
-  suggested_traces: string[]
+  name: string
+  elapsedMs: number
+  diagnosis: string                     # "Deadlock: 0% CPU, identical stacks"
+  threads: [{ name, stack: string[] }]  # Thread backtraces captured before kill
+  suggestedTraces: string[]
+```
+
+**StuckWarning** (in progress):
+```
+  testName?: string
+  idleMs: number
+  diagnosis: string                     # "0% CPU, stacks unchanged 6s"
+  suggestedTraces: string[]
 ```
 
 **Stuck detection** runs in parallel with the test subprocess. Multi-signal: output silence + CPU delta sampling (every 2s) + stack comparison (triggered at ~6s). Confirms stuck in ~8s regardless of test level. Captures thread backtraces before killing.
-
-**Adapter detection:** Auto-detect from `projectRoot` (Cargo.toml → cargo, binary probe → Catch2). Explicit `framework` override. Falls back to GenericAdapter (raw output, no structured parsing).
 
 ### debug_stop
 
@@ -207,12 +315,90 @@ Stop a session and clean up.
 
 ```
 Request:
-  session_id: string
+  sessionId: string
+  retain?: boolean       # Keep session data for post-mortem analysis (default: false)
 
 Response:
   success: boolean
-  events_collected: number
+  eventsCollected: number
 ```
+
+Retained sessions are accessible via `debug_list_sessions` and can be deleted with `debug_delete_session`.
+
+### debug_list_sessions
+
+List all retained debug sessions.
+
+```
+Request:
+  (no parameters)
+
+Response:
+  sessions: Array<{
+    sessionId: string
+    binaryPath: string
+    pid: number
+    startedAt: number
+    endedAt: number | null
+    status: "running" | "exited" | "stopped"
+  }>
+```
+
+### debug_delete_session
+
+Delete a retained session and its data.
+
+```
+Request:
+  sessionId: string
+
+Response:
+  success: boolean
+```
+
+### debug_read (Phase 1e — planned, not yet implemented)
+
+Read memory from a running process without tracing. Point-in-time snapshots independent of function hooks.
+
+**Full spec:** [specs/2026-02-08-phase-1e-live-memory-reads.md](specs/2026-02-08-phase-1e-live-memory-reads.md)
+
+```
+Request:
+  sessionId: string
+  targets: Array<
+    { variable: string } |                              # DWARF-resolved
+    { address: string, size: number, type: string }     # Raw address
+  >
+  depth?: number              # Struct traversal depth (default 1, max 5)
+  poll?: {
+    intervalMs: number        # Min 50, max 5000
+    durationMs: number        # Min 100, max 30000
+  }
+
+Response (one-shot):
+  results: Array<{
+    target: string
+    address: string
+    type: string
+    value: any
+    size: number
+    fields?: object           # For structs (depth-expanded)
+    file?: string             # For bytes type (written to file)
+    preview?: string          # Hex preview for bytes
+    error?: string            # Per-target errors
+  }>
+
+Response (poll):
+  polling: true
+  variableCount: number
+  intervalMs: number
+  durationMs: number
+  expectedSamples: number
+  eventType: "variable_snapshot"
+  hint: string
+```
+
+Poll samples are stored as `variable_snapshot` events in the timeline, interleaved with function traces. Query with `debug_query({ eventType: "variable_snapshot" })`.
 
 ## Pattern Syntax
 
@@ -236,17 +422,29 @@ Glob-style matching on demangled function names:
 
 Injected into the target process before resume. Compiled from `agent/src/` to `agent/dist/agent.js`, embedded in the Rust binary via `include_str!`.
 
+### CModule Tracing
+
+High-performance native C callbacks compiled via TinyCC at runtime. 10-50x faster than JS hooks.
+
+- Mode encoded in data pointer low bit: `data = (funcId << 1) | is_light`
+- C code decodes with bitwise ops, reads watch values from shared memory
+- 4 native CModule watches for best performance, remaining watches via JS
+
 ### Messages (Rust → Agent)
 
 - `initialize { sessionId }` — set session context
-- `hooks { action: "add"|"remove", functions: FunctionTarget[], imageBase?: string }` — update hooks (imageBase sent once for ASLR slide computation)
+- `hooks { action: "add"|"remove", functions: FunctionTarget[], imageBase?: string, mode?: "full"|"light", serializationDepth?: number }` — update hooks (imageBase sent once for ASLR slide computation)
+- `watches { watches: WatchTarget[], exprWatches?: ExprWatch[] }` — update variable watches
 
 ### Messages (Agent → Rust)
 
-- `{ type: "agent_loaded" }` — agent ready
-- `{ type: "initialized" }` — session context set
+- `{ type: "agent_loaded" }` — agent script loaded and ready
+- `{ type: "initialized", sessionId }` — session context set
 - `{ type: "hooks_updated", activeCount }` — hooks changed
-- `{ type: "events", events: (TraceEvent | OutputEvent)[] }` — buffered trace and output data
+- `{ type: "watches_updated", activeCount }` — watches changed
+- `{ type: "events", events: (TraceEvent | OutputEvent | CrashEvent)[] }` — buffered event data
+- `{ type: "sampling_state_change", funcId, funcName, enabled, sampleRate }` — hot function sampling toggled
+- `{ type: "sampling_stats", stats }` — periodic sampling statistics
 - `{ type: "log", message }` — debug logging
 
 ### Hook Behavior
@@ -268,6 +466,18 @@ Output is captured at the **Frida Device level**, not inside the agent:
 
 This is the most important capture mechanism — crash reports, error logs, and ASAN output all flow through stderr and are often sufficient to diagnose issues without any trace patterns.
 
+### Crash Capture
+
+When the target process crashes, Frida's exception handler captures full context:
+
+- Signal type and faulting address
+- CPU registers at crash time
+- Stack trace (accurate mode via `Thread.backtrace`)
+- Stack frame memory dump (512 bytes below FP, 128 above)
+- Memory access details for access violations
+
+Crash events are stored with `eventType: "crash"` and queryable via `debug_query`.
+
 ### Event Buffering
 
 - Buffer size: 1000 events
@@ -280,7 +490,15 @@ This is the most important capture mechanism — crash reports, error logs, and 
 - Strings truncated to 1024 chars
 - Arrays capped at 100 elements
 - Objects capped at 100 keys
-- Depth limited to 1 level (nested → `<TypeName>`)
+- Depth configurable via `serializationDepth` (default 3, max 10)
+- Nested objects beyond depth → `<TypeName>`
+
+### Event Storage Limits
+
+Per-session FIFO buffer (configurable via settings):
+- Default: 200,000 events
+- Oldest events auto-deleted when limit reached (async cleanup, never blocks tracing)
+- Configure via `events.maxPerSession` in settings
 
 ## Database
 
@@ -306,8 +524,10 @@ SQLite with WAL mode, `synchronous=NORMAL`.
 | session_id | TEXT FK | References sessions.id |
 | timestamp_ns | INTEGER | Elapsed ns since session start |
 | thread_id | INTEGER | OS thread ID |
+| thread_name | TEXT | Thread name (nullable) |
+| pid | INTEGER | Process ID for multi-process sessions (nullable) |
 | parent_event_id | TEXT | Parent in call stack (nullable) |
-| event_type | TEXT | "function_enter", "function_exit", "stdout", "stderr" |
+| event_type | TEXT | "function_enter", "function_exit", "stdout", "stderr", "crash" |
 | function_name | TEXT | Demangled name |
 | function_name_raw | TEXT | Original mangled name (nullable) |
 | source_file | TEXT | From DWARF (nullable) |
@@ -316,6 +536,12 @@ SQLite with WAL mode, `synchronous=NORMAL`.
 | return_value | JSON | For exit events (nullable) |
 | duration_ns | INTEGER | For exit events (nullable) |
 | text | TEXT | For stdout/stderr events (nullable) |
+| watch_values | JSON | Variable watch values (nullable) |
+| sampled | BOOLEAN | True if captured via hot function sampling (nullable) |
+| signal | TEXT | For crash events — signal type (nullable) |
+| fault_address | TEXT | For crash events — faulting address (nullable) |
+| registers | JSON | For crash events — CPU registers (nullable) |
+| backtrace | JSON | For crash events — stack trace (nullable) |
 
 Indexes on `(session_id, timestamp_ns)`, `function_name`, `source_file`.
 
@@ -334,6 +560,8 @@ Uses `gimli` + `object` crates. Supports ELF and Mach-O binaries.
 - Demangles Rust (`rustc-demangle`) and C++ (`cpp_demangle`) symbols
 - Extracts image base from `__TEXT` segment (Mach-O) for ASLR slide computation
 - DWARF parsers cached per binary path across sessions
+- Parallel CU parsing via rayon, lazy struct member resolution
+- Extracts global/static variables with addresses for watch variable resolution
 
 ## ASLR Support
 
@@ -355,6 +583,9 @@ macOS applies Address Space Layout Randomization (ASLR) to spawned processes. Fu
 | `PROCESS_EXITED` | Target exited (session still queryable) |
 | `FRIDA_ATTACH_FAILED` | Frida instrumentation failed |
 | `INVALID_PATTERN` | Malformed trace pattern |
+| `WATCH_FAILED` | Watch variable resolution error |
+| `TEST_RUN_NOT_FOUND` | Unknown test run ID |
+| `VALIDATION_ERROR` | Invalid request parameters |
 
 ## Dependencies
 
@@ -373,6 +604,7 @@ macOS applies Address Space Layout Randomization (ASLR) to spawned processes. Fu
 | uuid | 1.x | Event IDs |
 | chrono | 0.4 | Timestamps |
 | tracing | 0.1 | Structured logging |
+| rayon | 1.x | Parallel DWARF parsing |
 
 ## Setup
 

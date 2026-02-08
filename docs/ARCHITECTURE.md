@@ -113,10 +113,10 @@ Capturing function arguments requires serializing them to JSON. Trade-offs:
 
 - **Primitives:** Direct serialization (int → number, string → string)
 - **Pointers:** Captured as hex address by default, optionally dereferenced
-- **Structs:** Serialized to depth 1 by default (configurable)
+- **Structs:** Serialized to configurable depth (default 3, max 10 via `serializationDepth`)
 - **Arrays:** First N elements (configurable, default 100)
 
-The LLM can request deeper serialization for specific functions via `debug_trace({ depth: 2 })`.
+The LLM can request deeper serialization via `debug_trace({ serializationDepth: 5 })`.
 
 ### VS Code Extension: Phase 3, Not Core
 The primary interface is MCP for LLMs. VS Code extension is for:
@@ -157,7 +157,7 @@ Queries support thread filtering and ordering by timestamp or thread-then-timest
 
 ### Serialization & Circular References
 When serializing complex data structures:
-- **Default depth:** 1 level (LLM can request deeper via `debug_trace`)
+- **Default depth:** 3 levels (configurable 1-10 via `serializationDepth`)
 - **Circular references:** Detected and marked as `<circular ref to X>` (not just truncated)
 - **Binary data:** Base64 encoded when relevant (audio buffers, images)
 - **Large arrays:** Truncated with count indicator
@@ -236,8 +236,9 @@ Errors are opportunities for LLM-guided resolution:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     MCP Client (LLM)                             │
-│  debug_launch | debug_query | debug_trace | debug_ui_tree       │
-│  debug_ui_action | debug_test_scenario | debug_channel_*        │
+│  debug_launch | debug_trace | debug_query | debug_stop          │
+│  debug_test | debug_test_status | debug_read (planned)          │
+│  debug_list_sessions | debug_delete_session                     │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ MCP (JSON-RPC over stdio)
@@ -307,23 +308,28 @@ Central orchestrator. Single long-running process that:
 - Async runtime (tokio) for concurrent operations
 
 ```
-core/
-├── src/
-│   ├── main.rs              # Entry point, CLI
-│   ├── daemon.rs            # Main event loop
-│   ├── mcp/
-│   │   ├── server.rs        # MCP protocol handling
-│   │   └── tools.rs         # Tool implementations
-│   ├── storage/
-│   │   ├── index.rs         # SQLite operations
-│   │   └── schema.rs        # Event schema
-│   ├── collector/
-│   │   ├── manager.rs       # Manages Frida sessions
-│   │   ├── frida.rs         # Frida-specific logic
-│   │   └── symbols.rs       # DWARF/PDB parsing for user code detection
-│   └── crash/
-│       └── handler.rs       # Crash capture logic
-└── Cargo.toml
+src/
+├── main.rs                        # Entry point, CLI (daemon/mcp/install)
+├── config.rs                      # File-based settings system
+├── error.rs                       # Custom error types
+├── daemon/
+│   ├── server.rs                  # MCP tool dispatch, connection handling
+│   └── session_manager.rs         # Session CRUD, DWARF cache, hook/watch state
+├── mcp/
+│   └── types.rs                   # MCP request/response types, validation
+├── db/
+│   ├── mod.rs                     # SQLite operations, batched writes
+│   └── event.rs                   # Event schema, query builder
+├── frida_collector/
+│   └── spawner.rs                 # Frida FFI, process spawn, agent injection
+├── dwarf/
+│   └── parser.rs                  # DWARF parsing, function/variable extraction
+└── test/
+    ├── mod.rs                     # Test orchestration, async runs
+    ├── adapter.rs                 # TestAdapter trait
+    ├── cargo_adapter.rs           # Rust test adapter
+    ├── catch2_adapter.rs          # C++ test adapter
+    └── stuck_detector.rs          # Deadlock/hang detection
 ```
 
 ### Frida Agent (TypeScript)
@@ -332,20 +338,21 @@ Runs inside the target process. Compiled to JS, injected by Frida.
 
 Responsibilities:
 - Hook functions based on patterns from daemon
-- Serialize arguments and return values
-- Capture stdout/stderr by intercepting `write(2)` syscall (with re-entrancy guard and 50MB per-session limit)
+- Serialize arguments and return values (configurable depth 1-10)
+- High-performance CModule tracing (native C callbacks, 10-50x faster than JS)
+- Hot function detection with auto-sampling
+- Watch variable reads at function entry/exit
+- Intercept crash signals (exception handler captures registers, stack, frame memory)
 - Send events to daemon via Frida messaging
-- Intercept crash signals (SIGSEGV, SIGABRT)
-- Capture crash state before process dies
+
+**Note:** stdout/stderr capture happens at the Frida Device level (not in the agent), using `FRIDA_STDIO_PIPE`. This works reliably with ASAN/sanitizer binaries.
 
 ```
-frida-agent/
+agent/
 ├── src/
-│   ├── index.ts             # Entry point
-│   ├── hooks.ts             # Function hooking logic
-│   ├── serialize.ts         # Argument serialization
-│   ├── crash.ts             # Signal interception
-│   └── symbols.ts           # Symbol resolution helpers
+│   ├── agent.ts             # Main agent — hook installation, output capture, message handling
+│   ├── cmodule-tracer.ts    # High-perf native CModule tracing callbacks (10-50x faster)
+│   └── rate-tracker.ts      # Hot function detection and auto-sampling
 ├── package.json
 └── tsconfig.json
 ```
@@ -363,40 +370,38 @@ Optimized for:
 ```sql
 CREATE TABLE events (
     id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,        -- Groups events by debug session
-    timestamp_ns INTEGER NOT NULL,   -- Nanoseconds since session start
+    session_id TEXT NOT NULL,
+    timestamp_ns INTEGER NOT NULL,
     thread_id INTEGER NOT NULL,
-    parent_event_id TEXT,            -- For call tree reconstruction
+    thread_name TEXT,
+    pid INTEGER,                     -- For multi-process sessions
+    parent_event_id TEXT,
     event_type TEXT NOT NULL,        -- function_enter, function_exit, stdout, stderr, crash
 
     -- Location
-    module TEXT,
-    function TEXT,
+    function_name TEXT,
+    function_name_raw TEXT,
     source_file TEXT,
     line_number INTEGER,
-    address TEXT,
 
-    -- Payload (JSON)
+    -- Payload
     arguments JSON,                  -- For function_enter
     return_value JSON,               -- For function_exit
     duration_ns INTEGER,             -- For function_exit
     text TEXT,                       -- For stdout/stderr events
-    crash_info JSON                  -- For crash events
+    watch_values JSON,               -- Variable watch values
+    sampled INTEGER,                 -- Hot function sampling flag
+
+    -- Crash fields
+    signal TEXT,
+    fault_address TEXT,
+    registers JSON,
+    backtrace JSON
 );
 
--- Performance indexes
 CREATE INDEX idx_session_time ON events(session_id, timestamp_ns);
-CREATE INDEX idx_function ON events(function);
-CREATE INDEX idx_type ON events(event_type);
-CREATE INDEX idx_parent ON events(parent_event_id);
-
--- Full-text search on function names
-CREATE VIRTUAL TABLE events_fts USING fts5(
-    function,
-    source_file,
-    content=events,
-    content_rowid=rowid
-);
+CREATE INDEX idx_function ON events(function_name);
+CREATE INDEX idx_source ON events(source_file);
 ```
 
 ---
@@ -434,8 +439,12 @@ Stop a debug session.
 
 ```typescript
 debug_stop({
-  sessionId: string
-}) → { success: boolean }
+  sessionId: string,
+  retain?: boolean           // Keep data for post-mortem (default false)
+}) → {
+  success: boolean,
+  eventsCollected: number
+}
 ```
 
 ### debug_test (Phase 1d)
@@ -509,22 +518,30 @@ const events = await debug_query({
 
 ### debug_trace (Phase 1a)
 
-Add or remove trace patterns on a RUNNING session. No restart required.
+Add or remove trace patterns and watch variables on a RUNNING session. No restart required.
 
 **Recommended workflow:** Launch clean (no patterns) → check stderr/stdout → add targeted patterns only if needed.
 
 ```typescript
 debug_trace({
-  sessionId?: string,        // Omit for pending (pre-launch) mode, provide for runtime mode
-  add?: string[],            // Patterns to start tracing
-  remove?: string[],         // Patterns to stop tracing
-  depth?: number             // Serialization depth (Phase 1b, ignored in 1a)
+  sessionId?: string,               // Omit for pending (pre-launch) mode, provide for runtime mode
+  add?: string[],                   // Patterns to start tracing
+  remove?: string[],                // Patterns to stop tracing
+  serializationDepth?: number,      // Recursive argument depth (1-10, default 3)
+  projectRoot?: string,             // For settings resolution
+  watches?: {
+    add?: WatchTarget[],            // Watch variables (max 32 per session)
+    remove?: string[]               // Labels to remove
+  }
 }) → {
-  mode: "pending" | "runtime",   // Indicates pre-launch vs. running session
-  activePatterns: string[],      // Current trace patterns
-  hookedFunctions: number,       // Actual hooked function count (0 if pending or no matches)
-  matchedFunctions?: number,     // If different from hookedFunctions (e.g., crash during install)
-  status?: string                // Contextual guidance (e.g., troubleshooting for 0 hooks)
+  mode: "pending" | "runtime",
+  activePatterns: string[],
+  hookedFunctions: number,
+  matchedFunctions?: number,
+  activeWatches: ActiveWatch[],
+  warnings: string[],
+  eventLimit: number,               // From settings
+  status?: string
 }
 ```
 
@@ -540,12 +557,12 @@ debug_trace({
 
 ### debug_query (Phase 1a)
 
-Query the unified execution timeline (function traces + stdout/stderr).
+Query the unified execution timeline (function traces + stdout/stderr + crashes).
 
 ```typescript
 debug_query({
   sessionId: string,
-  eventType?: "function_enter" | "function_exit" | "stdout" | "stderr" | "crash",
+  eventType?: "function_enter" | "function_exit" | "stdout" | "stderr" | "crash" | "variable_snapshot",
   function?: {
     equals?: string,
     contains?: string,
@@ -559,19 +576,21 @@ debug_query({
     equals?: any,
     isNull?: boolean
   },
-  duration?: {
-    greaterThan?: string,    // e.g., "10ms"
-    lessThan?: string
+  threadName?: {
+    contains?: string
   },
-  timeRange?: {
-    start?: string,          // e.g., "-5s" or timestamp
-    end?: string
-  },
-  limit?: number,            // Default 100
-  offset?: number
+  timeFrom?: number | string,    // Absolute ns or "-5s", "-1m", "-500ms"
+  timeTo?: number | string,
+  minDurationNs?: number,        // Find slow functions
+  pid?: number,                  // Filter by process ID
+  limit?: number,                // Default 50, max 500
+  offset?: number,
+  verbose?: boolean              // Default false
 }) → {
   events: TraceEvent[],
-  totalCount: number
+  totalCount: number,
+  hasMore: boolean,
+  pids?: number[]                // All PIDs (when multiple)
 }
 ```
 
@@ -967,7 +986,7 @@ All collectors emit the same event types. Key fields:
 - `source_line` - Line number
 
 **Event Data:**
-- `event_type` - One of: function_enter, function_exit, stdout, stderr, crash, log
+- `event_type` - One of: function_enter, function_exit, stdout, stderr, crash
 - `arguments` - Serialized arguments (depth-limited, cycle-detected)
 - `return_value` - Serialized return value
 - `duration_ns` - Execution time (exit events only)

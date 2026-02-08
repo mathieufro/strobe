@@ -53,13 +53,13 @@ LLM: "Found it - memory pool exhaustion in ViewManager::setView(). Here's the fi
 ┌─────────────────────────────────────────────────────────────┐
 │  LLM                                                         │
 │  - debug_launch: start app (captures stdout/stderr)          │
-│  - debug_query: read output, search traces                   │
-│  - debug_trace: add patterns when you need deeper insight    │
-│  - debug_test: run tests, get structured results (Phase 1d)  │
+│  - debug_trace: add patterns, watches for deeper insight     │
+│  - debug_query: read output, search traces, find patterns    │
+│  - debug_read: inspect variables live (Phase 1e — planned)   │
+│  - debug_test: run tests, get structured results             │
+│  - debug_test_status: poll async test progress               │
 │  - debug_stop: end session and clean up                      │
-│  - debug_ui_tree: see the UI (Phase 4)                       │
-│  - debug_ui_action: interact with the UI (Phase 5)           │
-│  - debug_test_scenario: autonomous runtime tests (Phase 6)   │
+│  - debug_list_sessions / debug_delete_session                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -163,17 +163,26 @@ This is not for:
 **Validation:** App crashes → LLM gets full context. App forks → events tracked across processes.
 
 ### Phase 1d: Test Instrumentation
-- `debug_test` tool with universal structured output for any test framework
+- `debug_test` + `debug_test_status`: async test execution with progress polling
 - Backend-agnostic `TestAdapter` trait: detection, command construction, parsing, trace suggestions, stack capture
 - Built-in adapters: cargo test (Rust), Catch2 (C/C++), Generic fallback
 - Smart stuck detection: multi-signal (output silence + CPU delta + stack sampling), catches deadlocks/infinite loops in ~8s
 - Thread backtrace capture before killing stuck tests — LLM sees deadlock graph directly
 - Automatic path switching: direct subprocess (fast) vs Frida (instrumented) based on whether tracing requested
 - Test levels (`unit`, `integration`, `e2e`) with per-level hard timeouts
-- Proactive TDD onboarding: detects missing tests, ships skill to guide vibe coders
+- File-based settings system (`~/.strobe/settings.json`, `<projectRoot>/.strobe/settings.json`)
+- Session management: `debug_list_sessions`, `debug_delete_session`, `debug_stop({ retain: true })`
 - `strobe install`: auto-detects coding agent (Claude Code, OpenCode, Codex), installs MCP + skills
 
 **Validation:** Universal structured output. Stuck tests caught in seconds. LLM never re-runs tests just to parse output.
+
+### Phase 1e: Live Memory Reads (planned)
+- `debug_read`: on-demand memory snapshots from running processes without breakpoints
+- Read DWARF-resolved variables or raw addresses, struct traversal with configurable depth
+- Polling mode: sample variables at intervals, events interleave with traces in timeline
+- Buffer dumps written to file (not in-chat)
+
+**Validation:** LLM inspects live state without stopping execution. Polling reveals variable changes in context of function calls.
 
 ### Phase 2: Active Debugging
 - Conditional breakpoints
@@ -306,9 +315,18 @@ See [FEATURES.md](FEATURES.md#contributor-extensibility) for details.
 
 ```
 strobe/
-├── core/                    # Rust daemon + MCP server
-├── frida-scripts/           # TypeScript injection scripts
-├── vscode-extension/        # VS Code integration (Phase 3)
+├── src/                     # Rust daemon + MCP server
+│   ├── daemon/              # Server, session manager
+│   ├── frida_collector/     # Frida FFI, process spawn
+│   ├── dwarf/               # DWARF symbol parsing
+│   ├── db/                  # SQLite storage
+│   ├── mcp/                 # MCP protocol types
+│   ├── test/                # Test runner + adapters
+│   └── config.rs            # Settings system
+├── agent/                   # TypeScript Frida agent
+│   └── src/
+│       ├── agent.ts         # Main agent
+│       └── cmodule-tracer.ts # High-perf native hooks
 └── docs/                    # Documentation
 ```
 

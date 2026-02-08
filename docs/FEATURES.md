@@ -40,9 +40,9 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 - Queryable via `debug_query` with `eventType: "stdout"` or `"stderr"`
 - This is the primary debugging tool — often sufficient to diagnose crashes without any trace patterns
 
-#### Serialization (Fixed)
+#### Serialization
 - Primitives serialized directly
-- Structs serialized to depth 1
+- Structs serialized recursively (default depth 3, max 10 via `serializationDepth`)
 - Arrays truncated to first 100 elements
 - Strings truncated at 1KB
 - Pointers as hex address
@@ -371,8 +371,64 @@ Ships with a TDD skill that instructs the LLM to guide users toward test-first d
 
 `strobe install` detects the user's coding agent (Claude Code, OpenCode, Codex) and installs MCP config + skills automatically.
 
+#### Async Test Execution
+
+`debug_test` returns immediately with a `testRunId`. Poll `debug_test_status` for progress and results. The server blocks up to 15s per poll, throttling LLM calls while providing timely completion. Progress includes `currentTest`, `currentTestElapsedMs`, and `currentTestBaselineMs` (historical average from last 10 runs).
+
+#### File-Based Settings System
+
+Three-layer configuration with shallow merge:
+
+```
+Built-in defaults (Rust)
+  ↓ overridden by
+~/.strobe/settings.json (user global)
+  ↓ overridden by
+<projectRoot>/.strobe/settings.json (project-local)
+```
+
+**Current settings:**
+- `events.maxPerSession` — Event limit per session (default: 200,000)
+- `test.statusRetryMs` — Base polling delay for test status (default: 5,000ms)
+
+Settings are re-read on every tool call (no caching). Replaces previous `STROBE_MAX_EVENTS_PER_SESSION` env var.
+
+**Full spec:** [specs/2026-02-08-settings-system.md](specs/2026-02-08-settings-system.md)
+
+#### Session Management
+
+- `debug_stop({ retain: true })` preserves session data for post-mortem analysis
+- `debug_list_sessions` — list all retained sessions with metadata
+- `debug_delete_session` — manually delete a retained session
+
+#### Contextual Watch Filtering
+
+Watch variables only during specific functions using the `on` field with pattern matching:
+
+```json
+{ "variable": "gTempo", "on": ["audio::process"] }
+{ "variable": "gClock", "on": ["midi::*"] }
+{ "variable": "gState", "on": ["juce::**"] }
+```
+
+Pattern syntax: `*` stops at `::` (shallow), `**` crosses `::` (deep). Patterns resolved at runtime against installed hooks.
+
+**Full docs:** [features/2026-02-06-contextual-watch-filtering.md](features/2026-02-06-contextual-watch-filtering.md)
+
+#### Event Storage Limits
+
+Per-session FIFO buffer (configurable via settings):
+- Default: 200,000 events (~56MB DB, fast queries <10ms)
+- Audio/DSP: 500,000 events (~140MB DB, moderate queries ~28ms)
+- Avoid 1M+ unless necessary (slow queries >300ms)
+
+Oldest events auto-deleted when limit reached. Async cleanup never blocks tracing.
+
 #### MCP Tools
-- `debug_test` — Run tests, get structured results, auto-detect framework, smart stuck detection
+- `debug_test` — Start async test run, returns `testRunId`
+- `debug_test_status` — Poll test progress and results
+- `debug_list_sessions` — List retained sessions
+- `debug_delete_session` — Delete a retained session
 
 ### Context-Aware Tracing Defaults
 
@@ -409,6 +465,66 @@ Ships with a TDD skill that instructs the LLM to guide users toward test-first d
 4. User now has a regression test they didn't know they needed
 
 **Success:** Universal structured output. No test framework lock-in. Stuck tests caught in seconds, not minutes. LLM never re-runs tests just to understand what failed.
+
+---
+
+## Phase 1e: Live Memory Reads
+
+**Goal:** On-demand memory snapshots from running processes without breakpoints or tracing. Point-in-time reads of global/static variables, with polling mode for observing state changes over time.
+
+**Full spec:** [specs/2026-02-08-phase-1e-live-memory-reads.md](specs/2026-02-08-phase-1e-live-memory-reads.md)
+
+### Features
+
+#### Non-Blocking Memory Reads
+- Read variables by name (DWARF-resolved) or raw memory addresses
+- No breakpoints, no function hooks required
+- Multiple targets in a single call (up to 16)
+- Struct traversal with configurable depth (1-5)
+- Per-target error handling (one bad variable doesn't kill the whole read)
+
+#### Polling Mode
+- Sample variables at regular intervals (50-5000ms)
+- Events stored as `variable_snapshot` in timeline
+- Interleaved with function traces for causal analysis
+- Auto-stops after duration (max 30s)
+
+#### Timeline Integration
+
+Poll samples appear as `variable_snapshot` events in the unified timeline:
+
+```
+t=0ms     variable_snapshot  { "gTempo": 120.0, "gBufferSize": 0 }
+t=12ms    function_enter     midi::processBlock
+t=13ms    function_exit      midi::processBlock (ret: 3)
+t=100ms   variable_snapshot  { "gTempo": 120.0, "gBufferSize": 3 }
+```
+
+Query with `debug_query({ eventType: "variable_snapshot" })`.
+
+#### Buffer Dumps
+- `bytes` type writes raw data to file (not in-chat)
+- Response includes file path + hex preview of first 32 bytes
+
+#### MCP Tools
+- `debug_read` — Read memory on-demand (one-shot or poll mode)
+
+### Validation Criteria
+
+**Scenario A: One-shot memory inspection**
+1. LLM launches app, sees suspicious behavior in output
+2. LLM calls `debug_read({ sessionId, targets: [{ variable: "gTempo" }] })`
+3. Response shows current value without pausing execution
+4. LLM identifies wrong value, traces root cause
+
+**Scenario B: Polling for state changes**
+1. LLM suspects variable changes incorrectly during audio processing
+2. LLM calls `debug_read({ ..., poll: { intervalMs: 100, durationMs: 2000 } })`
+3. Returns immediately, samples appear in timeline
+4. LLM calls `debug_query({ eventType: "variable_snapshot" })`
+5. Timeline shows variable changes interleaved with function calls — causal chain visible
+
+**Success:** LLM can inspect live memory without stopping execution. Polling mode reveals state changes in context of function calls.
 
 ---
 
