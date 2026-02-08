@@ -8,6 +8,7 @@
  */
 
 import { ObjectSerializer, TypeInfo } from './object-serializer.js';
+import { PlatformAdapter } from './platform.js';
 import { reinterpretAsFloat, signExtend } from './utils.js';
 
 // ---------------------------------------------------------------------------
@@ -88,8 +89,6 @@ const CMODULE_SOURCE = `
 #include <gum/guminterceptor.h>
 #include <glib.h>
 
-extern unsigned long long mach_absolute_time(void);
-
 extern volatile gint write_idx;
 extern volatile gint overflow_count;
 extern volatile gint sample_interval;
@@ -130,7 +129,7 @@ static void write_entry(guint32 func_id, GumInvocationContext *ic,
   guint32 slot = ((guint32)pos) % RING_CAPACITY;
   TraceEntry *e = (TraceEntry *)(ring_data + slot * ENTRY_SIZE);
 
-  e->timestamp  = mach_absolute_time();
+  e->timestamp  = strobe_timestamp();
   e->func_id    = func_id;
   e->thread_id  = gum_invocation_context_get_thread_id(ic);
   e->depth      = gum_invocation_context_get_depth(ic);
@@ -306,7 +305,7 @@ export class CModuleTracer {
   // Thread name cache: threadId -> name
   private threadNames: Map<number, string | null> = new Map();
 
-  constructor(onEvents: (events: any[]) => void) {
+  constructor(onEvents: (events: any[]) => void, platform: PlatformAdapter) {
     this.onEvents = onEvents;
 
     // --- Allocate ring buffer shared memory ---
@@ -344,17 +343,13 @@ export class CModuleTracer {
     this.ringDataPtrHolder = Memory.alloc(Process.pointerSize);
     this.ringDataPtrHolder.writePointer(this.ringDataPtr);
 
-    // --- Resolve mach_absolute_time ---
-    // Use Process.getModuleByName (Frida 17.x — static Module.getExportByName was removed)
-    const libSystem = Process.getModuleByName('libSystem.B.dylib');
-    const machAbsTimePtr = libSystem.getExportByName('mach_absolute_time');
+    // --- Compute ticksToNs from platform ---
+    this.ticksToNs = platform.getTicksToNs();
 
-    // --- Compute ticksToNs ---
-    this.initTimebaseInfo();
-
-    // --- Create CModule ---
-    this.cm = new CModule(CMODULE_SOURCE, {
-      mach_absolute_time: machAbsTimePtr,
+    // --- Create CModule with platform-specific timing preamble ---
+    const fullSource = platform.getCModuleTimingPreamble() + CMODULE_SOURCE;
+    this.cm = new CModule(fullSource, {
+      ...platform.getCModuleTimingSymbols(),
       write_idx:            this.writeIdxPtr,
       overflow_count:       this.overflowCountPtr,
       sample_interval:      this.sampleIntervalPtr,
@@ -598,32 +593,6 @@ export class CModuleTracer {
       isGlobal: e.isGlobal || !e.onFuncIds || e.onFuncIds.length === 0,
       onFuncIds: e.onFuncIds ? new Set(e.onFuncIds) : new Set(),
     }));
-  }
-
-  // -----------------------------------------------------------------------
-  // Timestamp helpers
-  // -----------------------------------------------------------------------
-
-  private initTimebaseInfo(): void {
-    // On Apple Silicon, ticks == nanoseconds (ratio 1:1).
-    // On Intel, we need mach_timebase_info to convert.
-    try {
-      const timebaseInfoPtr = Process.getModuleByName('libSystem.B.dylib').getExportByName('mach_timebase_info');
-      if (timebaseInfoPtr) {
-        // struct mach_timebase_info { uint32_t numer; uint32_t denom; }
-        const infoStruct = Memory.alloc(8);
-        const machTimebaseInfo = new NativeFunction(timebaseInfoPtr, 'int', ['pointer']);
-        machTimebaseInfo(infoStruct);
-        const numer = infoStruct.readU32();
-        const denom = infoStruct.add(4).readU32();
-        if (denom !== 0) {
-          this.ticksToNs = numer / denom;
-        }
-      }
-    } catch (_e) {
-      // Fall back to ratio 1.0
-      this.ticksToNs = 1.0;
-    }
   }
 
   // -----------------------------------------------------------------------

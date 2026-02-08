@@ -105,20 +105,22 @@ impl DwarfParser {
             return Ok(parser);
         }
 
-        // On macOS, check for .dSYM bundle
-        let dsym_path = binary_path.with_extension("dSYM");
-        if dsym_path.exists() {
-            // The actual DWARF is in Contents/Resources/DWARF/<binary_name>
-            if let Some(binary_name) = binary_path.file_name() {
-                let dwarf_file = dsym_path
-                    .join("Contents")
-                    .join("Resources")
-                    .join("DWARF")
-                    .join(binary_name);
-                if dwarf_file.exists() {
-                    let mut parser = Self::parse_file(&dwarf_file)?;
-                    parser.image_base = image_base;
-                    return Ok(parser);
+        // On macOS, check for .dSYM bundle (Linux debug info is embedded in ELF)
+        #[cfg(target_os = "macos")]
+        {
+            let dsym_path = binary_path.with_extension("dSYM");
+            if dsym_path.exists() {
+                if let Some(binary_name) = binary_path.file_name() {
+                    let dwarf_file = dsym_path
+                        .join("Contents")
+                        .join("Resources")
+                        .join("DWARF")
+                        .join(binary_name);
+                    if dwarf_file.exists() {
+                        let mut parser = Self::parse_file(&dwarf_file)?;
+                        parser.image_base = image_base;
+                        return Ok(parser);
+                    }
                 }
             }
         }
@@ -207,9 +209,12 @@ impl DwarfParser {
                             if let Ok(Some(var)) = Self::parse_variable(&dwarf, &unit, entry) {
                                 // For pointer variables, store type offset for lazy struct resolution
                                 if matches!(var.type_kind, TypeKind::Pointer) {
-                                    if let Some(gimli::AttributeValue::UnitRef(type_off)) =
-                                        entry.attr_value(gimli::DW_AT_type).ok().flatten()
-                                    {
+                                    let type_unit_off = match entry.attr_value(gimli::DW_AT_type).ok().flatten() {
+                                        Some(gimli::AttributeValue::UnitRef(off)) => Some(off),
+                                        Some(gimli::AttributeValue::DebugInfoRef(off)) => off.to_unit_offset(&unit.header),
+                                        _ => None,
+                                    };
+                                    if let Some(type_off) = type_unit_off {
                                         lazy_infos.push((var.name.clone(), (cu_offset, type_off.0)));
                                     }
                                 }
@@ -594,6 +599,7 @@ impl DwarfParser {
 
         let offset = match type_attr {
             gimli::AttributeValue::UnitRef(o) => o,
+            gimli::AttributeValue::DebugInfoRef(di_off) => di_off.to_unit_offset(&unit.header)?,
             _ => return None,
         };
 
@@ -636,6 +642,7 @@ impl DwarfParser {
                         member_type_attr.and_then(|attr| {
                             let ptr_off = match attr {
                                 gimli::AttributeValue::UnitRef(o) => o,
+                                gimli::AttributeValue::DebugInfoRef(di_off) => di_off.to_unit_offset(&unit.header)?,
                                 _ => return None,
                             };
                             let mut pt = unit.entries_tree(Some(ptr_off)).ok()?;

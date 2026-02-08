@@ -26,43 +26,52 @@ async fn test_frida_e2e_scenarios() {
         .to_str()
         .unwrap();
 
-    eprintln!("=== Scenario 1/12: Output capture ===");
+    eprintln!("=== Scenario 1/15: Output capture ===");
     scenario_output_capture(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 2/12: Function tracing — C++ namespaces ===");
+    eprintln!("\n=== Scenario 2/15: Function tracing — C++ namespaces ===");
     scenario_cpp_tracing(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 3/12: Function tracing — Rust namespaces ===");
+    eprintln!("\n=== Scenario 3/15: Function tracing — Rust namespaces ===");
     scenario_rust_tracing(&sm, rust_str, rust_project).await;
 
-    eprintln!("\n=== Scenario 4/12: Crash capture (SIGSEGV) ===");
+    eprintln!("\n=== Scenario 4/15: Crash capture (SIGSEGV) ===");
     scenario_crash_null(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 5/12: Crash capture (SIGABRT) ===");
+    eprintln!("\n=== Scenario 5/15: Crash capture (SIGABRT) ===");
     scenario_crash_abort(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 6/12: Fork workers ===");
+    eprintln!("\n=== Scenario 6/15: Fork workers ===");
     scenario_fork_workers(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 7/12: Fork exec ===");
+    eprintln!("\n=== Scenario 7/15: Fork exec ===");
     scenario_fork_exec(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 8/12: Duration query filter ===");
+    eprintln!("\n=== Scenario 8/15: Duration query filter ===");
     scenario_duration_query(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 9/12: Time range query filter ===");
+    eprintln!("\n=== Scenario 9/15: Time range query filter ===");
     scenario_time_range_query(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 10/12: Pattern add/remove ===");
+    eprintln!("\n=== Scenario 10/15: Pattern add/remove ===");
     scenario_pattern_add_remove(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 11/12: Watch variables ===");
+    eprintln!("\n=== Scenario 11/15: Watch variables ===");
     scenario_watch_variables(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== Scenario 12/12: Multi-threaded tracing ===");
+    eprintln!("\n=== Scenario 12/15: Multi-threaded tracing ===");
     scenario_multithreaded(&sm, cpp_str, cpp_project).await;
 
-    eprintln!("\n=== All 12 Frida E2E scenarios passed ===");
+    eprintln!("\n=== Scenario 13/15: debug_read — one-shot DWARF variables ===");
+    scenario_read_oneshot(&sm, cpp_str, cpp_project).await;
+
+    eprintln!("\n=== Scenario 14/15: debug_read — struct pointer expansion ===");
+    scenario_read_struct(&sm, cpp_str, cpp_project).await;
+
+    eprintln!("\n=== Scenario 15/15: debug_read — poll mode ===");
+    scenario_read_poll(&sm, cpp_str, cpp_project).await;
+
+    eprintln!("\n=== All 15 Frida E2E scenarios passed ===");
 }
 
 // ─── Scenario 1: Output Capture ──────────────────────────────────────
@@ -816,6 +825,332 @@ async fn scenario_multithreaded(
         .filter_map(|e| e.thread_name.as_deref())
         .collect();
     eprintln!("Distinct thread names: {:?}", thread_names);
+
+    let _ = sm.stop_session(session_id);
+}
+
+// ─── Scenario 13: debug_read — One-Shot DWARF Variable Reads ─────────
+//
+// Exercises the full execute_debug_read pipeline: validation → DWARF resolution
+// → recipe building → imageBase injection → agent read → response formatting.
+
+async fn scenario_read_oneshot(
+    sm: &strobe::daemon::SessionManager,
+    binary: &str,
+    project_root: &str,
+) {
+    let session_id = "e2e-read-oneshot";
+
+    let pid = sm
+        .spawn_with_frida(
+            session_id,
+            binary,
+            &["globals".to_string()],
+            None,
+            project_root,
+            None,
+        )
+        .await
+        .unwrap();
+    sm.create_session(session_id, binary, project_root, pid).unwrap();
+
+    // Wait for the process to start updating globals
+    let _ = poll_events_typed(
+        sm,
+        session_id,
+        Duration::from_secs(5),
+        strobe::db::EventType::Stdout,
+        |events| {
+            let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
+            text.contains("[GLOBALS] Starting")
+        },
+    )
+    .await;
+
+    // Small delay to let the loop run a few iterations
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Call through the exact same code path as the MCP tool
+    let response = sm
+        .execute_debug_read(&serde_json::json!({
+            "sessionId": session_id,
+            "targets": [
+                { "variable": "g_counter" },
+                { "variable": "g_tempo" },
+                { "variable": "g_sample_rate" },
+            ]
+        }))
+        .await
+        .expect("execute_debug_read must succeed");
+
+    eprintln!("Read response: {}", serde_json::to_string_pretty(&response).unwrap());
+
+    let results = response
+        .get("results")
+        .and_then(|v| v.as_array())
+        .expect("Response should have results array");
+    assert_eq!(results.len(), 3, "Should have 3 results (one per variable)");
+
+    // g_counter: uint32, updated in loop from 0..49
+    let counter = &results[0];
+    assert_eq!(counter["target"], "g_counter");
+    assert!(
+        counter.get("error").is_none(),
+        "g_counter read should succeed, got: {:?}",
+        counter.get("error")
+    );
+    let counter_val = counter["value"]
+        .as_u64()
+        .expect("g_counter should be a number");
+    eprintln!("  g_counter = {}", counter_val);
+    assert!(counter_val <= 49, "g_counter should be 0-49, got {}", counter_val);
+
+    // g_tempo: double, set to 120.0 + (i % 10)
+    let tempo = &results[1];
+    assert_eq!(tempo["target"], "g_tempo");
+    assert!(tempo.get("error").is_none(), "g_tempo read should succeed");
+    let tempo_val = tempo["value"]
+        .as_f64()
+        .expect("g_tempo should be a float");
+    eprintln!("  g_tempo = {}", tempo_val);
+    assert!(
+        (120.0..=129.0).contains(&tempo_val),
+        "g_tempo should be 120.0-129.0, got {}",
+        tempo_val
+    );
+
+    // g_sample_rate: int64, constant 44100
+    let sr = &results[2];
+    assert_eq!(sr["target"], "g_sample_rate");
+    assert!(sr.get("error").is_none(), "g_sample_rate read should succeed");
+    let sr_val = sr["value"]
+        .as_i64()
+        .expect("g_sample_rate should be a number");
+    eprintln!("  g_sample_rate = {}", sr_val);
+    assert_eq!(sr_val, 44100, "g_sample_rate should be 44100");
+
+    let _ = sm.stop_session(session_id);
+}
+
+// ─── Scenario 14: debug_read — Struct Pointer Expansion ──────────────
+
+async fn scenario_read_struct(
+    sm: &strobe::daemon::SessionManager,
+    binary: &str,
+    project_root: &str,
+) {
+    let session_id = "e2e-read-struct";
+
+    let pid = sm
+        .spawn_with_frida(
+            session_id,
+            binary,
+            &["globals".to_string()],
+            None,
+            project_root,
+            None,
+        )
+        .await
+        .unwrap();
+    sm.create_session(session_id, binary, project_root, pid).unwrap();
+
+    // Wait for process to start
+    let _ = poll_events_typed(
+        sm,
+        session_id,
+        Duration::from_secs(5),
+        strobe::db::EventType::Stdout,
+        |events| {
+            let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
+            text.contains("[GLOBALS] Starting")
+        },
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // depth=1 triggers struct expansion for pointer-to-struct
+    let response = sm
+        .execute_debug_read(&serde_json::json!({
+            "sessionId": session_id,
+            "targets": [
+                { "variable": "g_point_ptr" }
+            ],
+            "depth": 1
+        }))
+        .await
+        .expect("execute_debug_read must succeed for struct");
+
+    eprintln!(
+        "Struct read response: {}",
+        serde_json::to_string_pretty(&response).unwrap()
+    );
+
+    let results = response
+        .get("results")
+        .and_then(|v| v.as_array())
+        .expect("Should have results");
+    assert_eq!(results.len(), 1);
+
+    let result = &results[0];
+    assert_eq!(result["target"], "g_point_ptr");
+    assert!(
+        result.get("error").is_none(),
+        "Struct read should succeed, got: {:?}",
+        result.get("error")
+    );
+
+    let fields_val = result
+        .get("fields")
+        .expect("Struct result should have 'fields'");
+    assert!(fields_val.is_object(), "Fields should be a JSON object");
+
+    let fields_obj = fields_val.as_object().unwrap();
+    assert!(fields_obj.contains_key("x"), "Should have field 'x'");
+    assert!(fields_obj.contains_key("y"), "Should have field 'y'");
+    assert!(fields_obj.contains_key("value"), "Should have field 'value'");
+
+    // In "globals" mode: g_point_ptr->x = i, y = i*2, value stays 99.9
+    let x = fields_obj["x"].as_i64().expect("x should be a number");
+    let y = fields_obj["y"].as_i64().expect("y should be a number");
+    let val = fields_obj["value"].as_f64().expect("value should be a float");
+
+    eprintln!("  Point {{ x: {}, y: {}, value: {} }}", x, y, val);
+    assert!(x >= 0 && x <= 49, "x should be 0-49, got {}", x);
+    assert!(y >= 0 && y <= 98, "y should be 0-98, got {}", y);
+    assert!(
+        (val - 99.9).abs() < 0.01,
+        "value should be ~99.9 (initial), got {}",
+        val
+    );
+
+    let _ = sm.stop_session(session_id);
+}
+
+// ─── Scenario 15: debug_read — Poll Mode ─────────────────────────────
+
+async fn scenario_read_poll(
+    sm: &strobe::daemon::SessionManager,
+    binary: &str,
+    project_root: &str,
+) {
+    let session_id = "e2e-read-poll";
+
+    let pid = sm
+        .spawn_with_frida(
+            session_id,
+            binary,
+            &["globals".to_string()],
+            None,
+            project_root,
+            None,
+        )
+        .await
+        .unwrap();
+    sm.create_session(session_id, binary, project_root, pid).unwrap();
+
+    // Wait for process to start
+    let _ = poll_events_typed(
+        sm,
+        session_id,
+        Duration::from_secs(5),
+        strobe::db::EventType::Stdout,
+        |events| {
+            let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
+            text.contains("[GLOBALS] Starting")
+        },
+    )
+    .await;
+
+    // Poll mode: read g_counter every 100ms for 1500ms
+    let response = sm
+        .execute_debug_read(&serde_json::json!({
+            "sessionId": session_id,
+            "targets": [
+                { "variable": "g_counter" }
+            ],
+            "poll": {
+                "intervalMs": 100,
+                "durationMs": 1500,
+            }
+        }))
+        .await
+        .expect("execute_debug_read poll must succeed");
+
+    eprintln!(
+        "Poll response: {}",
+        serde_json::to_string_pretty(&response).unwrap()
+    );
+
+    // Poll mode returns immediately with { "polling": true }
+    assert_eq!(
+        response.get("polling").and_then(|v| v.as_bool()),
+        Some(true),
+        "Poll mode should return {{ polling: true }}"
+    );
+
+    // Wait for variable_snapshot events to appear in the timeline
+    let snapshot_events = poll_events_typed(
+        sm,
+        session_id,
+        Duration::from_secs(5),
+        strobe::db::EventType::VariableSnapshot,
+        |events| events.len() >= 5,
+    )
+    .await;
+
+    eprintln!(
+        "Variable snapshots collected: {} (expected ~15 for 1500ms/100ms)",
+        snapshot_events.len()
+    );
+    assert!(
+        snapshot_events.len() >= 5,
+        "Should collect at least 5 variable snapshots, got {}",
+        snapshot_events.len()
+    );
+
+    // Verify snapshot structure
+    for (i, event) in snapshot_events.iter().take(3).enumerate() {
+        assert_eq!(event.event_type, strobe::db::EventType::VariableSnapshot);
+
+        let data = event
+            .arguments
+            .as_ref()
+            .expect("Snapshot event should have data in arguments field");
+        let data_obj = data.as_object().expect("Snapshot data should be a JSON object");
+        assert!(
+            data_obj.contains_key("g_counter"),
+            "Snapshot should contain g_counter"
+        );
+
+        let val = data_obj["g_counter"]
+            .as_u64()
+            .expect("g_counter in snapshot should be a number");
+        eprintln!("  snapshot[{}]: g_counter = {}", i, val);
+    }
+
+    // Verify snapshots show changing values (g_counter increments every 100ms)
+    if snapshot_events.len() >= 2 {
+        let first = snapshot_events[0]
+            .arguments
+            .as_ref()
+            .unwrap()["g_counter"]
+            .as_u64();
+        let last = snapshot_events[snapshot_events.len() - 1]
+            .arguments
+            .as_ref()
+            .unwrap()["g_counter"]
+            .as_u64();
+
+        if let (Some(f), Some(l)) = (first, last) {
+            eprintln!("  First snapshot g_counter={}, last={}", f, l);
+            // Over 1.5 seconds, g_counter should change (increments every 100ms)
+            // Allow for both cases since timing isn't guaranteed
+            if f == l {
+                eprintln!("  Warning: g_counter didn't change between snapshots (timing-dependent)");
+            }
+        }
+    }
 
     let _ = sm.stop_session(session_id);
 }

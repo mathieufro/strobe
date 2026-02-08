@@ -9,6 +9,31 @@ use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::{FridaSpawner, HookResult};
 use crate::Result;
 
+/// Map TypeKind to the string the agent expects.
+fn type_kind_to_agent_str(tk: &crate::dwarf::TypeKind) -> &'static str {
+    match tk {
+        crate::dwarf::TypeKind::Integer { signed } => {
+            if *signed { "int" } else { "uint" }
+        }
+        crate::dwarf::TypeKind::Float => "float",
+        crate::dwarf::TypeKind::Pointer => "pointer",
+        crate::dwarf::TypeKind::Unknown => "uint",
+    }
+}
+
+fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err(format!("Hex string must have even length, got {}", hex.len()));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("Invalid hex at offset {}: {}", i, e))
+        })
+        .collect()
+}
+
 /// Acquire a read lock, recovering from poisoned state.
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|e| e.into_inner())
@@ -412,8 +437,8 @@ impl SessionManager {
         spawner.set_watches(session_id, watches).await
     }
 
-    /// Send a read_memory command to the Frida agent and return the response.
-    pub async fn read_memory(
+    /// Send a raw read_memory command to the Frida agent and return the response.
+    async fn send_read_memory(
         &self,
         session_id: &str,
         recipes_json: String,
@@ -423,6 +448,197 @@ impl SessionManager {
             .ok_or_else(|| crate::Error::Frida("No Frida spawner available".to_string()))?;
 
         spawner.read_memory(session_id, recipes_json).await
+    }
+
+    /// Execute a debug_read request end-to-end: validate, resolve DWARF, build recipes,
+    /// send to agent, format response. This is the full pipeline used by the MCP tool.
+    pub async fn execute_debug_read(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use crate::mcp::*;
+
+        let req: DebugReadRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        // Verify session exists and is running
+        let session = self.get_session(&req.session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
+        if session.status != crate::db::SessionStatus::Running {
+            return Err(crate::Error::ReadFailed(
+                "Process exited — session still queryable but reads unavailable".to_string()
+            ));
+        }
+
+        let depth = req.depth.unwrap_or(1);
+
+        // Build read recipes from targets
+        let mut recipes: Vec<serde_json::Value> = Vec::new();
+        let mut response_results: Vec<ReadResult> = Vec::new();
+
+        // Get DWARF parser for variable resolution
+        let dwarf = self.get_dwarf(&req.session_id).await?;
+
+        for target in &req.targets {
+            if let Some(ref var_name) = target.variable {
+                let dwarf_ref = match dwarf.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        response_results.push(ReadResult {
+                            target: var_name.clone(),
+                            error: Some("No debug symbols available".to_string()),
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+                };
+
+                match dwarf_ref.resolve_read_target(var_name, depth) {
+                    Ok((recipe, struct_fields)) => {
+                        let type_kind_str = type_kind_to_agent_str(&recipe.type_kind);
+
+                        let mut recipe_json = serde_json::json!({
+                            "label": var_name,
+                            "address": format!("0x{:x}", recipe.base_address),
+                            "size": recipe.final_size,
+                            "typeKind": type_kind_str,
+                            "derefDepth": recipe.deref_chain.len().min(1),
+                            "derefOffset": recipe.deref_chain.first().copied().unwrap_or(0),
+                        });
+
+                        if let Some(fields) = struct_fields {
+                            recipe_json["struct"] = serde_json::json!(true);
+                            let fields_json: Vec<serde_json::Value> = fields.iter().map(|f| {
+                                serde_json::json!({
+                                    "name": f.name,
+                                    "offset": f.offset,
+                                    "size": f.size,
+                                    "typeKind": type_kind_to_agent_str(&f.type_kind),
+                                    "typeName": f.type_name,
+                                    "isTruncatedStruct": f.is_truncated_struct,
+                                })
+                            }).collect();
+                            recipe_json["fields"] = serde_json::json!(fields_json);
+                        }
+
+                        recipes.push(recipe_json);
+                    }
+                    Err(e) => {
+                        response_results.push(ReadResult {
+                            target: var_name.clone(),
+                            error: Some(e.to_string()),
+                            ..Default::default()
+                        });
+                    }
+                }
+            } else if let Some(ref addr) = target.address {
+                let size = target.size.unwrap_or(4);
+                let type_hint = target.type_hint.clone().unwrap_or_else(|| "bytes".to_string());
+
+                recipes.push(serde_json::json!({
+                    "label": addr,
+                    "address": addr,
+                    "size": size,
+                    "typeKind": type_hint,
+                    "derefDepth": 0,
+                    "derefOffset": 0,
+                    "noSlide": true,
+                }));
+            }
+        }
+
+        if recipes.is_empty() && !response_results.is_empty() {
+            return Ok(serde_json::to_value(DebugReadResponse {
+                results: response_results,
+            })?);
+        }
+
+        // Build message for agent
+        let mut msg = serde_json::json!({
+            "type": "read_memory",
+            "recipes": recipes,
+        });
+
+        // Include imageBase so the agent can compute ASLR slide even if no hooks are installed
+        if let Some(ref d) = dwarf {
+            msg["imageBase"] = serde_json::json!(format!("0x{:x}", d.image_base));
+        }
+
+        if let Some(ref poll) = req.poll {
+            msg["poll"] = serde_json::json!({
+                "intervalMs": poll.interval_ms,
+                "durationMs": poll.duration_ms,
+            });
+        }
+
+        let msg_str = serde_json::to_string(&msg)?;
+        let agent_response = self.send_read_memory(&req.session_id, msg_str).await?;
+
+        // Handle poll mode
+        if req.poll.is_some() {
+            let poll = req.poll.as_ref().unwrap();
+            let expected = poll.duration_ms / poll.interval_ms;
+            let response = DebugReadPollResponse {
+                polling: true,
+                variable_count: recipes.len(),
+                interval_ms: poll.interval_ms,
+                duration_ms: poll.duration_ms,
+                expected_samples: expected,
+                event_type: "variable_snapshot".to_string(),
+                hint: "Use debug_query({ eventType: 'variable_snapshot' }) to see results".to_string(),
+            };
+            return Ok(serde_json::to_value(response)?);
+        }
+
+        // Handle one-shot response — merge agent results with any pre-computed errors
+        if let Some(results) = agent_response.get("results").and_then(|v| v.as_array()) {
+            for result in results {
+                let label = result.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let mut read_result = ReadResult {
+                    target: label.to_string(),
+                    ..Default::default()
+                };
+
+                if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+                    read_result.error = Some(err.to_string());
+                } else if let Some(fields) = result.get("fields") {
+                    read_result.fields = Some(fields.clone());
+                } else if let Some(value) = result.get("value") {
+                    if result.get("isBytes").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        if let Some(hex) = value.as_str() {
+                            match hex_to_bytes(hex) {
+                                Ok(bytes) => {
+                                    let dir = "/tmp/strobe/reads";
+                                    let _ = std::fs::create_dir_all(dir);
+                                    let filename = format!("{}-{}.bin", req.session_id, chrono::Utc::now().timestamp());
+                                    let filepath = format!("{}/{}", dir, filename);
+                                    if let Err(e) = std::fs::write(&filepath, &bytes) {
+                                        read_result.error = Some(format!("Failed to write bytes file: {}", e));
+                                    } else {
+                                        read_result.file = Some(filepath);
+                                        let preview_bytes = &bytes[..bytes.len().min(32)];
+                                        read_result.preview = Some(
+                                            preview_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    read_result.error = Some(format!("Failed to decode bytes: {}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        read_result.value = Some(value.clone());
+                    }
+                }
+
+                response_results.push(read_result);
+            }
+        }
+
+        Ok(serde_json::to_value(DebugReadResponse {
+            results: response_results,
+        })?)
     }
 
     /// Stop Frida session

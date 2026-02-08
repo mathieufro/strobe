@@ -1,4 +1,5 @@
 import { CModuleTracer, HookMode, type FunctionTarget } from './cmodule-tracer.js';
+import { createPlatformAdapter, type PlatformAdapter } from './platform.js';
 import { RateTracker } from './rate-tracker.js';
 
 interface HookInstruction {
@@ -63,6 +64,7 @@ interface ReadRecipe {
 
 interface ReadMemoryMessage {
   recipes: ReadRecipe[];
+  imageBase?: string;  // For ASLR slide computation (if not already set via hooks)
   poll?: {
     intervalMs: number;
     durationMs: number;
@@ -91,6 +93,7 @@ interface WatchInstruction {
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
+  private platform: PlatformAdapter;
   private tracer: CModuleTracer;
   private rateTracker: RateTracker | null = null;
   private funcIdToName: Map<number, string> = new Map();
@@ -116,9 +119,10 @@ class StrobeAgent {
   private samplingStatsTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
+    this.platform = createPlatformAdapter();
     this.tracer = new CModuleTracer((events) => {
       send({ type: 'events', events });
-    });
+    }, this.platform);
     this.sessionStartNs = Date.now() * 1000000;
 
     // Periodic flush for output events
@@ -375,6 +379,10 @@ class StrobeAgent {
   }
 
   handleReadMemory(message: ReadMemoryMessage): void {
+    // Ensure ASLR slide is set (may not be if no hooks installed yet)
+    if (message.imageBase) {
+      this.tracer.setImageBase(message.imageBase);
+    }
     const slide = this.tracer.getSlide();
 
     if (message.poll) {
@@ -526,7 +534,7 @@ class StrobeAgent {
 
   private installOutputCapture(): void {
     const self = this;
-    const writePtr = Process.getModuleByName('libSystem.B.dylib').getExportByName('write');
+    const writePtr = this.platform.resolveWritePtr();
     if (!writePtr) return;
 
     // Note: inOutputCapture is a process-global flag, not thread-local.
