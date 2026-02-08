@@ -371,18 +371,22 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
         ("test", "started") => {
             p.phase = super::TestPhase::Running;
             p.current_test = v.get("name").and_then(|n| n.as_str()).map(String::from);
+            p.current_test_started_at = Some(std::time::Instant::now());
         }
         ("test", "ok") => {
             p.passed += 1;
             p.current_test = None;
+            p.current_test_started_at = None;
         }
         ("test", "failed") => {
             p.failed += 1;
             p.current_test = None;
+            p.current_test_started_at = None;
         }
         ("test", "ignored") => {
             p.skipped += 1;
             p.current_test = None;
+            p.current_test_started_at = None;
         }
         _ => {}
     }

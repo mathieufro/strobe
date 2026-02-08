@@ -294,6 +294,7 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
             if let Some(end) = after.find('"') {
                 let mut p = progress.lock().unwrap();
                 p.current_test = Some(after[..end].to_string());
+                p.current_test_started_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -305,6 +306,7 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
             p.failed += 1;
         }
         p.current_test = None;
+        p.current_test_started_at = None;
     }
     if trimmed.contains("</Catch2TestRun>") {
         let mut p = progress.lock().unwrap();

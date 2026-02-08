@@ -169,12 +169,12 @@ mod tests {
     fn test_out_of_range_retry_uses_default() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("settings.json");
-        // 100ms is below minimum
+        // Below minimum (500)
         std::fs::write(&file, r#"{"test.statusRetryMs": 100}"#).unwrap();
         let settings = resolve_with_paths(Some(&file), None);
         assert_eq!(settings.test_status_retry_ms, 5_000);
 
-        // 120000ms is above maximum
+        // Above maximum (60000)
         std::fs::write(&file, r#"{"test.statusRetryMs": 120000}"#).unwrap();
         let settings = resolve_with_paths(Some(&file), None);
         assert_eq!(settings.test_status_retry_ms, 5_000);
@@ -187,7 +187,8 @@ mod tests {
         std::fs::write(&file, r#"{"test.statusRetryMs": 2000}"#).unwrap();
 
         let settings = resolve_with_paths(Some(&file), None);
-        assert_eq!(settings.events_max_per_session, 200_000); // default preserved
-        assert_eq!(settings.test_status_retry_ms, 2_000); // overridden
+        assert_eq!(settings.test_status_retry_ms, 2_000);
+        assert_eq!(settings.events_max_per_session, 200_000); // unchanged
     }
+
 }

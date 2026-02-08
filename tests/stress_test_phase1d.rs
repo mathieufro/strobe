@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use strobe::test::adapter::*;
 use strobe::test::cargo_adapter::CargoTestAdapter;
@@ -22,6 +22,21 @@ fn test_session_manager() -> Arc<strobe::daemon::SessionManager> {
     // Leak the tempdir so it lives for the test duration
     std::mem::forget(tmp);
     Arc::new(strobe::daemon::SessionManager::new(&db_path).unwrap())
+}
+
+/// Shared SessionManager for tests that spawn Frida subprocesses (TestRunner::run).
+/// Multiple FridaSpawner instances in the same process share the underlying Frida
+/// local device — their spawn-gating signal handlers compete for child processes,
+/// causing output capture conflicts. Using a single shared SessionManager ensures
+/// one FridaSpawner and one coordinator thread, eliminating the race.
+fn shared_frida_session_manager() -> Arc<strobe::daemon::SessionManager> {
+    static SM: OnceLock<Arc<strobe::daemon::SessionManager>> = OnceLock::new();
+    SM.get_or_init(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("shared_frida_test.db");
+        std::mem::forget(tmp);
+        Arc::new(strobe::daemon::SessionManager::new(&db_path).unwrap())
+    }).clone()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -501,7 +516,7 @@ fn test_adapter_confidence_ordering() {
 #[tokio::test]
 async fn test_runner_run_real_cargo_tests() {
     let runner = strobe::test::TestRunner::new();
-    let sm = test_session_manager();
+    let sm = shared_frida_session_manager();
 
     // Part 1: Single test by name
     let progress1 = Arc::new(Mutex::new(TestProgress::new()));
@@ -580,7 +595,7 @@ async fn test_runner_run_catch2_erae_fw_tests() {
     }
 
     let runner = strobe::test::TestRunner::new();
-    let sm = test_session_manager();
+    let sm = shared_frida_session_manager();
     let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let result = runner.run(
@@ -622,7 +637,7 @@ async fn test_runner_run_catch2_erae_data_tests() {
     }
 
     let runner = strobe::test::TestRunner::new();
-    let sm = test_session_manager();
+    let sm = shared_frida_session_manager();
     let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let result = runner.run(
@@ -665,7 +680,7 @@ async fn test_runner_run_catch2_single_test() {
     }
 
     let runner = strobe::test::TestRunner::new();
-    let sm = test_session_manager();
+    let sm = shared_frida_session_manager();
     let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let result = runner.run(
@@ -1048,7 +1063,7 @@ fn test_catch2_detection_with_nonexistent_binary() {
 #[tokio::test]
 async fn test_e2e_cargo_run_and_write_details() {
     let runner = strobe::test::TestRunner::new();
-    let sm = test_session_manager();
+    let sm = shared_frida_session_manager();
     let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let run_result = runner.run(
@@ -1092,7 +1107,7 @@ async fn test_e2e_catch2_run_and_write_details() {
     }
 
     let runner = strobe::test::TestRunner::new();
-    let sm = test_session_manager();
+    let sm = shared_frida_session_manager();
     let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let run_result = runner.run(

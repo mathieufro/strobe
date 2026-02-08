@@ -344,11 +344,12 @@ ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
 Tests always run inside Frida, so you can add traces at any time without restarting.
 
 `debug_test` returns immediately with a `testRunId`. Poll `debug_test_status(testRunId)`
-for progress. IMPORTANT: Each status response includes `retryInMs` — wait that many
-milliseconds before polling again.
+for progress. The server blocks up to 15s waiting for completion, so it's safe to call
+immediately after each response.
 
 ### Status Response Fields
 - `progress.currentTest` — name of the currently executing test
+- `progress.currentTestElapsedMs` — how long the current test has been running
 - `progress.currentTestBaselineMs` — historical average duration for this test (if known)
 - `progress.warnings` — stuck detection warnings (see below)
 - `sessionId` — Frida session ID for `debug_trace` and `debug_stop`
@@ -568,7 +569,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test_status".to_string(),
-                description: "Query the status of a running test. Returns progress (elapsed_ms, passed/failed/skipped, phase, current test name) while running, or full results when complete. IMPORTANT: Use the retryInMs field from the response to determine how long to wait before the next poll — do NOT poll more frequently than indicated.".to_string(),
+                description: "Query the status of a running test. Returns progress (elapsed_ms, passed/failed/skipped, phase, current test name and its elapsed time) while running, or full results when complete. Server blocks up to 15s waiting for completion — safe to call immediately after previous response.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1500,15 +1501,9 @@ Validation Limits (enforced):
                     None
                 };
 
-                // Faster polling when stuck warnings are active
-                let settings = crate::config::resolve(
-                    Some(std::path::Path::new(&test_run.project_root))
-                );
-                let retry_ms = if warnings.is_empty() {
-                    settings.test_status_retry_ms
-                } else {
-                    settings.test_status_retry_ms.min(2_000)
-                };
+                // How long the current test has been running
+                let current_test_elapsed_ms = p.current_test_started_at
+                    .map(|t| t.elapsed().as_millis() as u64);
 
                 crate::mcp::DebugTestStatusResponse {
                     test_run_id: req.test_run_id,
@@ -1521,11 +1516,11 @@ Validation Limits (enforced):
                         current_test: p.current_test.clone(),
                         phase: Some(phase_str.to_string()),
                         warnings,
+                        current_test_elapsed_ms,
                         current_test_baseline_ms: baseline_ms,
                     }),
                     result: None,
                     error: None,
-                    retry_in_ms: Some(retry_ms),
                     session_id: test_run.session_id.clone(),
                 }
             }
@@ -1537,7 +1532,6 @@ Validation Limits (enforced):
                     progress: None,
                     result: Some(response.clone()),
                     error: None,
-                    retry_in_ms: None,
                     session_id: test_run.session_id.clone(),
                 }
             }
@@ -1549,7 +1543,6 @@ Validation Limits (enforced):
                     progress: None,
                     result: None,
                     error: Some(error.clone()),
-                    retry_in_ms: None,
                     session_id: test_run.session_id.clone(),
                 }
             }

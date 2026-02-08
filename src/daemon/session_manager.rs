@@ -89,17 +89,16 @@ impl SessionManager {
         project_root: &str,
         pid: u32,
     ) -> Result<Session> {
-        // Check for existing active session on this binary
+        // Clean up stale sessions on the same binary (dead process still marked Running)
         if let Some(existing) = self.db.get_session_by_binary(binary_path)? {
             if existing.status == SessionStatus::Running {
-                // Verify the old process is actually alive before blocking
                 let pid_alive = unsafe { libc::kill(existing.pid as i32, 0) } == 0;
-                if pid_alive {
-                    return Err(crate::Error::SessionExists);
+                if !pid_alive {
+                    tracing::warn!("Session {} has dead PID {}, marking as stopped", existing.id, existing.pid);
+                    self.db.update_session_status(&existing.id, SessionStatus::Stopped)?;
                 }
-                // Stale session — process is dead, clean it up
-                tracing::warn!("Session {} has dead PID {}, marking as stopped", existing.id, existing.pid);
-                self.db.update_session_status(&existing.id, SessionStatus::Stopped)?;
+                // Multiple concurrent sessions on the same binary are allowed
+                // (e.g. parallel agents debugging the same project)
             }
         }
 
