@@ -382,7 +382,8 @@ fn test_catch2_single_test_for_binary() {
         "Test case with spaces and [tags]",
     );
     assert_eq!(cmd.program, "/path/to/tests");
-    assert!(cmd.args.contains(&"Test case with spaces and [tags]".to_string()));
+    // Filter is wrapped in wildcards for substring matching
+    assert!(cmd.args.contains(&"*Test case with spaces and [tags]*".to_string()));
     assert!(cmd.args.contains(&"--reporter".to_string()));
 }
 
@@ -877,7 +878,6 @@ fn test_debug_test_request_full_roundtrip() {
         trace_patterns: Some(vec!["foo::*".to_string(), "@file:bar.rs".to_string()]),
         watches: None,
         env: Some(HashMap::from([("RUST_LOG".to_string(), "debug".to_string())])),
-        timeout: Some(60_000),
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -893,7 +893,6 @@ fn test_debug_test_request_full_roundtrip() {
     assert_eq!(back.project_root, "/my/project");
     assert_eq!(back.framework.as_deref(), Some("cargo"));
     assert_eq!(back.test.as_deref(), Some("test_foo"));
-    assert_eq!(back.timeout, Some(60_000));
 }
 
 #[test]
@@ -908,7 +907,6 @@ fn test_debug_test_request_minimal() {
     assert!(req.trace_patterns.is_none());
     assert!(req.watches.is_none());
     assert!(req.env.is_none());
-    assert!(req.timeout.is_none());
 }
 
 #[test]
@@ -1001,7 +999,7 @@ fn test_test_level_serde() {
 #[test]
 fn test_default_timeouts() {
     let adapter = CargoTestAdapter;
-    assert_eq!(adapter.default_timeout(None), 30_000);
+    assert_eq!(adapter.default_timeout(None), 120_000);
     assert_eq!(adapter.default_timeout(Some(TestLevel::Unit)), 30_000);
     assert_eq!(adapter.default_timeout(Some(TestLevel::Integration)), 120_000);
     assert_eq!(adapter.default_timeout(Some(TestLevel::E2e)), 300_000);

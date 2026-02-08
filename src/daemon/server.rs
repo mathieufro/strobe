@@ -314,7 +314,7 @@ If behavior requires user action (button press, network event), tell the user wh
 ## Limits
 
 - Aim for <50 hooks (fast, stable). 100+ risks crashes. Hard cap: 100 per debug_trace call.
-- Default 200k events/session (FIFO). Adjust via `eventLimit`. Use 500k for audio/DSP; avoid 1M+.
+- Default 200k events/session (FIFO). Configure via .strobe/settings.json. Use 500k for audio/DSP; avoid 1M+.
 
 ## Watches
 
@@ -411,7 +411,6 @@ When called WITHOUT sessionId (advanced/staging mode):
 - Consider launching clean and observing output first instead
 
 Validation Limits (enforced):
-- eventLimit: max 10,000,000 events per session
 - watches: max 32 per session
 - watch expressions/variables: max 1KB length, max 10 levels deep (-> or . operators)"#.to_string(),
                 input_schema: serde_json::json!({
@@ -420,8 +419,8 @@ Validation Limits (enforced):
                         "sessionId": { "type": "string", "description": "Session ID. Omit to set pending patterns for the next debug_launch. Provide to modify a running session." },
                         "add": { "type": "array", "items": { "type": "string" }, "description": "Patterns to start tracing (e.g. \"mymodule::*\", \"*::init\", \"@usercode\")" },
                         "remove": { "type": "array", "items": { "type": "string" }, "description": "Patterns to stop tracing" },
-                        "eventLimit": { "type": "integer", "description": "Maximum events to keep for this session (default: 200,000). Oldest events are deleted when limit is reached. Use higher limits (500k-1M) for audio/DSP debugging." },
                         "serializationDepth": { "type": "integer", "description": "Maximum depth for recursive argument serialization (default: 3, max: 10)", "minimum": 1, "maximum": 10 },
+                        "projectRoot": { "type": "string", "description": "Root directory for user code detection" },
                         "watches": {
                             "type": "object",
                             "description": "Watch global/static variables during function execution (requires debug symbols)",
@@ -562,8 +561,7 @@ Validation Limits (enforced):
                                 "remove": { "type": "array", "items": { "type": "string" } }
                             }
                         },
-                        "env": { "type": "object", "description": "Additional environment variables" },
-                        "timeout": { "type": "integer", "description": "Hard timeout in ms (default varies by level)" }
+                        "env": { "type": "object", "description": "Additional environment variables" }
                     },
                     "required": ["projectRoot"]
                 }),
@@ -814,7 +812,7 @@ Validation Limits (enforced):
                     matched_functions: None,
                     active_watches: vec![],
                     warnings: vec![],
-                    event_limit: crate::daemon::session_manager::DEFAULT_MAX_EVENTS_PER_SESSION,
+                    event_limit: crate::config::StrobeSettings::default().events_max_per_session,
                     status: Some(status_msg),
                 };
                 Ok(serde_json::to_value(response)?)
@@ -853,18 +851,16 @@ Validation Limits (enforced):
 
                 self.session_manager.set_hook_count(session_id, hook_result.installed);
 
-                // Update event limit if provided
-                const MAX_EVENT_LIMIT: usize = 10_000_000; // 10M hard cap
-
-                if let Some(limit) = req.event_limit {
-                    if limit == 0 || limit > MAX_EVENT_LIMIT {
-                        return Err(crate::Error::Frida(format!(
-                            "Event limit must be between 1 and {}",
-                            MAX_EVENT_LIMIT
-                        )));
-                    }
-                    self.session_manager.set_event_limit(session_id, limit);
-                }
+                // Resolve settings from project root
+                let project_root_str = req.project_root.clone().or_else(|| {
+                    self.session_manager.get_session(session_id).ok()
+                        .flatten()
+                        .map(|s| s.project_root)
+                });
+                let settings = crate::config::resolve(
+                    project_root_str.as_deref().map(std::path::Path::new)
+                );
+                self.session_manager.set_event_limit(session_id, settings.events_max_per_session);
 
                 let patterns = self.session_manager.get_patterns(session_id);
                 let event_limit = self.session_manager.get_event_limit(session_id);
@@ -1368,7 +1364,7 @@ Validation Limits (enforced):
                 req_clone.test.as_deref(),
                 req_clone.command.as_deref(),
                 &env,
-                req_clone.timeout,
+                None,  // timeout — uses adapter defaults, configurable via settings
                 &session_manager,
                 &trace_patterns,
                 req_clone.watches.as_ref(),
@@ -1505,7 +1501,14 @@ Validation Limits (enforced):
                 };
 
                 // Faster polling when stuck warnings are active
-                let retry_ms = if warnings.is_empty() { 5_000 } else { 2_000 };
+                let settings = crate::config::resolve(
+                    Some(std::path::Path::new(&test_run.project_root))
+                );
+                let retry_ms = if warnings.is_empty() {
+                    settings.test_status_retry_ms
+                } else {
+                    settings.test_status_retry_ms.min(2_000)
+                };
 
                 crate::mcp::DebugTestStatusResponse {
                     test_run_id: req.test_run_id,

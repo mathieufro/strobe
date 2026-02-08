@@ -62,7 +62,6 @@ fn test_debug_test_request_camelcase() {
         trace_patterns: Some(vec!["foo::*".to_string()]),
         watches: None,
         env: None,
-        timeout: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains("projectRoot"));

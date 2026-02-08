@@ -87,26 +87,6 @@ fn test_stress_binary_runs() {
     assert!(stdout.contains("ENGINE STATS"), "Expected engine stats output");
 }
 
-/// Validation test: Verify input validation prevents extreme parameters
-#[test]
-fn test_validation_prevents_extreme_event_limits() {
-    use strobe::mcp::DebugTraceRequest;
-
-    // Try to set 100M event limit (over 10M max)
-    let req = DebugTraceRequest {
-        session_id: Some("test".to_string()),
-        add: None,
-        remove: None,
-        watches: None,
-        event_limit: Some(100_000_000),
-        serialization_depth: None,
-    };
-
-    let result = req.validate();
-    assert!(result.is_err(), "Validation should reject 100M event limit");
-    assert!(result.unwrap_err().to_string().contains("10000000"));
-}
-
 // ============ Serialization Depth Stress Validation ============
 
 /// Validate serialization depth rejects extreme values under stress-like parameters
@@ -120,7 +100,7 @@ fn test_validation_prevents_extreme_serialization_depth() {
         add: Some(vec!["audio::*".to_string(), "midi::*".to_string()]),
         remove: None,
         watches: None,
-        event_limit: Some(500_000),
+        project_root: None,
         serialization_depth: Some(0),
     };
     assert!(req.validate().is_err(), "Depth 0 should be rejected");
@@ -131,7 +111,7 @@ fn test_validation_prevents_extreme_serialization_depth() {
         add: Some(vec!["audio::*".to_string()]),
         remove: None,
         watches: None,
-        event_limit: Some(1_000_000),
+        project_root: None,
         serialization_depth: Some(100),
     };
     let err = req.validate().unwrap_err();
@@ -191,7 +171,7 @@ fn test_serialization_depth_with_full_stress_params() {
             ]),
             remove: None,
         }),
-        event_limit: Some(500_000),
+        project_root: None,
         serialization_depth: Some(5), // Deep enough for EffectChain recursive struct
     };
 
@@ -218,7 +198,7 @@ fn test_serialization_depth_invalid_with_valid_stress_params() {
             }]),
             remove: None,
         }),
-        event_limit: Some(200_000),
+        project_root: None,
         serialization_depth: Some(11), // Just above max
     };
 
@@ -234,13 +214,11 @@ fn test_serialization_depth_mcp_json_stress() {
     let json = r#"{
         "sessionId": "stress-123",
         "add": ["audio::process_audio_buffer", "audio::apply_effect_chain", "midi::*"],
-        "serializationDepth": 5,
-        "eventLimit": 500000
+        "serializationDepth": 5
     }"#;
 
     let req: DebugTraceRequest = serde_json::from_str(json).unwrap();
     assert_eq!(req.serialization_depth, Some(5));
-    assert_eq!(req.event_limit, Some(500_000));
     assert_eq!(req.add.as_ref().unwrap().len(), 3);
     assert!(req.validate().is_ok());
 
@@ -266,7 +244,7 @@ fn test_serialization_depth_boundary_stress() {
         add: Some(vec!["audio::*".to_string(), "midi::*".to_string(), "engine::*".to_string()]),
         remove: None,
         watches: None,
-        event_limit: Some(1_000_000),
+        project_root: None,
         serialization_depth: Some(depth),
     };
 

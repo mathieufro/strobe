@@ -1,23 +1,6 @@
 use strobe::mcp::{DebugTraceRequest, WatchTarget, WatchUpdate};
 
 #[test]
-fn test_event_limit_too_large() {
-    let req = DebugTraceRequest {
-        session_id: Some("test".to_string()),
-        add: None,
-        remove: None,
-        watches: None,
-        event_limit: Some(11_000_000), // Over 10M limit
-        serialization_depth: None,
-    };
-
-    // Validation should fail
-    let result = req.validate();
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("10000000"));
-}
-
-#[test]
 fn test_too_many_watches() {
     let watches: Vec<WatchTarget> = (0..33)
         .map(|i| WatchTarget {
@@ -38,7 +21,7 @@ fn test_too_many_watches() {
             add: Some(watches),
             remove: None,
         }),
-        event_limit: None,
+        project_root: None,
         serialization_depth: None,
     };
 
@@ -66,7 +49,7 @@ fn test_watch_expression_too_long() {
             }]),
             remove: None,
         }),
-        event_limit: None,
+        project_root: None,
         serialization_depth: None,
     };
 
@@ -95,7 +78,7 @@ fn test_watch_expression_too_deep() {
             }]),
             remove: None,
         }),
-        event_limit: None,
+        project_root: None,
         serialization_depth: None,
     };
 
@@ -122,7 +105,7 @@ fn test_valid_requests_pass() {
             }]),
             remove: None,
         }),
-        event_limit: Some(500_000), // Well under 10M
+        project_root: None,
         serialization_depth: None,
     };
 
@@ -139,7 +122,7 @@ fn test_serialization_depth_zero_rejected() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: Some(0),
     };
 
@@ -155,7 +138,7 @@ fn test_serialization_depth_exceeds_max() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: Some(11),
     };
 
@@ -173,7 +156,7 @@ fn test_serialization_depth_valid_range() {
             add: Some(vec!["foo::*".to_string()]),
             remove: None,
             watches: None,
-            event_limit: None,
+            project_root: None,
             serialization_depth: Some(depth),
         };
 
@@ -189,7 +172,7 @@ fn test_serialization_depth_none_is_valid() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: None,
     };
 
@@ -204,7 +187,7 @@ fn test_serialization_depth_boundary_values() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: Some(0),
     };
     assert!(req.validate().is_err());
@@ -215,7 +198,7 @@ fn test_serialization_depth_boundary_values() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: Some(1),
     };
     assert!(req.validate().is_ok());
@@ -226,7 +209,7 @@ fn test_serialization_depth_boundary_values() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: Some(10),
     };
     assert!(req.validate().is_ok());
@@ -237,7 +220,7 @@ fn test_serialization_depth_boundary_values() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: Some(11),
     };
     assert!(req.validate().is_err());
@@ -261,7 +244,7 @@ fn test_serialization_depth_with_other_params() {
             }]),
             remove: None,
         }),
-        event_limit: Some(500_000),
+        project_root: None,
         serialization_depth: Some(5),
     };
 
@@ -269,14 +252,14 @@ fn test_serialization_depth_with_other_params() {
 }
 
 #[test]
-fn test_serialization_depth_invalid_with_valid_event_limit() {
-    // Invalid depth should fail even if event_limit is valid
+fn test_serialization_depth_invalid_with_valid_params() {
+    // Invalid depth should fail even with other valid params
     let req = DebugTraceRequest {
         session_id: Some("test".to_string()),
         add: None,
         remove: None,
         watches: None,
-        event_limit: Some(200_000),
+        project_root: None,
         serialization_depth: Some(0),
     };
 
@@ -291,7 +274,7 @@ fn test_serialization_depth_json_roundtrip() {
         add: Some(vec!["audio::*".to_string()]),
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: Some(5),
     };
 
@@ -310,7 +293,7 @@ fn test_serialization_depth_omitted_from_json_when_none() {
         add: None,
         remove: None,
         watches: None,
-        event_limit: None,
+        project_root: None,
         serialization_depth: None,
     };
 
@@ -336,7 +319,7 @@ fn test_serialization_depth_large_values_rejected() {
             add: None,
             remove: None,
             watches: None,
-            event_limit: None,
+            project_root: None,
             serialization_depth: Some(depth),
         };
         assert!(req.validate().is_err(), "depth={} should be rejected", depth);

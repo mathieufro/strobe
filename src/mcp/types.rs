@@ -42,12 +42,12 @@ pub struct DebugTraceRequest {
     pub remove: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watches: Option<WatchUpdate>,
-    /// Maximum events to keep for this session (default: 200,000)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_limit: Option<usize>,
     /// Maximum depth for recursive argument serialization (default: 3, max: 10)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serialization_depth: Option<u32>,
+    /// Project root for settings resolution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,7 +115,6 @@ pub struct DebugTraceResponse {
 }
 
 // Validation limits
-pub const MAX_EVENT_LIMIT: usize = 10_000_000;
 pub const MAX_WATCHES_PER_SESSION: usize = 32;
 pub const MAX_WATCH_EXPRESSION_LENGTH: usize = 256;
 pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 4;
@@ -123,15 +122,6 @@ pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 4;
 impl DebugTraceRequest {
     /// Validate request parameters against limits
     pub fn validate(&self) -> crate::Result<()> {
-        // Validate event_limit
-        if let Some(limit) = self.event_limit {
-            if limit > MAX_EVENT_LIMIT {
-                return Err(crate::Error::ValidationError(
-                    format!("event_limit ({}) exceeds maximum of {}", limit, MAX_EVENT_LIMIT)
-                ));
-            }
-        }
-
         // Validate serialization depth
         if let Some(depth) = self.serialization_depth {
             if depth < 1 || depth > 10 {
@@ -323,8 +313,6 @@ pub struct DebugTestRequest {
     pub watches: Option<WatchUpdate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

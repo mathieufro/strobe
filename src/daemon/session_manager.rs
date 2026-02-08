@@ -9,25 +9,6 @@ use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::{FridaSpawner, HookResult};
 use crate::Result;
 
-/// Maximum events to keep per session. Oldest events are deleted when limit is reached.
-/// This prevents unbounded database growth and maintains system stability.
-///
-/// Default: 200,000 events (~2 seconds of 48kHz audio tracing, or several minutes of normal tracing)
-/// Can be overridden via STROBE_MAX_EVENTS_PER_SESSION environment variable.
-///
-/// Performance characteristics (from stress testing):
-/// - 200k: Query <10ms, Cleanup ~94ms, DB ~56MB
-/// - 500k: Query ~28ms, Cleanup ~200ms, DB ~140MB (use for extended audio debugging)
-/// - 1M+: Queries become slow (>300ms), cleanup expensive (>700ms)
-pub const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 200_000;
-
-fn get_max_events_per_session() -> usize {
-    std::env::var("STROBE_MAX_EVENTS_PER_SESSION")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION)
-}
-
 #[derive(Clone)]
 pub struct ActiveWatchState {
     pub label: String,
@@ -128,7 +109,8 @@ impl SessionManager {
         self.patterns.write().unwrap().insert(id.to_string(), Vec::new());
         self.hook_counts.write().unwrap().insert(id.to_string(), 0);
         self.watches.write().unwrap().insert(id.to_string(), Vec::new());
-        self.event_limits.write().unwrap().insert(id.to_string(), get_max_events_per_session());
+        let settings = crate::config::resolve(Some(std::path::Path::new(project_root)));
+        self.event_limits.write().unwrap().insert(id.to_string(), settings.events_max_per_session);
 
         Ok(session)
     }
@@ -234,7 +216,7 @@ impl SessionManager {
             .unwrap()
             .get(session_id)
             .copied()
-            .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION)
+            .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session)
     }
 
     /// Get or start a background DWARF parse. Returns a handle immediately.
@@ -292,7 +274,7 @@ impl SessionManager {
         let event_limits = Arc::clone(&self.event_limits);
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(100);
-            let mut cached_limit = DEFAULT_MAX_EVENTS_PER_SESSION;
+            let mut cached_limit = crate::config::StrobeSettings::default().events_max_per_session;
             let mut batches_since_refresh = 0;
 
             loop {
@@ -307,7 +289,7 @@ impl SessionManager {
                                 cached_limit = event_limits.read().unwrap()
                                     .get(session_id)
                                     .copied()
-                                    .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION);
+                                    .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session);
                                 batches_since_refresh = 0;
                             }
                             batches_since_refresh += 1;
@@ -339,7 +321,7 @@ impl SessionManager {
                                 cached_limit = event_limits.read().unwrap()
                                     .get(session_id)
                                     .copied()
-                                    .unwrap_or(DEFAULT_MAX_EVENTS_PER_SESSION);
+                                    .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session);
                                 batches_since_refresh = 0;
                             }
                             batches_since_refresh += 1;
