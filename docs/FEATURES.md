@@ -530,37 +530,53 @@ Query with `debug_query({ eventType: "variable_snapshot" })`.
 
 ## Phase 2: Active Debugging
 
-**Goal:** LLM can pause execution and inspect state.
+**Goal:** LLM can pause execution at precise points, inspect and modify state, and step through code.
+
+**Supported languages:** C, C++, Rust, Swift (native binaries with standard DWARF). Go deferred to future phase.
+
+**Full spec:** [docs/specs/2026-02-09-active-debugging.md](specs/2026-02-09-active-debugging.md)
 
 ### Features
 
-#### Conditional Breakpoints
-- Break only when condition is met (field comparisons)
+#### Breakpoints (`debug_breakpoint`)
+- **Line-level granularity**: Break at any source line via DWARF `.debug_line` → instruction address
+- **Function-level**: Break at function entry via pattern matching
+- Conditional breakpoints (JS expression evaluation)
 - Hit count support (break on Nth occurrence)
-- Glob patterns for function matching
+- Pause via Frida's `recv().wait()` — blocks calling thread, JS event loop stays alive
 
-#### State Inspection
-- Inspect variables at current breakpoint
-- Or inspect at historical event (time-travel via event ID)
+#### Stepping (`debug_continue`)
+- **step-over**: Next line in same function (one-shot breakpoint at next DWARF line entry)
+- **step-into**: Follow function calls (one-shot hooks on callee entries)
+- **step-out**: Run until current function returns (hook at return address)
+
+#### State Inspection & Injection
+- Inspect variables while paused via existing `debug_read`
+- **Write globals/statics** (`debug_write`) — while paused or running
+- **Write locals** (`debug_write`) — at breakpoint, via DWARF location lists (Phase 2c)
 - Navigate struct fields, array elements
-- Returns value and type information
 
-#### Resume Execution
-- Continue after breakpoint
-- Optionally step to next function call
-
-#### Logpoints (Non-Breaking)
+#### Logpoints (`debug_logpoint`)
 - Log without stopping execution
-- Template substitution from local variables
+- Template substitution: `"tempo={args[0]}, rate={args[1].sampleRate}"`
+- Events appear in timeline alongside traces, queryable via `debug_query`
+
+### Implementation Phases
+
+- **Phase 2a**: Core breakpoints + continue + global writes + DWARF line tables
+- **Phase 2b**: Stepping (step-over/into/out) + logpoints
+- **Phase 2c**: Local variable writes (DWARF location lists, register mapping)
 
 ### Validation Criteria
 
 Find a bug that traces alone couldn't catch:
 1. LLM sees suspicious pattern in traces
-2. LLM sets conditional breakpoint
+2. LLM sets conditional breakpoint at specific source line
 3. App pauses at exact moment of interest
 4. LLM inspects local variables, finds wrong value
-5. LLM identifies root cause
+5. LLM writes corrected value to test hypothesis
+6. LLM continues, adds logpoint to verify fix persists
+7. LLM identifies root cause
 
 ---
 

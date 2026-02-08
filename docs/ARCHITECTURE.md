@@ -596,47 +596,84 @@ debug_query({
 
 ### debug_breakpoint (Phase 2)
 
-Set a conditional breakpoint.
+Set or remove breakpoints. Supports function-level and line-level targeting.
+See [active debugging spec](specs/2026-02-09-active-debugging.md) for full design.
 
 ```typescript
 debug_breakpoint({
   sessionId: string,
-  function: string,          // Function pattern
-  condition?: {
-    field: string,           // e.g., "args[0].length"
-    equals?: any,
-    greaterThan?: number,
-    lessThan?: number
-  },
-  hitCount?: number          // Break on Nth hit
+  add?: [{
+    function?: string,          // Pattern: "audio::processBlock", "MyClass::*"
+    file?: string,              // Source file: "src/audio/processor.cpp"
+    line?: number,              // Line number: 142
+    condition?: string,         // JS expression: "args[0] > 100"
+    hitCount?: number,          // Break on Nth hit
+  }],
+  remove?: string[],            // Breakpoint IDs to remove
 }) → {
-  breakpointId: string
+  breakpoints: [{
+    id: string,
+    function?: string,
+    file?: string,
+    line?: number,
+    address: string,
+  }]
 }
 ```
 
-### debug_inspect (Phase 2)
+### debug_logpoint (Phase 2)
 
-Inspect state at a breakpoint or historical event.
+Set or remove logpoints. Evaluate expressions without pausing.
 
 ```typescript
-debug_inspect({
+debug_logpoint({
   sessionId: string,
-  eventId?: string,          // Inspect at historical event
-  expression: string         // e.g., "config.sample_rate"
+  add?: [{
+    function?: string,
+    file?: string,
+    line?: number,
+    message: string,            // Template: "tempo={args[0]}"
+    condition?: string,
+  }],
+  remove?: string[],
 }) → {
-  value: any,
-  type: string
+  logpoints: [{ id: string, address: string }]
 }
 ```
 
 ### debug_continue (Phase 2)
 
-Resume execution after breakpoint.
+Resume execution after breakpoint pause.
 
 ```typescript
 debug_continue({
-  sessionId: string
-}) → { success: boolean }
+  sessionId: string,
+  action?: "continue" | "step-over" | "step-into" | "step-out",
+}) → {
+  status: "paused" | "running" | "exited",
+  breakpointId?: string,
+  file?: string,
+  line?: number,
+  function?: string,
+}
+```
+
+### debug_write (Phase 2)
+
+Write to variables while paused or running.
+
+```typescript
+debug_write({
+  sessionId: string,
+  targets: [{
+    variable?: string,          // "gTempo" (global) or "sampleRate" (local at breakpoint)
+    address?: string,
+    value: number | string | boolean,
+    type?: string,              // "f64", "i32", "pointer", etc.
+  }]
+}) → {
+  results: [{ variable?: string, address: string, previousValue: any, newValue: any }]
+}
 ```
 
 ### debug_ui_tree (Phase 4)
@@ -857,7 +894,11 @@ pub trait Collector: Send + Sync {
     fn detach(&mut self, session: SessionId) -> Result<()>;
     fn set_trace_patterns(&mut self, session: SessionId, patterns: Vec<Pattern>) -> Result<()>;
     fn set_breakpoint(&mut self, session: SessionId, bp: Breakpoint) -> Result<BreakpointId>;
-    fn resume(&mut self, session: SessionId) -> Result<()>;
+    fn remove_breakpoint(&mut self, session: SessionId, bp_id: BreakpointId) -> Result<()>;
+    fn set_logpoint(&mut self, session: SessionId, lp: Logpoint) -> Result<LogpointId>;
+    fn remove_logpoint(&mut self, session: SessionId, lp_id: LogpointId) -> Result<()>;
+    fn resume(&mut self, session: SessionId, action: ResumeAction) -> Result<()>;
+    fn write_memory(&mut self, session: SessionId, targets: Vec<WriteTarget>) -> Result<Vec<WriteResult>>;
     fn poll_events(&mut self, session: SessionId) -> Result<Vec<TraceEvent>>;
 }
 ```
