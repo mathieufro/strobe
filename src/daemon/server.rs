@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,8 @@ pub struct Daemon {
     connection_sessions: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Active and recently-completed test runs, keyed by testRunId
     test_runs: Arc<tokio::sync::RwLock<HashMap<String, crate::test::TestRun>>>,
+    /// Signaled by idle_timeout_loop to tell the accept loop to exit
+    shutdown_signal: Arc<tokio::sync::Notify>,
 }
 
 impl Daemon {
@@ -34,6 +37,22 @@ impl Daemon {
             .join(".strobe");
 
         std::fs::create_dir_all(&strobe_dir)?;
+
+        // Acquire exclusive lock — only one daemon can run at a time.
+        // The lock is held for the daemon's entire lifetime (_lock_file lives until run() returns).
+        let lock_path = strobe_dir.join("daemon.lock");
+        let _lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)?;
+
+        let lock_result = unsafe {
+            libc::flock(_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+        };
+        if lock_result != 0 {
+            tracing::info!("Another daemon is already running (lock held), exiting");
+            return Ok(());
+        }
 
         let socket_path = strobe_dir.join("strobe.sock");
         let pid_path = strobe_dir.join("strobe.pid");
@@ -55,6 +74,7 @@ impl Daemon {
             pending_patterns: Arc::new(RwLock::new(HashMap::new())),
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         });
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -66,21 +86,57 @@ impl Daemon {
             daemon_clone.idle_timeout_loop().await;
         });
 
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )?;
+        let shutdown = Arc::clone(&daemon.shutdown_signal);
+        let mut consecutive_accept_errors: u32 = 0;
+
         loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let daemon = Arc::clone(&daemon);
-                    tokio::spawn(async move {
-                        if let Err(e) = daemon.handle_connection(stream).await {
-                            tracing::error!("Connection error: {}", e);
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _)) => {
+                            consecutive_accept_errors = 0;
+                            let daemon = Arc::clone(&daemon);
+                            tokio::spawn(async move {
+                                if let Err(e) = daemon.handle_connection(stream).await {
+                                    tracing::error!("Connection error: {}", e);
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            consecutive_accept_errors += 1;
+                            tracing::error!("Accept error ({}/10): {}", consecutive_accept_errors, e);
+                            if consecutive_accept_errors >= 10 {
+                                tracing::error!("Too many consecutive accept errors, shutting down");
+                                daemon.graceful_shutdown().await;
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(
+                                100 * consecutive_accept_errors as u64
+                            )).await;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Accept error: {}", e);
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                    daemon.graceful_shutdown().await;
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Received SIGINT, initiating graceful shutdown");
+                    daemon.graceful_shutdown().await;
+                    break;
+                }
+                _ = shutdown.notified() => {
+                    // Idle timeout already called graceful_shutdown
+                    break;
                 }
             }
         }
+
+        Ok(())
     }
 
     async fn idle_timeout_loop(&self) {
@@ -91,7 +147,8 @@ impl Daemon {
             if last.elapsed() > IDLE_TIMEOUT {
                 tracing::info!("Idle timeout reached, shutting down");
                 self.graceful_shutdown().await;
-                std::process::exit(0);
+                self.shutdown_signal.notify_one();
+                return;
             }
         }
     }
@@ -1446,6 +1503,7 @@ mod tests {
             pending_patterns: Arc::new(RwLock::new(HashMap::new())),
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
         (daemon, dir)
@@ -1654,5 +1712,98 @@ mod tests {
         assert!(!a_patterns.contains("conn_b_pattern::*"));
         assert!(b_patterns.contains("conn_b_pattern::*"));
         assert!(!b_patterns.contains("conn_a_pattern::*"));
+    }
+
+    #[test]
+    fn test_daemon_lock_prevents_duplicates() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+
+        // First lock acquisition should succeed
+        let lock_file1 = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+
+        let result1 = unsafe {
+            libc::flock(lock_file1.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+        };
+        assert_eq!(result1, 0, "First lock should succeed");
+
+        // Second lock acquisition should fail
+        let lock_file2 = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+
+        let result2 = unsafe {
+            libc::flock(lock_file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+        };
+        assert_ne!(result2, 0, "Second lock should fail while first is held");
+
+        // After dropping first lock, acquisition should succeed
+        drop(lock_file1);
+
+        let result3 = unsafe {
+            libc::flock(lock_file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+        };
+        assert_eq!(result3, 0, "Lock should succeed after release");
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_cleans_files() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("test.sock");
+        let pid_path = dir.path().join("test.pid");
+
+        // Create the files
+        std::fs::write(&socket_path, "").unwrap();
+        std::fs::write(&pid_path, "12345").unwrap();
+        assert!(socket_path.exists());
+        assert!(pid_path.exists());
+
+        let db_path = dir.path().join("test.db");
+        let session_manager = Arc::new(SessionManager::new(&db_path).unwrap());
+
+        let daemon = Daemon {
+            socket_path: socket_path.clone(),
+            pid_path: pid_path.clone(),
+            session_manager,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            pending_patterns: Arc::new(RwLock::new(HashMap::new())),
+            connection_sessions: Arc::new(RwLock::new(HashMap::new())),
+            test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        daemon.graceful_shutdown().await;
+
+        // Files should be cleaned up
+        assert!(!socket_path.exists(), "Socket file should be removed");
+        assert!(!pid_path.exists(), "PID file should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_notify() {
+        let (daemon, _dir) = test_daemon();
+
+        // Notify should wake a waiting task
+        let signal = Arc::clone(&daemon.shutdown_signal);
+        let handle = tokio::spawn(async move {
+            signal.notified().await;
+            true
+        });
+
+        // Small delay to ensure the task is waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        daemon.shutdown_signal.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(result.is_ok(), "Notify should wake the waiting task");
+        assert!(result.unwrap().unwrap(), "Task should return true");
     }
 }
