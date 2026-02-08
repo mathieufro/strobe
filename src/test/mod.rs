@@ -181,13 +181,22 @@ impl TestRunner {
 
         let hard_timeout = timeout.unwrap_or_else(|| adapter.default_timeout(level));
 
+        // Resolve program to absolute path (Frida's Device.spawn doesn't do PATH lookup)
+        let program = resolve_program(&test_cmd.program);
+
         let mut combined_env = test_cmd.env.clone();
         combined_env.extend(env.clone());
+        // Ensure PATH is inherited so cargo can find cc, rustc, etc.
+        if !combined_env.contains_key("PATH") {
+            if let Ok(path) = std::env::var("PATH") {
+                combined_env.insert("PATH".to_string(), path);
+            }
+        }
 
         // Spawn via Frida
         let pid = session_manager.spawn_with_frida(
             session_id,
-            &test_cmd.program,
+            &program,
             &test_cmd.args,
             Some(project_root.to_str().unwrap_or(".")),
             project_root.to_str().unwrap_or("."),
@@ -324,6 +333,23 @@ impl TestRunner {
             raw_stderr: stderr_buf,
         })
     }
+}
+
+/// Resolve a program name to an absolute path via PATH lookup.
+/// Frida's Device.spawn() doesn't do PATH resolution like a shell.
+fn resolve_program(program: &str) -> String {
+    if program.contains('/') {
+        return program.to_string();
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let full = format!("{}/{}", dir, program);
+            if Path::new(&full).exists() {
+                return full;
+            }
+        }
+    }
+    program.to_string()
 }
 
 /// Combined result from test run, used by MCP tool handler.

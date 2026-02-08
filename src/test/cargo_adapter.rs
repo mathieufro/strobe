@@ -63,7 +63,6 @@ impl TestAdapter for CargoTestAdapter {
                 "test".to_string(),
                 "--".to_string(),
                 test_name.to_string(),
-                "--exact".to_string(),
                 "-Zunstable-options".to_string(),
                 "--format".to_string(),
                 "json".to_string(),
@@ -485,7 +484,8 @@ mod tests {
             "parser::tests::test_empty_input",
         ).unwrap();
         assert_eq!(cmd.program, "cargo");
-        assert!(cmd.args.contains(&"--exact".to_string()));
+        // No --exact: substring matching allows both full paths and partial names
+        assert!(!cmd.args.contains(&"--exact".to_string()));
         assert!(cmd.args.contains(&"parser::tests::test_empty_input".to_string()));
     }
 }

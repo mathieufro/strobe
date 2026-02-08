@@ -551,7 +551,7 @@ Validation Limits (enforced):
                         "projectRoot": { "type": "string", "description": "Project root for adapter detection" },
                         "framework": { "type": "string", "description": "Override auto-detection: \"cargo\", \"catch2\"" },
                         "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
-                        "test": { "type": "string", "description": "Run a single test by name" },
+                        "test": { "type": "string", "description": "Run a single test by name (substring match — e.g. 'stuck_detector' runs all tests containing that string)" },
                         "command": { "type": "string", "description": "Test binary path (required for compiled test frameworks like Catch2)" },
                         "tracePatterns": { "type": "array", "items": { "type": "string" }, "description": "Trace patterns to apply immediately (tests always run inside Frida)" },
                         "watches": {
