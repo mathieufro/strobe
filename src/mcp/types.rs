@@ -381,6 +381,20 @@ pub struct DebugTestStatusResponse {
     /// Suggested delay in ms before next poll. Saves tokens by avoiding excessive polling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_in_ms: Option<u64>,
+    /// Frida session ID — use with debug_trace/debug_stop to instrument or kill the test.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestStuckWarning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_name: Option<String>,
+    pub idle_ms: u64,
+    pub diagnosis: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub suggested_traces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +409,12 @@ pub struct TestProgressSnapshot {
     /// Current phase: "compiling", "running", or "suites_finished"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// Advisory warnings from stuck detector (deadlock, infinite loop, hard timeout).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<TestStuckWarning>,
+    /// Historical baseline duration for the current test (average of last 10 passed runs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_test_baseline_ms: Option<u64>,
 }
 
 // ============ Errors ============

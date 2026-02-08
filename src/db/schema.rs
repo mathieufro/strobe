@@ -132,6 +132,24 @@ impl Database {
             Err(e) => return Err(e.into()),
         }
 
+        // Test baselines table for historical per-test durations
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS test_baselines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_name TEXT NOT NULL,
+                project_root TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_baseline_lookup
+             ON test_baselines(test_name, project_root, recorded_at DESC)",
+            [],
+        )?;
+
         // Create indexes
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_time ON events(session_id, timestamp_ns)",

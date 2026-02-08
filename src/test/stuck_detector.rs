@@ -2,74 +2,114 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::TestProgress;
+use super::adapter::ThreadStack;
 
-/// Result of stuck detection analysis.
-pub struct StuckInfo {
-    pub elapsed_ms: u64,
-    pub diagnosis: String,
-    pub suggested_traces: Vec<String>,
-}
-
-/// Multi-signal stuck detector.
+/// Multi-signal stuck detector — continuous advisory monitor.
 /// Runs in parallel with test subprocess, monitors:
 /// 1. CPU time delta (every 2s)
-/// 2. Stack sampling (triggered when suspicious)
+/// 2. Stack sampling to confirm (when CPU heuristic is suspicious)
 ///
-/// When shared progress is available, the detector skips stuck diagnosis
-/// if all test suites have already finished (process is just cleaning up).
+/// Writes advisory warnings to shared TestProgress instead of killing.
+/// The LLM decides when to kill via debug_stop(sessionId).
 pub struct StuckDetector {
     pid: u32,
     hard_timeout_ms: u64,
-    progress: Option<Arc<Mutex<TestProgress>>>,
+    progress: Arc<Mutex<TestProgress>>,
 }
 
 impl StuckDetector {
-    pub fn new(pid: u32, hard_timeout_ms: u64) -> Self {
-        Self { pid, hard_timeout_ms, progress: None }
+    pub fn new(pid: u32, hard_timeout_ms: u64, progress: Arc<Mutex<TestProgress>>) -> Self {
+        Self { pid, hard_timeout_ms, progress }
     }
 
-    pub fn with_progress(mut self, progress: Arc<Mutex<TestProgress>>) -> Self {
-        self.progress = Some(progress);
-        self
+    fn current_phase(&self) -> super::TestPhase {
+        self.progress.lock().unwrap().phase.clone()
     }
 
-    /// Check if test suites have finished (process is just exiting, not stuck).
-    fn suites_finished(&self) -> bool {
-        if let Some(ref p) = self.progress {
-            let guard = p.lock().unwrap();
-            guard.phase == super::TestPhase::SuitesFinished
-        } else {
-            false
-        }
+    fn current_test(&self) -> Option<String> {
+        self.progress.lock().unwrap().current_test.clone()
     }
 
-    /// Run the detection loop. Returns Some(StuckInfo) if stuck, None if process exits first.
-    pub async fn run(self) -> Option<StuckInfo> {
+    fn write_warning(&self, diagnosis: &str, idle_ms: u64) {
+        let mut p = self.progress.lock().unwrap();
+        let test_name = p.current_test.clone();
+        // Clear any previous warning for this test (replace, don't accumulate)
+        p.warnings.retain(|w| w.test_name != test_name);
+        p.warnings.push(super::StuckWarning {
+            test_name,
+            idle_ms,
+            diagnosis: diagnosis.to_string(),
+            suggested_traces: vec![],
+        });
+    }
+
+    fn clear_warnings(&self) {
+        self.progress.lock().unwrap().warnings.clear();
+    }
+
+    /// Run as continuous monitor. Returns when process exits.
+    /// Writes warnings to shared progress instead of returning StuckInfo.
+    pub async fn run(self) {
         let start = Instant::now();
+        let mut running_since: Option<Instant> = None;
         let mut prev_cpu_ns: Option<u64> = None;
         let mut suspicious_since: Option<Instant> = None;
         let mut zero_delta_count = 0u32;
         let mut constant_high_count = 0u32;
+        let mut prev_test: Option<String> = None;
 
         loop {
-            // Check if process is still alive
             let alive = unsafe { libc::kill(self.pid as i32, 0) } == 0;
             if !alive {
-                return None; // Process exited — not stuck
+                return; // Process exited
             }
 
-            // Check hard timeout
-            let elapsed = start.elapsed();
-            if elapsed.as_millis() as u64 >= self.hard_timeout_ms {
-                // Even on hard timeout, if suites finished, it's not stuck
-                if self.suites_finished() {
-                    return None;
+            let phase = self.current_phase();
+
+            // Track when tests start running (transition out of Compiling)
+            if running_since.is_none() && phase != super::TestPhase::Compiling {
+                running_since = Some(Instant::now());
+            }
+
+            // If current test changed, clear any warnings (test progressed)
+            let current = self.current_test();
+            if current != prev_test && prev_test.is_some() {
+                self.clear_warnings();
+                suspicious_since = None;
+                zero_delta_count = 0;
+                constant_high_count = 0;
+            }
+            prev_test = current;
+
+            // SuitesFinished — not stuck, just cleaning up
+            if phase == super::TestPhase::SuitesFinished {
+                self.clear_warnings();
+                suspicious_since = None;
+                zero_delta_count = 0;
+                constant_high_count = 0;
+                prev_cpu_ns = Some(get_process_tree_cpu_ns(self.pid));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+
+            // Hard timeout — write warning but don't kill
+            if let Some(since) = running_since {
+                if since.elapsed().as_millis() as u64 >= self.hard_timeout_ms {
+                    self.write_warning(
+                        "Hard timeout reached — consider stopping the test with debug_stop(sessionId)",
+                        start.elapsed().as_millis() as u64,
+                    );
+                    // Keep running — LLM may want to investigate before killing
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
                 }
-                return Some(StuckInfo {
-                    elapsed_ms: elapsed.as_millis() as u64,
-                    diagnosis: "Hard timeout reached".to_string(),
-                    suggested_traces: vec![],
-                });
+            }
+
+            // During compilation, don't analyze CPU patterns — compilers are bursty
+            if phase == super::TestPhase::Compiling {
+                prev_cpu_ns = Some(get_process_tree_cpu_ns(self.pid));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
             }
 
             // CPU time sampling — includes child processes (e.g. cargo → rustc)
@@ -80,52 +120,49 @@ impl StuckDetector {
                 let sample_interval_ns = 2_000_000_000u64; // 2 seconds
 
                 if delta == 0 {
-                    // CPU idle — but if suites already finished, the process is
-                    // just winding down (e.g. cargo waiting for child reap). Not stuck.
-                    if self.suites_finished() {
-                        // Reset and keep waiting for clean exit
-                        suspicious_since = None;
-                        zero_delta_count = 0;
-                    } else {
-                        // Potential deadlock
-                        zero_delta_count += 1;
-                        constant_high_count = 0;
-
-                        if suspicious_since.is_none() {
-                            suspicious_since = Some(Instant::now());
-                        }
+                    zero_delta_count += 1;
+                    constant_high_count = 0;
+                    if suspicious_since.is_none() {
+                        suspicious_since = Some(Instant::now());
                     }
                 } else if delta > sample_interval_ns * 80 / 100 {
-                    // CPU near 100% — potential infinite loop
                     constant_high_count += 1;
                     zero_delta_count = 0;
-
                     if suspicious_since.is_none() {
                         suspicious_since = Some(Instant::now());
                     }
                 } else {
-                    // Normal activity — reset
                     zero_delta_count = 0;
                     constant_high_count = 0;
                     suspicious_since = None;
+                    // CPU looks normal — clear any active warnings
+                    self.clear_warnings();
                 }
 
-                // Trigger stack sampling after ~6s of suspicious signals (3 samples)
+                // After ~6s of suspicious CPU signals, confirm with stack sampling
                 if let Some(since) = suspicious_since {
                     if since.elapsed() > Duration::from_secs(6) {
-                        let diagnosis = if zero_delta_count >= 3 {
-                            "Deadlock: 0% CPU, process completely blocked".to_string()
+                        let diagnosis_type = if zero_delta_count >= 3 {
+                            "deadlock"
                         } else if constant_high_count >= 3 {
-                            "Infinite loop: 100% CPU, no output progress".to_string()
+                            "infinite_loop"
                         } else {
-                            "Process appears stuck".to_string()
+                            "unknown"
                         };
 
-                        return Some(StuckInfo {
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                            diagnosis,
-                            suggested_traces: vec![],
-                        });
+                        if let Some(diagnosis) = self.confirm_with_stacks(diagnosis_type).await {
+                            let idle_ms = since.elapsed().as_millis() as u64;
+                            self.write_warning(&diagnosis, idle_ms);
+                            // DON'T return — continue monitoring
+                            // Reset suspicious counters but keep the warning
+                            suspicious_since = None;
+                            zero_delta_count = 0;
+                            constant_high_count = 0;
+                        } else {
+                            suspicious_since = None;
+                            zero_delta_count = 0;
+                            constant_high_count = 0;
+                        }
                     }
                 }
             }
@@ -134,6 +171,62 @@ impl StuckDetector {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
+
+    /// Take two stack samples 2s apart. If the top frames are identical,
+    /// the process is truly stuck. Returns the diagnosis string if confirmed.
+    async fn confirm_with_stacks(&self, diagnosis_type: &str) -> Option<String> {
+        let pid = self.pid;
+
+        let stacks1 = tokio::task::spawn_blocking(move || {
+            super::cargo_adapter::capture_native_stacks(pid)
+        }).await.unwrap_or_default();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Check if process exited or suites finished during wait
+        let alive = unsafe { libc::kill(self.pid as i32, 0) } == 0;
+        if !alive {
+            return None;
+        }
+        if self.current_phase() == super::TestPhase::SuitesFinished {
+            return None;
+        }
+
+        let stacks2 = tokio::task::spawn_blocking(move || {
+            super::cargo_adapter::capture_native_stacks(pid)
+        }).await.unwrap_or_default();
+
+        if stacks_match(&stacks1, &stacks2) {
+            let diagnosis = match diagnosis_type {
+                "deadlock" => "Deadlock: 0% CPU, stacks unchanged across samples",
+                "infinite_loop" => "Infinite loop: 100% CPU, stacks unchanged across samples",
+                _ => "Process appears stuck: stacks unchanged across samples",
+            };
+            Some(diagnosis.to_string())
+        } else {
+            None // Stacks differ — process is making progress (I/O, etc.)
+        }
+    }
+}
+
+/// Compare two stack snapshots. Returns true if they represent the same
+/// stuck state (top N frames are identical for all threads).
+fn stacks_match(a: &[ThreadStack], b: &[ThreadStack]) -> bool {
+    // If either sample is empty, we can't confirm — be conservative (not stuck)
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+
+    // Compare top 5 frames of each thread by name
+    let top_frames = |stacks: &[ThreadStack]| -> Vec<Vec<String>> {
+        let mut result: Vec<Vec<String>> = stacks.iter()
+            .map(|t| t.stack.iter().take(5).cloned().collect())
+            .collect();
+        result.sort();
+        result
+    };
+
+    top_frames(a) == top_frames(b)
 }
 
 /// Get cumulative CPU time (user + system) for a process and all its descendants.
@@ -329,16 +422,40 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_stuck_detector_returns_none_for_fast_exit() {
+    async fn test_stuck_detector_returns_for_fast_exit() {
         let mut child = tokio::process::Command::new("true")
             .spawn()
             .unwrap();
         let pid = child.id().unwrap();
-        // Wait for child to fully exit (avoid zombie keeping PID alive)
         let _ = child.wait().await;
-        let detector = StuckDetector::new(pid, 5000);
-        let result = detector.run().await;
-        assert!(result.is_none());
+        let progress = Arc::new(Mutex::new(super::super::TestProgress::new()));
+        let detector = StuckDetector::new(pid, 5000, Arc::clone(&progress));
+        detector.run().await; // Should return quickly
+        assert!(progress.lock().unwrap().warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stuck_detector_writes_warnings_instead_of_returning() {
+        // Spawn a fast-exiting process and reap it first to avoid zombie
+        // (kill(pid, 0) returns 0 for zombies, which would block the detector)
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("0.1")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let _ = child.wait().await;
+
+        let progress = Arc::new(Mutex::new(super::super::TestProgress::new()));
+        {
+            let mut p = progress.lock().unwrap();
+            p.phase = super::super::TestPhase::Running;
+        }
+
+        let detector = StuckDetector::new(pid, 60_000, Arc::clone(&progress));
+        detector.run().await;
+
+        let p = progress.lock().unwrap();
+        assert!(p.warnings.is_empty());
     }
 
     #[test]

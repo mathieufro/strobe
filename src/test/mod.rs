@@ -5,12 +5,11 @@ pub mod generic_adapter;
 pub mod stuck_detector;
 pub mod output;
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-use tokio::pin;
 
 use adapter::*;
 use cargo_adapter::CargoTestAdapter;
@@ -29,6 +28,16 @@ pub enum TestPhase {
     SuitesFinished,
 }
 
+/// Advisory warning from the stuck detector — informs the LLM, does not kill.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StuckWarning {
+    pub test_name: Option<String>,
+    pub idle_ms: u64,
+    pub diagnosis: String,
+    pub suggested_traces: Vec<String>,
+}
+
 /// Live progress state for an in-flight test run, updated incrementally.
 #[derive(Debug, Clone)]
 pub struct TestProgress {
@@ -38,6 +47,7 @@ pub struct TestProgress {
     pub current_test: Option<String>,
     pub started_at: Instant,
     pub phase: TestPhase,
+    pub warnings: Vec<StuckWarning>,
 }
 
 impl TestProgress {
@@ -49,6 +59,7 @@ impl TestProgress {
             current_test: None,
             started_at: Instant::now(),
             phase: TestPhase::Compiling,
+            warnings: Vec::new(),
         }
     }
 
@@ -81,6 +92,10 @@ pub struct TestRun {
     pub state: TestRunState,
     /// Whether results have been fetched (eligible for cleanup).
     pub fetched: bool,
+    /// Frida session ID — always set when running inside Frida.
+    pub session_id: Option<String>,
+    /// Project root for baseline lookup.
+    pub project_root: String,
 }
 
 pub struct TestRunner {
@@ -130,7 +145,8 @@ impl TestRunner {
         best.map(|(a, _)| a).unwrap_or(self.adapters.last().unwrap().as_ref())
     }
 
-    /// Run tests via direct subprocess (fast path — no Frida).
+    /// Run tests inside Frida with DB-based progress polling.
+    /// Always spawns via Frida — the LLM can add trace patterns at any time via debug_trace.
     pub async fn run(
         &self,
         project_root: &Path,
@@ -140,12 +156,17 @@ impl TestRunner {
         command: Option<&str>,
         env: &HashMap<String, String>,
         timeout: Option<u64>,
-        progress: Option<Arc<Mutex<TestProgress>>>,
+        session_manager: &crate::daemon::SessionManager,
+        trace_patterns: &[String],
+        _watches: Option<&crate::mcp::WatchUpdate>,
+        _connection_id: &str,
+        session_id: &str,
+        progress: Arc<Mutex<TestProgress>>,
     ) -> crate::Result<TestRunResult> {
         let adapter = self.detect_adapter(project_root, framework, command);
         let framework_name = adapter.name().to_string();
 
-        // Build command — if a command is provided, use it as the binary path
+        // Build command
         let test_cmd = if let Some(cmd) = command {
             if let Some(test_name) = test {
                 Catch2Adapter::single_test_for_binary(cmd, test_name)
@@ -160,236 +181,12 @@ impl TestRunner {
 
         let hard_timeout = timeout.unwrap_or_else(|| adapter.default_timeout(level));
 
-        // Merge user env with adapter env (user env takes precedence)
         let mut combined_env = test_cmd.env.clone();
         combined_env.extend(env.clone());
 
-        // Spawn subprocess
-        let mut child = tokio::process::Command::new(&test_cmd.program)
-            .args(&test_cmd.args)
-            .envs(&combined_env)
-            .current_dir(project_root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| crate::Error::Frida(format!(
-                "Failed to spawn test command '{}': {}", test_cmd.program, e
-            )))?;
-
-        let pid = child.id().unwrap_or(0);
-
-        // Run stuck detector in parallel (shares progress to avoid false positives)
-        let mut detector = StuckDetector::new(pid, hard_timeout);
-        if let Some(ref p) = progress {
-            detector = detector.with_progress(Arc::clone(p));
-        }
-        let detector_handle = tokio::spawn(async move { detector.run().await });
-
-        // Capture stdout and stderr
-        let child_stdout = child.stdout.take();
-        let mut child_stderr = child.stderr.take();
-
-        // Select the right progress updater based on adapter
-        let progress_fn: Option<fn(&str, &Arc<Mutex<TestProgress>>)> = match framework_name.as_str() {
-            "cargo" => Some(cargo_adapter::update_progress),
-            "catch2" => Some(catch2_adapter::update_progress),
-            _ => None,
-        };
-
-        let stdout_progress = progress.clone();
-        let stdout_task = tokio::spawn(async move {
-            let mut buf = String::new();
-            if let Some(stdout) = child_stdout {
-                let mut reader = tokio::io::BufReader::new(stdout);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if let (Some(f), Some(ref p)) = (progress_fn, &stdout_progress) {
-                                f(&line, p);
-                            }
-                            buf.push_str(&line);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-            // stdout closed — all test output consumed, suites are finished
-            if let Some(ref p) = stdout_progress {
-                let mut guard = p.lock().unwrap();
-                guard.phase = TestPhase::SuitesFinished;
-            }
-            buf
-        });
-
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = String::new();
-            if let Some(ref mut stderr) = child_stderr {
-                let _ = stderr.read_to_string(&mut buf).await;
-            }
-            buf
-        });
-
-        // Wait for exit or stuck detection
-        pin!(detector_handle);
-        tokio::select! {
-            status = child.wait() => {
-                // Process exited normally
-                detector_handle.abort();
-                let stdout_buf = stdout_task.await.unwrap_or_default();
-                let stderr_buf = stderr_task.await.unwrap_or_default();
-
-                let exit_code = status
-                    .map(|s| s.code().unwrap_or(-1))
-                    .unwrap_or(-1);
-
-                let mut result = adapter.parse_output(&stdout_buf, &stderr_buf, exit_code);
-
-                // Add suggested traces to failures that don't have them
-                for failure in &mut result.failures {
-                    if failure.suggested_traces.is_empty() {
-                        failure.suggested_traces = adapter.suggest_traces(failure);
-                    }
-                }
-
-                Ok(TestRunResult {
-                    framework: framework_name,
-                    result,
-                    session_id: None,
-                    raw_stdout: stdout_buf,
-                    raw_stderr: stderr_buf,
-                })
-            }
-            stuck_result = &mut detector_handle => {
-                // Stuck detected — capture stacks before killing
-                match stuck_result {
-                    Ok(Some(stuck_info)) => {
-                        // Capture stacks
-                        let threads = adapter.capture_stacks(pid);
-
-                        // Kill the process
-                        let _ = child.kill().await;
-                        let stdout_buf = stdout_task.await.unwrap_or_default();
-                        let stderr_buf = stderr_task.await.unwrap_or_default();
-
-                        let stuck_test = StuckTest {
-                            name: test.unwrap_or("unknown").to_string(),
-                            elapsed_ms: stuck_info.elapsed_ms,
-                            diagnosis: stuck_info.diagnosis,
-                            threads: threads.clone(),
-                            suggested_traces: stuck_info.suggested_traces,
-                        };
-
-                        let result = TestResult {
-                            summary: TestSummary {
-                                passed: 0,
-                                failed: 0,
-                                skipped: 0,
-                                stuck: Some(1),
-                                duration_ms: stuck_info.elapsed_ms,
-                            },
-                            failures: vec![],
-                            stuck: vec![stuck_test],
-                            all_tests: vec![],
-                        };
-
-                        Ok(TestRunResult {
-                            framework: framework_name,
-                            result,
-                            session_id: None,
-                            raw_stdout: stdout_buf,
-                            raw_stderr: stderr_buf,
-                        })
-                    }
-                    _ => {
-                        // Hard timeout with no stuck diagnosis
-                        let _ = child.kill().await;
-                        let stdout_buf = stdout_task.await.unwrap_or_default();
-                        let stderr_buf = stderr_task.await.unwrap_or_default();
-
-                        let result = TestResult {
-                            summary: TestSummary {
-                                passed: 0,
-                                failed: 0,
-                                skipped: 0,
-                                stuck: Some(1),
-                                duration_ms: hard_timeout,
-                            },
-                            failures: vec![],
-                            stuck: vec![StuckTest {
-                                name: test.unwrap_or("unknown").to_string(),
-                                elapsed_ms: hard_timeout,
-                                diagnosis: "Hard timeout reached".to_string(),
-                                threads: vec![],
-                                suggested_traces: vec![],
-                            }],
-                            all_tests: vec![],
-                        };
-
-                        Ok(TestRunResult {
-                            framework: framework_name,
-                            result,
-                            session_id: None,
-                            raw_stdout: stdout_buf,
-                            raw_stderr: stderr_buf,
-                        })
-                    }
-                }
-            }
-        }
-    }
-
-    /// Run tests with Frida instrumentation (instrumented path).
-    /// Returns results + sessionId for debug_query.
-    pub async fn run_instrumented(
-        &self,
-        project_root: &Path,
-        framework: Option<&str>,
-        test: Option<&str>,
-        command: Option<&str>,
-        env: &HashMap<String, String>,
-        timeout: Option<u64>,
-        session_manager: &crate::daemon::SessionManager,
-        trace_patterns: &[String],
-        _watches: Option<&crate::mcp::WatchUpdate>,
-        _connection_id: &str,
-        _progress: Option<Arc<Mutex<TestProgress>>>,
-    ) -> crate::Result<TestRunResult> {
-        let adapter = self.detect_adapter(project_root, framework, command);
-        let framework_name = adapter.name().to_string();
-
-        // Build the test command (typically single test for instrumented rerun)
-        let test_cmd = if let Some(cmd) = command {
-            if let Some(test_name) = test {
-                Catch2Adapter::single_test_for_binary(cmd, test_name)
-            } else {
-                Catch2Adapter::command_for_binary(cmd, None)
-            }
-        } else if let Some(test_name) = test {
-            adapter.single_test_command(project_root, test_name)?
-        } else {
-            adapter.suite_command(project_root, None, env)?
-        };
-
-        let hard_timeout = timeout.unwrap_or_else(|| adapter.default_timeout(None));
-
-        // Generate session ID and spawn with Frida
-        let binary = &test_cmd.program;
-        let binary_name = Path::new(binary)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("test");
-        let session_id = session_manager.generate_session_id(
-            &format!("test-{}", binary_name)
-        );
-
-        let mut combined_env = test_cmd.env.clone();
-        combined_env.extend(env.clone());
-
+        // Spawn via Frida
         let pid = session_manager.spawn_with_frida(
-            &session_id,
+            session_id,
             &test_cmd.program,
             &test_cmd.args,
             Some(project_root.to_str().unwrap_or(".")),
@@ -398,23 +195,23 @@ impl TestRunner {
         ).await?;
 
         session_manager.create_session(
-            &session_id,
+            session_id,
             &test_cmd.program,
             project_root.to_str().unwrap_or("."),
             pid,
         )?;
 
-        // Apply trace patterns
+        // Apply trace patterns if any
         if !trace_patterns.is_empty() {
-            session_manager.add_patterns(&session_id, trace_patterns)?;
+            session_manager.add_patterns(session_id, trace_patterns)?;
             match session_manager.update_frida_patterns(
-                &session_id,
+                session_id,
                 Some(trace_patterns),
                 None,
                 None,
             ).await {
                 Ok(result) => {
-                    session_manager.set_hook_count(&session_id, result.installed);
+                    session_manager.set_hook_count(session_id, result.installed);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to apply trace patterns for test session: {}", e);
@@ -422,31 +219,76 @@ impl TestRunner {
             }
         }
 
-        // Wait for process to exit (poll kill(pid, 0))
+        // Select progress updater based on adapter
+        let progress_fn: Option<fn(&str, &Arc<Mutex<TestProgress>>)> = match framework_name.as_str() {
+            "cargo" => Some(cargo_adapter::update_progress),
+            "catch2" => Some(catch2_adapter::update_progress),
+            _ => None,
+        };
+
+        // Spawn stuck detector as background monitor
+        let detector_progress = Arc::clone(&progress);
+        let detector = StuckDetector::new(pid, hard_timeout, detector_progress);
+        let detector_handle = tokio::spawn(async move { detector.run().await });
+
+        // Progress-aware polling loop — poll DB for stdout events
+        let mut last_stdout_offset = 0u32;
+        let poll_interval = std::time::Duration::from_millis(500);
+        let safety_timeout = std::time::Duration::from_secs(600); // 10 min safety net
         let start = std::time::Instant::now();
+
         loop {
             let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
             if !alive {
                 break;
             }
-            if start.elapsed().as_millis() as u64 > hard_timeout {
-                // Timeout — kill and report as stuck
+
+            // Safety net timeout
+            if start.elapsed() > safety_timeout {
                 unsafe { libc::kill(pid as i32, libc::SIGKILL); }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // Poll DB for new stdout events and update progress
+            if let Some(update_fn) = progress_fn {
+                let new_events = session_manager.db().query_events(session_id, |q| {
+                    q.event_type(crate::db::EventType::Stdout)
+                     .offset(last_stdout_offset)
+                     .limit(500)
+                }).unwrap_or_default();
+
+                for event in &new_events {
+                    if let Some(text) = &event.text {
+                        update_fn(text, &progress);
+                    }
+                }
+                last_stdout_offset += new_events.len() as u32;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Abort detector
+        detector_handle.abort();
+
+        // Mark suites finished in progress
+        {
+            let mut p = progress.lock().unwrap();
+            if p.phase != TestPhase::SuitesFinished {
+                p.phase = TestPhase::SuitesFinished;
+            }
         }
 
         // Let DB writer flush
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Query captured stdout/stderr from session DB
-        let stdout_events = session_manager.db().query_events(&session_id, |q| {
+        // Query ALL stdout/stderr from DB
+        let stdout_events = session_manager.db().query_events(session_id, |q| {
             q.event_type(crate::db::EventType::Stdout).limit(10000)
         }).unwrap_or_default();
 
-        let stderr_events = session_manager.db().query_events(&session_id, |q| {
+        let stderr_events = session_manager.db().query_events(session_id, |q| {
             q.event_type(crate::db::EventType::Stderr).limit(10000)
         }).unwrap_or_default();
 
@@ -459,7 +301,7 @@ impl TestRunner {
             .collect::<Vec<_>>()
             .join("");
 
-        let exit_code = session_manager.get_session(&session_id)?
+        let exit_code = session_manager.get_session(session_id)?
             .map(|s| match s.status {
                 crate::db::SessionStatus::Stopped => 0,
                 _ => -1,
@@ -477,7 +319,7 @@ impl TestRunner {
         Ok(TestRunResult {
             framework: framework_name,
             result,
-            session_id: Some(session_id),
+            session_id: Some(session_id.to_string()),
             raw_stdout: stdout_buf,
             raw_stderr: stderr_buf,
         })
@@ -510,5 +352,36 @@ mod tests {
         let runner = TestRunner::new();
         let adapter = runner.detect_adapter(Path::new("/nonexistent"), Some("generic"), None);
         assert_eq!(adapter.name(), "generic");
+    }
+
+    #[test]
+    fn test_run_has_session_id() {
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(TestProgress::new()));
+        let run = TestRun {
+            id: "test-abc123".to_string(),
+            state: TestRunState::Running { progress },
+            fetched: false,
+            session_id: Some("session-xyz".to_string()),
+            project_root: "/project".to_string(),
+        };
+        assert_eq!(run.session_id.as_deref(), Some("session-xyz"));
+    }
+
+    #[test]
+    fn test_progress_warnings() {
+        let mut progress = TestProgress::new();
+        assert!(progress.warnings.is_empty());
+
+        progress.warnings.push(StuckWarning {
+            test_name: Some("test_auth".to_string()),
+            idle_ms: 12000,
+            diagnosis: "0% CPU, stacks unchanged 6s".to_string(),
+            suggested_traces: vec!["auth::*".to_string()],
+        });
+        assert_eq!(progress.warnings.len(), 1);
+        assert_eq!(progress.warnings[0].idle_ms, 12000);
+
+        progress.warnings.clear();
+        assert!(progress.warnings.is_empty());
     }
 }

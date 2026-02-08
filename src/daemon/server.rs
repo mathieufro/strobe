@@ -341,11 +341,34 @@ Read globals during function execution (requires DWARF symbols).
 ## Running Tests
 
 ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
-`debug_test` returns immediately with a `testRunId`. Poll `debug_test_status(testRunId)` for progress. IMPORTANT: Each status response includes `retryInMs` — wait that many milliseconds before polling again. During compilation this is 10s; during test execution 5s.
-- While running: `{ status: \"running\", progress: { elapsedMs, passed, failed, skipped, currentTest } }`
-- When done: `{ status: \"completed\", result: { framework, summary, failures, stuck, ... } }`
+Tests always run inside Frida, so you can add traces at any time without restarting.
+
+`debug_test` returns immediately with a `testRunId`. Poll `debug_test_status(testRunId)`
+for progress. IMPORTANT: Each status response includes `retryInMs` — wait that many
+milliseconds before polling again.
+
+### Status Response Fields
+- `progress.currentTest` — name of the currently executing test
+- `progress.currentTestBaselineMs` — historical average duration for this test (if known)
+- `progress.warnings` — stuck detection warnings (see below)
+- `sessionId` — Frida session ID for `debug_trace` and `debug_stop`
+
+### Stuck Test Detection
+The test runner monitors for stuck tests (deadlocks, infinite loops). When detected,
+`debug_test_status` includes warnings:
+```json
+{ \"warnings\": [{ \"testName\": \"test_auth\", \"idleMs\": 12000,
+  \"diagnosis\": \"0% CPU, stacks unchanged 6s\" }] }
+```
+
+When you see a warning:
+1. Use `debug_trace({ sessionId, add: [\"relevant::patterns\"] })` to investigate
+2. Use `debug_query({ sessionId })` to see what's happening
+3. Use `debug_stop({ sessionId })` to kill the test when you understand the issue
+
+### Quick Reference
 - Rust: provide `projectRoot` | C++: provide `command` (test binary path)
-- Add `tracePatterns` for Frida instrumentation alongside results"#
+- Add `tracePatterns` to trace from the start (optional — can add later via `debug_trace`)"#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
@@ -530,10 +553,10 @@ Validation Limits (enforced):
                         "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
                         "test": { "type": "string", "description": "Run a single test by name" },
                         "command": { "type": "string", "description": "Test binary path (required for compiled test frameworks like Catch2)" },
-                        "tracePatterns": { "type": "array", "items": { "type": "string" }, "description": "Presence triggers Frida instrumented path" },
+                        "tracePatterns": { "type": "array", "items": { "type": "string" }, "description": "Trace patterns to apply immediately (tests always run inside Frida)" },
                         "watches": {
                             "type": "object",
-                            "description": "Watch variables during test (triggers Frida path)",
+                            "description": "Watch variables during test execution",
                             "properties": {
                                 "add": { "type": "array", "items": { "type": "object" } },
                                 "remove": { "type": "array", "items": { "type": "string" } }
@@ -1307,10 +1330,14 @@ Validation Limits (enforced):
         let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test::TestProgress::new()));
         let test_run_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
+        // Generate session_id upfront so it's available in TestRun immediately
+        let session_id = format!("test-{}-{}", framework_name, &uuid::Uuid::new_v4().to_string()[..8]);
+
         // Clone everything needed for the spawned task
         let progress_clone = std::sync::Arc::clone(&progress);
         let session_manager = std::sync::Arc::clone(&self.session_manager);
         let connection_id_owned = connection_id.to_string();
+        let session_id_clone = session_id.clone();
         let run_id = test_run_id.clone();
         let test_runs = std::sync::Arc::clone(&self.test_runs);
         let req_clone = req.clone();
@@ -1323,42 +1350,47 @@ Validation Limits (enforced):
                 id: test_run_id.clone(),
                 state: crate::test::TestRunState::Running { progress },
                 fetched: false,
+                session_id: Some(session_id),
+                project_root: req.project_root.clone(),
             });
         }
 
         tokio::spawn(async move {
             let runner = crate::test::TestRunner::new();
             let env = req_clone.env.unwrap_or_default();
-            let has_instrumentation = req_clone.trace_patterns.is_some() || req_clone.watches.is_some();
+            let trace_patterns = req_clone.trace_patterns.unwrap_or_default();
             let project_root = std::path::PathBuf::from(&req_clone.project_root);
 
-            let run_result = if has_instrumentation {
-                let trace_patterns = req_clone.trace_patterns.unwrap_or_default();
-                runner.run_instrumented(
-                    &project_root,
-                    req_clone.framework.as_deref(),
-                    req_clone.test.as_deref(),
-                    req_clone.command.as_deref(),
-                    &env,
-                    req_clone.timeout,
-                    &session_manager,
-                    &trace_patterns,
-                    req_clone.watches.as_ref(),
-                    &connection_id_owned,
-                    Some(progress_clone),
-                ).await
-            } else {
-                runner.run(
-                    &project_root,
-                    req_clone.framework.as_deref(),
-                    req_clone.level,
-                    req_clone.test.as_deref(),
-                    req_clone.command.as_deref(),
-                    &env,
-                    req_clone.timeout,
-                    Some(progress_clone),
-                ).await
-            };
+            let run_result = runner.run(
+                &project_root,
+                req_clone.framework.as_deref(),
+                req_clone.level,
+                req_clone.test.as_deref(),
+                req_clone.command.as_deref(),
+                &env,
+                req_clone.timeout,
+                &session_manager,
+                &trace_patterns,
+                req_clone.watches.as_ref(),
+                &connection_id_owned,
+                &session_id_clone,
+                progress_clone,
+            ).await;
+
+            // Record baselines for completed tests
+            if let Ok(ref run_result) = run_result {
+                for test_detail in &run_result.result.all_tests {
+                    let _ = session_manager.db().record_test_baseline(
+                        &test_detail.name,
+                        project_root.to_str().unwrap_or("."),
+                        test_detail.duration_ms,
+                        &test_detail.status,
+                    );
+                }
+                let _ = session_manager.db().cleanup_old_baselines(
+                    project_root.to_str().unwrap_or(".")
+                );
+            }
 
             // Transition state
             let new_state = match run_result {
@@ -1417,6 +1449,29 @@ Validation Limits (enforced):
     async fn tool_debug_test_status(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let req: crate::mcp::DebugTestStatusRequest = serde_json::from_value(args.clone())?;
 
+        // Block for up to 15 seconds, returning immediately if the test completes.
+        // This throttles LLM polling while still providing timely completion results.
+        let poll_interval = std::time::Duration::from_secs(1);
+        let max_wait = std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + max_wait;
+
+        loop {
+            let runs = self.test_runs.read().await;
+            let test_run = runs.get(&req.test_run_id)
+                .ok_or_else(|| crate::Error::TestRunNotFound(req.test_run_id.clone()))?;
+
+            match &test_run.state {
+                crate::test::TestRunState::Running { .. } => {
+                    drop(runs);
+                    if std::time::Instant::now() >= deadline {
+                        break; // Waited long enough, return current progress
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+                _ => break, // Completed or Failed — return immediately
+            }
+        }
+
         let mut runs = self.test_runs.write().await;
         let test_run = runs.get_mut(&req.test_run_id)
             .ok_or_else(|| crate::Error::TestRunNotFound(req.test_run_id.clone()))?;
@@ -1429,13 +1484,29 @@ Validation Limits (enforced):
                     crate::test::TestPhase::Running => "running",
                     crate::test::TestPhase::SuitesFinished => "suites_finished",
                 };
-                // Suggest longer poll intervals during compilation (nothing to report),
-                // shorter once tests are actively running
-                let retry_in_ms = match p.phase {
-                    crate::test::TestPhase::Compiling => 10_000,
-                    crate::test::TestPhase::Running => 5_000,
-                    crate::test::TestPhase::SuitesFinished => 5_000,
+
+                // Convert internal warnings to MCP type
+                let warnings: Vec<crate::mcp::TestStuckWarning> = p.warnings.iter().map(|w| {
+                    crate::mcp::TestStuckWarning {
+                        test_name: w.test_name.clone(),
+                        idle_ms: w.idle_ms,
+                        diagnosis: w.diagnosis.clone(),
+                        suggested_traces: w.suggested_traces.clone(),
+                    }
+                }).collect();
+
+                // Look up baseline for current test
+                let baseline_ms = if let Some(ref test_name) = p.current_test {
+                    self.session_manager.db()
+                        .get_test_baseline(test_name, &test_run.project_root)
+                        .unwrap_or(None)
+                } else {
+                    None
                 };
+
+                // Faster polling when stuck warnings are active
+                let retry_ms = if warnings.is_empty() { 5_000 } else { 2_000 };
+
                 crate::mcp::DebugTestStatusResponse {
                     test_run_id: req.test_run_id,
                     status: "running".to_string(),
@@ -1446,10 +1517,13 @@ Validation Limits (enforced):
                         skipped: p.skipped,
                         current_test: p.current_test.clone(),
                         phase: Some(phase_str.to_string()),
+                        warnings,
+                        current_test_baseline_ms: baseline_ms,
                     }),
                     result: None,
                     error: None,
-                    retry_in_ms: Some(retry_in_ms),
+                    retry_in_ms: Some(retry_ms),
+                    session_id: test_run.session_id.clone(),
                 }
             }
             crate::test::TestRunState::Completed { response, .. } => {
@@ -1461,6 +1535,7 @@ Validation Limits (enforced):
                     result: Some(response.clone()),
                     error: None,
                     retry_in_ms: None,
+                    session_id: test_run.session_id.clone(),
                 }
             }
             crate::test::TestRunState::Failed { error, .. } => {
@@ -1472,6 +1547,7 @@ Validation Limits (enforced):
                     result: None,
                     error: Some(error.clone()),
                     retry_in_ms: None,
+                    session_id: test_run.session_id.clone(),
                 }
             }
         };

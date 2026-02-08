@@ -245,17 +245,40 @@ pub fn capture_native_stacks(pid: u32) -> Vec<ThreadStack> {
 
 #[cfg(target_os = "macos")]
 fn capture_stacks_macos(pid: u32) -> Vec<ThreadStack> {
-    let output = std::process::Command::new("sample")
-        .args([&pid.to_string(), "1"])
-        .output();
+    use std::io::Read as _;
 
-    match output {
-        Ok(output) => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            parse_sample_output(&text)
+    let mut child = match std::process::Command::new("sample")
+        .args([&pid.to_string(), "1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    // Wait up to 5 seconds for sample to complete (1s sampling + overhead)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return vec![];
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return vec![],
         }
-        Err(_) => vec![],
     }
+
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    parse_sample_output(&stdout)
 }
 
 #[cfg(target_os = "macos")]
@@ -341,8 +364,10 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
             }
         }
         ("suite", "ok") | ("suite", "failed") => {
-            // Suite finished — but more suites may follow (multi-target runs).
-            // We'll mark SuitesFinished; if another suite starts, Running resumes.
+            // Suite finished — mark SuitesFinished so stuck detector knows tests
+            // completed. If another suite starts, ("suite", "started") won't
+            // regress this since it only transitions from Compiling.
+            p.phase = super::TestPhase::SuitesFinished;
         }
         ("test", "started") => {
             p.phase = super::TestPhase::Running;

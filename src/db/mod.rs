@@ -1,3 +1,4 @@
+mod baselines;
 mod schema;
 mod session;
 mod event;

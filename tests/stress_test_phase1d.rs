@@ -6,12 +6,23 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use strobe::test::adapter::*;
 use strobe::test::cargo_adapter::CargoTestAdapter;
 use strobe::test::catch2_adapter::Catch2Adapter;
 use strobe::test::generic_adapter::GenericAdapter;
 use strobe::test::stuck_detector::{StuckDetector, get_process_cpu_ns};
+use strobe::test::TestProgress;
+
+/// Create a SessionManager with a temp DB for integration tests.
+fn test_session_manager() -> Arc<strobe::daemon::SessionManager> {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("test.db");
+    // Leak the tempdir so it lives for the test duration
+    std::mem::forget(tmp);
+    Arc::new(strobe::daemon::SessionManager::new(&db_path).unwrap())
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SECTION 1: CargoTestAdapter — parse_output stress
@@ -489,8 +500,10 @@ fn test_adapter_confidence_ordering() {
 #[tokio::test]
 async fn test_runner_run_real_cargo_tests() {
     let runner = strobe::test::TestRunner::new();
+    let sm = test_session_manager();
 
     // Part 1: Single test by name
+    let progress1 = Arc::new(Mutex::new(TestProgress::new()));
     let single_result = runner.run(
         Path::new("."),
         Some("cargo"),
@@ -499,15 +512,21 @@ async fn test_runner_run_real_cargo_tests() {
         None,
         &HashMap::new(),
         Some(120_000),
+        &sm,
+        &[],
         None,
+        "test-conn",
+        "test-single-cargo",
+        progress1,
     ).await.unwrap();
 
     assert_eq!(single_result.framework, "cargo");
     assert!(single_result.result.summary.passed >= 1, "Expected pass, got: {:?}", single_result.result.summary);
     assert_eq!(single_result.result.summary.failed, 0);
-    assert!(single_result.session_id.is_none()); // fast path = no session
+    assert!(single_result.session_id.is_some()); // always has session now
 
     // Part 2: Full lib suite
+    let progress2 = Arc::new(Mutex::new(TestProgress::new()));
     let lib_result = runner.run(
         Path::new("."),
         Some("cargo"),
@@ -516,7 +535,12 @@ async fn test_runner_run_real_cargo_tests() {
         None,
         &HashMap::new(),
         Some(120_000),
+        &sm,
+        &[],
         None,
+        "test-conn",
+        "test-lib-cargo",
+        progress2,
     ).await.unwrap();
 
     assert_eq!(lib_result.framework, "cargo");
@@ -555,6 +579,8 @@ async fn test_runner_run_catch2_erae_fw_tests() {
     }
 
     let runner = strobe::test::TestRunner::new();
+    let sm = test_session_manager();
+    let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let result = runner.run(
         Path::new("/Users/alex/erae_touch_mk2_fw"),
@@ -564,7 +590,12 @@ async fn test_runner_run_catch2_erae_fw_tests() {
         Some(ERAE_FW_TEST_BINARY),
         &HashMap::new(),
         Some(30_000),
+        &sm,
+        &[],
         None,
+        "test-conn",
+        "test-catch2-fw",
+        progress,
     ).await.unwrap();
 
     assert_eq!(result.framework, "catch2");
@@ -590,6 +621,8 @@ async fn test_runner_run_catch2_erae_data_tests() {
     }
 
     let runner = strobe::test::TestRunner::new();
+    let sm = test_session_manager();
+    let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let result = runner.run(
         Path::new("/Users/alex/erae_touch_mk2_fw"),
@@ -599,7 +632,12 @@ async fn test_runner_run_catch2_erae_data_tests() {
         Some(ERAE_DATA_TEST_BINARY),
         &HashMap::new(),
         Some(30_000),
+        &sm,
+        &[],
         None,
+        "test-conn",
+        "test-catch2-data",
+        progress,
     ).await.unwrap();
 
     assert_eq!(result.framework, "catch2");
@@ -626,6 +664,8 @@ async fn test_runner_run_catch2_single_test() {
     }
 
     let runner = strobe::test::TestRunner::new();
+    let sm = test_session_manager();
+    let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let result = runner.run(
         Path::new("/Users/alex/erae_touch_mk2_fw"),
@@ -635,7 +675,12 @@ async fn test_runner_run_catch2_single_test() {
         Some(ERAE_FW_TEST_BINARY),
         &HashMap::new(),
         Some(10_000),
+        &sm,
+        &[],
         None,
+        "test-conn",
+        "test-catch2-single",
+        progress,
     ).await.unwrap();
 
     assert_eq!(result.framework, "catch2");
@@ -658,32 +703,51 @@ async fn test_stuck_detector_fast_exit_process() {
     let pid = child.id().unwrap();
     let _ = child.wait().await;
 
-    let detector = StuckDetector::new(pid, 5000);
-    let result = detector.run().await;
-    assert!(result.is_none(), "Fast process should not be stuck");
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(strobe::test::TestProgress::new()));
+    let detector = StuckDetector::new(pid, 5000, std::sync::Arc::clone(&progress));
+    detector.run().await;
+    assert!(progress.lock().unwrap().warnings.is_empty(), "Fast process should have no warnings");
 }
 
 #[tokio::test]
 async fn test_stuck_detector_hard_timeout() {
-    // sleep 100 with a 2s timeout should trigger hard timeout
+    // sleep 100 with a 2s timeout should trigger hard timeout warning
     let mut child = tokio::process::Command::new("sleep")
         .arg("100")
         .spawn()
         .unwrap();
     let pid = child.id().unwrap();
 
-    let detector = StuckDetector::new(pid, 2000);
-    let result = detector.run().await;
-    assert!(result.is_some(), "Should detect stuck for sleeping process");
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(strobe::test::TestProgress::new()));
+    {
+        let mut p = progress.lock().unwrap();
+        p.phase = strobe::test::TestPhase::Running;
+    }
+    let progress_clone = std::sync::Arc::clone(&progress);
+    let detector = StuckDetector::new(pid, 2000, progress_clone);
+    let detector_handle = tokio::spawn(async move { detector.run().await });
 
-    let info = result.unwrap();
-    assert!(info.diagnosis.contains("timeout") || info.diagnosis.contains("Timeout")
-        || info.diagnosis.contains("stuck") || info.diagnosis.contains("blocked"),
-        "Diagnosis should mention timeout/stuck: {}", info.diagnosis
-    );
+    // Wait for warning to appear (timeout is 2s, check every 500ms)
+    let start = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let p = progress.lock().unwrap();
+        if !p.warnings.is_empty() {
+            let warning = &p.warnings[0];
+            assert!(warning.diagnosis.contains("timeout") || warning.diagnosis.contains("Timeout")
+                || warning.diagnosis.contains("stopping"),
+                "Diagnosis should mention timeout: {}", warning.diagnosis
+            );
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            panic!("Timed out waiting for stuck warning");
+        }
+    }
 
     // Clean up
     let _ = child.kill().await;
+    detector_handle.abort();
 }
 
 #[test]
@@ -986,6 +1050,8 @@ fn test_catch2_detection_with_nonexistent_binary() {
 #[tokio::test]
 async fn test_e2e_cargo_run_and_write_details() {
     let runner = strobe::test::TestRunner::new();
+    let sm = test_session_manager();
+    let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let run_result = runner.run(
         Path::new("."),
@@ -995,7 +1061,12 @@ async fn test_e2e_cargo_run_and_write_details() {
         None,
         &HashMap::new(),
         Some(120_000),
+        &sm,
+        &[],
         None,
+        "test-conn",
+        "test-e2e-cargo",
+        progress,
     ).await.unwrap();
 
     // Write details
@@ -1023,6 +1094,8 @@ async fn test_e2e_catch2_run_and_write_details() {
     }
 
     let runner = strobe::test::TestRunner::new();
+    let sm = test_session_manager();
+    let progress = Arc::new(Mutex::new(TestProgress::new()));
 
     let run_result = runner.run(
         Path::new("/Users/alex/erae_touch_mk2_fw"),
@@ -1032,7 +1105,12 @@ async fn test_e2e_catch2_run_and_write_details() {
         Some(ERAE_FW_TEST_BINARY),
         &HashMap::new(),
         Some(30_000),
+        &sm,
+        &[],
         None,
+        "test-conn",
+        "test-e2e-catch2",
+        progress,
     ).await.unwrap();
 
     // Write details

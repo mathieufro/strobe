@@ -135,7 +135,8 @@ pub trait TestAdapter: Send + Sync {
     /// Default hard timeout for a given test level.
     fn default_timeout(&self, level: Option<TestLevel>) -> u64 {
         match level {
-            Some(TestLevel::Unit) | None => 30_000,
+            Some(TestLevel::Unit) => 30_000,
+            None => 120_000, // Running all tests across multiple binaries
             Some(TestLevel::Integration) => 120_000,
             Some(TestLevel::E2e) => 300_000,
         }

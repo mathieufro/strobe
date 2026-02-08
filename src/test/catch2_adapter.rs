@@ -300,6 +300,10 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
         }
         p.current_test = None;
     }
+    if trimmed.contains("</Catch2TestRun>") {
+        let mut p = progress.lock().unwrap();
+        p.phase = super::TestPhase::SuitesFinished;
+    }
 }
 
 #[cfg(test)]
