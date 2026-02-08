@@ -10,6 +10,8 @@ export interface RateStats {
     sampleRate: number; // 0.0 to 1.0
 }
 
+export type LogFn = (message: string) => void;
+
 export class RateTracker {
     private readonly HOT_THRESHOLD = 100_000; // calls/sec
     private readonly DEFAULT_SAMPLE_RATE = 0.01; // 1%
@@ -23,13 +25,15 @@ export class RateTracker {
     private lastRates: Map<number, number> = new Map();
 
     private windowStartTime: number = Date.now();
+    private rateCheckTimer: ReturnType<typeof setInterval>;
 
     constructor(
         private readonly funcNames: Map<number, string>,
-        private readonly onSamplingChange: (funcId: number, enabled: boolean, rate: number) => void
+        private readonly onSamplingChange: (funcId: number, enabled: boolean, rate: number) => void,
+        private readonly onLog: LogFn = (_msg) => {},
     ) {
         // Check rates every 100ms
-        setInterval(() => this.checkRates(), 100);
+        this.rateCheckTimer = setInterval(() => this.checkRates(), 100);
     }
 
     recordCall(funcId: number): boolean {
@@ -75,7 +79,7 @@ export class RateTracker {
                     this.onSamplingChange(funcId, false, 1.0);
 
                     const funcName = this.funcNames.get(funcId) || `func_${funcId}`;
-                    send({ type: 'log', message: `[RateTracker] Function cooled down: ${funcName} (${Math.round(rate)} calls/sec) - full capture resumed` });
+                    this.onLog(`[RateTracker] Function cooled down: ${funcName} (${Math.round(rate)} calls/sec) - full capture resumed`);
                 }
             }
         }

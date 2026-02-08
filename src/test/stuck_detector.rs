@@ -4,6 +4,31 @@ use std::time::{Duration, Instant};
 use super::TestProgress;
 use super::adapter::ThreadStack;
 
+/// Tracks the suspicion state for stuck detection. The triplet of fields
+/// (since, zero_delta_count, constant_high_count) is reset together
+/// at multiple points in the detection loop.
+struct SuspicionState {
+    since: Option<Instant>,
+    zero_delta_count: u32,
+    constant_high_count: u32,
+}
+
+impl SuspicionState {
+    fn new() -> Self {
+        Self {
+            since: None,
+            zero_delta_count: 0,
+            constant_high_count: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.since = None;
+        self.zero_delta_count = 0;
+        self.constant_high_count = 0;
+    }
+}
+
 /// Multi-signal stuck detector — continuous advisory monitor.
 /// Runs in parallel with test subprocess, monitors:
 /// 1. CPU time delta (every 2s)
@@ -53,17 +78,11 @@ impl StuckDetector {
         let start = Instant::now();
         let mut running_since: Option<Instant> = None;
         let mut prev_cpu_ns: Option<u64> = None;
-        let mut suspicious_since: Option<Instant> = None;
-        let mut zero_delta_count = 0u32;
-        let mut constant_high_count = 0u32;
+        let mut suspicion = SuspicionState::new();
         let mut prev_test: Option<String> = None;
 
         loop {
-            let alive = {
-                let r = unsafe { libc::kill(self.pid as i32, 0) };
-                r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-            };
-            if !alive {
+            if !super::stacks::is_process_alive(self.pid) {
                 return; // Process exited
             }
 
@@ -78,18 +97,14 @@ impl StuckDetector {
             let current = self.current_test();
             if current != prev_test && prev_test.is_some() {
                 self.clear_warnings();
-                suspicious_since = None;
-                zero_delta_count = 0;
-                constant_high_count = 0;
+                suspicion.reset();
             }
             prev_test = current;
 
             // SuitesFinished — not stuck, just cleaning up
             if phase == super::TestPhase::SuitesFinished {
                 self.clear_warnings();
-                suspicious_since = None;
-                zero_delta_count = 0;
-                constant_high_count = 0;
+                suspicion.reset();
                 prev_cpu_ns = Some(get_process_tree_cpu_ns(self.pid));
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
@@ -123,31 +138,29 @@ impl StuckDetector {
                 let sample_interval_ns = 2_000_000_000u64; // 2 seconds
 
                 if delta == 0 {
-                    zero_delta_count += 1;
-                    constant_high_count = 0;
-                    if suspicious_since.is_none() {
-                        suspicious_since = Some(Instant::now());
+                    suspicion.zero_delta_count += 1;
+                    suspicion.constant_high_count = 0;
+                    if suspicion.since.is_none() {
+                        suspicion.since = Some(Instant::now());
                     }
                 } else if delta > sample_interval_ns * 80 / 100 {
-                    constant_high_count += 1;
-                    zero_delta_count = 0;
-                    if suspicious_since.is_none() {
-                        suspicious_since = Some(Instant::now());
+                    suspicion.constant_high_count += 1;
+                    suspicion.zero_delta_count = 0;
+                    if suspicion.since.is_none() {
+                        suspicion.since = Some(Instant::now());
                     }
                 } else {
-                    zero_delta_count = 0;
-                    constant_high_count = 0;
-                    suspicious_since = None;
+                    suspicion.reset();
                     // CPU looks normal — clear any active warnings
                     self.clear_warnings();
                 }
 
                 // After ~6s of suspicious CPU signals, confirm with stack sampling
-                if let Some(since) = suspicious_since {
+                if let Some(since) = suspicion.since {
                     if since.elapsed() > Duration::from_secs(6) {
-                        let diagnosis_type = if zero_delta_count >= 3 {
+                        let diagnosis_type = if suspicion.zero_delta_count >= 3 {
                             "deadlock"
-                        } else if constant_high_count >= 3 {
+                        } else if suspicion.constant_high_count >= 3 {
                             "infinite_loop"
                         } else {
                             "unknown"
@@ -158,14 +171,8 @@ impl StuckDetector {
                             self.write_warning(&diagnosis, idle_ms);
                             // DON'T return — continue monitoring
                             // Reset suspicious counters but keep the warning
-                            suspicious_since = None;
-                            zero_delta_count = 0;
-                            constant_high_count = 0;
-                        } else {
-                            suspicious_since = None;
-                            zero_delta_count = 0;
-                            constant_high_count = 0;
                         }
+                        suspicion.reset();
                     }
                 }
             }
@@ -183,18 +190,14 @@ impl StuckDetector {
         let stacks1 = tokio::time::timeout(
             Duration::from_secs(8),
             tokio::task::spawn_blocking(move || {
-                super::cargo_adapter::capture_native_stacks(pid)
+                super::stacks::capture_native_stacks(pid)
             })
         ).await.ok().and_then(|r| r.ok()).unwrap_or_default();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Check if process exited or suites finished during wait
-        let alive = {
-                let r = unsafe { libc::kill(self.pid as i32, 0) };
-                r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-            };
-        if !alive {
+        if !super::stacks::is_process_alive(self.pid) {
             return None;
         }
         if self.current_phase() == super::TestPhase::SuitesFinished {
@@ -204,7 +207,7 @@ impl StuckDetector {
         let stacks2 = tokio::time::timeout(
             Duration::from_secs(8),
             tokio::task::spawn_blocking(move || {
-                super::cargo_adapter::capture_native_stacks(pid)
+                super::stacks::capture_native_stacks(pid)
             })
         ).await.ok().and_then(|r| r.ok()).unwrap_or_default();
 

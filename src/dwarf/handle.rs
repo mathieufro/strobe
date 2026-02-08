@@ -32,10 +32,7 @@ impl DwarfHandle {
     /// Check if this handle resolved to a failed parse.
     /// Returns false if still pending or if parse succeeded.
     pub fn is_failed(&self) -> bool {
-        match self.rx.borrow().as_ref() {
-            Some(Err(_)) => true,
-            _ => false, // None (pending) or Some(Ok(_)) (success)
-        }
+        matches!(self.rx.borrow().as_ref(), Some(Err(_)))
     }
 
     /// Wrap an already-parsed result (cache hit).

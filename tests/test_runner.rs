@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_runner_scenarios() {
+    // Pre-build fixtures so cargo test / catch2 spawned via Frida don't need to compile
+    let _ = rust_target();
+    let _ = cpp_test_suite();
+
     let (sm, _dir) = create_session_manager();
 
     eprintln!("=== Test 1/7: Cargo test execution ===");

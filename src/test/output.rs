@@ -46,7 +46,7 @@ mod tests {
             stuck: vec![],
             all_tests: vec![TestDetail {
                 name: "test_foo".to_string(),
-                status: "pass".to_string(),
+                status: TestStatus::Pass,
                 duration_ms: 100,
                 stdout: None,
                 stderr: None,

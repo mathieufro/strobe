@@ -5,6 +5,8 @@
  * Replaces raw hex pointer display with structured object inspection.
  */
 
+import { reinterpretAsFloat, signExtend } from './utils.js';
+
 export type TypeInfo = {
   typeKind: 'int' | 'uint' | 'float' | 'pointer' | 'struct' | 'array';
   byteSize: number;
@@ -77,15 +79,15 @@ export class ObjectSerializer {
     switch (size) {
       case 1: {
         const val = addr.readU8();
-        return signed ? ((val << 24) >> 24) : val;
+        return signed ? signExtend(val, 1) : val;
       }
       case 2: {
         const val = addr.readU16();
-        return signed ? ((val << 16) >> 16) : val;
+        return signed ? signExtend(val, 2) : val;
       }
       case 4: {
         const val = addr.readU32();
-        return signed ? (val | 0) : val >>> 0;
+        return signed ? signExtend(val, 4) : val >>> 0;
       }
       case 8: {
         const val = addr.readU64();
@@ -97,21 +99,14 @@ export class ObjectSerializer {
   }
 
   private readFloat(addr: NativePointer, size: number): number {
-    const buf = new ArrayBuffer(8);
-    const view = new DataView(buf);
-
     if (size === 4) {
-      view.setUint32(0, addr.readU32(), true);
-      return view.getFloat32(0, true);
-    } else {
-      // Frida UInt64 → reinterpret as f64 via two 32-bit halves
-      const raw = addr.readU64();
-      const lo = raw.and(0xFFFFFFFF).toNumber();
-      const hi = raw.shr(32).and(0xFFFFFFFF).toNumber();
-      view.setUint32(0, lo, true);
-      view.setUint32(4, hi, true);
-      return view.getFloat64(0, true);
+      return reinterpretAsFloat(addr.readU32(), 0, 4);
     }
+    // Frida UInt64 -> reinterpret as f64 via two 32-bit halves
+    const raw = addr.readU64();
+    const lo = raw.and(0xFFFFFFFF).toNumber();
+    const hi = raw.shr(32).and(0xFFFFFFFF).toNumber();
+    return reinterpretAsFloat(lo, hi, 8);
   }
 
   private serializePointer(addr: NativePointer, typeInfo: TypeInfo): SerializedValue {

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::adapter::*;
-use super::cargo_adapter::capture_native_stacks;
 
 pub struct Catch2Adapter;
 
@@ -68,9 +67,6 @@ impl TestAdapter for Catch2Adapter {
         traces
     }
 
-    fn capture_stacks(&self, pid: u32) -> Vec<ThreadStack> {
-        capture_native_stacks(pid)
-    }
 }
 
 impl Catch2Adapter {
@@ -137,7 +133,6 @@ fn parse_catch2_xml(xml: &str) -> TestResult {
     let mut tc_duration_ms = 0u64;
 
     // State for current Expression (assertion failure)
-    let mut _in_expression = false;
     let mut expr_file = String::new();
     let mut expr_line = 0u32;
     let mut expr_original = String::new();
@@ -165,7 +160,6 @@ fn parse_catch2_xml(xml: &str) -> TestResult {
                         expr_line = 0;
                     }
                     b"Expression" => {
-                        _in_expression = true;
                         let success = get_attr(e, "success");
                         if success == "false" {
                             tc_success = false;
@@ -199,7 +193,7 @@ fn parse_catch2_xml(xml: &str) -> TestResult {
                             passed += 1;
                             all_tests.push(TestDetail {
                                 name: tc_name.clone(),
-                                status: "pass".to_string(),
+                                status: TestStatus::Pass,
                                 duration_ms: tc_duration_ms,
                                 stdout: None,
                                 stderr: None,
@@ -213,10 +207,25 @@ fn parse_catch2_xml(xml: &str) -> TestResult {
                                 "Test failed".to_string()
                             };
 
+                            let file = if !expr_file.is_empty() {
+                                Some(expr_file.clone())
+                            } else if !tc_file.is_empty() {
+                                Some(tc_file.clone())
+                            } else {
+                                None
+                            };
+                            let line = if expr_line > 0 {
+                                Some(expr_line)
+                            } else if tc_line > 0 {
+                                Some(tc_line)
+                            } else {
+                                None
+                            };
+
                             failures.push(TestFailure {
                                 name: tc_name.clone(),
-                                file: if !expr_file.is_empty() { Some(expr_file.clone()) } else if !tc_file.is_empty() { Some(tc_file.clone()) } else { None },
-                                line: if expr_line > 0 { Some(expr_line) } else if tc_line > 0 { Some(tc_line) } else { None },
+                                file,
+                                line,
                                 message: message.clone(),
                                 rerun: Some(tc_name.clone()),
                                 suggested_traces: vec![],
@@ -224,7 +233,7 @@ fn parse_catch2_xml(xml: &str) -> TestResult {
 
                             all_tests.push(TestDetail {
                                 name: tc_name.clone(),
-                                status: "fail".to_string(),
+                                status: TestStatus::Fail,
                                 duration_ms: tc_duration_ms,
                                 stdout: None,
                                 stderr: None,
@@ -233,9 +242,7 @@ fn parse_catch2_xml(xml: &str) -> TestResult {
                         }
                         in_test_case = false;
                     }
-                    b"Expression" => {
-                        _in_expression = false;
-                    }
+                    b"Expression" => {}
                     b"Original" => {
                         reading_original = false;
                     }

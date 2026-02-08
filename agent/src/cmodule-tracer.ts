@@ -8,6 +8,7 @@
  */
 
 import { ObjectSerializer, TypeInfo } from './object-serializer.js';
+import { reinterpretAsFloat, signExtend } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -395,11 +396,12 @@ export class CModuleTracer {
     this.rateCheck = fn;
   }
 
-  installHook(func: FunctionTarget, mode: HookMode = 'full'): boolean {
-    if (this.hooks.has(func.address)) {
-      return true; // Already hooked
+  installHook(func: FunctionTarget, mode: HookMode = 'full'): number | null {
+    const existing = this.hooks.get(func.address);
+    if (existing) {
+      return existing.funcId; // Already hooked
     }
-    if (!this.cm) return false;
+    if (!this.cm) return null;
 
     const funcId = this.nextFuncId++;
 
@@ -407,7 +409,7 @@ export class CModuleTracer {
     // JS << operates on int32, so (funcId << 1) overflows sign bit at 2^30.
     // Guard at 2^29 to ensure (funcId << 1) | 1 stays positive.
     if (funcId >= (1 << 29)) {
-      return false;
+      return null;
     }
 
     this.funcRegistry.set(funcId, func);
@@ -426,11 +428,11 @@ export class CModuleTracer {
       const listener = Interceptor.attach(addr, this.cm as any, data);
 
       this.hooks.set(func.address, { listener, funcId, funcName: func.name });
-      return true;
+      return funcId;
     } catch (_e) {
       // Silently skip functions that can't be hooked
       this.funcRegistry.delete(funcId);
-      return false;
+      return null;
     }
   }
 
@@ -521,15 +523,28 @@ export class CModuleTracer {
   private matchPatternsToFuncIds(patterns: string[]): Set<number> {
     const matchedIds = new Set<number>();
 
+    // Precompile all patterns into regexes to avoid rebuilding per-hook
+    const compiledPatterns = patterns.map(p => this.compilePattern(p));
+
     // Iterate through all installed hooks
     for (const [_address, entry] of this.hooks) {
       const funcName = entry.funcName;
 
       // Check if function name matches any pattern
-      for (const pattern of patterns) {
-        if (this.matchPattern(funcName, pattern)) {
-          matchedIds.add(entry.funcId);
-          break; // Found a match, no need to check other patterns
+      for (const compiled of compiledPatterns) {
+        if (compiled === null) continue; // @file: patterns skipped at runtime
+        if (typeof compiled === 'string') {
+          // Exact match
+          if (funcName === compiled) {
+            matchedIds.add(entry.funcId);
+            break;
+          }
+        } else {
+          // Regex match
+          if (compiled.test(funcName)) {
+            matchedIds.add(entry.funcId);
+            break;
+          }
         }
       }
     }
@@ -537,16 +552,13 @@ export class CModuleTracer {
     return matchedIds;
   }
 
-  // Simple pattern matching: supports * wildcards and ** for deep matching
-  private matchPattern(name: string, pattern: string): boolean {
-    // Exact match
-    if (name === pattern) return true;
-
+  // Compile a pattern into a RegExp, exact string, or null (@file: patterns).
+  private compilePattern(pattern: string): RegExp | string | null {
     // @file: pattern - match source file substring
+    // We don't have source file info at runtime, so treat as no match.
+    // In practice, @file patterns should be resolved at hook installation time.
     if (pattern.startsWith('@file:')) {
-      // We don't have source file info at runtime, so treat as no match
-      // In practice, @file patterns should be resolved at hook installation time
-      return false;
+      return null;
     }
 
     // Pattern with wildcards
@@ -564,11 +576,11 @@ export class CModuleTracer {
       // Step 4: Restore ** marker as .* (matches anything including ::)
       regexPattern = regexPattern.replace(/\x00DEEP\x00/g, '.*');
 
-      const regex = new RegExp(`^${regexPattern}$`);
-      return regex.test(name);
+      return new RegExp(`^${regexPattern}$`);
     }
 
-    return false;
+    // Exact match — return the string itself
+    return pattern;
   }
 
   updateExprWatches(exprs: Array<{
@@ -838,22 +850,12 @@ export class CModuleTracer {
 
   private formatWatchValue(raw: UInt64, cfg: WatchConfig): number | string {
     if (cfg.typeKind === 'float') {
-      const buf = new ArrayBuffer(8);
-      const view = new DataView(buf);
-      if (cfg.size === 4) {
-        view.setUint32(0, raw.toNumber(), true);
-        return view.getFloat32(0, true);
-      } else {
-        view.setBigUint64(0, BigInt(raw.toString()), true);
-        return view.getFloat64(0, true);
-      }
+      const lo = raw.and(0xFFFFFFFF).toNumber();
+      const hi = raw.shr(32).and(0xFFFFFFFF).toNumber();
+      return reinterpretAsFloat(lo, hi, cfg.size as 4 | 8);
     }
     if (cfg.typeKind === 'int') {
-      const n = raw.toNumber();
-      if (cfg.size === 1) return (n << 24) >> 24;
-      if (cfg.size === 2) return (n << 16) >> 16;
-      if (cfg.size === 4) return n | 0;
-      return n;
+      return signExtend(raw.toNumber(), cfg.size);
     }
     return raw.toNumber();
   }

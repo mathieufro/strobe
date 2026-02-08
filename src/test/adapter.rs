@@ -75,10 +75,36 @@ pub struct TestResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestStatus {
+    Pass,
+    Fail,
+    Skip,
+    Stuck,
+}
+
+impl TestStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TestStatus::Pass => "pass",
+            TestStatus::Fail => "fail",
+            TestStatus::Skip => "skip",
+            TestStatus::Stuck => "stuck",
+        }
+    }
+}
+
+impl std::fmt::Display for TestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestDetail {
     pub name: String,
-    pub status: String, // "pass", "fail", "skip", "stuck"
+    pub status: TestStatus,
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout: Option<String>,
@@ -130,7 +156,10 @@ pub trait TestAdapter: Send + Sync {
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String>;
 
     /// Capture thread stacks for stuck detection. Language-aware.
-    fn capture_stacks(&self, pid: u32) -> Vec<ThreadStack>;
+    /// Default implementation uses OS-level native stack capture.
+    fn capture_stacks(&self, pid: u32) -> Vec<ThreadStack> {
+        super::stacks::capture_native_stacks(pid)
+    }
 
     /// Default hard timeout for a given test level.
     fn default_timeout(&self, level: Option<TestLevel>) -> u64 {

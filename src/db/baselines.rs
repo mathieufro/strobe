@@ -10,10 +10,7 @@ impl super::Database {
         status: &str,
     ) -> crate::Result<()> {
         let conn = self.connection();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO test_baselines (test_name, project_root, duration_ms, status, recorded_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",

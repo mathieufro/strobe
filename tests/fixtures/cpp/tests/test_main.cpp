@@ -56,7 +56,7 @@ TEST_CASE("Intentional failure", "[unit][expected-fail]") {
 }
 
 // Intentionally stuck test (for stuck detector validation)
-TEST_CASE("Stuck test - infinite loop", "[stuck]") {
+TEST_CASE("Stuck test - infinite loop", "[.][stuck]") {
     volatile bool done = false;
     while (!done) { }
 }

@@ -3,6 +3,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use crate::Result;
 
+/// Add a column to a table, ignoring "duplicate column" errors (idempotent migration).
+fn add_column_if_not_exists(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
+    match conn.execute(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type), []) {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
 }
@@ -72,65 +81,17 @@ impl Database {
             [],
         )?;
 
-        // Add watch_values column (idempotent for existing DBs)
-        match conn.execute("ALTER TABLE events ADD COLUMN watch_values JSON", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // Add thread_name column (idempotent for existing DBs)
-        match conn.execute("ALTER TABLE events ADD COLUMN thread_name TEXT", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // Add retention columns to sessions (idempotent for existing DBs)
-        match conn.execute("ALTER TABLE sessions ADD COLUMN retained_at INTEGER", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-        match conn.execute("ALTER TABLE sessions ADD COLUMN size_bytes INTEGER", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // Add pid column (idempotent for existing DBs)
-        match conn.execute("ALTER TABLE events ADD COLUMN pid INTEGER", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // Crash-related columns
-        match conn.execute("ALTER TABLE events ADD COLUMN signal TEXT", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-        match conn.execute("ALTER TABLE events ADD COLUMN fault_address TEXT", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-        match conn.execute("ALTER TABLE events ADD COLUMN registers JSON", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-        match conn.execute("ALTER TABLE events ADD COLUMN backtrace JSON", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
-        match conn.execute("ALTER TABLE events ADD COLUMN locals JSON", []) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("duplicate column") => {}
-            Err(e) => return Err(e.into()),
-        }
+        // Idempotent column migrations
+        add_column_if_not_exists(&conn, "events", "watch_values", "JSON")?;
+        add_column_if_not_exists(&conn, "events", "thread_name", "TEXT")?;
+        add_column_if_not_exists(&conn, "sessions", "retained_at", "INTEGER")?;
+        add_column_if_not_exists(&conn, "sessions", "size_bytes", "INTEGER")?;
+        add_column_if_not_exists(&conn, "events", "pid", "INTEGER")?;
+        add_column_if_not_exists(&conn, "events", "signal", "TEXT")?;
+        add_column_if_not_exists(&conn, "events", "fault_address", "TEXT")?;
+        add_column_if_not_exists(&conn, "events", "registers", "JSON")?;
+        add_column_if_not_exists(&conn, "events", "backtrace", "JSON")?;
+        add_column_if_not_exists(&conn, "events", "locals", "JSON")?;
 
         // Test baselines table for historical per-test durations
         conn.execute(

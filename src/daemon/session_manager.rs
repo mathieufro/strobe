@@ -9,6 +9,16 @@ use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::{FridaSpawner, HookResult};
 use crate::Result;
 
+/// Acquire a read lock, recovering from poisoned state.
+fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Acquire a write lock, recovering from poisoned state.
+fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Clone)]
 pub struct ActiveWatchState {
     pub label: String,
@@ -120,11 +130,11 @@ impl SessionManager {
         let session = self.db.create_session(id, binary_path, project_root, pid)?;
 
         // Initialize pattern storage, watches, and event limit
-        self.patterns.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), Vec::new());
-        self.hook_counts.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), 0);
-        self.watches.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), Vec::new());
+        write_lock(&self.patterns).insert(id.to_string(), Vec::new());
+        write_lock(&self.hook_counts).insert(id.to_string(), 0);
+        write_lock(&self.watches).insert(id.to_string(), Vec::new());
         let settings = crate::config::resolve(Some(std::path::Path::new(project_root)));
-        self.event_limits.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), settings.events_max_per_session);
+        write_lock(&self.event_limits).insert(id.to_string(), settings.events_max_per_session);
 
         Ok(session)
     }
@@ -141,24 +151,24 @@ impl SessionManager {
         let count = self.db.count_session_events(id)?;
 
         // Signal database writer task to flush and exit
-        if let Some(cancel_tx) = self.writer_cancel_tokens.write().unwrap_or_else(|e| e.into_inner()).remove(id) {
+        if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
             let _ = cancel_tx.send(true);
         }
 
         self.db.delete_session(id)?;
 
         // Clean up in-memory state
-        self.patterns.write().unwrap_or_else(|e| e.into_inner()).remove(id);
-        self.hook_counts.write().unwrap_or_else(|e| e.into_inner()).remove(id);
-        self.watches.write().unwrap_or_else(|e| e.into_inner()).remove(id);
-        self.event_limits.write().unwrap_or_else(|e| e.into_inner()).remove(id);
-        self.child_pids.write().unwrap_or_else(|e| e.into_inner()).remove(id);
+        write_lock(&self.patterns).remove(id);
+        write_lock(&self.hook_counts).remove(id);
+        write_lock(&self.watches).remove(id);
+        write_lock(&self.event_limits).remove(id);
+        write_lock(&self.child_pids).remove(id);
 
         Ok(count)
     }
 
     pub fn add_child_pid(&self, session_id: &str, pid: u32) {
-        self.child_pids.write().unwrap_or_else(|e| e.into_inner())
+        write_lock(&self.child_pids)
             .entry(session_id.to_string())
             .or_default()
             .push(pid);
@@ -169,14 +179,14 @@ impl SessionManager {
         if let Ok(Some(session)) = self.get_session(session_id) {
             pids.push(session.pid);
         }
-        if let Some(children) = self.child_pids.read().unwrap_or_else(|e| e.into_inner()).get(session_id) {
+        if let Some(children) = read_lock(&self.child_pids).get(session_id) {
             pids.extend(children);
         }
         pids
     }
 
     pub fn add_patterns(&self, session_id: &str, patterns: &[String]) -> Result<()> {
-        let mut all_patterns = self.patterns.write().unwrap_or_else(|e| e.into_inner());
+        let mut all_patterns = write_lock(&self.patterns);
         let session_patterns = all_patterns
             .entry(session_id.to_string())
             .or_default();
@@ -191,7 +201,7 @@ impl SessionManager {
     }
 
     pub fn remove_patterns(&self, session_id: &str, patterns: &[String]) -> Result<()> {
-        let mut all_patterns = self.patterns.write().unwrap_or_else(|e| e.into_inner());
+        let mut all_patterns = write_lock(&self.patterns);
         if let Some(session_patterns) = all_patterns.get_mut(session_id) {
             session_patterns.retain(|p| !patterns.contains(p));
         }
@@ -199,25 +209,19 @@ impl SessionManager {
     }
 
     pub fn get_patterns(&self, session_id: &str) -> Vec<String> {
-        self.patterns
-            .read()
-            .unwrap()
+        read_lock(&self.patterns)
             .get(session_id)
             .cloned()
             .unwrap_or_default()
     }
 
     pub fn set_hook_count(&self, session_id: &str, count: u32) {
-        self.hook_counts
-            .write()
-            .unwrap()
+        write_lock(&self.hook_counts)
             .insert(session_id.to_string(), count);
     }
 
     pub fn get_hook_count(&self, session_id: &str) -> u32 {
-        self.hook_counts
-            .read()
-            .unwrap()
+        read_lock(&self.hook_counts)
             .get(session_id)
             .copied()
             .unwrap_or(0)
@@ -226,14 +230,12 @@ impl SessionManager {
     pub fn set_event_limit(&self, session_id: &str, limit: usize) {
         self.event_limits
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(session_id.to_string(), limit);
     }
 
     pub fn get_event_limit(&self, session_id: &str) -> usize {
-        self.event_limits
-            .read()
-            .unwrap()
+        read_lock(&self.event_limits)
             .get(session_id)
             .copied()
             .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session)
@@ -254,7 +256,7 @@ impl SessionManager {
 
         // Fast path: read lock only
         {
-            let cache = self.dwarf_cache.read().unwrap_or_else(|e| e.into_inner());
+            let cache = read_lock(&self.dwarf_cache);
             if let Some(handle) = cache.get(&cache_key) {
                 if !handle.is_failed() {
                     return handle.clone();
@@ -263,7 +265,7 @@ impl SessionManager {
         }
 
         // Slow path: write lock with double-check
-        let mut cache = self.dwarf_cache.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = write_lock(&self.dwarf_cache);
         if let Some(handle) = cache.get(&cache_key) {
             if !handle.is_failed() {
                 return handle.clone();
@@ -303,88 +305,51 @@ impl SessionManager {
         let db = self.db.clone();
         let event_limits = Arc::clone(&self.event_limits);
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-        self.writer_cancel_tokens.write().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string(), cancel_tx);
+        write_lock(&self.writer_cancel_tokens).insert(session_id.to_string(), cancel_tx);
 
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(100);
             let mut cached_limit = crate::config::StrobeSettings::default().events_max_per_session;
-            let mut batches_since_refresh = 0;
+            let mut batches_since_refresh = 0u32;
+
+            let flush_batch = |batch: &mut Vec<Event>, cached_limit: &mut usize, batches_since_refresh: &mut u32| {
+                if batch.is_empty() { return; }
+                if *batches_since_refresh >= 10 {
+                    let session_id = &batch[0].session_id;
+                    *cached_limit = read_lock(&event_limits)
+                        .get(session_id)
+                        .copied()
+                        .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session);
+                    *batches_since_refresh = 0;
+                }
+                *batches_since_refresh += 1;
+                match db.insert_events_with_limit(batch, *cached_limit) {
+                    Ok(stats) => {
+                        if stats.events_deleted > 0 {
+                            tracing::warn!(
+                                "Event limit cleanup: deleted {} old events from {} session(s) to stay within {} event limit",
+                                stats.events_deleted, stats.sessions_cleaned.len(), cached_limit
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!("Failed to insert events: {}", e),
+                }
+                batch.clear();
+            };
 
             loop {
                 tokio::select! {
                     Some(event) = rx.recv() => {
                         batch.push(event);
-
                         if batch.len() >= 100 {
-                            // Refresh cached limit every 10 batches to reduce lock contention
-                            if batches_since_refresh >= 10 {
-                                let session_id = &batch[0].session_id;
-                                cached_limit = event_limits.read().unwrap_or_else(|e| e.into_inner())
-                                    .get(session_id)
-                                    .copied()
-                                    .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session);
-                                batches_since_refresh = 0;
-                            }
-                            batches_since_refresh += 1;
-                            let max_events = cached_limit;
-
-                            match db.insert_events_with_limit(&batch, max_events) {
-                                Ok(stats) => {
-                                    if stats.events_deleted > 0 {
-                                        tracing::warn!(
-                                            "Event limit cleanup: deleted {} old events from {} session(s) to stay within {} event limit",
-                                            stats.events_deleted,
-                                            stats.sessions_cleaned.len(),
-                                            max_events
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to insert events: {}", e);
-                                }
-                            }
-                            batch.clear();
+                            flush_batch(&mut batch, &mut cached_limit, &mut batches_since_refresh);
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                        if !batch.is_empty() {
-                            // Refresh cached limit every 10 batches to reduce lock contention
-                            if batches_since_refresh >= 10 {
-                                let session_id = &batch[0].session_id;
-                                cached_limit = event_limits.read().unwrap_or_else(|e| e.into_inner())
-                                    .get(session_id)
-                                    .copied()
-                                    .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session);
-                                batches_since_refresh = 0;
-                            }
-                            batches_since_refresh += 1;
-                            let max_events = cached_limit;
-
-                            match db.insert_events_with_limit(&batch, max_events) {
-                                Ok(stats) => {
-                                    if stats.events_deleted > 0 {
-                                        tracing::warn!(
-                                            "Event limit cleanup: deleted {} old events from {} session(s) to stay within {} event limit",
-                                            stats.events_deleted,
-                                            stats.sessions_cleaned.len(),
-                                            max_events
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to insert events: {}", e);
-                                }
-                            }
-                            batch.clear();
-                        }
+                        flush_batch(&mut batch, &mut cached_limit, &mut batches_since_refresh);
                     }
                     _ = cancel_rx.changed() => {
-                        // Cancellation requested — flush remaining events and exit
-                        if !batch.is_empty() {
-                            let max_events = cached_limit;
-                            let _ = db.insert_events_with_limit(&batch, max_events);
-                            batch.clear();
-                        }
+                        flush_batch(&mut batch, &mut cached_limit, &mut batches_since_refresh);
                         break;
                     }
                 }
@@ -460,13 +425,13 @@ impl SessionManager {
     pub fn set_watches(&self, session_id: &str, watches: Vec<ActiveWatchState>) {
         self.watches
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(session_id.to_string(), watches);
     }
 
     /// Remove watches by label, returning the remaining watches
     pub fn remove_watches(&self, session_id: &str, labels: &[String]) -> Vec<ActiveWatchState> {
-        let mut watches_map = self.watches.write().unwrap_or_else(|e| e.into_inner());
+        let mut watches_map = write_lock(&self.watches);
         if let Some(watches) = watches_map.get_mut(session_id) {
             watches.retain(|w| !labels.contains(&w.label));
             watches.clone()
@@ -477,9 +442,7 @@ impl SessionManager {
 
     /// Get active watches for a session
     pub fn get_watches(&self, session_id: &str) -> Vec<ActiveWatchState> {
-        self.watches
-            .read()
-            .unwrap()
+        read_lock(&self.watches)
             .get(session_id)
             .cloned()
             .unwrap_or_default()

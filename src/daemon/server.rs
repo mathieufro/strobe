@@ -30,6 +30,89 @@ pub struct Daemon {
     shutdown_signal: Arc<tokio::sync::Notify>,
 }
 
+fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
+    if event.event_type == crate::db::EventType::Crash {
+        return serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": "crash",
+            "pid": event.pid,
+            "threadId": event.thread_id,
+            "signal": event.signal,
+            "faultAddress": event.fault_address,
+            "registers": event.registers,
+            "backtrace": event.backtrace,
+            "locals": event.locals,
+        });
+    }
+
+    if event.event_type == crate::db::EventType::Stdout || event.event_type == crate::db::EventType::Stderr {
+        return serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": event.event_type.as_str(),
+            "threadId": event.thread_id,
+            "pid": event.pid,
+            "text": event.text,
+        });
+    }
+
+    if verbose {
+        serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": event.event_type.as_str(),
+            "function": event.function_name,
+            "functionRaw": event.function_name_raw,
+            "sourceFile": event.source_file,
+            "line": event.line_number,
+            "duration_ns": event.duration_ns,
+            "threadId": event.thread_id,
+            "pid": event.pid,
+            "parentEventId": event.parent_event_id,
+            "arguments": event.arguments,
+            "returnValue": event.return_value,
+            "watchValues": event.watch_values,
+        })
+    } else {
+        serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": event.event_type.as_str(),
+            "function": event.function_name,
+            "sourceFile": event.source_file,
+            "line": event.line_number,
+            "duration_ns": event.duration_ns,
+            "pid": event.pid,
+            "returnType": event.return_value.as_ref()
+                .map(|v| match v {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                })
+                .unwrap_or("void"),
+            "watchValues": event.watch_values,
+        })
+    }
+}
+
+fn hook_status_message(installed: u32, matched: u32, patterns_empty: bool) -> String {
+    if installed > 0 && matched > installed {
+        format!("{} functions hooked (out of {} matches — excess skipped to stay under limit). Use debug_query to see traced events.", installed, matched)
+    } else if installed > 0 {
+        format!("{} functions hooked. Use debug_query to see traced events.", installed)
+    } else if matched > 0 {
+        format!("{} functions matched but could not be hooked. They may be inlined or optimized out. Try broader patterns or @file: patterns.", matched)
+    } else if patterns_empty {
+        "No patterns active. Add patterns with debug_trace to start tracing.".to_string()
+    } else {
+        "No functions matched. Try broader patterns, @file: patterns, or check that the binary has debug symbols (DWARF).".to_string()
+    }
+}
+
 impl Daemon {
     pub async fn run() -> Result<()> {
         let strobe_dir = dirs::home_dir()
@@ -622,6 +705,18 @@ Validation Limits (enforced):
         }
     }
 
+    fn require_session(&self, session_id: &str) -> crate::Result<crate::db::Session> {
+        self.session_manager.get_session(session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))
+    }
+
+    async fn untrack_session(&self, session_id: &str) {
+        let mut sessions = self.connection_sessions.write().await;
+        for session_list in sessions.values_mut() {
+            session_list.retain(|s| s != session_id);
+        }
+    }
+
     async fn handle_disconnect(&self, connection_id: &str) {
         // Clean up pending patterns for this connection
         {
@@ -699,10 +794,7 @@ Validation Limits (enforced):
                 let _ = self.session_manager.stop_session(&existing.id);
 
                 // Remove from all connection tracking
-                let mut sessions = self.connection_sessions.write().await;
-                for session_list in sessions.values_mut() {
-                    session_list.retain(|s| s != &existing.id);
-                }
+                self.untrack_session(&existing.id).await;
             }
         }
 
@@ -838,8 +930,7 @@ Validation Limits (enforced):
             // Has session ID - modify running session
             Some(ref session_id) => {
                 // Verify session exists
-                let _ = self.session_manager.get_session(session_id)?
-                    .ok_or_else(|| crate::Error::SessionNotFound(session_id.clone()))?;
+                let _ = self.require_session(session_id)?;
 
                 // Update patterns in session manager
                 if let Some(ref add) = req.add {
@@ -1031,20 +1122,11 @@ Validation Limits (enforced):
                 let mut all_warnings = hook_result.warnings;
                 all_warnings.extend(watch_warnings);
 
-                // Generate contextual status message
-                let status_msg = if hook_result.installed == 0 && hook_result.matched > 0 {
-                    format!("Warning: {} function(s) matched but 0 hooks installed. Process likely crashed during hook installation. Check stderr for crash reports.", hook_result.matched)
-                } else if hook_result.installed == 0 && !patterns.is_empty() {
-                    "Warning: 0 functions matched patterns. Possible causes: 1) Functions are inline/constexpr (not in binary), 2) Name mangling differs from pattern, 3) Missing debug symbols. Try: use @file:filename.cpp patterns, verify debug symbols exist (dSYM on macOS), or check function names with 'nm' tool.".to_string()
-                } else if hook_result.installed == 0 && patterns.is_empty() {
-                    "No trace patterns active. Add patterns with debug_trace({ sessionId, add: [...] }). Remember: stdout/stderr are always captured automatically.".to_string()
-                } else if hook_result.installed < 50 {
-                    format!("Successfully hooked {} function(s). Under 50 hooks - excellent stability.", hook_result.installed)
-                } else if hook_result.installed < 100 {
-                    format!("Hooked {} function(s). 50-100 hooks range - good stability, but watch for performance impact.", hook_result.installed)
-                } else {
-                    format!("Hooked {} function(s). Over 100 hooks - high crash risk. Consider narrowing patterns for better stability.", hook_result.installed)
-                };
+                let status_msg = hook_status_message(
+                    hook_result.installed,
+                    hook_result.matched,
+                    patterns.is_empty(),
+                );
 
                 let response = DebugTraceResponse {
                     mode: "runtime".to_string(),
@@ -1095,8 +1177,7 @@ Validation Limits (enforced):
         let req: DebugQueryRequest = serde_json::from_value(args.clone())?;
 
         // Verify session exists
-        let _ = self.session_manager.get_session(&req.session_id)?
-            .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
+        let _ = self.require_session(&req.session_id)?;
 
         let limit = req.limit.unwrap_or(50).min(500);
         let offset = req.offset.unwrap_or(0);
@@ -1155,82 +1236,14 @@ Validation Limits (enforced):
             q.limit(limit).offset(offset)
         })?;
 
-        let total_count = self.session_manager.db().count_events(&req.session_id)?;
+        let total_count = self.session_manager.db().count_session_events(&req.session_id)?;
         let has_more = (offset + events.len() as u32) < total_count as u32;
 
         // Convert to appropriate format
         let verbose = req.verbose.unwrap_or(false);
-        let event_values: Vec<serde_json::Value> = events.iter().map(|e| {
-            // Crash events have their own shape
-            if e.event_type == crate::db::EventType::Crash {
-                return serde_json::json!({
-                    "id": e.id,
-                    "timestamp_ns": e.timestamp_ns,
-                    "eventType": "crash",
-                    "pid": e.pid,
-                    "threadId": e.thread_id,
-                    "signal": e.signal,
-                    "faultAddress": e.fault_address,
-                    "registers": e.registers,
-                    "backtrace": e.backtrace,
-                    "locals": e.locals,
-                });
-            }
-
-            // Output events have a different shape
-            if e.event_type == crate::db::EventType::Stdout || e.event_type == crate::db::EventType::Stderr {
-                return serde_json::json!({
-                    "id": e.id,
-                    "timestamp_ns": e.timestamp_ns,
-                    "eventType": e.event_type.as_str(),
-                    "threadId": e.thread_id,
-                    "pid": e.pid,
-                    "text": e.text,
-                });
-            }
-
-            // Function trace events
-            if verbose {
-                serde_json::json!({
-                    "id": e.id,
-                    "timestamp_ns": e.timestamp_ns,
-                    "eventType": e.event_type.as_str(),
-                    "function": e.function_name,
-                    "functionRaw": e.function_name_raw,
-                    "sourceFile": e.source_file,
-                    "line": e.line_number,
-                    "duration_ns": e.duration_ns,
-                    "threadId": e.thread_id,
-                    "pid": e.pid,
-                    "parentEventId": e.parent_event_id,
-                    "arguments": e.arguments,
-                    "returnValue": e.return_value,
-                    "watchValues": e.watch_values,
-                })
-            } else {
-                serde_json::json!({
-                    "id": e.id,
-                    "timestamp_ns": e.timestamp_ns,
-                    "eventType": e.event_type.as_str(),
-                    "function": e.function_name,
-                    "sourceFile": e.source_file,
-                    "line": e.line_number,
-                    "duration_ns": e.duration_ns,
-                    "pid": e.pid,
-                    "returnType": e.return_value.as_ref()
-                        .map(|v| match v {
-                            serde_json::Value::Null => "null",
-                            serde_json::Value::Bool(_) => "bool",
-                            serde_json::Value::Number(_) => "number",
-                            serde_json::Value::String(_) => "string",
-                            serde_json::Value::Array(_) => "array",
-                            serde_json::Value::Object(_) => "object",
-                        })
-                        .unwrap_or("void"),
-                    "watchValues": e.watch_values,
-                })
-            }
-        }).collect();
+        let event_values: Vec<serde_json::Value> = events.iter()
+            .map(|e| format_event(e, verbose))
+            .collect();
 
         let pids = self.session_manager.get_all_pids(&req.session_id);
         let response = DebugQueryResponse {
@@ -1247,8 +1260,7 @@ Validation Limits (enforced):
         let req: DebugStopRequest = serde_json::from_value(args.clone())?;
 
         // Verify session exists
-        let _ = self.session_manager.get_session(&req.session_id)?
-            .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
+        let _ = self.require_session(&req.session_id)?;
 
         // Stop Frida session
         self.session_manager.stop_frida(&req.session_id).await?;
@@ -1266,12 +1278,7 @@ Validation Limits (enforced):
         }
 
         // Remove from connection tracking so disconnect cleanup doesn't try to stop it again
-        {
-            let mut sessions = self.connection_sessions.write().await;
-            for session_list in sessions.values_mut() {
-                session_list.retain(|s| s != &req.session_id);
-            }
-        }
+        self.untrack_session(&req.session_id).await;
 
         let response = DebugStopResponse {
             success: true,
@@ -1304,24 +1311,25 @@ Validation Limits (enforced):
     }
 
     async fn tool_debug_delete_session(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let req: DebugStopRequest = serde_json::from_value(args.clone())?;
+        let session_id = args.get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::Error::ValidationError("sessionId is required".to_string()))?;
 
         // Verify session exists and is retained
-        let session = self.session_manager.get_session(&req.session_id)?
-            .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
+        let session = self.require_session(session_id)?;
 
         if !session.retained {
             return Err(crate::Error::Frida(
-                format!("Session {} is not retained and cannot be manually deleted", req.session_id)
+                format!("Session {} is not retained and cannot be manually deleted", session_id)
             ));
         }
 
         // Delete the session
-        self.session_manager.db().delete_session(&req.session_id)?;
+        self.session_manager.db().delete_session(session_id)?;
 
         Ok(serde_json::json!({
             "success": true,
-            "deletedSessionId": req.session_id,
+            "deletedSessionId": session_id,
         }))
     }
 
@@ -1398,7 +1406,7 @@ Validation Limits (enforced):
                         &test_detail.name,
                         project_root.to_str().unwrap_or("."),
                         test_detail.duration_ms,
-                        &test_detail.status,
+                        test_detail.status.as_str(),
                     );
                 }
                 let _ = session_manager.db().cleanup_old_baselines(
@@ -1576,13 +1584,10 @@ Validation Limits (enforced):
                 crate::test::TestRunState::Running { .. } => true,
                 crate::test::TestRunState::Completed { completed_at, .. }
                 | crate::test::TestRunState::Failed { completed_at, .. } => {
-                    if run.fetched && now.duration_since(*completed_at) > std::time::Duration::from_secs(300) {
-                        false
-                    } else if now.duration_since(*completed_at) > std::time::Duration::from_secs(1800) {
-                        false
-                    } else {
-                        true
-                    }
+                    let age = now.duration_since(*completed_at);
+                    let expired = (run.fetched && age > Duration::from_secs(300))
+                        || age > Duration::from_secs(1800);
+                    !expired
                 }
             }
         });

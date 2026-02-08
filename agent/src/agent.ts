@@ -1,4 +1,4 @@
-import { HookInstaller, HookMode } from './hooks.js';
+import { CModuleTracer, HookMode, type FunctionTarget } from './cmodule-tracer.js';
 import { RateTracker } from './rate-tracker.js';
 
 interface HookInstruction {
@@ -9,14 +9,6 @@ interface HookInstruction {
   serializationDepth?: number;
 }
 
-interface FunctionTarget {
-  address: string;
-  name: string;
-  nameRaw?: string;
-  sourceFile?: string;
-  lineNumber?: number;
-}
-
 interface OutputEvent {
   id: string;
   sessionId: string;
@@ -24,6 +16,30 @@ interface OutputEvent {
   threadId: number;
   eventType: 'stdout' | 'stderr';
   text: string;
+}
+
+interface BacktraceFrame {
+  address: string;
+  moduleName: string | null;
+  name: string | null;
+  fileName: string | null;
+  lineNumber: number | null;
+}
+
+interface CrashEvent {
+  id: string;
+  timestampNs: number;
+  threadId: number;
+  threadName: null;
+  eventType: 'crash';
+  pid: number;
+  signal: string;
+  faultAddress: string;
+  registers: Record<string, string>;
+  backtrace: BacktraceFrame[];
+  frameMemory: string | null;
+  frameBase: string | null;
+  memoryAccess?: { operation: string; address: string };
 }
 
 interface WatchInstruction {
@@ -48,10 +64,9 @@ interface WatchInstruction {
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
-  private hookInstaller: HookInstaller;
+  private tracer: CModuleTracer;
   private rateTracker: RateTracker | null = null;
   private funcIdToName: Map<number, string> = new Map();
-  private nextFuncId: number = 0;
 
   // Output event buffering (low-frequency, stays in JS)
   private outputBuffer: OutputEvent[] = [];
@@ -66,16 +81,18 @@ class StrobeAgent {
   private outputBytesCapture: number = 0;
   private maxOutputBytes: number = 50 * 1024 * 1024;
 
+  // Interval handles for cleanup
+  private outputFlushTimer: ReturnType<typeof setInterval> | null = null;
+  private samplingStatsTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor() {
-    this.hookInstaller = new HookInstaller((events) => {
-      // Note: Full sampling integration would intercept events here
-      // For now, events flow through unchanged
+    this.tracer = new CModuleTracer((events) => {
       send({ type: 'events', events });
     });
     this.sessionStartNs = Date.now() * 1000000;
 
     // Periodic flush for output events
-    setInterval(() => this.flushOutput(), this.outputFlushInterval);
+    this.outputFlushTimer = setInterval(() => this.flushOutput(), this.outputFlushInterval);
 
     // Intercept write(2) for stdout/stderr capture (non-fatal if it fails,
     // e.g. with ASAN-instrumented binaries where write() isn't hookable)
@@ -89,7 +106,7 @@ class StrobeAgent {
   initialize(sessionId: string): void {
     this.sessionId = sessionId;
     this.sessionStartNs = Date.now() * 1000000;
-    this.hookInstaller.setSessionId(sessionId);
+    this.tracer.setSessionId(sessionId);
 
     // Initialize rate tracker for hot function detection
     this.rateTracker = new RateTracker(
@@ -102,20 +119,21 @@ class StrobeAgent {
           enabled,
           sampleRate: rate,
         });
+      },
+      (message: string) => {
+        send({ type: 'log', message });
       }
     );
 
     // Wire rate tracker into the CModule tracer drain loop
     const tracker = this.rateTracker;
-    this.hookInstaller.setRateCheck((funcId: number) => tracker.recordCall(funcId));
+    this.tracer.setRateCheck((funcId: number) => tracker.recordCall(funcId));
 
     // Periodically send sampling stats
-    setInterval(() => {
-      if (this.rateTracker) {
-        const stats = this.rateTracker.getSamplingStats();
-        if (stats.some(s => s.samplingEnabled)) {
-          send({ type: 'sampling_stats', stats });
-        }
+    this.samplingStatsTimer = setInterval(() => {
+      const stats = this.rateTracker!.getSamplingStats();
+      if (stats.some(s => s.samplingEnabled)) {
+        send({ type: 'sampling_stats', stats });
       }
     }, 1000);
 
@@ -130,13 +148,13 @@ class StrobeAgent {
       // Set imageBase for ASLR slide computation (only needs to happen once)
       if (message.imageBase) {
         send({ type: 'log', message: `Setting imageBase=${message.imageBase}` });
-        this.hookInstaller.setImageBase(message.imageBase);
+        this.tracer.setImageBase(message.imageBase);
         send({ type: 'log', message: `ASLR slide computed` });
       }
 
       // Set serialization depth if provided
       if (message.serializationDepth) {
-        this.hookInstaller.setSerializationDepth(message.serializationDepth);
+        this.tracer.setSerializationDepth(message.serializationDepth);
       }
 
       const mode: HookMode = message.mode || 'full';
@@ -145,9 +163,8 @@ class StrobeAgent {
 
       if (message.action === 'add') {
         for (const func of message.functions) {
-          if (this.hookInstaller.installHook(func, mode)) {
-            // Track funcId -> name mapping for rate tracker
-            const funcId = this.nextFuncId++;
+          const funcId = this.tracer.installHook(func, mode);
+          if (funcId !== null) {
             this.funcIdToName.set(funcId, func.name);
             installed++;
           } else {
@@ -157,29 +174,29 @@ class StrobeAgent {
         send({ type: 'log', message: `Hooks: ${installed} installed, ${failed} failed` });
       } else if (message.action === 'remove') {
         for (const func of message.functions) {
-          this.hookInstaller.removeHook(func.address);
+          this.tracer.removeHook(func.address);
         }
       }
 
       send({
         type: 'hooks_updated',
-        activeCount: this.hookInstaller.activeHookCount()
+        activeCount: this.tracer.activeHookCount()
       });
     } catch (e: any) {
       send({ type: 'log', message: `handleMessage CRASHED: ${e.message}\n${e.stack}` });
       // Still try to send hooks_updated so the worker doesn't hang
       send({
         type: 'hooks_updated',
-        activeCount: this.hookInstaller.activeHookCount()
+        activeCount: this.tracer.activeHookCount()
       });
     }
   }
 
   handleWatches(message: WatchInstruction): void {
     try {
-      this.hookInstaller.updateWatches(message.watches);
+      this.tracer.updateWatches(message.watches);
       if (message.exprWatches) {
-        this.hookInstaller.updateExprWatches(message.exprWatches);
+        this.tracer.updateExprWatches(message.exprWatches);
       }
       send({ type: 'watches_updated', activeCount: message.watches.length });
     } catch (e: any) {
@@ -228,12 +245,12 @@ class StrobeAgent {
     });
   }
 
-  private buildCrashEvent(details: ExceptionDetails): any {
+  private buildCrashEvent(details: ExceptionDetails): CrashEvent {
     const timestamp = this.getTimestampNs();
     const eventId = `${this.sessionId || 'uninitialized'}-crash-${Date.now()}`;
 
     // Build stack trace using Thread.backtrace
-    let backtrace: any[] = [];
+    let backtrace: BacktraceFrame[] = [];
     try {
       const frames = Thread.backtrace(details.context, Backtracer.ACCURATE);
       backtrace = frames.map((addr: NativePointer) => {
@@ -291,7 +308,7 @@ class StrobeAgent {
     }
 
     // Memory access details (for access violations)
-    let memoryAccess: any = undefined;
+    let memoryAccess: CrashEvent['memoryAccess'] = undefined;
     if (details.memory) {
       memoryAccess = {
         operation: details.memory.operation,
@@ -308,11 +325,22 @@ class StrobeAgent {
       pid: Process.id,
       signal: details.type,
       faultAddress: details.address.toString(),
-      registers: registers,
-      backtrace: backtrace,
-      frameMemory: frameMemory,
-      frameBase: frameBase,
-      memoryAccess: memoryAccess,
+      registers,
+      backtrace,
+      frameMemory,
+      frameBase,
+      memoryAccess,
+    };
+  }
+
+  private createOutputEvent(fd: number, text: string): OutputEvent {
+    return {
+      id: this.generateOutputEventId(),
+      sessionId: this.sessionId,
+      timestampNs: this.getTimestampNs(),
+      threadId: Process.getCurrentThreadId(),
+      eventType: fd === 1 ? 'stdout' : 'stderr',
+      text,
     };
   }
 
@@ -346,15 +374,9 @@ class StrobeAgent {
         if (count > 1048576) {
           self.inOutputCapture = true;
           try {
-            const event: OutputEvent = {
-              id: self.generateOutputEventId(),
-              sessionId: self.sessionId,
-              timestampNs: self.getTimestampNs(),
-              threadId: Process.getCurrentThreadId(),
-              eventType: fd === 1 ? 'stdout' : 'stderr',
-              text: `[strobe: write of ${count} bytes truncated (>1MB)]`,
-            };
-            self.bufferOutputEvent(event);
+            self.bufferOutputEvent(
+              self.createOutputEvent(fd, `[strobe: write of ${count} bytes truncated (>1MB)]`)
+            );
           } finally {
             self.inOutputCapture = false;
           }
@@ -380,28 +402,13 @@ class StrobeAgent {
 
           // Check if we just exceeded the limit
           if (self.outputBytesCapture >= self.maxOutputBytes) {
-            const event: OutputEvent = {
-              id: self.generateOutputEventId(),
-              sessionId: self.sessionId,
-              timestampNs: self.getTimestampNs(),
-              threadId: Process.getCurrentThreadId(),
-              eventType: fd === 1 ? 'stdout' : 'stderr',
-              text: text + '\n[strobe: output capture limit reached (50MB), further output truncated]',
-            };
-            self.bufferOutputEvent(event);
+            self.bufferOutputEvent(
+              self.createOutputEvent(fd, text + '\n[strobe: output capture limit reached (50MB), further output truncated]')
+            );
             return;
           }
 
-          const event: OutputEvent = {
-            id: self.generateOutputEventId(),
-            sessionId: self.sessionId,
-            timestampNs: self.getTimestampNs(),
-            threadId: Process.getCurrentThreadId(),
-            eventType: fd === 1 ? 'stdout' : 'stderr',
-            text,
-          };
-
-          self.bufferOutputEvent(event);
+          self.bufferOutputEvent(self.createOutputEvent(fd, text));
         } finally {
           self.inOutputCapture = false;
         }

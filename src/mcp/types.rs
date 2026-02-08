@@ -135,10 +135,27 @@ pub const MAX_WATCHES_PER_SESSION: usize = 32;
 pub const MAX_WATCH_EXPRESSION_LENGTH: usize = 256;
 pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 4;
 
+/// Validate a watch field (expression or variable name) against length and depth limits.
+fn validate_watch_field(value: &str, field_name: &str) -> crate::Result<()> {
+    if value.len() > MAX_WATCH_EXPRESSION_LENGTH {
+        return Err(crate::Error::ValidationError(
+            format!("Watch {} length ({} bytes) exceeds maximum of {} bytes",
+                field_name, value.len(), MAX_WATCH_EXPRESSION_LENGTH)
+        ));
+    }
+    let depth = value.matches("->").count() + value.matches('.').count();
+    if depth > MAX_WATCH_EXPRESSION_DEPTH {
+        return Err(crate::Error::ValidationError(
+            format!("Watch {} depth ({}) exceeds maximum of {}",
+                field_name, depth, MAX_WATCH_EXPRESSION_DEPTH)
+        ));
+    }
+    Ok(())
+}
+
 impl DebugTraceRequest {
     /// Validate request parameters against limits
     pub fn validate(&self) -> crate::Result<()> {
-        // Validate serialization depth
         if let Some(depth) = self.serialization_depth {
             if depth < 1 || depth > 10 {
                 return Err(crate::Error::ValidationError(
@@ -147,53 +164,20 @@ impl DebugTraceRequest {
             }
         }
 
-        // Validate watches
         if let Some(ref watch_update) = self.watches {
             if let Some(ref add_watches) = watch_update.add {
-                // Check watch count
                 if add_watches.len() > MAX_WATCHES_PER_SESSION {
                     return Err(crate::Error::ValidationError(
                         format!("Cannot add {} watches (max {})", add_watches.len(), MAX_WATCHES_PER_SESSION)
                     ));
                 }
 
-                // Validate each watch
                 for watch in add_watches {
-                    // Check expression length and depth
                     if let Some(ref expr) = watch.expr {
-                        if expr.len() > MAX_WATCH_EXPRESSION_LENGTH {
-                            return Err(crate::Error::ValidationError(
-                                format!("Watch expression length ({} bytes) exceeds maximum of {} bytes",
-                                    expr.len(), MAX_WATCH_EXPRESSION_LENGTH)
-                            ));
-                        }
-
-                        // Check expression depth (count -> and . operators)
-                        let depth = expr.matches("->").count() + expr.matches('.').count();
-                        if depth > MAX_WATCH_EXPRESSION_DEPTH {
-                            return Err(crate::Error::ValidationError(
-                                format!("Watch expression depth ({}) exceeds maximum of {}",
-                                    depth, MAX_WATCH_EXPRESSION_DEPTH)
-                            ));
-                        }
+                        validate_watch_field(expr, "expression")?;
                     }
-
-                    // Check variable length and depth
                     if let Some(ref var) = watch.variable {
-                        if var.len() > MAX_WATCH_EXPRESSION_LENGTH {
-                            return Err(crate::Error::ValidationError(
-                                format!("Watch variable length ({} bytes) exceeds maximum of {} bytes",
-                                    var.len(), MAX_WATCH_EXPRESSION_LENGTH)
-                            ));
-                        }
-
-                        let depth = var.matches("->").count() + var.matches('.').count();
-                        if depth > MAX_WATCH_EXPRESSION_DEPTH {
-                            return Err(crate::Error::ValidationError(
-                                format!("Watch variable depth ({}) exceeds maximum of {}",
-                                    depth, MAX_WATCH_EXPRESSION_DEPTH)
-                            ));
-                        }
+                        validate_watch_field(var, "variable")?;
                     }
                 }
             }
@@ -436,6 +420,7 @@ pub enum ErrorCode {
     WatchFailed,
     TestRunNotFound,
     ValidationError,
+    InternalError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,7 +442,7 @@ impl From<crate::Error> for McpError {
             crate::Error::WatchFailed(_) => ErrorCode::WatchFailed,
             crate::Error::ValidationError(_) => ErrorCode::ValidationError,
             crate::Error::TestRunNotFound(_) => ErrorCode::TestRunNotFound,
-            _ => ErrorCode::FridaAttachFailed, // Generic fallback
+            _ => ErrorCode::InternalError,
         };
 
         Self {

@@ -19,20 +19,6 @@ impl HookManager {
         }
     }
 
-    pub fn expand_patterns(&self, patterns: &[String], project_root: &str) -> Vec<String> {
-        patterns
-            .iter()
-            .map(|p| {
-                if p == "@usercode" {
-                    // Expand to match all functions in project root
-                    format!("{}/**", project_root)
-                } else {
-                    p.clone()
-                }
-            })
-            .collect()
-    }
-
     pub fn add_patterns(&mut self, patterns: &[String]) {
         for p in patterns {
             self.active_patterns.insert(p.clone());

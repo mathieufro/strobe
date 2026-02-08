@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod cargo_adapter;
 pub mod catch2_adapter;
 pub mod generic_adapter;
+pub mod stacks;
 pub mod stuck_detector;
 pub mod output;
 
@@ -186,14 +187,11 @@ impl TestRunner {
         // Resolve program to absolute path (Frida's Device.spawn doesn't do PATH lookup)
         let program = resolve_program(&test_cmd.program);
 
-        let mut combined_env = test_cmd.env.clone();
+        // Inherit parent environment, then overlay test-specific and user-provided vars.
+        // envp() replaces the environment entirely, so we must include everything.
+        let mut combined_env: HashMap<String, String> = std::env::vars().collect();
+        combined_env.extend(test_cmd.env.clone());
         combined_env.extend(env.clone());
-        // Ensure PATH is inherited so cargo can find cc, rustc, etc.
-        if !combined_env.contains_key("PATH") {
-            if let Ok(path) = std::env::var("PATH") {
-                combined_env.insert("PATH".to_string(), path);
-            }
-        }
 
         // Spawn via Frida
         let pid = session_manager.spawn_with_frida(
@@ -249,11 +247,7 @@ impl TestRunner {
         let start = std::time::Instant::now();
 
         loop {
-            let alive = {
-                let r = unsafe { libc::kill(pid as i32, 0) };
-                r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-            };
-            if !alive {
+            if !stacks::is_process_alive(pid) {
                 break;
             }
 
@@ -298,22 +292,8 @@ impl TestRunner {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Query ALL stdout/stderr from DB
-        let stdout_events = session_manager.db().query_events(session_id, |q| {
-            q.event_type(crate::db::EventType::Stdout).limit_uncapped(50000)
-        }).unwrap_or_default();
-
-        let stderr_events = session_manager.db().query_events(session_id, |q| {
-            q.event_type(crate::db::EventType::Stderr).limit_uncapped(50000)
-        }).unwrap_or_default();
-
-        let stdout_buf: String = stdout_events.iter()
-            .filter_map(|e| e.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
-        let stderr_buf: String = stderr_events.iter()
-            .filter_map(|e| e.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
+        let stdout_buf = collect_output(session_manager.db(), session_id, crate::db::EventType::Stdout);
+        let stderr_buf = collect_output(session_manager.db(), session_id, crate::db::EventType::Stderr);
 
         // Get exit code: try waitpid for real exit code, fall back to test results
         let exit_code = {
@@ -367,6 +347,18 @@ fn resolve_program(program: &str) -> String {
         }
     }
     program.to_string()
+}
+
+/// Collect all output events of a given type from the database into a single string.
+fn collect_output(db: &crate::db::Database, session_id: &str, event_type: crate::db::EventType) -> String {
+    db.query_events(session_id, |q| {
+        q.event_type(event_type).limit_uncapped(50000)
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|e| e.text)
+    .collect::<Vec<_>>()
+    .join("")
 }
 
 /// Combined result from test run, used by MCP tool handler.

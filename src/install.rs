@@ -21,9 +21,7 @@ fn detect_agent() -> Option<AgentSystem> {
 
 /// Get the path to the strobe binary.
 fn strobe_binary_path() -> Result<String> {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| crate::Error::Io(e))
+    Ok(std::env::current_exe()?.to_string_lossy().to_string())
 }
 
 /// Install Strobe MCP config + TDD skill for the detected agent.

@@ -1,7 +1,6 @@
 use gimli::{self, RunTimeEndian, EndianSlice, SectionId};
 use object::{Object, ObjectSection, ObjectSegment};
 use memmap2::Mmap;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -10,6 +9,61 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 use crate::symbols::demangle_symbol;
 use super::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation};
+
+/// Parsed DWARF sections with their associated endianness.
+/// Owns all section data (copied from mmap) so there are no lifetime constraints.
+struct LoadedDwarf {
+    sections: gimli::DwarfSections<Vec<u8>>,
+    endian: RunTimeEndian,
+    has_debug_info: bool,
+}
+
+/// Load DWARF sections from a binary file. Section data is copied into owned `Vec<u8>`
+/// so the returned value is self-contained with no lifetime dependencies on the mmap.
+fn load_dwarf_sections(path: &Path) -> Result<LoadedDwarf> {
+    let file = File::open(path)
+        .map_err(|e| Error::Frida(format!("Failed to open binary: {}", e)))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| Error::Frida(format!("Failed to mmap binary: {}", e)))?;
+    let object = object::File::parse(&*mmap)
+        .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
+
+    let has_debug_info = object.section_by_name(".debug_info").is_some()
+        || object.section_by_name("__debug_info").is_some();
+
+    let endian = if object.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+
+    let load_section = |id: SectionId| -> std::result::Result<Vec<u8>, gimli::Error> {
+        let name = id.name();
+        let data = object
+            .section_by_name(name)
+            .or_else(|| {
+                let macho_name = name.replace(".debug_", "__debug_");
+                object.section_by_name(&macho_name)
+            })
+            .and_then(|section| section.data().ok())
+            .unwrap_or(&[]);
+        Ok(data.to_vec())
+    };
+
+    let sections = gimli::DwarfSections::load(&load_section)
+        .map_err(|e| Error::Frida(format!("Failed to load DWARF: {}", e)))?;
+
+    Ok(LoadedDwarf { sections, endian, has_debug_info })
+}
+
+impl LoadedDwarf {
+    /// Borrow the owned sections as `EndianSlice` references for DWARF traversal.
+    fn borrow(&self) -> gimli::Dwarf<EndianSlice<'_, RunTimeEndian>> {
+        self.sections.borrow(|section| {
+            EndianSlice::new(section, self.endian)
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct StructMember {
@@ -101,42 +155,13 @@ impl DwarfParser {
     }
 
     fn parse_file(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let object = object::File::parse(&*mmap)
-            .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
+        let loaded = load_dwarf_sections(path)?;
 
-        // Check if debug info exists
-        if object.section_by_name(".debug_info").is_none()
-            && object.section_by_name("__debug_info").is_none() {
+        if !loaded.has_debug_info {
             return Err(Error::NoDebugSymbols);
         }
 
-        let endian = if object.is_little_endian() {
-            RunTimeEndian::Little
-        } else {
-            RunTimeEndian::Big
-        };
-
-        let load_section = |id: SectionId| -> std::result::Result<Cow<[u8]>, gimli::Error> {
-            let name = id.name();
-            let data = object
-                .section_by_name(name)
-                .or_else(|| {
-                    let macho_name = name.replace(".debug_", "__debug_");
-                    object.section_by_name(&macho_name)
-                })
-                .and_then(|section| section.data().ok())
-                .unwrap_or(&[]);
-            Ok(Cow::Borrowed(data))
-        };
-
-        let dwarf_cow = gimli::DwarfSections::load(&load_section)
-            .map_err(|e| Error::Frida(format!("Failed to load DWARF: {}", e)))?;
-
-        let dwarf = dwarf_cow.borrow(|section| {
-            EndianSlice::new(section.as_ref(), endian)
-        });
+        let dwarf = loaded.borrow();
 
         // Collect all compilation unit headers for parallel processing
         let mut headers = Vec::new();
@@ -156,7 +181,7 @@ impl DwarfParser {
                 };
                 let mut functions = Vec::new();
                 let mut variables = Vec::new();
-                let mut lazy_infos: Vec<(String, usize, usize)> = Vec::new();
+                let mut lazy_infos: Vec<(String, (usize, usize))> = Vec::new();
 
                 let mut entries = unit.entries();
                 let mut in_subprogram = false;
@@ -185,7 +210,7 @@ impl DwarfParser {
                                     if let Some(gimli::AttributeValue::UnitRef(type_off)) =
                                         entry.attr_value(gimli::DW_AT_type).ok().flatten()
                                     {
-                                        lazy_infos.push((var.name.clone(), cu_offset, type_off.0));
+                                        lazy_infos.push((var.name.clone(), (cu_offset, type_off.0)));
                                     }
                                 }
                                 variables.push(var);
@@ -206,9 +231,7 @@ impl DwarfParser {
         for (funcs, vars, infos) in results {
             functions.extend(funcs);
             variables.extend(vars);
-            for (name, cu_off, type_off) in infos {
-                lazy_struct_info.insert(name, (cu_off, type_off));
-            }
+            lazy_struct_info.extend(infos);
         }
 
         // Build indexes
@@ -255,30 +278,13 @@ impl DwarfParser {
     ) -> Result<Option<FunctionInfo>> {
         // Get function name: prefer DW_AT_linkage_name (fully qualified mangled name) over
         // DW_AT_name (short name). Handles DWARF v4 and v5 string forms.
-        let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name)
-            .ok()
-            .flatten()
-            .and_then(|v| {
-                let s = dwarf.attr_string(unit, v).ok()?;
-                let cow = s.to_string_lossy().ok()?;
-                Some(cow.to_string())
-            });
+        let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
+            .and_then(|v| dwarf.attr_string(unit, v).ok())
+            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
 
-        let short_name = match entry.attr_value(gimli::DW_AT_name)
-            .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
-        {
-            Some(attr_val) => {
-                match dwarf.attr_string(unit, attr_val) {
-                    Ok(s) => Some(
-                        s.to_string_lossy()
-                            .map_err(|e| Error::Frida(format!("UTF-8 error: {}", e)))?
-                            .to_string()
-                    ),
-                    Err(_) => None,
-                }
-            }
-            _ => None,
-        };
+        let short_name = entry.attr_value(gimli::DW_AT_name).ok().flatten()
+            .and_then(|v| dwarf.attr_string(unit, v).ok())
+            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
 
         // Use linkage name for demangling (gives qualified names), fall back to short name
         let name = match linkage_name.or(short_name) {
@@ -287,13 +293,9 @@ impl DwarfParser {
         };
 
         // Get low_pc (handles DWARF v4 Addr and DWARF v5 DebugAddrIndex)
-        let low_pc = match entry.attr_value(gimli::DW_AT_low_pc)
-            .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
-        {
+        let low_pc = match entry.attr_value(gimli::DW_AT_low_pc).ok().flatten() {
             Some(attr_val) => {
-                match dwarf.attr_address(unit, attr_val)
-                    .map_err(|e| Error::Frida(format!("DWARF address error: {}", e)))?
-                {
+                match dwarf.attr_address(unit, attr_val).ok().flatten() {
                     Some(addr) => addr,
                     None => return Ok(None),
                 }
@@ -302,9 +304,7 @@ impl DwarfParser {
         };
 
         // Get high_pc (can be absolute address, indexed address, or offset from low_pc)
-        let high_pc = match entry.attr_value(gimli::DW_AT_high_pc)
-            .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
-        {
+        let high_pc = match entry.attr_value(gimli::DW_AT_high_pc).ok().flatten() {
             Some(gimli::AttributeValue::Udata(offset)) => low_pc + offset,
             Some(attr_val) => {
                 match dwarf.attr_address(unit, attr_val) {
@@ -315,43 +315,10 @@ impl DwarfParser {
             _ => low_pc + 1, // Minimal range if not specified
         };
 
-        // Get source file
-        let source_file = match entry.attr_value(gimli::DW_AT_decl_file)
-            .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
-        {
-            Some(gimli::AttributeValue::FileIndex(index)) => {
-                if let Some(line_program) = &unit.line_program {
-                    let header = line_program.header();
-                    if let Some(file) = header.file(index) {
-                        let mut path = String::new();
-                        if let Some(dir) = file.directory(header) {
-                            if let Ok(s) = dwarf.attr_string(unit, dir) {
-                                path.push_str(&s.to_string_lossy().unwrap_or_default());
-                                path.push('/');
-                            }
-                        }
-                        if let Ok(s) = dwarf.attr_string(unit, file.path_name()) {
-                            path.push_str(&s.to_string_lossy().unwrap_or_default());
-                        }
-                        if !path.is_empty() {
-                            Some(path)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+        // Get source file and line number
+        let source_file = Self::parse_source_file(dwarf, unit, entry);
 
-        // Get line number
-        let line_number = match entry.attr_value(gimli::DW_AT_decl_line)
-            .map_err(|e| Error::Frida(format!("DWARF error: {}", e)))?
-        {
+        let line_number = match entry.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
             Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
             _ => None,
         };
@@ -464,11 +431,39 @@ impl DwarfParser {
     ) -> Option<(u8, TypeKind, Option<String>)> {
         if depth > 10 { return None; } // prevent infinite loops
 
-        let offset = match type_attr {
-            gimli::AttributeValue::UnitRef(o) => o,
-            _ => return None,
-        };
+        match type_attr {
+            gimli::AttributeValue::UnitRef(offset) => {
+                Self::resolve_type_in_unit(dwarf, unit, offset, depth)
+            }
+            gimli::AttributeValue::DebugInfoRef(di_offset) => {
+                // DWARF v5: section-relative type reference (DW_FORM_ref_addr).
+                // May cross CU boundaries. Find the containing unit.
+                let mut headers = dwarf.debug_info.units();
+                while let Ok(Some(header)) = headers.next() {
+                    let cu_base = match header.offset() {
+                        gimli::UnitSectionOffset::DebugInfoOffset(o) => o.0,
+                        gimli::UnitSectionOffset::DebugTypesOffset(o) => o.0,
+                    };
+                    if di_offset.0 < cu_base { continue; }
+                    let unit_offset = gimli::UnitOffset(di_offset.0 - cu_base);
+                    if let Ok(target_unit) = dwarf.unit(header) {
+                        if let Some(result) = Self::resolve_type_in_unit(dwarf, &target_unit, unit_offset, depth) {
+                            return Some(result);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
 
+    fn resolve_type_in_unit<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        offset: gimli::UnitOffset<R::Offset>,
+        depth: usize,
+    ) -> Option<(u8, TypeKind, Option<String>)> {
         let mut tree = unit.entries_tree(Some(offset)).ok()?;
         let root = tree.root().ok()?;
         let type_entry = root.entry();
@@ -527,15 +522,7 @@ impl DwarfParser {
                     member_count += 1;
                     if member_count > 1 { break; } // more than one member, not a newtype
                     // Check offset is 0
-                    let offset_val = child.entry()
-                        .attr_value(gimli::DW_AT_data_member_location).ok().flatten()
-                        .and_then(|v| match v {
-                            gimli::AttributeValue::Udata(n) => Some(n),
-                            gimli::AttributeValue::Sdata(n) if n >= 0 => Some(n as u64),
-                            _ => None,
-                        })
-                        .unwrap_or(0);
-                    if offset_val == 0 {
+                    if Self::parse_member_offset(child.entry()) == 0 {
                         member_type_attr = child.entry()
                             .attr_value(gimli::DW_AT_type).ok().flatten();
                     }
@@ -549,6 +536,21 @@ impl DwarfParser {
             }
             _ => None,
         }
+    }
+
+    /// Extract the byte offset of a struct member from DW_AT_data_member_location.
+    fn parse_member_offset<R: gimli::Reader>(
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> u64 {
+        entry.attr_value(gimli::DW_AT_data_member_location)
+            .ok()
+            .flatten()
+            .and_then(|v| match v {
+                gimli::AttributeValue::Udata(n) => Some(n),
+                gimli::AttributeValue::Sdata(n) if n >= 0 => Some(n as u64),
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 
     fn parse_source_file<R: gimli::Reader>(
@@ -619,15 +621,7 @@ impl DwarfParser {
                         None => continue,
                     };
 
-                    // Get member offset (DW_AT_data_member_location)
-                    let member_offset = child_entry.attr_value(gimli::DW_AT_data_member_location)
-                        .ok().flatten()
-                        .and_then(|v| match v {
-                            gimli::AttributeValue::Udata(n) => Some(n),
-                            gimli::AttributeValue::Sdata(n) if n >= 0 => Some(n as u64),
-                            _ => None,
-                        })
-                        .unwrap_or(0);
+                    let member_offset = Self::parse_member_offset(child_entry);
 
                     // Get member type info
                     let member_type_attr = child_entry.attr_value(gimli::DW_AT_type).ok().flatten();
@@ -695,25 +689,8 @@ impl DwarfParser {
         let binary_path = self.binary_path.as_ref()
             .ok_or_else(|| Error::Frida("No binary path for lazy struct member resolution".into()))?;
 
-        let file = File::open(binary_path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let object = object::File::parse(&*mmap)
-            .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
-
-        let endian = if object.is_little_endian() { RunTimeEndian::Little } else { RunTimeEndian::Big };
-
-        let load_section = |id: SectionId| -> std::result::Result<Cow<[u8]>, gimli::Error> {
-            let name = id.name();
-            let data = object.section_by_name(name)
-                .or_else(|| object.section_by_name(&name.replace(".debug_", "__debug_")))
-                .and_then(|section| section.data().ok())
-                .unwrap_or(&[]);
-            Ok(Cow::Borrowed(data))
-        };
-
-        let dwarf_cow = gimli::DwarfSections::load(&load_section)
-            .map_err(|e| Error::Frida(format!("DWARF load: {}", e)))?;
-        let dwarf = dwarf_cow.borrow(|s| EndianSlice::new(s.as_ref(), endian));
+        let loaded = load_dwarf_sections(binary_path)?;
+        let dwarf = loaded.borrow();
 
         // Jump directly to the right CU using stored offset
         let header = dwarf.debug_info.header_from_offset(gimli::DebugInfoOffset(cu_offset))
@@ -886,30 +863,8 @@ impl DwarfParser {
         let binary_path = self.binary_path.as_ref()
             .ok_or_else(|| Error::Frida("No binary path for DWARF re-parse".into()))?;
 
-        let file = File::open(binary_path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let object = object::File::parse(&*mmap)
-            .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
-
-        let endian = if object.is_little_endian() {
-            RunTimeEndian::Little
-        } else {
-            RunTimeEndian::Big
-        };
-
-        let load_section = |id: SectionId| -> std::result::Result<Cow<[u8]>, gimli::Error> {
-            let name = id.name();
-            let data = object.section_by_name(name)
-                .or_else(|| object.section_by_name(&name.replace(".debug_", "__debug_")))
-                .and_then(|section| section.data().ok())
-                .unwrap_or(&[]);
-            Ok(Cow::Borrowed(data))
-        };
-
-        let dwarf_cow = gimli::Dwarf::load(&load_section)
-            .map_err(|e| Error::Frida(format!("DWARF load: {}", e)))?;
-        #[allow(deprecated)]
-        let dwarf = dwarf_cow.borrow(|s| EndianSlice::new(s.as_ref(), endian));
+        let loaded = load_dwarf_sections(binary_path)?;
+        let dwarf = loaded.borrow();
 
         let mut locals = Vec::new();
 
@@ -1015,15 +970,13 @@ impl DwarfParser {
 }
 
 /// Glob-style pattern matcher for function names
-pub struct PatternMatcher {
-    pattern: String,
+pub struct PatternMatcher<'a> {
+    pattern: &'a str,
 }
 
-impl PatternMatcher {
-    pub fn new(pattern: &str) -> Self {
-        Self {
-            pattern: pattern.to_string(),
-        }
+impl<'a> PatternMatcher<'a> {
+    pub fn new(pattern: &'a str) -> Self {
+        Self { pattern }
     }
 
     pub fn matches(&self, name: &str) -> bool {
@@ -1035,7 +988,7 @@ impl PatternMatcher {
             Some(idx) => &name[..idx],
             None => name,
         };
-        Self::glob_match(&self.pattern, name)
+        Self::glob_match(self.pattern, name)
     }
 
     fn glob_match(pattern: &str, text: &str) -> bool {

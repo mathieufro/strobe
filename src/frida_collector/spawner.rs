@@ -10,6 +10,20 @@ use crate::Result;
 use super::{HookManager, HookMode};
 use libc;
 
+/// Check a GLib error pointer. Returns Ok(()) if null, or the error message if set.
+/// Frees the GError after extracting the message.
+unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(), String> {
+    if error.is_null() {
+        return Ok(());
+    }
+    let msg = CStr::from_ptr((*error).message)
+        .to_str()
+        .unwrap_or("unknown error")
+        .to_string();
+    frida_sys::g_error_free(error);
+    Err(msg)
+}
+
 // ---------------------------------------------------------------------------
 // Raw frida-sys wrappers
 //
@@ -108,14 +122,7 @@ unsafe fn create_script_raw(
     // Clean up options
     frida_sys::frida_unref(opt as *mut c_void);
 
-    if !error.is_null() {
-        let err_msg = CStr::from_ptr((*error).message)
-            .to_str()
-            .unwrap_or("unknown error")
-            .to_string();
-        frida_sys::g_error_free(error);
-        return Err(err_msg);
-    }
+    check_gerror(error)?;
 
     if script_ptr.is_null() {
         return Err("script_ptr is null".to_string());
@@ -132,10 +139,11 @@ unsafe extern "C" fn destroy_handler(data: *mut c_void, _closure: *mut frida_sys
 }
 
 /// Register message handler on a raw script pointer.
+/// The handler is freed by `destroy_handler` when the signal is disconnected.
 unsafe fn register_handler_raw(
     script_ptr: *mut frida_sys::_FridaScript,
     handler: AgentMessageHandler,
-) -> *mut AgentMessageHandler {
+) {
     let handler_ptr = Box::into_raw(Box::new(handler));
     let signal_name = CString::new("message").unwrap();
 
@@ -152,8 +160,6 @@ unsafe fn register_handler_raw(
         Some(destroy_handler),
         0,
     );
-
-    handler_ptr
 }
 
 /// Load a raw script.
@@ -162,16 +168,7 @@ unsafe fn load_script_raw(
 ) -> std::result::Result<(), String> {
     let mut error: *mut frida_sys::GError = std::ptr::null_mut();
     frida_sys::frida_script_load_sync(script_ptr, std::ptr::null_mut(), &mut error);
-
-    if !error.is_null() {
-        let err_msg = CStr::from_ptr((*error).message)
-            .to_str()
-            .unwrap_or("unknown error")
-            .to_string();
-        frida_sys::g_error_free(error);
-        return Err(err_msg);
-    }
-    Ok(())
+    check_gerror(error)
 }
 
 /// Extract raw `_FridaDevice` pointer from `frida::Device`.
@@ -243,26 +240,10 @@ unsafe extern "C" fn raw_on_output(
         id: format!("{}-output-{}", ctx.session_id, counter),
         session_id: ctx.session_id.clone(),
         timestamp_ns: now_ns,
-        thread_id: 0,
-        thread_name: None,
         event_type,
-        function_name: String::new(),
-        function_name_raw: None,
-        source_file: None,
-        line_number: None,
-        duration_ns: None,
-        parent_event_id: None,
-        arguments: None,
-        return_value: None,
         text: Some(text),
-        sampled: None,
-        watch_values: None,
         pid: Some(ctx.pid),
-        signal: None,
-        fault_address: None,
-        registers: None,
-        backtrace: None,
-        locals: None,
+        ..Event::default()
     };
 
     let _ = ctx.event_tx.try_send(event);
@@ -284,6 +265,17 @@ const AGENT_CODE: &str = include_str!("../../agent/dist/agent.js");
 /// Channel for the worker to wait on agent responses (e.g., hooks_updated).
 /// The message handler sends on this when it receives a hooks_updated message.
 type HooksReadySignal = Arc<Mutex<Option<std::sync::mpsc::Sender<u64>>>>;
+
+/// Signal the worker that hooks or watches are ready.
+fn signal_ready(hooks_ready: &HooksReadySignal, label: &str, session_id: &str, payload: &serde_json::Value) {
+    let count = payload.get("activeCount").and_then(|v| v.as_u64()).unwrap_or(0);
+    tracing::info!("{} for session {}: {} active", label, session_id, count);
+    if let Ok(mut guard) = hooks_ready.lock() {
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(count);
+        }
+    }
+}
 
 /// Message handler passed as user_data to the raw GLib signal callback.
 /// No longer implements `ScriptHandler` — messages are parsed directly in `raw_on_message`.
@@ -311,26 +303,10 @@ impl AgentMessageHandler {
                 tracing::info!("Agent initialized for session {}", self.session_id);
             }
             "hooks_updated" => {
-                let count = payload.get("activeCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                tracing::info!("Hooks updated for session {}: {} active", self.session_id, count);
-
-                // Signal the worker that hooks are installed
-                if let Ok(mut guard) = self.hooks_ready.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(count);
-                    }
-                }
+                signal_ready(&self.hooks_ready, "Hooks updated", &self.session_id, payload);
             }
             "watches_updated" => {
-                let count = payload.get("activeCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                tracing::info!("Watches updated for session {}: {} active", self.session_id, count);
-
-                // Signal the worker that watches are installed (reuse hooks_ready signal)
-                if let Ok(mut guard) = self.hooks_ready.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(count);
-                    }
-                }
+                signal_ready(&self.hooks_ready, "Watches updated", &self.session_id, payload);
             }
             "log" => {
                 if let Some(msg) = payload.get("message").and_then(|v| v.as_str()) {
@@ -540,10 +516,8 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
             std::ptr::null_mut(),
             &mut error,
         );
-        if !error.is_null() {
-            let err_msg = CStr::from_ptr((*error).message).to_str().unwrap_or("?");
-            tracing::warn!("Failed to enable spawn gating: {}", err_msg);
-            frida_sys::g_error_free(error);
+        if let Err(msg) = check_gerror(error) {
+            tracing::warn!("Failed to enable spawn gating: {}", msg);
         } else {
             tracing::info!("Spawn gating enabled — will intercept child processes");
 
@@ -663,7 +637,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         hooks_ready: hooks_ready.clone(),
                     };
 
-                    let _handler_ptr = unsafe { register_handler_raw(script_ptr, handler) };
+                    unsafe { register_handler_raw(script_ptr, handler) };
 
                     unsafe {
                         load_script_raw(script_ptr)
@@ -772,9 +746,7 @@ fn session_worker(
                         std::ptr::null_mut(),
                         &mut error,
                     );
-                    if !error.is_null() {
-                        frida_sys::g_error_free(error);
-                    }
+                    let _ = check_gerror(error);
                     frida_sys::frida_unref(raw_ptr as *mut c_void);
                 }
                 break;
@@ -1005,7 +977,7 @@ fn handle_child_spawn(
                         hooks_ready: hooks_ready.clone(),
                     };
                     unsafe {
-                        let _ = register_handler_raw(script_ptr, handler);
+                        register_handler_raw(script_ptr, handler);
                         if let Err(e) = load_script_raw(script_ptr) {
                             tracing::error!("Failed to load script in child {}: {}", child_pid, e);
                             let _ = device.resume(child_pid);
@@ -1058,16 +1030,7 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             session_id: session_id.to_string(),
             timestamp_ns: json.get("timestampNs")?.as_i64()?,
             thread_id: json.get("threadId")?.as_i64()?,
-            thread_name: None,
-            parent_event_id: None,
             event_type,
-            function_name: String::new(),
-            function_name_raw: None,
-            source_file: None,
-            line_number: None,
-            arguments: None,
-            return_value: None,
-            duration_ns: None,
             // Store frameMemory/frameBase in text as JSON for later local variable resolution
             text: {
                 let fm = json.get("frameMemory");
@@ -1081,14 +1044,12 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
                     None
                 }
             },
-            sampled: None,
-            watch_values: None,
             pid,
             signal: json.get("signal").and_then(|v| v.as_str()).map(|s| s.to_string()),
             fault_address: json.get("faultAddress").and_then(|v| v.as_str()).map(|s| s.to_string()),
             registers: json.get("registers").cloned(),
             backtrace: json.get("backtrace").cloned(),
-            locals: None,
+            ..Event::default()
         });
     }
 
@@ -1099,24 +1060,10 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             timestamp_ns: json.get("timestampNs")?.as_i64()?,
             thread_id: json.get("threadId")?.as_i64()?,
             thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            parent_event_id: None,
             event_type,
-            function_name: String::new(),
-            function_name_raw: None,
-            source_file: None,
-            line_number: None,
-            arguments: None,
-            return_value: None,
-            duration_ns: None,
             text: json.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            sampled: None,
-            watch_values: None,
             pid,
-            signal: None,
-            fault_address: None,
-            registers: None,
-            backtrace: None,
-            locals: None,
+            ..Event::default()
         });
     }
 
@@ -1135,15 +1082,10 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         arguments: json.get("arguments").cloned(),
         return_value: json.get("returnValue").cloned(),
         duration_ns: json.get("durationNs").and_then(|v| v.as_i64()),
-        text: None,
         sampled: json.get("sampled").and_then(|v| v.as_bool()),
         watch_values: json.get("watchValues").cloned(),
         pid,
-        signal: None,
-        fault_address: None,
-        registers: None,
-        backtrace: None,
-        locals: None,
+        ..Event::default()
     })
 }
 
@@ -1289,27 +1231,22 @@ impl FridaSpawner {
         let image_base = session.image_base;
         let mut total_hooks = 0u32;
 
-        // Send full-mode chunks (pass serialization_depth only on first chunk)
+        // Send chunks for both modes (serialization_depth only on the first chunk overall)
         let mut depth_sent = false;
-        for chunk in full_funcs.chunks(CHUNK_SIZE) {
-            let depth = if !depth_sent { depth_sent = true; serialization_depth } else { None };
-            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Full, depth).await {
-                Ok(count) => total_hooks += count,
-                Err(e) => {
-                    warnings.push(format!("Hook installation error: {}", e));
-                    break;
-                }
-            }
-        }
+        let batches: [(Vec<FunctionTarget>, HookMode); 2] = [
+            (full_funcs, HookMode::Full),
+            (light_funcs, HookMode::Light),
+        ];
 
-        // Send light-mode chunks
-        for chunk in light_funcs.chunks(CHUNK_SIZE) {
-            let depth = if !depth_sent { depth_sent = true; serialization_depth } else { None };
-            match self.send_add_chunk(session_id, chunk.to_vec(), image_base, HookMode::Light, depth).await {
-                Ok(count) => total_hooks += count,
-                Err(e) => {
-                    warnings.push(format!("Hook installation error: {}", e));
-                    break;
+        'outer: for (funcs, mode) in &batches {
+            for chunk in funcs.chunks(CHUNK_SIZE) {
+                let depth = if !depth_sent { depth_sent = true; serialization_depth } else { None };
+                match self.send_add_chunk(session_id, chunk.to_vec(), image_base, *mode, depth).await {
+                    Ok(count) => total_hooks += count,
+                    Err(e) => {
+                        warnings.push(format!("Hook installation error: {}", e));
+                        break 'outer;
+                    }
                 }
             }
         }

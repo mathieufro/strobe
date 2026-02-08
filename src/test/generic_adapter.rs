@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 use super::adapter::*;
-use super::cargo_adapter::capture_native_stacks;
 
 static FAIL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
@@ -96,9 +95,6 @@ impl TestAdapter for GenericAdapter {
         vec![]
     }
 
-    fn capture_stacks(&self, pid: u32) -> Vec<ThreadStack> {
-        capture_native_stacks(pid)
-    }
 }
 
 #[cfg(test)]

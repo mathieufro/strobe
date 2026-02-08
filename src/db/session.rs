@@ -44,6 +44,37 @@ pub struct Session {
     pub size_bytes: Option<i64>,
 }
 
+impl Session {
+    /// Parse a Session from a row with the standard 9-column SELECT order.
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        let retained_at: Option<i64> = row.get(7).ok().flatten();
+        Ok(Self {
+            id: row.get(0)?,
+            binary_path: row.get(1)?,
+            project_root: row.get(2)?,
+            pid: row.get(3)?,
+            started_at: row.get(4)?,
+            ended_at: row.get(5)?,
+            status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
+            retained: retained_at.is_some(),
+            retained_at,
+            size_bytes: row.get(8).ok().flatten(),
+        })
+    }
+}
+
+/// Convert QueryReturnedNoRows into Ok(None).
+fn optional_query<T>(result: rusqlite::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+const SESSION_SELECT: &str =
+    "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes";
+
 impl Database {
     /// Mark all sessions with status='running' as 'stopped'.
     /// Called on daemon startup to clean up stale sessions from previous runs.
@@ -93,84 +124,28 @@ impl Database {
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
-            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
-             FROM sessions WHERE id = ?"
+            &format!("{} FROM sessions WHERE id = ?", SESSION_SELECT)
         )?;
-
-        let session = stmt.query_row(params![id], |row| {
-            Ok(Session {
-                id: row.get(0)?,
-                binary_path: row.get(1)?,
-                project_root: row.get(2)?,
-                pid: row.get(3)?,
-                started_at: row.get(4)?,
-                ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
-                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
-                retained_at: row.get(7).ok().flatten(),
-                size_bytes: row.get(8).ok().flatten(),
-            })
-        });
-
-        match session {
-            Ok(s) => Ok(Some(s)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        optional_query(stmt.query_row(params![id], Session::from_row))
     }
 
     pub fn get_running_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
-            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
-             FROM sessions WHERE status = 'running'"
+            &format!("{} FROM sessions WHERE status = 'running'", SESSION_SELECT)
         )?;
 
-        let sessions = stmt.query_map([], |row| {
-            Ok(Session {
-                id: row.get(0)?,
-                binary_path: row.get(1)?,
-                project_root: row.get(2)?,
-                pid: row.get(3)?,
-                started_at: row.get(4)?,
-                ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
-                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
-                retained_at: row.get(7).ok().flatten(),
-                size_bytes: row.get(8).ok().flatten(),
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
-
+        let sessions = stmt.query_map([], Session::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(sessions)
     }
 
     pub fn get_session_by_binary(&self, binary_path: &str) -> Result<Option<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
-            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
-             FROM sessions WHERE binary_path = ? AND status = 'running'"
+            &format!("{} FROM sessions WHERE binary_path = ? AND status = 'running'", SESSION_SELECT)
         )?;
-
-        let session = stmt.query_row(params![binary_path], |row| {
-            Ok(Session {
-                id: row.get(0)?,
-                binary_path: row.get(1)?,
-                project_root: row.get(2)?,
-                pid: row.get(3)?,
-                started_at: row.get(4)?,
-                ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
-                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
-                retained_at: row.get(7).ok().flatten(),
-                size_bytes: row.get(8).ok().flatten(),
-            })
-        });
-
-        match session {
-            Ok(s) => Ok(Some(s)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        optional_query(stmt.query_row(params![binary_path], Session::from_row))
     }
 
     pub fn update_session_status(&self, id: &str, new_status: SessionStatus) -> Result<()> {
@@ -209,31 +184,27 @@ impl Database {
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.connection();
-
-        // Delete events first (foreign key)
         conn.execute("DELETE FROM events WHERE session_id = ?", params![id])?;
         conn.execute("DELETE FROM sessions WHERE id = ?", params![id])?;
-
         Ok(())
-    }
-
-    pub fn count_session_events(&self, session_id: &str) -> Result<u64> {
-        let conn = self.connection();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE session_id = ?",
-            params![session_id],
-            |row| row.get(0),
-        )?;
-        Ok(count as u64)
     }
 
     pub fn mark_session_retained(&self, id: &str) -> Result<()> {
         let conn = self.connection();
         let retained_at = chrono::Utc::now().timestamp();
 
-        // Calculate session size
+        // Calculate session size (includes all text/JSON columns for accuracy)
         let size: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(LENGTH(id) + LENGTH(session_id) + LENGTH(COALESCE(function_name,'')) + LENGTH(COALESCE(arguments,'')) + LENGTH(COALESCE(return_value,'')) + LENGTH(COALESCE(text,'')) + 100), 0) FROM events WHERE session_id = ?",
+            "SELECT COALESCE(SUM(
+                LENGTH(id) + LENGTH(session_id) + LENGTH(COALESCE(function_name,''))
+                + LENGTH(COALESCE(function_name_raw,'')) + LENGTH(COALESCE(source_file,''))
+                + LENGTH(COALESCE(arguments,'')) + LENGTH(COALESCE(return_value,''))
+                + LENGTH(COALESCE(text,'')) + LENGTH(COALESCE(thread_name,''))
+                + LENGTH(COALESCE(watch_values,'')) + LENGTH(COALESCE(signal,''))
+                + LENGTH(COALESCE(fault_address,'')) + LENGTH(COALESCE(registers,''))
+                + LENGTH(COALESCE(backtrace,'')) + LENGTH(COALESCE(locals,''))
+                + 100
+            ), 0) FROM events WHERE session_id = ?",
             params![id],
             |row| row.get(0),
         )?;
@@ -249,25 +220,11 @@ impl Database {
     pub fn list_retained_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
-            "SELECT id, binary_path, project_root, pid, started_at, ended_at, status, retained_at, size_bytes
-             FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at DESC"
+            &format!("{} FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at DESC", SESSION_SELECT)
         )?;
 
-        let sessions = stmt.query_map([], |row| {
-            Ok(Session {
-                id: row.get(0)?,
-                binary_path: row.get(1)?,
-                project_root: row.get(2)?,
-                pid: row.get(3)?,
-                started_at: row.get(4)?,
-                ended_at: row.get(5)?,
-                status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
-                retained: row.get::<_, Option<i64>>(7).ok().flatten().is_some(),
-                retained_at: row.get(7).ok().flatten(),
-                size_bytes: row.get(8).ok().flatten(),
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
-
+        let sessions = stmt.query_map([], Session::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(sessions)
     }
 
@@ -283,7 +240,6 @@ impl Database {
         let conn = self.connection();
         let mut deleted = 0u64;
 
-        // Delete oldest retained sessions until under limit
         let mut stmt = conn.prepare(
             "SELECT id, COALESCE(size_bytes, 0) FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at ASC"
         )?;
