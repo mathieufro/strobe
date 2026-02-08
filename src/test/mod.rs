@@ -243,6 +243,8 @@ impl TestRunner {
         // Progress-aware polling loop — poll DB for stdout events
         let mut last_stdout_offset = 0u32;
         let poll_interval = std::time::Duration::from_millis(500);
+        // Hard timeout kills the process; add grace period for stuck detector to write warnings
+        let kill_timeout = std::time::Duration::from_secs(hard_timeout + 5);
         let safety_timeout = std::time::Duration::from_secs(600); // 10 min safety net
         let start = std::time::Instant::now();
 
@@ -251,10 +253,20 @@ impl TestRunner {
                 break;
             }
 
+            // Hard timeout — kill the process (stuck detector has already written warnings)
+            if start.elapsed() > kill_timeout {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                // Reap zombie so is_process_alive returns false
+                unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG); }
+                break;
+            }
+
             // Safety net timeout
             if start.elapsed() > safety_timeout {
                 unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG); }
                 break;
             }
 
