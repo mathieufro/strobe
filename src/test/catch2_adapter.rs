@@ -96,13 +96,19 @@ impl Catch2Adapter {
     }
 
     /// Build command for running a single test in a Catch2 binary.
+    /// Wraps in wildcards for substring matching (Catch2 treats bare names as exact).
     pub fn single_test_for_binary(binary: &str, test_name: &str) -> TestCommand {
+        let filter = if test_name.contains('*') {
+            test_name.to_string()
+        } else {
+            format!("*{}*", test_name)
+        };
         TestCommand {
             program: binary.to_string(),
             args: vec![
                 "--reporter".to_string(),
                 "xml".to_string(),
-                test_name.to_string(),
+                filter,
             ],
             env: HashMap::new(),
         }
