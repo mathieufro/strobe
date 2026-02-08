@@ -730,4 +730,186 @@ mod read_tests {
         };
         assert!(req.validate().is_err());
     }
+
+    #[test]
+    fn test_debug_read_request_validation_depth_zero() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None, size: None, type_hint: None,
+            }],
+            depth: Some(0),
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_poll_interval_too_high() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None, size: None, type_hint: None,
+            }],
+            depth: None,
+            poll: Some(PollConfig {
+                interval_ms: 6000,  // above max 5000
+                duration_ms: 10000,
+            }),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_poll_duration_too_low() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None, size: None, type_hint: None,
+            }],
+            depth: None,
+            poll: Some(PollConfig {
+                interval_ms: 100,
+                duration_ms: 50,  // below min 100
+            }),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_poll_duration_too_high() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None, size: None, type_hint: None,
+            }],
+            depth: None,
+            poll: Some(PollConfig {
+                interval_ms: 100,
+                duration_ms: 40000,  // above max 30000
+            }),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_invalid_type_hint() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: None,
+                address: Some("0x1000".to_string()),
+                size: Some(4),
+                type_hint: Some("int64".to_string()),  // invalid — should be "i64"
+            }],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_size_zero() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: None,
+                address: Some("0x1000".to_string()),
+                size: Some(0),  // invalid
+                type_hint: Some("u32".to_string()),
+            }],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_size_too_large() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: None,
+                address: Some("0x1000".to_string()),
+                size: Some(100000),  // above max 65536
+                type_hint: Some("bytes".to_string()),
+            }],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_no_variable_or_address() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: None,
+                address: None,
+                size: None,
+                type_hint: None,
+            }],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_valid_raw_address() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: None,
+                address: Some("0x7ff800".to_string()),
+                size: Some(64),
+                type_hint: Some("bytes".to_string()),
+            }],
+            depth: None,
+            poll: None,
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_valid_poll() {
+        let req = DebugReadRequest {
+            session_id: "s1".to_string(),
+            targets: vec![ReadTarget {
+                variable: Some("gTempo".to_string()),
+                address: None, size: None, type_hint: None,
+            }],
+            depth: Some(1),
+            poll: Some(PollConfig {
+                interval_ms: 100,
+                duration_ms: 2000,
+            }),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_debug_read_request_validation_all_valid_type_hints() {
+        let valid_types = ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
+                           "f32", "f64", "pointer", "bytes"];
+        for type_hint in valid_types {
+            let req = DebugReadRequest {
+                session_id: "s1".to_string(),
+                targets: vec![ReadTarget {
+                    variable: None,
+                    address: Some("0x1000".to_string()),
+                    size: Some(8),
+                    type_hint: Some(type_hint.to_string()),
+                }],
+                depth: None,
+                poll: None,
+            };
+            assert!(req.validate().is_ok(), "type '{}' should be valid", type_hint);
+        }
+    }
 }

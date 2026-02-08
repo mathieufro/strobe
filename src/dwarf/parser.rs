@@ -812,6 +812,10 @@ impl DwarfParser {
 
     /// Convert cached StructMembers to flat field recipes for the agent.
     /// This is a pure transformation — no DWARF re-parsing needed.
+    ///
+    /// NOTE: Currently only depth=1 is effective. Depth > 1 marks nested structs
+    /// as truncated rather than recursively expanding them. Recursive expansion
+    /// would require nested field JSON in the agent protocol.
     pub(crate) fn struct_members_to_recipes(members: &[StructMember], depth: usize) -> Vec<super::StructFieldRecipe> {
         members.iter().map(|m| {
             let is_struct_field = !matches!(m.type_kind, TypeKind::Integer { .. } | TypeKind::Float | TypeKind::Pointer);
@@ -1268,5 +1272,49 @@ mod struct_expansion_tests {
         assert_eq!(recipes[1].name, "data");
         assert_eq!(recipes[1].offset, 8);
         assert!(!recipes[0].is_truncated_struct);
+        assert!(!recipes[1].is_truncated_struct); // pointer fields are not truncated structs
+    }
+
+    #[test]
+    fn test_struct_truncation_at_depth_1() {
+        let members = vec![
+            StructMember {
+                name: "id".to_string(),
+                offset: 0,
+                byte_size: 4,
+                type_kind: TypeKind::Integer { signed: false },
+                type_name: Some("uint32_t".to_string()),
+                is_pointer: false,
+                pointed_struct_members: None,
+            },
+            StructMember {
+                name: "owner".to_string(),
+                offset: 8,
+                byte_size: 16,
+                type_kind: TypeKind::Unknown, // struct type — not Integer/Float/Pointer
+                type_name: Some("AudioEngine".to_string()),
+                is_pointer: false,
+                pointed_struct_members: None,
+            },
+        ];
+
+        // At depth=1, nested struct fields should be truncated
+        let recipes = DwarfParser::struct_members_to_recipes(&members, 1);
+        assert_eq!(recipes.len(), 2);
+        assert!(!recipes[0].is_truncated_struct, "primitive field should not be truncated");
+        assert!(recipes[1].is_truncated_struct, "nested struct at depth=1 should be truncated");
+        assert_eq!(recipes[1].type_name.as_deref(), Some("AudioEngine"));
+
+        // At depth=2, nested struct fields should NOT be truncated
+        // (even though recursive expansion isn't implemented yet)
+        let recipes_d2 = DwarfParser::struct_members_to_recipes(&members, 2);
+        assert!(!recipes_d2[1].is_truncated_struct, "nested struct at depth=2 should not be truncated");
+    }
+
+    #[test]
+    fn test_struct_expansion_empty_members() {
+        let members: Vec<StructMember> = vec![];
+        let recipes = DwarfParser::struct_members_to_recipes(&members, 1);
+        assert!(recipes.is_empty());
     }
 }

@@ -49,6 +49,7 @@ interface ReadRecipe {
   typeKind: string;  // "int", "uint", "float", "pointer", "bytes"
   derefDepth: number;
   derefOffset: number;
+  noSlide?: boolean;  // true for raw user-provided addresses (already absolute)
   struct?: boolean;
   fields?: Array<{
     name: string;
@@ -106,6 +107,9 @@ class StrobeAgent {
   // Per-session output capture limit (50MB)
   private outputBytesCapture: number = 0;
   private maxOutputBytes: number = 50 * 1024 * 1024;
+
+  // Active poll timer — only one poll at a time, new poll cancels previous
+  private activePollTimer: ReturnType<typeof setInterval> | null = null;
 
   // Interval handles for cleanup
   private outputFlushTimer: ReturnType<typeof setInterval> | null = null;
@@ -385,7 +389,10 @@ class StrobeAgent {
 
   private readSingleTarget(recipe: ReadRecipe, slide: NativePointer): any {
     try {
-      const baseAddr = ptr(recipe.address).add(slide);
+      // Raw user-provided addresses are already absolute — don't apply ASLR slide
+      const baseAddr = recipe.noSlide
+        ? ptr(recipe.address)
+        : ptr(recipe.address).add(slide);
 
       // Handle struct reads
       if (recipe.struct && recipe.fields) {
@@ -471,6 +478,12 @@ class StrobeAgent {
     slide: NativePointer,
     poll: { intervalMs: number; durationMs: number }
   ): void {
+    // Cancel any existing poll before starting a new one
+    if (this.activePollTimer !== null) {
+      clearInterval(this.activePollTimer);
+      this.activePollTimer = null;
+    }
+
     const startTime = Date.now();
     let sampleCount = 0;
 
@@ -478,6 +491,7 @@ class StrobeAgent {
       const elapsed = Date.now() - startTime;
       if (elapsed >= poll.durationMs) {
         clearInterval(timer);
+        this.activePollTimer = null;
         send({ type: 'poll_complete', sampleCount });
         return;
       }
@@ -506,6 +520,8 @@ class StrobeAgent {
         }],
       });
     }, poll.intervalMs);
+
+    this.activePollTimer = timer;
   }
 
   private installOutputCapture(): void {

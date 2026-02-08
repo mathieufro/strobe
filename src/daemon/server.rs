@@ -111,12 +111,14 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
 }
 
 fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err(format!("Hex string must have even length, got {}", hex.len()));
+    }
     (0..hex.len())
         .step_by(2)
         .map(|i| {
-            let end = (i + 2).min(hex.len());
-            u8::from_str_radix(&hex[i..end], 16)
-                .map_err(|e| format!("Invalid hex: {}", e))
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("Invalid hex at offset {}: {}", i, e))
         })
         .collect()
 }
@@ -1370,12 +1372,14 @@ Validation Limits (enforced):
                             crate::dwarf::TypeKind::Unknown => "uint",
                         };
 
+                        // NOTE: Only single-level deref is supported (ptr->member).
+                        // Multi-level chains (a->b->c) would need agent protocol changes.
                         let mut recipe_json = serde_json::json!({
                             "label": var_name,
                             "address": format!("0x{:x}", recipe.base_address),
                             "size": recipe.final_size,
                             "typeKind": type_kind_str,
-                            "derefDepth": recipe.deref_chain.len(),
+                            "derefDepth": recipe.deref_chain.len().min(1),
                             "derefOffset": recipe.deref_chain.first().copied().unwrap_or(0),
                         });
 
@@ -1425,6 +1429,7 @@ Validation Limits (enforced):
                     "typeKind": type_hint,
                     "derefDepth": 0,
                     "derefOffset": 0,
+                    "noSlide": true,
                 }));
             }
         }
@@ -1487,17 +1492,25 @@ Validation Limits (enforced):
                     // Handle bytes type: write to file
                     if result.get("isBytes").and_then(|v| v.as_bool()).unwrap_or(false) {
                         if let Some(hex) = value.as_str() {
-                            let dir = "/tmp/strobe/reads";
-                            let _ = std::fs::create_dir_all(dir);
-                            let filename = format!("{}-{}.bin", req.session_id, chrono::Utc::now().timestamp());
-                            let filepath = format!("{}/{}", dir, filename);
-                            if let Ok(bytes) = hex_to_bytes(hex) {
-                                let _ = std::fs::write(&filepath, &bytes);
-                                read_result.file = Some(filepath);
-                                let preview_bytes = &bytes[..bytes.len().min(32)];
-                                read_result.preview = Some(
-                                    preview_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
-                                );
+                            match hex_to_bytes(hex) {
+                                Ok(bytes) => {
+                                    let dir = "/tmp/strobe/reads";
+                                    let _ = std::fs::create_dir_all(dir);
+                                    let filename = format!("{}-{}.bin", req.session_id, chrono::Utc::now().timestamp());
+                                    let filepath = format!("{}/{}", dir, filename);
+                                    if let Err(e) = std::fs::write(&filepath, &bytes) {
+                                        read_result.error = Some(format!("Failed to write bytes file: {}", e));
+                                    } else {
+                                        read_result.file = Some(filepath);
+                                        let preview_bytes = &bytes[..bytes.len().min(32)];
+                                        read_result.preview = Some(
+                                            preview_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    read_result.error = Some(format!("Failed to decode bytes: {}", e));
+                                }
                             }
                         }
                     } else {

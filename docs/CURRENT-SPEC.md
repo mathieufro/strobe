@@ -356,7 +356,7 @@ Response:
   success: boolean
 ```
 
-### debug_read (Phase 1e — planned, not yet implemented)
+### debug_read (Phase 1e)
 
 Read memory from a running process without tracing. Point-in-time snapshots independent of function hooks.
 
