@@ -52,11 +52,115 @@ The extension talks directly to the Strobe daemon over its Unix socket using JSO
 
 **Daemon lifecycle**: Invisible to user. Extension auto-starts daemon on first use, shows green dot in status bar. Daemon's 30-minute idle timeout handles cleanup.
 
+**Error resilience**: All daemon calls use optimistic try/catch. `SESSION_NOT_FOUND` is treated as graceful session end (not an error). No request queue — the daemon handles its own concurrency. If the daemon crashes, the extension shows "Reconnecting..." and retries.
+
+## Daemon API Prerequisites
+
+The following daemon changes are required before/during extension development:
+
+### P1: `debug_session_status` (lightweight heartbeat)
+
+New MCP tool for fast polling. Returns session state without querying the event timeline.
+
+```rust
+// Request
+pub struct DebugSessionStatusRequest {
+    pub session_id: String,
+}
+
+// Response
+pub struct DebugSessionStatusResponse {
+    pub status: String,               // "running" | "paused" | "exited"
+    pub pid: u32,
+    pub event_count: u64,
+    pub hooked_functions: u32,
+    pub trace_patterns: Vec<String>,
+    pub breakpoints: Vec<BreakpointInfo>,
+    pub logpoints: Vec<LogpointInfo>,
+    pub watches: Vec<ActiveWatch>,
+    pub paused_threads: Vec<PausedThreadInfo>,  // threadId, breakpointId, file, line, function
+}
+```
+
+**Rationale**: Extension needs a single poll endpoint for sidebar + DAP state sync. Avoids querying breakpoints, logpoints, and patterns with separate calls. Solves the "no list all breakpoints" gap.
+
+### P2: Extend `eventType` filter in `debug_query`
+
+Add missing values to the query filter enum exposed in the tool schema:
+- `pause` — breakpoint hit events
+- `logpoint` — logpoint message events
+- `variable_snapshot` — polling read snapshots
+- `condition_error` — JS condition eval failures
+
+The `EventTypeFilter` enum in `types.rs` already has these — they just need to appear in the `debug_query` tool schema in `server.rs`.
+
+### P3: Cursor-based query pagination
+
+Add `afterEventId` field to `debug_query` for reliable incremental polling:
+
+```rust
+pub struct DebugQueryRequest {
+    // existing fields...
+    /// Cursor: return only events with rowid > after_event_id
+    pub after_event_id: Option<i64>,
+}
+
+pub struct DebugQueryResponse {
+    pub events: Vec<serde_json::Value>,
+    pub total_count: u64,
+    pub has_more: bool,
+    /// Highest event rowid in this response (use as next cursor)
+    pub last_event_id: Option<i64>,
+    /// True if FIFO eviction happened since the cursor position
+    pub events_dropped: bool,
+}
+```
+
+**Rationale**: Timestamp-based `timeFrom` can miss events during FIFO rollover. Cursor-based pagination guarantees no silent data loss. Extension shows warning when `events_dropped` is true.
+
+### P4: Backtrace capture at breakpoint pause
+
+When the agent pauses at a breakpoint, capture `Thread.backtrace()` and include it in the pause message to the daemon. Store on `PauseInfo`:
+
+```rust
+pub struct PauseInfo {
+    pub breakpoint_id: String,
+    pub func_name: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub paused_at: Instant,
+    pub return_address: Option<u64>,
+    // NEW:
+    pub backtrace: Vec<BacktraceFrame>,  // from Frida Thread.backtrace()
+    pub locals: Vec<LocalVariable>,       // best-effort from Interceptor args + DWARF
+}
+
+pub struct BacktraceFrame {
+    pub address: u64,
+    pub module_name: Option<String>,
+    pub function_name: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+}
+```
+
+**Rationale**: DAP's `stackTrace` request needs multiple frames. Crash events already capture backtraces — same pattern. Also capture best-effort locals (function args from Interceptor are always available, DWARF globals via `debug_read`).
+
+### P5: Implement proper step-into (callee resolution)
+
+Currently `step-into` behaves identically to `step-over`. To make the DAP "Step Into" button useful, implement callee resolution in the DWARF parser:
+
+- Parse `DW_TAG_call_site` / `DW_AT_call_target` attributes
+- For indirect calls (vtable, function pointers): fall back to step-over behavior
+- For direct calls: resolve callee address, set one-shot breakpoint at callee entry
+
+**Scope**: This is significant DWARF work. Can be implemented incrementally — direct calls first, indirect calls deferred.
+
 ## Components
 
 ### 1. StrobeClient
 
-TypeScript library wrapping all 14 MCP tools. Shared by every extension component.
+TypeScript library wrapping all MCP tools. Shared by every extension component.
 
 ```typescript
 class StrobeClient extends EventEmitter {
@@ -70,6 +174,7 @@ class StrobeClient extends EventEmitter {
   stop(sessionId: string, retain?: boolean): Promise<StopResponse>
   trace(req: TraceRequest): Promise<TraceResponse>
   query(req: QueryRequest): Promise<QueryResponse>
+  sessionStatus(sessionId: string): Promise<SessionStatusResponse>  // NEW
   setBreakpoints(req: BreakpointRequest): Promise<BreakpointResponse>
   continue(sessionId: string, action?: StepAction): Promise<ContinueResponse>
   read(req: ReadRequest): Promise<ReadResponse>
@@ -86,17 +191,18 @@ class StrobeClient extends EventEmitter {
 
   // Events (from polling)
   on('events', (events: StrobeEvent[]) => void)    // New trace/output events
-  on('pause', (info: PauseInfo) => void)            // Breakpoint hit
+  on('pause', (info: PauseInfo) => void)            // Breakpoint hit (from session_status)
   on('testProgress', (p: TestProgress) => void)     // Test status update
   on('sessionEnd', (id: string) => void)            // Process exited
+  on('eventsDropped', () => void)                   // FIFO rollover warning
 }
 ```
 
-**Polling strategy** (since daemon is request/response only):
-- Active session: `debug_query(timeFrom=lastSeen)` every 200ms
-- Test run: `debug_test_status` every 1s (server blocks up to 15s)
-- Paused at breakpoint: Single query for pause event, then stop until resume
-- No session: No polling
+**Polling strategy** (two-tier):
+- **Fast path**: `debug_session_status` every 200ms — detects pause/exit, updates sidebar state
+- **Event path**: `debug_query(afterEventId=cursor)` every 500ms — feeds Output Channel + decorations
+- **Test runs**: `debug_test_status` every 1s (server blocks up to 15s)
+- **No session**: No polling
 
 ### 2. DAP Adapter
 
@@ -117,6 +223,10 @@ Implements VS Code's Debug Adapter Protocol, translating to Strobe API calls.
 }
 ```
 
+**Two ways to use Strobe:**
+- **Quick Trace (zero-config)**: Right-click any function → "Trace with Strobe" → instantly see calls. Uses workspace defaults from `.strobe/settings.json` (if present). No launch.json needed.
+- **Full Debug Session (launch.json)**: F5 to launch with pre-configured patterns, watches, breakpoints. Ideal for complex workflows. These modes are NOT mutually exclusive — launch with F5, then right-click to add more patterns to the same session.
+
 **DAP → Strobe mapping:**
 
 | DAP Request | Strobe Call |
@@ -125,22 +235,35 @@ Implements VS Code's Debug Adapter Protocol, translating to Strobe API calls.
 | `setBreakpoints` | `debug_breakpoint({ add/remove })` |
 | `continue` | `debug_continue({ action: "continue" })` |
 | `next` | `debug_continue({ action: "step-over" })` |
-| `stepIn` | `debug_continue({ action: "step-into" })` |
+| `stepIn` | `debug_continue({ action: "step-into" })` — requires P5 |
 | `stepOut` | `debug_continue({ action: "step-out" })` |
-| `stackTrace` | `debug_query({ eventType: "pause" })` |
-| `scopes` / `variables` | `debug_read({ targets: [...] })` |
+| `stackTrace` | Read from `debug_session_status` → `paused_threads[].backtrace` |
+| `scopes` | Two scopes: "Arguments" (from Interceptor) + "Globals" (from `debug_read`) |
+| `variables` | `debug_read({ targets: [...] })` for globals/watches; args from pause info |
 | `evaluate` | `debug_read({ targets: [{ variable: expr }] })` |
 | `disconnect` | `debug_stop` |
 
 **Breakpoint hit flow:**
-1. Polling engine detects `pause` event in `debug_query`
+1. Fast-path poll (`debug_session_status`) detects `status: "paused"` + `paused_threads`
 2. DAP adapter fires `stopped` event to VS Code
-3. VS Code requests `stackTrace` → we return function/file/line from pause info
-4. VS Code requests `variables` → we call `debug_read` for locals/globals
+3. VS Code requests `stackTrace` → served from `paused_threads[].backtrace` (captured at pause time, P4)
+4. VS Code requests `scopes` → "Arguments" scope (from pause info) + "Globals" scope
+5. VS Code requests `variables` for "Globals" → calls `debug_read` for DWARF globals/statics
+6. VS Code requests `variables` for "Arguments" → served from pause info args (Interceptor capture)
+
+**Variable inspection model:**
+- **Arguments scope**: Function arguments captured by Frida's Interceptor at breakpoint entry. Always available, zero latency.
+- **Globals scope**: DWARF-resolved global/static variables via `debug_read`. Available for any variable the DWARF parser can resolve.
+- **Watch scope**: User-defined watch expressions evaluated via `debug_read`.
+- **Locals scope**: Best-effort. Available locals from the pause info's `locals` field (P4). Some variables may be optimized out or unavailable.
+
+**Known limitations:**
+- `step-into` requires daemon P5 (callee resolution). Until then, ships as implemented — may behave as step-over for some calls.
+- `step-out` may return `ValidationError` when no return address is available. DAP adapter handles this gracefully by showing a notification.
 
 ### 3. Sidebar (TreeView)
 
-Session-centric TreeView. Activates when a session starts.
+Session-centric TreeView. Activates when a session starts. State refreshed from `debug_session_status` poll.
 
 ```
 STROBE
@@ -174,7 +297,21 @@ STROBE
 
 Registers with VS Code's native Testing API (beaker icon sidebar).
 
-**Test discovery**: Watches workspace for `Cargo.toml`, `CMakeLists.txt`, Catch2 binaries. Enumerates tests by running framework-specific list commands.
+**Test discovery (extension-side):** Uses a `TestDiscoverer` interface with per-framework implementations. Runs discovery commands directly (no daemon needed):
+
+```typescript
+interface TestDiscoverer {
+  detect(workspaceFolder: string): Promise<number>;  // confidence 0-100
+  listTests(workspaceFolder: string): Promise<DiscoveredTest[]>;
+}
+
+// Implementations:
+// - CargoDiscoverer: runs `cargo test -- --list`, parses output
+// - Catch2Discoverer: runs binary `--list-tests`, parses output
+// - GenericDiscoverer: regex scan for test patterns in source files
+```
+
+Extensible for future frameworks (Jest, pytest, Go test, etc.) by adding new `TestDiscoverer` implementations.
 
 **Live execution view:**
 ```
@@ -194,7 +331,7 @@ Registers with VS Code's native Testing API (beaker icon sidebar).
 
 **Polling**: During test execution, polls `debug_test_status` every 1s:
 - Updates pass/fail counts as they arrive
-- Shows currently-running test name + elapsed time
+- Shows all `running_tests` with individual elapsed times and baselines
 - Surfaces stuck detection warnings immediately
 - Displays failure messages with file:line links
 
@@ -241,7 +378,7 @@ VS Code native Output Channel named "Strobe". Appears alongside Terminal, Debug 
 void process(int frame) {  // ⚡ 1,247 calls | avg 0.3ms | last → 0
 ```
 
-Shown as faded `decorationType` text. Updated every poll cycle.
+Shown as faded `decorationType` text. **Debounced**: decorations re-render at most once per second, not every poll cycle. Extension tracks dirty functions (those with new events since last render) and batches all decoration updates into a single `setDecorations()` call per editor.
 
 **On breakpoint lines (when hit):**
 ```cpp
@@ -266,6 +403,8 @@ Strobe ▸
   ├── Watch Return Value
   └── Profile Duration
 ```
+
+**Function identification:** Uses VS Code's `executeDocumentSymbolProvider` command (talks to rust-analyzer, clangd, or whatever language server is active) to identify the function at cursor position. Falls back to regex heuristics when no language server is available.
 
 **Smart behavior:**
 - If no session active: "Trace This Function" prompts for binary path, launches, and traces
@@ -297,7 +436,7 @@ strobe-vscode/
 │   ├── extension.ts                # activate/deactivate, register all providers
 │   ├── client/
 │   │   ├── strobe-client.ts        # StrobeClient class (JSON-RPC over Unix socket)
-│   │   ├── polling-engine.ts       # Event polling with configurable intervals
+│   │   ├── polling-engine.ts       # Two-tier polling (session_status + query)
 │   │   └── types.ts                # TypeScript types mirroring MCP types.rs
 │   ├── dap/
 │   │   ├── debug-adapter.ts        # DAP implementation
@@ -309,12 +448,13 @@ strobe-vscode/
 │   │   └── commands.ts             # Sidebar action handlers
 │   ├── testing/
 │   │   ├── test-controller.ts      # VS Code TestController implementation
-│   │   ├── test-discovery.ts       # Framework detection + test enumeration
+│   │   ├── test-discovery.ts       # TestDiscoverer interface + implementations
 │   │   └── test-run.ts             # Async test execution + progress polling
 │   ├── editor/
-│   │   ├── decorations.ts          # Inline decorations (call count, timing)
+│   │   ├── decorations.ts          # Inline decorations (debounced, dirty-tracked)
 │   │   ├── codelens-provider.ts    # CodeLens on traced/test functions
-│   │   └── context-menu.ts         # "Strobe" submenu actions
+│   │   ├── context-menu.ts         # "Strobe" submenu actions
+│   │   └── function-identifier.ts  # LSP + regex function detection at cursor
 │   ├── output/
 │   │   └── output-channel.ts       # Strobe Output Channel formatting
 │   └── utils/
@@ -330,13 +470,22 @@ strobe-vscode/
 
 ## Milestones
 
+### M0: Daemon Prerequisites (1 week)
+
+**Daemon-side changes required before extension work:**
+- P1: `debug_session_status` tool (lightweight heartbeat with full session state)
+- P2: Extend `eventType` filter (add `pause`, `logpoint`, `variable_snapshot`, `condition_error`)
+- P3: Cursor-based query pagination (`afterEventId` + `events_dropped`)
+
+These are small, focused daemon changes that enable reliable extension polling.
+
 ### M1: Core Extension — Right-Click Trace + Output (2-3 weeks)
 
 **Ships:**
 - Extension scaffold (TypeScript, webpack, VS Code extension API)
-- `StrobeClient` with daemon auto-start and polling engine
+- `StrobeClient` with daemon auto-start, two-tier polling engine, cursor-based pagination
 - "Strobe" Output Channel showing live stdout/stderr/trace events
-- Right-click context menu: "Strobe > Trace This Function"
+- Right-click context menu: "Strobe > Trace This Function" (LSP + regex identification)
 - Command palette: "Strobe: Launch", "Strobe: Stop", "Strobe: Add Trace Pattern"
 - Status bar item with connection/session status
 - Basic sidebar showing active session, patterns, event count
@@ -350,8 +499,9 @@ strobe-vscode/
 ### M2: Test Runner Integration (1-2 weeks)
 
 **Ships:**
-- Test Explorer provider (discovery + live execution)
-- Red/green test status with `debug_test_status` polling
+- Test Explorer provider with extensible `TestDiscoverer` interface
+- `CargoDiscoverer` (runs `cargo test -- --list` directly, no daemon needed)
+- Live red/green test status with `debug_test_status` polling + `running_tests` display
 - Stuck detection warnings surfaced as test messages
 - Failure details with file:line links and suggested traces
 - "Debug with Strobe" action on failed tests
@@ -360,27 +510,31 @@ strobe-vscode/
 **Demo moment:** Click play on test suite, watch tests go green one by one. A failure shows the exact assertion line and "suggested traces" — click to instantly trace the failing path.
 
 **Key risks:**
-- Test discovery for different frameworks (start with Cargo, add Catch2 later)
 - Mapping Strobe's test output to VS Code's TestItem API
+- Catch2 discoverer (binary `--list-tests`) needs the test binary to already be built
 
 ### M3: Full DAP Debugging (2-3 weeks)
 
+**Daemon prerequisites (can overlap with M2):**
+- P4: Backtrace capture at breakpoint pause (agent + daemon)
+- P5: Proper step-into with callee resolution (DWARF parser)
+
 **Ships:**
-- Complete DAP adapter (breakpoints, stepping, variables, watches)
+- Complete DAP adapter (breakpoints, stepping, variable scopes)
 - launch.json configuration with IntelliSense schema
 - Breakpoint gutter integration (click-to-set, conditional via right-click)
 - Debug toolbar (play/pause/step-over/step-into/step-out)
-- Variable inspection in Debug sidebar via `debug_read`
-- Watch expressions
-- Inline decorations on traced functions (call count, avg duration, last return value)
-- Sidebar enrichment: watches tree, breakpoints tree, logpoints tree
+- Variable scopes: Arguments (from Interceptor), Globals (from `debug_read`), best-effort Locals
+- Watch expressions via `debug_read`
+- Inline decorations on traced functions (debounced, call count, avg duration, last return value)
+- Sidebar enrichment: watches tree, breakpoints tree, logpoints tree (from `debug_session_status`)
 - Logpoint support via context menu
 
 **Demo moment:** Set a breakpoint in a C++ function, launch with Strobe, hit the breakpoint — full VS Code debug experience with variables and stepping. But trace patterns are also running, showing execution flow in the Output panel alongside. Two debugger paradigms unified.
 
 **Key risks:**
-- Polling latency for breakpoint hits (200ms poll means up to 200ms delay before VS Code shows pause state)
-- Variable resolution: DWARF variables need `debug_read`, which may not cover all local variables yet
+- Polling latency for breakpoint hits (200ms poll on `session_status` means up to 200ms delay)
+- Step-into callee resolution (P5) is significant DWARF work — may ship partially
 
 ### M4: Polish & Power Features (1-2 weeks)
 
@@ -401,7 +555,7 @@ strobe-vscode/
 The extension communicates with the daemon the same way the MCP proxy does:
 
 1. **Connect** to `~/.strobe/strobe.sock` via Node.js `net.Socket`
-2. **Handshake**: Send MCP `initialize` request, receive capabilities
+2. **Handshake**: Send MCP `initialize` request, receive capabilities (required — daemon enforces this)
 3. **Send** `notifications/initialized`
 4. **Call tools** via `tools/call` method with tool name + arguments
 5. **Parse** JSON-RPC responses with `result` or `error` fields
@@ -411,6 +565,9 @@ The extension communicates with the daemon the same way the MCP proxy does:
 - `SIP_BLOCKED` → "macOS SIP is blocking Frida. See Strobe docs for workaround."
 - `SESSION_EXISTS` → "A session is already running for this binary."
 - `PROCESS_EXITED` → "The process has exited." (auto-cleanup session state)
+- `SESSION_NOT_FOUND` → Treated as graceful session end. Clear sidebar, stop polling.
+
+**Resilience**: All daemon calls wrapped in try/catch. `SESSION_NOT_FOUND` on any call triggers automatic cleanup. If daemon connection drops, extension shows "Reconnecting..." and retries with exponential backoff.
 
 ## Future Considerations
 
