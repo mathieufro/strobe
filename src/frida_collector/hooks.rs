@@ -4,8 +4,8 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookMode {
-    Full,   // enter + leave, no sampling
-    Light,  // enter only, adaptive sampling
+    Full,   // enter + exit, no sampling
+    Light,  // enter + exit, adaptive sampling
 }
 
 pub struct HookManager {

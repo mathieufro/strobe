@@ -83,7 +83,8 @@ const DRAIN_INTERVAL_MS = 10;
 // The shift limits func_id to 2^30 (1 billion) to prevent signed 32-bit overflow
 // (2^31 - 1 = 2,147,483,647). In practice, hook cap of 100 means we never approach this.
 // In onEnter: light hooks check sampling, full hooks don't.
-// In onLeave: light hooks are skipped entirely (enter-only).
+// In onLeave: both modes write exit events. Per-invocation data pairs enter/exit
+// so exits are only written when the corresponding enter passed sampling.
 
 const CMODULE_SOURCE = `
 #include <gum/guminterceptor.h>
@@ -195,18 +196,21 @@ void onEnter(GumInvocationContext *ic) {
   gsize raw = (gsize)gum_invocation_context_get_listener_function_data(ic);
   guint32 func_id = (guint32)(raw >> 1);
   guint8 is_light = (guint8)(raw & 1);
+  guint8 *inv = (guint8 *)gum_invocation_context_get_listener_invocation_data(ic, 1);
 
   if (is_light) {
     gint interval = g_atomic_int_add(&sample_interval, 0);
     if (interval > 1) {
       gint count = g_atomic_int_add(&global_counter, 1);
-      if ((count % interval) != 0) return;
+      if ((count % interval) != 0) { *inv = 0; return; }
     }
+    *inv = 1;
     write_entry(func_id, ic, 0, interval > 1 ? 1 : 0,
       (guint64)gum_invocation_context_get_nth_argument(ic, 0),
       (guint64)gum_invocation_context_get_nth_argument(ic, 1),
       0);
   } else {
+    *inv = 1;
     write_entry(func_id, ic, 0, 0,
       (guint64)gum_invocation_context_get_nth_argument(ic, 0),
       (guint64)gum_invocation_context_get_nth_argument(ic, 1),
@@ -215,12 +219,18 @@ void onEnter(GumInvocationContext *ic) {
 }
 
 void onLeave(GumInvocationContext *ic) {
-  gsize raw = (gsize)gum_invocation_context_get_listener_function_data(ic);
-  guint8 is_light = (guint8)(raw & 1);
-  if (is_light) return;
+  guint8 *inv = (guint8 *)gum_invocation_context_get_listener_invocation_data(ic, 1);
+  if (!*inv) return;
 
+  gsize raw = (gsize)gum_invocation_context_get_listener_function_data(ic);
   guint32 func_id = (guint32)(raw >> 1);
-  write_entry(func_id, ic, 1, 0, 0, 0,
+  guint8 is_light = (guint8)(raw & 1);
+  guint8 sampled = 0;
+  if (is_light) {
+    gint interval = g_atomic_int_add(&sample_interval, 0);
+    sampled = interval > 1 ? 1 : 0;
+  }
+  write_entry(func_id, ic, 1, sampled, 0, 0,
     (guint64)gum_invocation_context_get_return_value(ic));
 }
 `;
@@ -466,14 +476,9 @@ export class CModuleTracer {
         entryPtr.add(46).writeU8(0);               // watchEntryCount
 
         writeIdxPtr.writeU32(writeIdxPtr.readU32() + 1);
-
-        if (!isLight) {
-          (this as any)._strobeEntryIdx = idx;
-        }
+        (this as any)._strobeEntryIdx = idx;
       },
       onLeave(retval) {
-        if (isLight) return;
-
         const idx = (writeIdxPtr.readU32() % RING_CAPACITY);
         const entryPtr = ringDataPtr.add(idx * ENTRY_SIZE);
         const now = uint64(Date.now() * 1000000);
