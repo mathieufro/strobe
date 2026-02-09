@@ -1407,10 +1407,11 @@ Validation Limits (enforced):
         // Stop Frida session
         self.session_manager.stop_frida(&req.session_id).await?;
 
-        let events_collected = self.session_manager.stop_session(&req.session_id)?;
+        let retain = req.retain.unwrap_or(false);
 
-        // Mark session as retained if requested
-        if req.retain.unwrap_or(false) {
+        // Mark session as retained BEFORE stop_session, which deletes the DB rows.
+        // When retaining, we skip the DB deletion so events remain queryable.
+        if retain {
             self.session_manager.db().mark_session_retained(&req.session_id)?;
             // Enforce global size limit
             let deleted = self.session_manager.db().enforce_global_size_limit()?;
@@ -1418,6 +1419,12 @@ Validation Limits (enforced):
                 tracing::info!("Deleted {} old retained sessions to enforce 10GB limit", deleted);
             }
         }
+
+        let events_collected = if retain {
+            self.session_manager.stop_session_retain(&req.session_id)?
+        } else {
+            self.session_manager.stop_session(&req.session_id)?
+        };
 
         // Remove from connection tracking so disconnect cleanup doesn't try to stop it again
         self.untrack_session(&req.session_id).await;

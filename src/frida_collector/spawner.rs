@@ -435,7 +435,7 @@ enum SessionCommand {
     },
     RemovePatterns {
         functions: Vec<FunctionTarget>,
-        response: oneshot::Sender<Result<()>>,
+        response: oneshot::Sender<Result<u32>>,
     },
     SetWatches {
         watches: Vec<WatchTarget>,
@@ -813,7 +813,7 @@ fn session_worker(
             }
 
             SessionCommand::RemovePatterns { functions, response } => {
-                let result = handle_remove_patterns(raw_ptr, &functions);
+                let result = handle_remove_patterns(raw_ptr, &hooks_ready, &functions);
                 let _ = response.send(result);
             }
 
@@ -912,15 +912,23 @@ fn handle_add_patterns(
 }
 
 /// Handle RemovePatterns on a session worker thread.
+/// Returns the number of hooks still active after removal.
 fn handle_remove_patterns(
     script_ptr: *mut frida_sys::_FridaScript,
+    hooks_ready: &HooksReadySignal,
     functions: &[FunctionTarget],
-) -> Result<()> {
+) -> Result<u32> {
     let func_list: Vec<serde_json::Value> = functions.iter().map(|f| {
         serde_json::json!({
             "address": format!("0x{:x}", f.address),
         })
     }).collect();
+
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+    {
+        let mut guard = hooks_ready.lock().unwrap();
+        *guard = Some(signal_tx);
+    }
 
     let hooks_msg = serde_json::json!({
         "type": "hooks",
@@ -933,7 +941,16 @@ fn handle_remove_patterns(
             .map_err(|e| crate::Error::Frida(format!("Failed to send hooks: {}", e)))?;
     }
 
-    Ok(())
+    match signal_rx.recv_timeout(std::time::Duration::from_secs(TIMEOUT_PER_CHUNK_SECS)) {
+        Ok(count) => {
+            tracing::info!("Agent confirmed {} hooks active after remove", count);
+            Ok(count as u32)
+        }
+        Err(_) => {
+            tracing::warn!("Timed out waiting for remove confirmation ({}s)", TIMEOUT_PER_CHUNK_SECS);
+            Ok(0)
+        }
+    }
 }
 
 /// Handle SetWatches on a session worker thread.
@@ -1534,7 +1551,8 @@ impl FridaSpawner {
             for chunk in funcs.chunks(CHUNK_SIZE) {
                 let depth = if !depth_sent { depth_sent = true; serialization_depth } else { None };
                 match self.send_add_chunk(session_id, chunk.to_vec(), image_base, *mode, depth).await {
-                    Ok(count) => total_hooks += count,
+                    // activeCount is the total hooks active (not delta), so use latest value
+                    Ok(count) => total_hooks = count,
                     Err(e) => {
                         warnings.push(format!("Hook installation error: {}", e));
                         break 'outer;
@@ -1571,7 +1589,7 @@ impl FridaSpawner {
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn remove_patterns(&mut self, session_id: &str, patterns: &[String]) -> Result<()> {
+    pub async fn remove_patterns(&mut self, session_id: &str, patterns: &[String]) -> Result<u32> {
         let session = self.sessions.get_mut(session_id)
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 

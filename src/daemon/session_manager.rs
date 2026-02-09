@@ -192,6 +192,29 @@ impl SessionManager {
         Ok(count)
     }
 
+    /// Stop a session but retain its DB rows for later inspection.
+    /// Cleans up in-memory state and flushes the writer, but does NOT delete from DB.
+    pub fn stop_session_retain(&self, id: &str) -> Result<u64> {
+        let count = self.db.count_session_events(id)?;
+
+        // Signal database writer task to flush and exit
+        if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
+            let _ = cancel_tx.send(true);
+        }
+
+        // Mark session as stopped (but keep it in the DB)
+        self.db.mark_session_stopped(id)?;
+
+        // Clean up in-memory state
+        write_lock(&self.patterns).remove(id);
+        write_lock(&self.hook_counts).remove(id);
+        write_lock(&self.watches).remove(id);
+        write_lock(&self.event_limits).remove(id);
+        write_lock(&self.child_pids).remove(id);
+
+        Ok(count)
+    }
+
     pub fn add_child_pid(&self, session_id: &str, pid: u32) {
         write_lock(&self.child_pids)
             .entry(session_id.to_string())
@@ -427,7 +450,8 @@ impl SessionManager {
         }
 
         if let Some(patterns) = remove {
-            spawner.remove_patterns(session_id, patterns).await?;
+            let remaining = spawner.remove_patterns(session_id, patterns).await?;
+            return Ok(HookResult { installed: remaining, matched: 0, warnings: vec![] });
         }
 
         Ok(HookResult { installed: 0, matched: 0, warnings: vec![] })

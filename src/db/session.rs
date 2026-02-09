@@ -189,6 +189,10 @@ impl Database {
         Ok(())
     }
 
+    pub fn mark_session_stopped(&self, id: &str) -> Result<()> {
+        self.update_session_status(id, SessionStatus::Stopped)
+    }
+
     pub fn mark_session_retained(&self, id: &str) -> Result<()> {
         let conn = self.connection();
         let retained_at = chrono::Utc::now().timestamp();
