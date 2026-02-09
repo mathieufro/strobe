@@ -196,7 +196,7 @@ async fn test_stepping_suite() {
             Err(e) => panic!("Failed to set logpoint: {}", e),
         }
 
-        sm.remove_logpoint(session_id, "lp-1");
+        sm.remove_logpoint(session_id, "lp-1").await;
         let logpoints = sm.get_logpoints(session_id);
         assert_eq!(logpoints.len(), 0);
         println!("✓ Logpoint removed successfully");
@@ -226,7 +226,7 @@ async fn test_stepping_suite() {
             assert_eq!(breakpoints.len(), 2);
             println!("✓ Multiple breakpoints set successfully");
 
-            sm.remove_breakpoint(session_id, "bp-1");
+            sm.remove_breakpoint(session_id, "bp-1").await;
             let breakpoints = sm.get_breakpoints(session_id);
             assert_eq!(breakpoints.len(), 1);
             assert_eq!(breakpoints[0].id, "bp-2");

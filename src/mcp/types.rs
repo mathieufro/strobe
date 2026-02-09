@@ -134,6 +134,9 @@ pub struct DebugTraceResponse {
 pub const MAX_WATCHES_PER_SESSION: usize = 32;
 pub const MAX_WATCH_EXPRESSION_LENGTH: usize = 256;
 pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 4;
+pub const MAX_BREAKPOINTS_PER_SESSION: usize = 50;
+pub const MAX_LOGPOINTS_PER_SESSION: usize = 100;
+pub const MAX_LINE_NUMBER: u32 = 1_000_000;
 
 /// Validate a watch field (expression or variable name) against length and depth limits.
 fn validate_watch_field(value: &str, field_name: &str) -> crate::Result<()> {
@@ -762,6 +765,12 @@ impl DebugBreakpointRequest {
         }
 
         if let Some(targets) = &self.add {
+            if targets.len() > MAX_BREAKPOINTS_PER_SESSION {
+                return Err(crate::Error::ValidationError(
+                    format!("Too many breakpoints: {} (max {})", targets.len(), MAX_BREAKPOINTS_PER_SESSION)
+                ));
+            }
+
             for target in targets {
                 // Must specify either function OR file:line
                 let has_function = target.function.is_some();
@@ -783,6 +792,14 @@ impl DebugBreakpointRequest {
                     return Err(crate::Error::ValidationError(
                         "Breakpoint with 'file' must also specify 'line'".to_string()
                     ));
+                }
+
+                if let Some(line) = target.line {
+                    if line > MAX_LINE_NUMBER {
+                        return Err(crate::Error::ValidationError(
+                            format!("Line number {} exceeds maximum ({})", line, MAX_LINE_NUMBER)
+                        ));
+                    }
                 }
             }
         }
@@ -893,6 +910,12 @@ impl DebugLogpointRequest {
         }
 
         if let Some(targets) = &self.add {
+            if targets.len() > MAX_LOGPOINTS_PER_SESSION {
+                return Err(crate::Error::ValidationError(
+                    format!("Too many logpoints: {} (max {})", targets.len(), MAX_LOGPOINTS_PER_SESSION)
+                ));
+            }
+
             for target in targets {
                 let has_function = target.function.is_some();
                 let has_file_line = target.file.is_some() && target.line.is_some();
@@ -907,6 +930,14 @@ impl DebugLogpointRequest {
                     return Err(crate::Error::ValidationError(
                         "Logpoint message must not be empty".to_string()
                     ));
+                }
+
+                if let Some(line) = target.line {
+                    if line > MAX_LINE_NUMBER {
+                        return Err(crate::Error::ValidationError(
+                            format!("Line number {} exceeds maximum ({})", line, MAX_LINE_NUMBER)
+                        ));
+                    }
                 }
             }
         }

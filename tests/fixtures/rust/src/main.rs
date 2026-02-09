@@ -63,6 +63,32 @@ fn main() {
             }
             println!("[GLOBALS] Done");
         }
+        "breakpoint-loop" => {
+            let iterations: u64 = std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
+            println!("[BP-LOOP] Running {} iterations", iterations);
+            for i in 0..iterations {
+                G_BUFFER_COUNT.store(i, Ordering::Relaxed);
+                G_TEMPO.store(120_000 + i * 100, Ordering::Relaxed);
+                let buf = audio::generate_sine(440.0);
+                let rms = audio::process_buffer(&buf);
+                println!("[BP-LOOP] iter={} rms={:.3}", i, rms);
+            }
+            println!("[BP-LOOP] Done");
+        }
+        "step-target" => {
+            println!("[STEP] Start");
+            G_BUFFER_COUNT.store(0, Ordering::Relaxed);
+            let buf = audio::generate_sine(440.0);
+            let rms = audio::process_buffer(&buf);
+            midi::note_on(60, 100);
+            midi::control_change(1, 64);
+            engine::update_state();
+            G_BUFFER_COUNT.store(42, Ordering::Relaxed);
+            println!("[STEP] Done rms={:.3}", rms);
+        }
         _ => {
             eprintln!("Unknown mode: {}", mode);
             std::process::exit(1);

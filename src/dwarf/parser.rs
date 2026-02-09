@@ -1125,10 +1125,14 @@ impl DwarfParser {
         let table = self.line_table.lock().unwrap();
         let entries = table.as_ref()?;
 
-        // Find entries matching file
+        // Find entries matching file.
+        // Use path-component-aware matching: require separator before the match
+        // to avoid "main.c" matching "not_main.c".
         let mut matches: Vec<_> = entries
             .iter()
-            .filter(|e| e.is_statement && e.file.ends_with(file))
+            .filter(|e| {
+                e.is_statement && (e.file == file || e.file.ends_with(&format!("/{}", file)))
+            })
             .collect();
 
         if matches.is_empty() {
@@ -1155,7 +1159,7 @@ impl DwarfParser {
         // Get all unique statement lines for this file
         let mut lines: Vec<u32> = entries
             .iter()
-            .filter(|e| e.is_statement && e.file.ends_with(file))
+            .filter(|e| e.is_statement && (e.file == file || e.file.ends_with(&format!("/{}", file))))
             .map(|e| e.line)
             .collect();
 
@@ -1182,31 +1186,48 @@ impl DwarfParser {
         result.join(", ")
     }
 
-    /// Reverse lookup: address → (file, line, column)
+    /// Reverse lookup: address → (file, line, column).
+    /// For addresses between line entries, returns the closest preceding entry
+    /// (the line that "contains" that address).
     pub fn resolve_address(&self, address: u64) -> Option<(String, u32, u32)> {
         self.ensure_line_table();
         let table = self.line_table.lock().unwrap();
         let entries = table.as_ref()?;
 
-        // Binary search for address (entries are sorted)
-        let idx = entries.binary_search_by_key(&address, |e| e.address).ok()?;
+        let idx = match entries.binary_search_by_key(&address, |e| e.address) {
+            Ok(idx) => idx,           // Exact match
+            Err(0) => return None,    // Before all entries
+            Err(idx) => idx - 1,      // Closest preceding entry
+        };
         let entry = &entries[idx];
         Some((entry.file.clone(), entry.line, entry.column))
     }
 
     /// Find next statement line in the same function. Used for step-over.
+    /// Respects function boundaries using the DWARF function table (high_pc).
     pub fn next_line_in_function(&self, address: u64) -> Option<(u64, String, u32)> {
         self.ensure_line_table();
         let table = self.line_table.lock().unwrap();
         let entries = table.as_ref()?;
 
-        // Find current entry
-        let idx = entries.binary_search_by_key(&address, |e| e.address).ok()?;
+        // Find current entry (use closest preceding for non-exact addresses)
+        let idx = match entries.binary_search_by_key(&address, |e| e.address) {
+            Ok(idx) => idx,
+            Err(0) => return None,
+            Err(idx) => idx - 1,
+        };
         let current = &entries[idx];
 
-        // Find next is_statement line with different line number, same file
+        // Find the function containing this address to enforce boundary
+        let func_high_pc = self.functions.iter()
+            .find(|f| address >= f.low_pc && address < f.high_pc)
+            .map(|f| f.high_pc);
+
+        // Find next is_statement line with different line number, same file,
+        // staying within the function boundary
         entries[idx + 1..]
             .iter()
+            .take_while(|e| func_high_pc.map_or(true, |hp| e.address < hp))
             .find(|e| e.is_statement && e.file == current.file && e.line != current.line)
             .map(|e| (e.address, e.file.clone(), e.line))
     }

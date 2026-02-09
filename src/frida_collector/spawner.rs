@@ -284,6 +284,7 @@ pub struct PauseNotification {
     pub session_id: String,
     pub thread_id: u64,
     pub breakpoint_id: String,
+    pub hits: u32,
     pub func_name: Option<String>,
     pub file: Option<String>,
     pub line: Option<u32>,
@@ -391,6 +392,7 @@ impl AgentMessageHandler {
                 // Phase 2: Breakpoint pause event
                 let thread_id = payload.get("threadId").and_then(|v| v.as_u64()).unwrap_or(0);
                 let breakpoint_id_str = payload.get("breakpointId").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let hits = payload.get("hits").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let func_name = payload.get("funcName").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let file = payload.get("file").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let line = payload.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
@@ -431,6 +433,7 @@ impl AgentMessageHandler {
                         session_id: self.session_id.clone(),
                         thread_id,
                         breakpoint_id: breakpoint_id_str.to_string(),
+                        hits,
                         func_name,
                         file,
                         line,
@@ -438,6 +441,38 @@ impl AgentMessageHandler {
                     };
                     let _ = tx.try_send(notification);
                 }
+            }
+            "breakpointSet" | "logpointSet" => {
+                let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                tracing::info!("[{}] {} confirmed: {}", self.session_id, msg_type, id);
+                // Signal the hooks_ready channel so set_breakpoint_async can unblock
+                signal_ready(&self.hooks_ready, msg_type, &self.session_id, payload);
+            }
+            "breakpointRemoved" | "logpointRemoved" => {
+                let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                tracing::info!("[{}] {} confirmed: {}", self.session_id, msg_type, id);
+                signal_ready(&self.hooks_ready, msg_type, &self.session_id, payload);
+            }
+            "conditionError" => {
+                let bp_id = payload.get("breakpointId").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let error = payload.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                tracing::warn!("[{}] Condition error on breakpoint {}: {}", self.session_id, bp_id, error);
+
+                // Store as event for queryability
+                let timestamp_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64;
+                let event = Event {
+                    id: format!("{}-cond-err-{}", self.session_id, timestamp_ns),
+                    session_id: self.session_id.clone(),
+                    timestamp_ns,
+                    event_type: EventType::ConditionError,
+                    breakpoint_id: Some(bp_id.to_string()),
+                    function_name: error.to_string(),
+                    ..Event::default()
+                };
+                let _ = self.event_tx.try_send(event);
             }
             _ => {
                 tracing::debug!("Unknown message type from agent: {}", msg_type);
@@ -529,9 +564,19 @@ enum SessionCommand {
         message: serde_json::Value,
         response: oneshot::Sender<Result<()>>,
     },
+    RemoveBreakpoint {
+        breakpoint_id: String,
+        response: oneshot::Sender<Result<()>>,
+    },
+    RemoveLogpoint {
+        logpoint_id: String,
+        response: oneshot::Sender<Result<()>>,
+    },
     ResumeThread {
         thread_id: u64,
-        one_shot_addresses: Vec<u64>,
+        /// Each address: (addr, no_slide). no_slide=true for runtime addresses (e.g., return address).
+        one_shot_addresses: Vec<(u64, bool)>,
+        image_base: u64,
         response: oneshot::Sender<Result<()>>,
     },
     Shutdown,
@@ -927,17 +972,107 @@ fn session_worker(
             }
 
             SessionCommand::SetBreakpoint { message, response } => {
-                let result = unsafe {
+                // Arm the hooks_ready signal to wait for agent confirmation
+                let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+                {
+                    let mut guard = hooks_ready.lock().unwrap();
+                    *guard = Some(signal_tx);
+                }
+
+                let post_result = unsafe {
                     post_message_raw(raw_ptr, &serde_json::to_string(&message).unwrap())
                         .map_err(|e| crate::Error::Frida(format!("Failed to send breakpoint: {}", e)))
+                };
+
+                let result = match post_result {
+                    Ok(()) => {
+                        // Wait for breakpointSet/logpointSet confirmation from agent
+                        match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                            Ok(_) => Ok(()),
+                            Err(_) => {
+                                tracing::warn!("Timed out waiting for breakpoint confirmation (5s)");
+                                // Don't fail — the breakpoint may still work, just wasn't confirmed
+                                Ok(())
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
                 };
                 let _ = response.send(result);
             }
 
-            SessionCommand::ResumeThread { thread_id, one_shot_addresses, response } => {
+            SessionCommand::RemoveBreakpoint { breakpoint_id, response } => {
+                let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+                {
+                    let mut guard = hooks_ready.lock().unwrap();
+                    *guard = Some(signal_tx);
+                }
+
+                let msg = serde_json::json!({
+                    "type": "removeBreakpoint",
+                    "id": breakpoint_id,
+                });
+                let post_result = unsafe {
+                    post_message_raw(raw_ptr, &serde_json::to_string(&msg).unwrap())
+                        .map_err(|e| crate::Error::Frida(format!("Failed to send removeBreakpoint: {}", e)))
+                };
+
+                let result = match post_result {
+                    Ok(()) => {
+                        match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                            Ok(_) => Ok(()),
+                            Err(_) => {
+                                tracing::warn!("Timed out waiting for breakpoint removal confirmation (5s)");
+                                Ok(())
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = response.send(result);
+            }
+
+            SessionCommand::RemoveLogpoint { logpoint_id, response } => {
+                let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+                {
+                    let mut guard = hooks_ready.lock().unwrap();
+                    *guard = Some(signal_tx);
+                }
+
+                let msg = serde_json::json!({
+                    "type": "removeLogpoint",
+                    "id": logpoint_id,
+                });
+                let post_result = unsafe {
+                    post_message_raw(raw_ptr, &serde_json::to_string(&msg).unwrap())
+                        .map_err(|e| crate::Error::Frida(format!("Failed to send removeLogpoint: {}", e)))
+                };
+
+                let result = match post_result {
+                    Ok(()) => {
+                        match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                            Ok(_) => Ok(()),
+                            Err(_) => {
+                                tracing::warn!("Timed out waiting for logpoint removal confirmation (5s)");
+                                Ok(())
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = response.send(result);
+            }
+
+            SessionCommand::ResumeThread { thread_id, one_shot_addresses, image_base, response } => {
                 let resume_msg = serde_json::json!({
                     "type": format!("resume-{}", thread_id),
-                    "oneShot": one_shot_addresses.iter().map(|addr| format!("0x{:x}", addr)).collect::<Vec<_>>(),
+                    "oneShot": one_shot_addresses.iter().map(|(addr, no_slide)| {
+                        serde_json::json!({
+                            "address": format!("0x{:x}", addr),
+                            "noSlide": no_slide,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "imageBase": format!("0x{:x}", image_base),
                 });
                 let result = unsafe {
                     post_message_raw(raw_ptr, &serde_json::to_string(&resume_msg).unwrap())
@@ -1899,12 +2034,50 @@ impl FridaSpawner {
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
+    pub async fn remove_breakpoint(
+        &mut self,
+        session_id: &str,
+        breakpoint_id: &str,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let worker_tx = self.session_workers.get(session_id)
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        worker_tx.send(SessionCommand::RemoveBreakpoint {
+            breakpoint_id: breakpoint_id.to_string(),
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
+
+    pub async fn remove_logpoint(
+        &mut self,
+        session_id: &str,
+        logpoint_id: &str,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let worker_tx = self.session_workers.get(session_id)
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        worker_tx.send(SessionCommand::RemoveLogpoint {
+            logpoint_id: logpoint_id.to_string(),
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
+
     pub async fn resume_thread(
         &mut self,
         session_id: &str,
         thread_id: u64,
     ) -> Result<()> {
-        self.resume_thread_with_step(session_id, thread_id, Vec::new()).await
+        self.resume_thread_with_step(session_id, thread_id, Vec::new(), 0).await
     }
 
     /// Resume thread with optional one-shot breakpoints for stepping
@@ -1912,7 +2085,8 @@ impl FridaSpawner {
         &mut self,
         session_id: &str,
         thread_id: u64,
-        one_shot_addresses: Vec<u64>,
+        one_shot_addresses: Vec<(u64, bool)>,
+        image_base: u64,
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -1922,6 +2096,7 @@ impl FridaSpawner {
         worker_tx.send(SessionCommand::ResumeThread {
             thread_id,
             one_shot_addresses,
+            image_base,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
 

@@ -1874,7 +1874,7 @@ Validation Limits (enforced):
         // Handle removals
         if let Some(ids) = req.remove {
             for id in ids {
-                self.session_manager.remove_breakpoint(&req.session_id, &id);
+                self.session_manager.remove_breakpoint(&req.session_id, &id).await;
             }
         }
 
@@ -1943,7 +1943,7 @@ Validation Limits (enforced):
         // Handle removals
         if let Some(ids) = req.remove {
             for id in ids {
-                self.session_manager.remove_logpoint(&req.session_id, &id);
+                self.session_manager.remove_logpoint(&req.session_id, &id).await;
             }
         }
 

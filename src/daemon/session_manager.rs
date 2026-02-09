@@ -198,6 +198,9 @@ impl SessionManager {
         write_lock(&self.watches).remove(id);
         write_lock(&self.event_limits).remove(id);
         write_lock(&self.child_pids).remove(id);
+        write_lock(&self.breakpoints).remove(id);
+        write_lock(&self.logpoints).remove(id);
+        write_lock(&self.paused_threads).remove(id);
 
         Ok(count)
     }
@@ -221,6 +224,9 @@ impl SessionManager {
         write_lock(&self.watches).remove(id);
         write_lock(&self.event_limits).remove(id);
         write_lock(&self.child_pids).remove(id);
+        write_lock(&self.breakpoints).remove(id);
+        write_lock(&self.logpoints).remove(id);
+        write_lock(&self.paused_threads).remove(id);
 
         Ok(count)
     }
@@ -418,11 +424,13 @@ impl SessionManager {
         // Create pause notification channel for breakpoint support
         let (pause_tx, mut pause_rx) = mpsc::channel::<crate::frida_collector::PauseNotification>(100);
         let paused_threads = Arc::clone(&self.paused_threads);
+        let breakpoints_for_hits = Arc::clone(&self.breakpoints);
         let sid = session_id.to_string();
 
         // Spawn receiver task that bridges pause notifications to SessionManager state
         tokio::spawn(async move {
             while let Some(notification) = pause_rx.recv().await {
+                let bp_id = notification.breakpoint_id.clone();
                 let info = PauseInfo {
                     breakpoint_id: notification.breakpoint_id,
                     func_name: notification.func_name,
@@ -435,6 +443,14 @@ impl SessionManager {
                     .entry(sid.clone())
                     .or_insert_with(HashMap::new)
                     .insert(notification.thread_id, info);
+
+                // Update breakpoint hit counter from agent-reported value
+                let mut bp_guard = write_lock(&breakpoints_for_hits);
+                if let Some(session_bps) = bp_guard.get_mut(&sid) {
+                    if let Some(bp) = session_bps.get_mut(&bp_id) {
+                        bp.hits = notification.hits;
+                    }
+                }
             }
         });
 
@@ -1057,6 +1073,7 @@ impl SessionManager {
             "funcName": resolved_function,
             "file": resolved_file,
             "line": resolved_line,
+            "imageBase": format!("0x{:x}", dwarf.image_base),
         });
 
         spawner.set_breakpoint(session_id, message).await?;
@@ -1111,9 +1128,11 @@ impl SessionManager {
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
         // For stepping actions, we need DWARF info
-        let one_shot_addresses = if action != "continue" {
+        // Each address is (addr, no_slide): no_slide=true for runtime addresses (e.g., return address)
+        let (one_shot_addresses, image_base) = if action != "continue" {
             let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
             let dwarf = dwarf_handle.get().await?;
+            let ib = dwarf.image_base;
 
             // Get the first paused thread (stepping is single-threaded)
             let (_thread_id, pause_info) = paused.iter().next()
@@ -1123,22 +1142,22 @@ impl SessionManager {
             let bp = self.get_breakpoint(session_id, &pause_info.breakpoint_id);
             let current_address = bp.map(|b| b.address).unwrap_or(0);
 
-            match action.as_str() {
+            let addrs = match action.as_str() {
                 "step-over" => {
-                    let mut addresses = Vec::new();
+                    let mut addresses: Vec<(u64, bool)> = Vec::new();
 
-                    // Find next line in same function
+                    // Find next line in same function (DWARF-static → needs slide)
                     if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
-                        addresses.push(next_addr);
+                        addresses.push((next_addr, false));
                         tracing::debug!("step-over: next line at 0x{:x}", next_addr);
                     } else {
                         tracing::warn!("step-over: no next line for 0x{:x}", current_address);
                     }
 
-                    // Also hook return address as fallback (end of function)
+                    // Return address is already runtime → no slide
                     if let Some(ret_addr) = pause_info.return_address {
-                        if !addresses.contains(&ret_addr) {
-                            addresses.push(ret_addr);
+                        if !addresses.iter().any(|(a, _)| *a == ret_addr) {
+                            addresses.push((ret_addr, true));
                             tracing::debug!("step-over: return address fallback at 0x{:x}", ret_addr);
                         }
                     }
@@ -1146,59 +1165,46 @@ impl SessionManager {
                     addresses
                 }
                 "step-into" => {
-                    // Same as step-over for now (full step-into requires call target resolution)
-                    let mut addresses = Vec::new();
+                    let mut addresses: Vec<(u64, bool)> = Vec::new();
 
+                    // Next line in same function (DWARF-static → needs slide)
                     if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
-                        addresses.push(next_addr);
-                        tracing::debug!("step-into: next line at 0x{:x}", next_addr);
-                    } else {
-                        tracing::warn!("step-into: no next line for 0x{:x}", current_address);
-                    }
-
-                    let mut addresses = Vec::new();
-
-                    // Next line in same function (like step-over)
-                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
-                        addresses.push(next_addr);
+                        addresses.push((next_addr, false));
                         tracing::debug!("step-into: next line at 0x{:x}", next_addr);
                     }
 
-                    // Also hook return address as fallback (end of function)
+                    // Return address is already runtime → no slide
                     if let Some(ret_addr) = pause_info.return_address {
-                        if !addresses.contains(&ret_addr) {
-                            addresses.push(ret_addr);
+                        if !addresses.iter().any(|(a, _)| *a == ret_addr) {
+                            addresses.push((ret_addr, true));
                             tracing::debug!("step-into: return address fallback at 0x{:x}", ret_addr);
                         }
                     }
 
-                    // Callee resolution: hook entry points of functions that
-                    // could be called from the current line. First one to fire
-                    // wins (either next line or callee entry).
+                    // Callee entry points (DWARF-static → needs slide)
                     let callee_addresses = dwarf.callee_entry_addresses(current_address);
                     let callee_count = callee_addresses.len();
 
-                    // Limit to 20 callee hooks to avoid overwhelming the target
                     for callee_addr in callee_addresses.into_iter().take(20) {
-                        if !addresses.contains(&callee_addr) {
-                            addresses.push(callee_addr);
+                        if !addresses.iter().any(|(a, _)| *a == callee_addr) {
+                            addresses.push((callee_addr, false));
                         }
                     }
 
                     tracing::debug!(
                         "step-into: {} one-shot addresses ({} callees, capped at 20 from {})",
                         addresses.len(),
-                        addresses.len().saturating_sub(2), // minus next-line and return
+                        addresses.len().saturating_sub(2),
                         callee_count
                     );
                     addresses
                 }
                 "step-out" => {
-                    // Set one-shot at return address
-                    let mut addresses = Vec::new();
+                    let mut addresses: Vec<(u64, bool)> = Vec::new();
 
+                    // Return address is already runtime → no slide
                     if let Some(ret_addr) = pause_info.return_address {
-                        addresses.push(ret_addr);
+                        addresses.push((ret_addr, true));
                         tracing::debug!("step-out: hooking return address 0x{:x}", ret_addr);
                     } else {
                         tracing::warn!("step-out: no return address available, resuming normally");
@@ -1211,9 +1217,10 @@ impl SessionManager {
                         format!("Unknown action: '{}'. Valid: continue, step-over, step-into, step-out", action)
                     ));
                 }
-            }
+            };
+            (addrs, ib)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
 
         // Send resume message to each paused thread
@@ -1222,7 +1229,7 @@ impl SessionManager {
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         for (thread_id, _pause_info) in paused {
-            spawner.resume_thread_with_step(session_id, thread_id, one_shot_addresses.clone()).await?;
+            spawner.resume_thread_with_step(session_id, thread_id, one_shot_addresses.clone(), image_base).await?;
             self.remove_paused_thread(session_id, thread_id);
         }
 
@@ -1302,6 +1309,7 @@ impl SessionManager {
             "funcName": resolved_function,
             "file": resolved_file,
             "line": resolved_line,
+            "imageBase": format!("0x{:x}", dwarf.image_base),
         });
 
         spawner.set_breakpoint(session_id, msg).await?;
@@ -1343,7 +1351,21 @@ impl SessionManager {
             .insert(breakpoint.id.clone(), breakpoint);
     }
 
-    pub fn remove_breakpoint(&self, session_id: &str, breakpoint_id: &str) {
+    pub async fn remove_breakpoint(&self, session_id: &str, breakpoint_id: &str) {
+        // Send removal to agent via spawner pipeline (best-effort)
+        let send_result = async {
+            let mut spawner_guard = self.frida_spawner.write().await;
+            if let Some(spawner) = spawner_guard.as_mut() {
+                spawner.remove_breakpoint(session_id, breakpoint_id).await
+            } else {
+                Ok(())
+            }
+        }.await;
+
+        if let Err(e) = send_result {
+            tracing::warn!("Failed to send breakpoint removal to agent: {} (cleaning up state anyway)", e);
+        }
+
         let mut guard = write_lock(&self.breakpoints);
         if let Some(session_bps) = guard.get_mut(session_id) {
             session_bps.remove(breakpoint_id);
@@ -1372,7 +1394,21 @@ impl SessionManager {
             .insert(logpoint.id.clone(), logpoint);
     }
 
-    pub fn remove_logpoint(&self, session_id: &str, logpoint_id: &str) {
+    pub async fn remove_logpoint(&self, session_id: &str, logpoint_id: &str) {
+        // Send removal to agent via spawner pipeline (best-effort)
+        let send_result = async {
+            let mut spawner_guard = self.frida_spawner.write().await;
+            if let Some(spawner) = spawner_guard.as_mut() {
+                spawner.remove_logpoint(session_id, logpoint_id).await
+            } else {
+                Ok(())
+            }
+        }.await;
+
+        if let Err(e) = send_result {
+            tracing::warn!("Failed to send logpoint removal to agent: {} (cleaning up state anyway)", e);
+        }
+
         let mut guard = write_lock(&self.logpoints);
         if let Some(session_lps) = guard.get_mut(session_id) {
             session_lps.remove(logpoint_id);
@@ -1469,8 +1505,8 @@ pub struct PauseInfo {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_breakpoint_state_management() {
+    #[tokio::test]
+    async fn test_breakpoint_state_management() {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join("strobe_test_bp.db");
         let _ = std::fs::remove_file(&db_path); // Clean start
@@ -1498,8 +1534,8 @@ mod tests {
         assert_eq!(breakpoints.len(), 1);
         assert_eq!(breakpoints[0].id, "bp1");
 
-        // Remove breakpoint
-        sm.remove_breakpoint(session_id, "bp1");
+        // Remove breakpoint (async — spawner not initialized, so just cleans state)
+        sm.remove_breakpoint(session_id, "bp1").await;
         let breakpoints = sm.get_breakpoints(session_id);
         assert_eq!(breakpoints.len(), 0);
 
@@ -1543,8 +1579,8 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 
-    #[test]
-    fn test_logpoint_state_management() {
+    #[tokio::test]
+    async fn test_logpoint_state_management() {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join("strobe_test_lp.db");
         let _ = std::fs::remove_file(&db_path);
@@ -1569,8 +1605,8 @@ mod tests {
         assert_eq!(logpoints[0].id, "lp1");
         assert_eq!(logpoints[0].message, "hit: {args[0]}");
 
-        // Remove
-        sm.remove_logpoint(session_id, "lp1");
+        // Remove (async — spawner not initialized, so just cleans state)
+        sm.remove_logpoint(session_id, "lp1").await;
         let logpoints = sm.get_logpoints(session_id);
         assert_eq!(logpoints.len(), 0);
 

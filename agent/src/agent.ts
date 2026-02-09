@@ -126,6 +126,7 @@ interface SetBreakpointMessage {
   funcName?: string;
   file?: string;
   line?: number;
+  imageBase?: string;
 }
 
 interface RemoveBreakpointMessage {
@@ -140,6 +141,7 @@ interface SetLogpointMessage {
   funcName?: string;
   file?: string;
   line?: number;
+  imageBase?: string;
 }
 
 interface LogpointState {
@@ -153,13 +155,20 @@ interface LogpointState {
   line?: number;
 }
 
+interface OneShotAddress {
+  address: string;
+  noSlide?: boolean;  // true for runtime addresses (e.g., return address)
+}
+
 interface ResumeMessage {
-  oneShot?: string[]; // Addresses for one-shot step breakpoints
+  oneShot?: OneShotAddress[]; // Addresses for one-shot step breakpoints
+  imageBase?: string;         // For ASLR slide computation
 }
 
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
+  private eventSeq: number = 0;
   private platform: PlatformAdapter;
   private tracer: CModuleTracer;
   private rateTracker: RateTracker | null = null;
@@ -804,7 +813,12 @@ class StrobeAgent {
   // ========== Phase 2: Breakpoint methods ==========
 
   setBreakpoint(msg: SetBreakpointMessage): void {
-    const address = ptr(msg.address);
+    // Apply ASLR slide: address from daemon is DWARF-static
+    if (msg.imageBase) {
+      this.tracer.setImageBase(msg.imageBase);
+    }
+    const slide = this.tracer.getSlide();
+    const address = ptr(msg.address).add(slide);
     const self = this;
 
     const listener = Interceptor.attach(address, {
@@ -835,6 +849,7 @@ class StrobeAgent {
           type: 'paused',
           threadId,
           breakpointId: bp.id,
+          hits: bp.hits,
           funcName: bp.funcName,
           file: bp.file,
           line: bp.line,
@@ -845,17 +860,30 @@ class StrobeAgent {
         const op = recv(`resume-${threadId}`, (resumeMsg: ResumeMessage) => {
           // Phase 2b: Install one-shot stepping breakpoints
           if (resumeMsg.oneShot && resumeMsg.oneShot.length > 0) {
+            // Compute ASLR slide for DWARF-static addresses
+            if (resumeMsg.imageBase) {
+              self.tracer.setImageBase(resumeMsg.imageBase);
+            }
+            const stepSlide = self.tracer.getSlide();
+
             const stepId = `step-${threadId}-${Date.now()}`;
             const listeners: InvocationListener[] = [];
+            let fired = false;
 
-            for (const addressStr of resumeMsg.oneShot) {
-              const addr = ptr(addressStr);
+            const cleanupAll = () => {
+              if (fired) return;
+              fired = true;
+              for (const l of listeners) {
+                l.detach();
+              }
+            };
+
+            for (const entry of resumeMsg.oneShot) {
+              // noSlide=true for runtime addresses (e.g., return address)
+              const addr = entry.noSlide ? ptr(entry.address) : ptr(entry.address).add(stepSlide);
               const stepListener = Interceptor.attach(addr, {
                 onEnter() {
-                  // Clean up all one-shot hooks from this step operation
-                  for (const l of listeners) {
-                    l.detach();
-                  }
+                  cleanupAll();
 
                   // Send pause event with return address
                   send({
@@ -875,6 +903,14 @@ class StrobeAgent {
               });
               listeners.push(stepListener);
             }
+
+            // Safety timeout: clean up one-shot hooks after 30s if none fired
+            setTimeout(() => {
+              if (!fired) {
+                cleanupAll();
+                send({ type: 'log', message: `One-shot step hooks timed out for thread ${threadId}` });
+              }
+            }, 30000);
           }
         });
         op.wait(); // CRITICAL: Blocks native thread, releases JS lock
@@ -906,7 +942,12 @@ class StrobeAgent {
   }
 
   setLogpoint(msg: SetLogpointMessage): void {
-    const address = ptr(msg.address);
+    // Apply ASLR slide: address from daemon is DWARF-static
+    if (msg.imageBase) {
+      this.tracer.setImageBase(msg.imageBase);
+    }
+    const slide = this.tracer.getSlide();
+    const address = ptr(msg.address).add(slide);
 
     const listener = Interceptor.attach(address, {
       onEnter: (args) => {
@@ -949,7 +990,7 @@ class StrobeAgent {
         send({
           type: 'events',
           events: [{
-            id: `${this.sessionId}-logpoint-${Date.now()}`,
+            id: `${this.sessionId}-logpoint-${++this.eventSeq}`,
             timestampNs: this.getTimestampNs(),
             threadId: Process.getCurrentThreadId(),
             eventType: 'logpoint',

@@ -130,7 +130,7 @@ async fn test_breakpoint_suite() {
             let breakpoints = sm.get_breakpoints(session_id);
             assert!(breakpoints.iter().any(|b| b.id == "bp-to-remove"));
 
-            sm.remove_breakpoint(session_id, "bp-to-remove");
+            sm.remove_breakpoint(session_id, "bp-to-remove").await;
 
             let breakpoints = sm.get_breakpoints(session_id);
             assert!(!breakpoints.iter().any(|b| b.id == "bp-to-remove"));

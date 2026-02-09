@@ -141,9 +141,53 @@ int main(int argc, char* argv[]) {
             usleep(100000);
         }
         printf("[GLOBALS] Done\n");
+    } else if (strcmp(mode, "breakpoint-loop") == 0) {
+        // Deterministic loop calling process_buffer N times.
+        // Useful for breakpoint, hit count, logpoint, and stepping tests.
+        int iterations = 10;
+        if (argc > 2) iterations = atoi(argv[2]);
+        printf("[BP-LOOP] Running %d iterations\n", iterations);
+        for (int i = 0; i < iterations; i++) {
+            g_counter = i;
+            g_tempo = 120.0 + i;
+            auto buf = audio::generate_sine(440.0f);
+            float rms = audio::process_buffer(&buf);
+            audio::apply_effect(&buf, 0.5f);
+            printf("[BP-LOOP] iter=%d counter=%u rms=%.3f tempo=%.1f\n",
+                   i, g_counter, rms, g_tempo);
+        }
+        printf("[BP-LOOP] Done, counter=%u\n", g_counter);
+    } else if (strcmp(mode, "step-target") == 0) {
+        // Designed for stepping tests.
+        // Each function call is on its own source line for clear step targets.
+        printf("[STEP] Start\n");
+        g_counter = 0;
+        auto buf = audio::generate_sine(440.0f);
+        float rms = audio::process_buffer(&buf);
+        audio::apply_effect(&buf, 0.5f);
+        midi::note_on(60, 100);
+        midi::control_change(1, 64);
+        g_counter = 42;
+        printf("[STEP] Done counter=%u rms=%.3f\n", g_counter, rms);
+    } else if (strcmp(mode, "write-target") == 0) {
+        // For debug_write tests: loops calling process_buffer, exits when g_counter>=999.
+        // Uses >= because process_buffer/generate_sine increment g_counter, so the write
+        // to 999 might be followed by an increment before the check runs.
+        printf("[WRITE] Waiting for g_counter to reach 999\n");
+        g_counter = 0;
+        for (int i = 0; i < 100; i++) {
+            auto buf = audio::generate_sine(440.0f);
+            audio::process_buffer(&buf);
+            if (g_counter >= 999) {
+                printf("[WRITE] g_counter reached 999 (actual=%u) at iteration %d\n", g_counter, i);
+                return 0;
+            }
+            usleep(50000); // 50ms
+        }
+        printf("[WRITE] Timed out, g_counter=%u\n", g_counter);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode);
-        fprintf(stderr, "Usage: %s [hello|crash-null|crash-abort|crash-stack|fork-workers|fork-exec|slow-functions|threads|globals]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [hello|crash-null|crash-abort|crash-stack|fork-workers|fork-exec|slow-functions|threads|globals|breakpoint-loop|step-target|write-target]\n", argv[0]);
         return 1;
     }
 

@@ -7,7 +7,7 @@
     },
     {
       "name": "strobe-field-test",
-      "path": "skills/strobe-field-test.md",
+      "path": ".claude/strobe-field-test.md",
       "description": "Dogfood Strobe against the ERAE Touch MK2 Simulator to validate features in practice"
     }
   ]

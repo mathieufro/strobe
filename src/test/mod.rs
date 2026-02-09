@@ -50,6 +50,8 @@ pub struct TestProgress {
     pub started_at: Instant,
     pub phase: TestPhase,
     pub warnings: Vec<StuckWarning>,
+    /// Wall-clock durations per test (name → ms), populated as tests complete.
+    pub test_durations: HashMap<String, u64>,
 }
 
 impl TestProgress {
@@ -63,6 +65,7 @@ impl TestProgress {
             started_at: Instant::now(),
             phase: TestPhase::Compiling,
             warnings: Vec::new(),
+            test_durations: HashMap::new(),
         }
     }
 
@@ -258,10 +261,11 @@ impl TestRunner {
         let detector_handle = tokio::spawn(async move { detector.run().await });
 
         // Progress-aware polling loop — poll DB for stdout events
-        let mut last_stdout_offset = 0u32;
+        let mut last_seen_timestamp_ns: i64 = 0;
         let poll_interval = std::time::Duration::from_millis(500);
-        // Hard timeout kills the process; add grace period for stuck detector to write warnings
-        let kill_timeout = std::time::Duration::from_secs(hard_timeout + 5);
+        // Hard timeout kills the process; add grace period for stuck detector to write warnings.
+        // hard_timeout is in milliseconds (from adapter.default_timeout).
+        let kill_timeout = std::time::Duration::from_millis(hard_timeout + 5_000);
         let safety_timeout = std::time::Duration::from_secs(600); // 10 min safety net
         let start = std::time::Instant::now();
 
@@ -287,20 +291,31 @@ impl TestRunner {
                 break;
             }
 
-            // Poll DB for new stdout events and update progress
+            // Poll DB for new stdout events and update progress.
+            // Use timestamp-based filtering: only fetch events newer than last seen.
+            // (Offset-based pagination is broken with DESC ordering — new events
+            // arrive at the "top" but offset skips from the top, missing them.)
             if let Some(update_fn) = progress_fn {
-                let new_events = session_manager.db().query_events(session_id, |q| {
-                    q.event_type(crate::db::EventType::Stdout)
-                     .offset(last_stdout_offset)
-                     .limit(500)
+                let mut new_events = session_manager.db().query_events(session_id, |q| {
+                    let mut q = q.event_type(crate::db::EventType::Stdout).limit(500);
+                    if last_seen_timestamp_ns > 0 {
+                        q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
+                    }
+                    q
                 }).unwrap_or_default();
 
+                // DB returns newest-first; reverse to chronological so "test started"
+                // is processed before "test ok".
+                new_events.reverse();
+
                 for event in &new_events {
+                    if event.timestamp_ns > last_seen_timestamp_ns {
+                        last_seen_timestamp_ns = event.timestamp_ns;
+                    }
                     if let Some(text) = &event.text {
                         update_fn(text, &progress);
                     }
                 }
-                last_stdout_offset += new_events.len() as u32;
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -319,6 +334,26 @@ impl TestRunner {
 
         // Let DB writer flush
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Final progress drain — process any remaining stdout events that arrived
+        // after the last poll (e.g., test "ok" events emitted just before process exit).
+        if let Some(update_fn) = progress_fn {
+            let mut remaining = session_manager.db().query_events(session_id, |q| {
+                let mut q = q.event_type(crate::db::EventType::Stdout).limit_uncapped(5000);
+                if last_seen_timestamp_ns > 0 {
+                    q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
+                }
+                q
+            }).unwrap_or_default();
+
+            remaining.reverse(); // Chronological order
+
+            for event in &remaining {
+                if let Some(text) = &event.text {
+                    update_fn(text, &progress);
+                }
+            }
+        }
 
         // Query ALL stdout/stderr from DB
         let stdout_buf = collect_output(session_manager.db(), session_id, crate::db::EventType::Stdout);
@@ -344,6 +379,53 @@ impl TestRunner {
         };
 
         let mut result = adapter.parse_output(&stdout_buf, &stderr_buf, exit_code);
+
+        // Compute per-test durations from DB event timestamps.
+        // Cargo's JSON format doesn't include exec_time on individual test events,
+        // so we derive durations from the time between "started" and "ok"/"failed"
+        // stdout events in the database.
+        {
+            let mut test_start_times: HashMap<String, i64> = HashMap::new();
+            let mut test_durations: HashMap<String, u64> = HashMap::new();
+
+            let mut all_stdout = session_manager.db().query_events(session_id, |q| {
+                q.event_type(crate::db::EventType::Stdout).limit_uncapped(50000)
+            }).unwrap_or_default();
+            all_stdout.reverse(); // Chronological order
+
+            for event in &all_stdout {
+                if let Some(text) = &event.text {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            let eevent = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
+                            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            match (etype, eevent) {
+                                ("test", "started") if !name.is_empty() => {
+                                    test_start_times.insert(name.to_string(), event.timestamp_ns);
+                                }
+                                ("test", "ok") | ("test", "failed") if !name.is_empty() => {
+                                    if let Some(start_ns) = test_start_times.get(name) {
+                                        let dur_ms = (event.timestamp_ns - start_ns).max(0) as u64 / 1_000_000;
+                                        test_durations.insert(name.to_string(), dur_ms);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            for test in &mut result.all_tests {
+                if test.duration_ms == 0 {
+                    if let Some(&dur) = test_durations.get(&test.name) {
+                        test.duration_ms = dur;
+                    }
+                }
+            }
+        }
 
         for failure in &mut result.failures {
             if failure.suggested_traces.is_empty() {
