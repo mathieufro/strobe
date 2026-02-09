@@ -193,7 +193,8 @@ impl TestRunner {
         combined_env.extend(test_cmd.env.clone());
         combined_env.extend(env.clone());
 
-        // Spawn via Frida
+        // Spawn via Frida — defer resume if we need to install hooks first
+        let has_trace_patterns = !trace_patterns.is_empty();
         let pid = session_manager.spawn_with_frida(
             session_id,
             &program,
@@ -201,6 +202,7 @@ impl TestRunner {
             Some(project_root.to_str().unwrap_or(".")),
             project_root.to_str().unwrap_or("."),
             Some(&combined_env),
+            has_trace_patterns, // defer_resume: install hooks before running
         ).await?;
 
         session_manager.create_session(
@@ -210,8 +212,8 @@ impl TestRunner {
             pid,
         )?;
 
-        // Apply trace patterns if any
-        if !trace_patterns.is_empty() {
+        // Apply trace patterns BEFORE resuming the process
+        if has_trace_patterns {
             session_manager.add_patterns(session_id, trace_patterns)?;
             match session_manager.update_frida_patterns(
                 session_id,
@@ -226,6 +228,8 @@ impl TestRunner {
                     tracing::warn!("Failed to apply trace patterns for test session: {}", e);
                 }
             }
+            // NOW resume — hooks are installed
+            session_manager.resume_process(pid).await?;
         }
 
         // Select progress updater based on adapter
@@ -363,14 +367,16 @@ fn resolve_program(program: &str) -> String {
 
 /// Collect all output events of a given type from the database into a single string.
 fn collect_output(db: &crate::db::Database, session_id: &str, event_type: crate::db::EventType) -> String {
-    db.query_events(session_id, |q| {
+    let mut events = db.query_events(session_id, |q| {
         q.event_type(event_type).limit_uncapped(50000)
     })
-    .unwrap_or_default()
-    .into_iter()
-    .filter_map(|e| e.text)
-    .collect::<Vec<_>>()
-    .join("")
+    .unwrap_or_default();
+    // Query returns newest-first; reverse to chronological for output concatenation
+    events.reverse();
+    events.into_iter()
+        .filter_map(|e| e.text)
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Combined result from test run, used by MCP tool handler.

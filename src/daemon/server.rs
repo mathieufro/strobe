@@ -110,6 +110,24 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
     }
 }
 
+/// Parse a type hint string (e.g. "u32", "f64", "pointer") into (size_bytes, type_kind_str).
+fn parse_type_hint(hint: &str) -> (u8, String) {
+    match hint {
+        "i8"  => (1, "int".to_string()),
+        "u8"  => (1, "uint".to_string()),
+        "i16" => (2, "int".to_string()),
+        "u16" => (2, "uint".to_string()),
+        "i32" => (4, "int".to_string()),
+        "u32" => (4, "uint".to_string()),
+        "i64" => (8, "int".to_string()),
+        "u64" => (8, "uint".to_string()),
+        "f32" => (4, "float".to_string()),
+        "f64" => (8, "float".to_string()),
+        "pointer" => (8, "pointer".to_string()),
+        _ => (4, "uint".to_string()), // default: 4-byte unsigned
+    }
+}
+
 fn hook_status_message(installed: u32, matched: u32, patterns_empty: bool) -> String {
     if installed > 0 && matched > installed {
         format!("{} functions hooked (out of {} matches — excess skipped to stay under limit). Use debug_query to see traced events.", installed, matched)
@@ -869,6 +887,7 @@ Validation Limits (enforced):
             req.cwd.as_deref(),
             &req.project_root,
             req.env.as_ref(),
+            false, // debug_launch: resume immediately
         ).await?;
 
         self.session_manager.create_session(
@@ -1032,116 +1051,180 @@ Validation Limits (enforced):
                 let mut watch_warnings = vec![];
                 if let Some(ref watch_update) = req.watches {
                     if let Some(ref add_watches) = watch_update.add {
-                        // Get DWARF parser for this session
-                        if let Some(dwarf) = self.session_manager.get_dwarf(session_id).await? {
-                            let mut frida_watches = vec![];
-                            let mut state_watches = vec![];
+                        let dwarf = self.session_manager.get_dwarf(session_id).await?;
+                        let mut frida_watches = vec![];
+                        let mut expr_watches = vec![];
+                        let mut state_watches = vec![];
 
-                            use crate::mcp::{MAX_WATCH_EXPRESSION_LENGTH as MAX_WATCH_EXPR_LEN, MAX_WATCH_EXPRESSION_DEPTH as MAX_DEREF_DEPTH, MAX_WATCHES_PER_SESSION};
+                        use crate::mcp::{MAX_WATCH_EXPRESSION_LENGTH as MAX_WATCH_EXPR_LEN, MAX_WATCH_EXPRESSION_DEPTH as MAX_DEREF_DEPTH, MAX_WATCHES_PER_SESSION};
 
-                            // Get existing watches to check cumulative limit
-                            let existing_watches = self.session_manager.get_watches(session_id);
+                        let existing_watches = self.session_manager.get_watches(session_id);
 
-                            for watch_target in add_watches {
-                                // Check cumulative watch count limit (existing + new)
-                                let total_watch_count = existing_watches.len() + frida_watches.len();
-                                if total_watch_count >= MAX_WATCHES_PER_SESSION {
-                                    watch_warnings.push(format!(
-                                        "Watch limit reached ({} existing + {} new >= {} max). Additional watches ignored.",
-                                        existing_watches.len(),
-                                        frida_watches.len(),
-                                        MAX_WATCHES_PER_SESSION
-                                    ));
-                                    break;
-                                }
-                                // Validate expression/variable before parsing
-                                let expr_str = watch_target.expr.as_ref()
-                                    .or(watch_target.variable.as_ref());
+                        for watch_target in add_watches {
+                            let total_watch_count = existing_watches.len() + frida_watches.len() + expr_watches.len();
+                            if total_watch_count >= MAX_WATCHES_PER_SESSION {
+                                watch_warnings.push(format!(
+                                    "Watch limit reached ({} existing + {} new >= {} max). Additional watches ignored.",
+                                    existing_watches.len(),
+                                    frida_watches.len() + expr_watches.len(),
+                                    MAX_WATCHES_PER_SESSION
+                                ));
+                                break;
+                            }
 
-                                if let Some(expr) = expr_str {
+                            let on_patterns = watch_target.on.clone();
+
+                            // 1) Address-based watch: raw address, no DWARF needed
+                            if let Some(ref addr_str) = watch_target.address {
+                                let addr = u64::from_str_radix(addr_str.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                                    .map_err(|_| crate::Error::Frida(format!("Invalid watch address: {}", addr_str)))?;
+
+                                let type_hint = watch_target.type_hint.as_deref().unwrap_or("u32");
+                                let (size, type_kind_str) = parse_type_hint(type_hint);
+                                let label = watch_target.label.clone().unwrap_or_else(|| format!("0x{:x}", addr));
+
+                                frida_watches.push(crate::frida_collector::WatchTarget {
+                                    label: label.clone(),
+                                    address: addr,
+                                    size,
+                                    type_kind_str: type_kind_str.clone(),
+                                    deref_depth: 0,
+                                    deref_offset: 0,
+                                    type_name: Some(type_hint.to_string()),
+                                    on_patterns: on_patterns.clone(),
+                                    no_slide: true,
+                                });
+
+                                state_watches.push(crate::daemon::ActiveWatchState {
+                                    label: label.clone(),
+                                    address: addr,
+                                    size,
+                                    type_kind_str,
+                                    deref_depth: 0,
+                                    deref_offset: 0,
+                                    type_name: Some(type_hint.to_string()),
+                                    on_patterns: on_patterns.clone(),
+                                    is_expr: false,
+                                    expr: None,
+                                });
+
+                                active_watches.push(crate::mcp::ActiveWatch {
+                                    label,
+                                    address: format!("0x{:x}", addr),
+                                    size,
+                                    type_name: Some(type_hint.to_string()),
+                                    on: on_patterns,
+                                });
+                                continue;
+                            }
+
+                            // 2) Expression watch: JS expression evaluated in agent, no DWARF
+                            if let Some(ref expr) = watch_target.expr {
+                                if watch_target.variable.is_none() {
                                     if expr.len() > MAX_WATCH_EXPR_LEN {
                                         watch_warnings.push(format!(
                                             "Watch expression too long (max {} chars): {}...",
-                                            MAX_WATCH_EXPR_LEN,
-                                            &expr[..50.min(expr.len())]
+                                            MAX_WATCH_EXPR_LEN, &expr[..50.min(expr.len())]
                                         ));
                                         continue;
                                     }
-                                    if expr.matches("->").count() > MAX_DEREF_DEPTH {
-                                        watch_warnings.push(format!(
-                                            "Watch expression has too many dereferences (max {}): {}",
-                                            MAX_DEREF_DEPTH,
-                                            expr
-                                        ));
-                                        continue;
-                                    }
+                                    let label = watch_target.label.clone().unwrap_or_else(|| expr.clone());
+                                    let is_global = on_patterns.as_ref().map_or(true, |p| p.is_empty());
+
+                                    expr_watches.push(crate::frida_collector::ExprWatchTarget {
+                                        label: label.clone(),
+                                        expr: expr.clone(),
+                                        is_global,
+                                        on_patterns: on_patterns.clone(),
+                                    });
+
+                                    active_watches.push(crate::mcp::ActiveWatch {
+                                        label,
+                                        address: "expr".to_string(),
+                                        size: 0,
+                                        type_name: None,
+                                        on: on_patterns,
+                                    });
+                                    continue;
                                 }
-
-                                // Resolve watch expression or variable
-                                let recipe = if let Some(ref expr) = watch_target.expr {
-                                    dwarf.resolve_watch_expression(expr)?
-                                } else if let Some(ref var_name) = watch_target.variable {
-                                    dwarf.resolve_watch_expression(var_name)?
-                                } else {
-                                    continue; // Skip invalid watch
-                                };
-
-                                // Pass pattern strings to agent for runtime matching
-                                // Agent will match these patterns against installed hook names
-                                // and build the funcId set dynamically
-                                let on_patterns = watch_target.on.clone();
-
-                                let label = watch_target.label.as_ref().unwrap_or(&recipe.label).clone();
-                                let type_kind_str = match recipe.type_kind {
-                                    crate::dwarf::TypeKind::Integer { signed } => {
-                                        if signed { "int".to_string() } else { "uint".to_string() }
-                                    }
-                                    crate::dwarf::TypeKind::Float => "float".to_string(),
-                                    crate::dwarf::TypeKind::Pointer => "pointer".to_string(),
-                                    crate::dwarf::TypeKind::Unknown => "unknown".to_string(),
-                                };
-
-                                // Build WatchTarget for Frida
-                                frida_watches.push(crate::frida_collector::WatchTarget {
-                                    label: label.clone(),
-                                    address: recipe.base_address,
-                                    size: recipe.final_size,
-                                    type_kind_str: type_kind_str.clone(),
-                                    deref_depth: recipe.deref_chain.len() as u8,
-                                    deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
-                                    type_name: recipe.type_name.clone(),
-                                    on_patterns: on_patterns.clone(),
-                                });
-
-                                // Store for state tracking
-                                state_watches.push(crate::daemon::ActiveWatchState {
-                                    label: label.clone(),
-                                    address: recipe.base_address,
-                                    size: recipe.final_size,
-                                    type_kind_str: type_kind_str.clone(),
-                                    deref_depth: recipe.deref_chain.len() as u8,
-                                    deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
-                                    type_name: recipe.type_name.clone(),
-                                    on_patterns: watch_target.on.clone(),
-                                    is_expr: watch_target.expr.is_some(),
-                                    expr: watch_target.expr.clone(),
-                                });
-
-                                // Add to response
-                                active_watches.push(crate::mcp::ActiveWatch {
-                                    label,
-                                    address: format!("0x{:x}", recipe.base_address),
-                                    size: recipe.final_size,
-                                    type_name: recipe.type_name,
-                                    on: watch_target.on.clone(),
-                                });
                             }
 
-                            // Send watches to Frida agent
-                            if !frida_watches.is_empty() {
-                                self.session_manager.update_frida_watches(session_id, frida_watches).await?;
-                                self.session_manager.set_watches(session_id, state_watches);
+                            // 3) DWARF variable watch: resolve via DWARF symbols
+                            let var_or_expr = watch_target.variable.as_ref()
+                                .or(watch_target.expr.as_ref());
+
+                            let Some(name) = var_or_expr else { continue; };
+
+                            if name.len() > MAX_WATCH_EXPR_LEN {
+                                watch_warnings.push(format!(
+                                    "Watch expression too long (max {} chars): {}...",
+                                    MAX_WATCH_EXPR_LEN, &name[..50.min(name.len())]
+                                ));
+                                continue;
                             }
+                            if name.matches("->").count() > MAX_DEREF_DEPTH {
+                                watch_warnings.push(format!(
+                                    "Watch expression has too many dereferences (max {}): {}",
+                                    MAX_DEREF_DEPTH, name
+                                ));
+                                continue;
+                            }
+
+                            let Some(ref dwarf) = dwarf else {
+                                watch_warnings.push("No debug symbols available for DWARF variable watches".to_string());
+                                break;
+                            };
+
+                            let recipe = dwarf.resolve_watch_expression(name)?;
+
+                            let label = watch_target.label.as_ref().unwrap_or(&recipe.label).clone();
+                            let type_kind_str = match recipe.type_kind {
+                                crate::dwarf::TypeKind::Integer { signed } => {
+                                    if signed { "int".to_string() } else { "uint".to_string() }
+                                }
+                                crate::dwarf::TypeKind::Float => "float".to_string(),
+                                crate::dwarf::TypeKind::Pointer => "pointer".to_string(),
+                                crate::dwarf::TypeKind::Unknown => "unknown".to_string(),
+                            };
+
+                            frida_watches.push(crate::frida_collector::WatchTarget {
+                                label: label.clone(),
+                                address: recipe.base_address,
+                                size: recipe.final_size,
+                                type_kind_str: type_kind_str.clone(),
+                                deref_depth: recipe.deref_chain.len() as u8,
+                                deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
+                                type_name: recipe.type_name.clone(),
+                                on_patterns: on_patterns.clone(),
+                                no_slide: false,
+                            });
+
+                            state_watches.push(crate::daemon::ActiveWatchState {
+                                label: label.clone(),
+                                address: recipe.base_address,
+                                size: recipe.final_size,
+                                type_kind_str: type_kind_str.clone(),
+                                deref_depth: recipe.deref_chain.len() as u8,
+                                deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
+                                type_name: recipe.type_name.clone(),
+                                on_patterns: on_patterns.clone(),
+                                is_expr: false,
+                                expr: None,
+                            });
+
+                            active_watches.push(crate::mcp::ActiveWatch {
+                                label,
+                                address: format!("0x{:x}", recipe.base_address),
+                                size: recipe.final_size,
+                                type_name: recipe.type_name,
+                                on: on_patterns,
+                            });
+                        }
+
+                        // Send watches to Frida agent
+                        if !frida_watches.is_empty() || !expr_watches.is_empty() {
+                            self.session_manager.update_frida_watches(session_id, frida_watches, expr_watches).await?;
+                            self.session_manager.set_watches(session_id, state_watches);
                         }
                     }
 
@@ -1161,11 +1244,12 @@ Validation Limits (enforced):
                                 deref_offset: w.deref_offset,
                                 type_name: w.type_name.clone(),
                                 on_patterns: w.on_patterns.clone(),
+                                no_slide: false,
                             }
                         }).collect();
 
                         // Update agent with remaining watches (empty list if all removed)
-                        self.session_manager.update_frida_watches(session_id, frida_watches).await?;
+                        self.session_manager.update_frida_watches(session_id, frida_watches, vec![]).await?;
 
                         watch_warnings.push(format!("Removed {} watch(es)", remove_labels.len()));
                     }

@@ -123,9 +123,9 @@ mod tests {
 
         let all = db.query_events("s1", |q| q).unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].event_type, EventType::Stdout);
-        assert_eq!(all[0].text.as_deref(), Some("Hello from stdout\n"));
-        assert_eq!(all[1].event_type, EventType::Stderr);
+        assert_eq!(all[0].event_type, EventType::Stderr);
+        assert_eq!(all[0].text.as_deref(), Some("Error: something went wrong\n"));
+        assert_eq!(all[1].event_type, EventType::Stdout);
 
         let stdout_only = db.query_events("s1", |q| q.event_type(EventType::Stdout)).unwrap();
         assert_eq!(stdout_only.len(), 1);
@@ -159,10 +159,10 @@ mod tests {
 
         let all = db.query_events("s1", |q| q).unwrap();
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].event_type, EventType::FunctionEnter);
+        assert_eq!(all[0].event_type, EventType::FunctionExit);
         assert_eq!(all[1].event_type, EventType::Stdout);
         assert_eq!(all[1].text.as_deref(), Some("Running...\n"));
-        assert_eq!(all[2].event_type, EventType::FunctionExit);
+        assert_eq!(all[2].event_type, EventType::FunctionEnter);
 
         assert_eq!(db.query_events("s1", |q| q.function_contains("run")).unwrap().len(), 2);
         assert_eq!(db.query_events("s1", |q| q.event_type(EventType::Stdout)).unwrap().len(), 1);
@@ -189,8 +189,8 @@ mod tests {
 
         let results = db.query_events("s1", |q| q).unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].function_name, "init");
-        assert_eq!(results[1].text.as_deref(), Some("batch output line\n"));
+        assert_eq!(results[0].text.as_deref(), Some("batch output line\n"));
+        assert_eq!(results[1].function_name, "init");
     }
 
     #[test]
@@ -300,8 +300,8 @@ mod tests {
 
         let all = db.query_events("s1", |q| q).unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].event_type, EventType::Stdout);
-        assert_eq!(all[1].event_type, EventType::Crash);
+        assert_eq!(all[0].event_type, EventType::Crash);
+        assert_eq!(all[1].event_type, EventType::Stdout);
 
         let crashes = db.query_events("s1", |q| q.event_type(EventType::Crash)).unwrap();
         assert_eq!(crashes.len(), 1);

@@ -201,6 +201,7 @@ fn start_daemon(strobe_dir: &Path) -> Result<()> {
 
     std::process::Command::new(exe)
         .arg("daemon")
+        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file))

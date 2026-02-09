@@ -4,6 +4,7 @@ mod hooks;
 pub use spawner::FridaSpawner;
 pub use spawner::HookResult;
 pub use spawner::WatchTarget;
+pub use spawner::ExprWatchTarget;
 pub use hooks::HookManager;
 pub use hooks::HookMode;
 

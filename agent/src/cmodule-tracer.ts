@@ -463,10 +463,19 @@ export class CModuleTracer {
     this.exprWatches = [];
   }
 
+  /** Final drain — flush any buffered events before script teardown. */
+  dispose(): void {
+    if (this.drainTimer !== null) {
+      clearInterval(this.drainTimer);
+      this.drainTimer = null;
+    }
+    this.drain();
+  }
+
   updateWatches(watches: Array<{
     address: string; size: number; label: string;
     derefDepth: number; derefOffset: number;
-    typeKind: string; isGlobal: boolean; onFuncIds?: number[]; onPatterns?: string[];
+    typeKind: string; isGlobal: boolean; noSlide?: boolean; onFuncIds?: number[]; onPatterns?: string[];
   }>): void {
     if (watches.length > 4) throw new Error('Max 4 CModule watches');
 
@@ -476,12 +485,28 @@ export class CModuleTracer {
     for (let i = 0; i < 4; i++) {
       if (i < watches.length) {
         const w = watches[i];
-        const runtimeAddr = ptr(w.address).add(this.aslrSlide);
+        const runtimeAddr = w.noSlide ? ptr(w.address) : ptr(w.address).add(this.aslrSlide);
 
-        // Validate address is readable
-        const range = Process.findRangeByAddress(runtimeAddr);
-        if (!range || !range.protection.includes('r')) {
-          throw new Error(`Watch address ${runtimeAddr} not readable`);
+        // Validate address is readable before installing in CModule.
+        // readByteArray uses gum_memory_read (setjmp-based safe access) —
+        // throws on unmapped addresses instead of crashing the target.
+        if (!runtimeAddr.isNull()) {
+          let readable = false;
+          try {
+            const probe = runtimeAddr.readByteArray(1);
+            readable = probe !== null;
+          } catch (_e) {
+            // Access violation — address is not mapped
+          }
+          if (!readable) {
+            send({ type: 'log', message: `Watch "${w.label}": address ${runtimeAddr} is not readable, skipping` });
+            this.watchAddrsPtr.add(i * 8).writeU64(uint64(0));
+            this.watchSizesPtr.add(i).writeU8(0);
+            this.watchDerefDepthsPtr.add(i).writeU8(0);
+            this.watchDerefOffsetsPtr.add(i * 8).writeU64(uint64(0));
+            this.watchConfigs[i] = null;
+            continue;
+          }
         }
 
         this.watchAddrsPtr.add(i * 8).writeU64(uint64(runtimeAddr.toString()));
@@ -583,16 +608,20 @@ export class CModuleTracer {
   }
 
   updateExprWatches(exprs: Array<{
-    expr: string; label: string; isGlobal: boolean; onFuncIds: number[];
+    expr: string; label: string; isGlobal: boolean; onPatterns?: string[];
   }>): void {
-    this.exprWatches = exprs.map(e => ({
-      label: e.label,
-      expr: e.expr,
-      compiledFn: new Function('return ' + e.expr) as () => any,
-      // Treat as global if isGlobal is true OR onFuncIds is null/undefined/empty
-      isGlobal: e.isGlobal || !e.onFuncIds || e.onFuncIds.length === 0,
-      onFuncIds: e.onFuncIds ? new Set(e.onFuncIds) : new Set(),
-    }));
+    this.exprWatches = exprs.map(e => {
+      const resolvedFuncIds = (e.onPatterns && e.onPatterns.length > 0)
+        ? this.matchPatternsToFuncIds(e.onPatterns)
+        : new Set<number>();
+      return {
+        label: e.label,
+        expr: e.expr,
+        compiledFn: new Function('return ' + e.expr) as () => any,
+        isGlobal: e.isGlobal || resolvedFuncIds.size === 0,
+        onFuncIds: resolvedFuncIds,
+      };
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -727,7 +756,7 @@ export class CModuleTracer {
           for (const ew of this.exprWatches) {
             if (!ew.isGlobal && !ew.onFuncIds.has(funcId)) continue;
             try { watchValues[ew.label] = ew.compiledFn(); }
-            catch { watchValues[ew.label] = '<error>'; }
+            catch (e: any) { watchValues[ew.label] = '<error>'; }
           }
 
           if (Object.keys(watchValues).length > 0) {

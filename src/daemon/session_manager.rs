@@ -316,6 +316,7 @@ impl SessionManager {
         cwd: Option<&str>,
         project_root: &str,
         env: Option<&std::collections::HashMap<String, String>>,
+        defer_resume: bool,
     ) -> Result<u32> {
         // Extract image base cheaply (<10ms) — only reads __TEXT segment address
         let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
@@ -394,7 +395,17 @@ impl SessionManager {
             dwarf_handle,
             image_base,
             tx,
+            defer_resume,
         ).await
+    }
+
+    /// Resume a process that was spawned with defer_resume=true.
+    pub async fn resume_process(&self, pid: u32) -> Result<()> {
+        let guard = self.frida_spawner.read().await;
+        match guard.as_ref() {
+            Some(spawner) => spawner.resume(pid).await,
+            None => Err(crate::Error::Frida("No Frida spawner initialized".to_string())),
+        }
     }
 
     /// Update Frida trace patterns
@@ -427,6 +438,7 @@ impl SessionManager {
         &self,
         session_id: &str,
         watches: Vec<crate::frida_collector::WatchTarget>,
+        expr_watches: Vec<crate::frida_collector::ExprWatchTarget>,
     ) -> Result<()> {
         let mut guard = self.frida_spawner.write().await;
         let spawner = match guard.as_mut() {
@@ -434,7 +446,7 @@ impl SessionManager {
             None => return Ok(()),
         };
 
-        spawner.set_watches(session_id, watches).await
+        spawner.set_watches(session_id, watches, expr_watches).await
     }
 
     /// Send a raw read_memory command to the Frida agent and return the response.

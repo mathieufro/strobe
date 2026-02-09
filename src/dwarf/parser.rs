@@ -441,21 +441,27 @@ impl DwarfParser {
                 Self::resolve_type_in_unit(dwarf, unit, offset, depth)
             }
             gimli::AttributeValue::DebugInfoRef(di_offset) => {
-                // DWARF v5: section-relative type reference (DW_FORM_ref_addr).
-                // May cross CU boundaries. Find the containing unit.
+                // Fast path: most DebugInfoRef point within the same CU.
+                if let Some(unit_offset) = di_offset.to_unit_offset(&unit.header) {
+                    return Self::resolve_type_in_unit(dwarf, unit, unit_offset, depth);
+                }
+                // Slow path: true cross-CU reference. Find the containing unit.
                 let mut headers = dwarf.debug_info.units();
                 while let Ok(Some(header)) = headers.next() {
-                    let cu_base = match header.offset() {
+                    let cu_range_start = match header.offset() {
                         gimli::UnitSectionOffset::DebugInfoOffset(o) => o.0,
                         gimli::UnitSectionOffset::DebugTypesOffset(o) => o.0,
                     };
-                    if di_offset.0 < cu_base { continue; }
-                    let unit_offset = gimli::UnitOffset(di_offset.0 - cu_base);
-                    if let Ok(target_unit) = dwarf.unit(header) {
-                        if let Some(result) = Self::resolve_type_in_unit(dwarf, &target_unit, unit_offset, depth) {
-                            return Some(result);
-                        }
+                    let cu_range_end = cu_range_start + header.length_including_self();
+                    if di_offset.0 < cu_range_start || di_offset.0 >= cu_range_end {
+                        continue;
                     }
+                    // Found the containing CU
+                    let unit_offset = gimli::UnitOffset(di_offset.0 - cu_range_start);
+                    if let Ok(target_unit) = dwarf.unit(header) {
+                        return Self::resolve_type_in_unit(dwarf, &target_unit, unit_offset, depth);
+                    }
+                    break;
                 }
                 None
             }

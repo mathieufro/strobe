@@ -84,7 +84,7 @@ async fn scenario_output_capture(
     let session_id = "e2e-output";
 
     let pid = sm
-        .spawn_with_frida(session_id, binary, &["hello".to_string()], None, project_root, None)
+        .spawn_with_frida(session_id, binary, &["hello".to_string()], None, project_root, None, false)
         .await
         .unwrap();
     sm.create_session(session_id, binary, project_root, pid).unwrap();
@@ -137,6 +137,7 @@ async fn scenario_cpp_tracing(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -203,6 +204,7 @@ async fn scenario_rust_tracing(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -252,6 +254,7 @@ async fn scenario_crash_null(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -336,6 +339,7 @@ async fn scenario_crash_abort(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -392,6 +396,7 @@ async fn scenario_fork_workers(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -439,6 +444,7 @@ async fn scenario_fork_exec(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -484,6 +490,7 @@ async fn scenario_duration_query(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -560,6 +567,7 @@ async fn scenario_time_range_query(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -620,6 +628,7 @@ async fn scenario_pattern_add_remove(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -671,6 +680,7 @@ async fn scenario_watch_variables(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -716,9 +726,10 @@ async fn scenario_watch_variables(
         deref_offset: recipe.deref_chain.first().copied().unwrap_or(0),
         type_name: recipe.type_name.clone(),
         on_patterns: None,
+        no_slide: false,
     }];
 
-    sm.update_frida_watches(session_id, watch_targets)
+    sm.update_frida_watches(session_id, watch_targets, vec![])
         .await
         .expect("Watch install must succeed");
     eprintln!("Watch installed for g_counter at 0x{:x}", recipe.base_address);
@@ -772,6 +783,7 @@ async fn scenario_multithreaded(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -849,6 +861,7 @@ async fn scenario_read_oneshot(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -949,6 +962,7 @@ async fn scenario_read_struct(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1044,6 +1058,7 @@ async fn scenario_read_poll(
             None,
             project_root,
             None,
+            false,
         )
         .await
         .unwrap();

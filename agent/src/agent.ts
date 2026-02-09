@@ -80,13 +80,14 @@ interface WatchInstruction {
     derefOffset: number;
     typeKind: string;
     isGlobal: boolean;
-    onFuncIds: number[];
+    noSlide?: boolean;
+    onPatterns?: string[];
   }>;
   exprWatches?: Array<{
     expr: string;
     label: string;
     isGlobal: boolean;
-    onFuncIds: number[];
+    onPatterns?: string[];
   }>;
 }
 
@@ -232,7 +233,8 @@ class StrobeAgent {
       if (message.exprWatches) {
         this.tracer.updateExprWatches(message.exprWatches);
       }
-      send({ type: 'watches_updated', activeCount: message.watches.length });
+      const totalCount = message.watches.length + (message.exprWatches ? message.exprWatches.length : 0);
+      send({ type: 'watches_updated', activeCount: totalCount });
     } catch (e: any) {
       send({ type: 'log', message: `handleWatches error: ${e.message}` });
       send({ type: 'watches_updated', activeCount: 0 });
@@ -376,6 +378,29 @@ class StrobeAgent {
       eventType: fd === 1 ? 'stdout' : 'stderr',
       text,
     };
+  }
+
+  /** Clean shutdown: flush all buffered data before script teardown. */
+  dispose(): void {
+    // Stop all timers
+    if (this.outputFlushTimer !== null) {
+      clearInterval(this.outputFlushTimer);
+      this.outputFlushTimer = null;
+    }
+    if (this.samplingStatsTimer !== null) {
+      clearInterval(this.samplingStatsTimer);
+      this.samplingStatsTimer = null;
+    }
+    if (this.activePollTimer !== null) {
+      clearInterval(this.activePollTimer);
+      this.activePollTimer = null;
+    }
+
+    // Flush CModule ring buffer (final drain) and stop its timer
+    this.tracer.dispose();
+
+    // Flush any remaining output events
+    this.flushOutput();
   }
 
   handleReadMemory(message: ReadMemoryMessage): void {
@@ -650,6 +675,14 @@ function onReadMemoryMessage(message: ReadMemoryMessage): void {
   agent.handleReadMemory(message);
 }
 recv('read_memory', onReadMemoryMessage);
+
+// Frida calls rpc.exports.dispose() before script unload — ensures all
+// buffered trace events (CModule ring buffer) and output events are flushed.
+rpc.exports = {
+  dispose() {
+    agent.dispose();
+  }
+};
 
 // Export for potential direct usage
 (globalThis as any).strobeAgent = agent;

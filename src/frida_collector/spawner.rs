@@ -401,7 +401,12 @@ enum CoordinatorCommand {
         cwd: Option<String>,
         env: Option<HashMap<String, String>>,
         event_tx: mpsc::Sender<Event>,
+        defer_resume: bool,
         response: oneshot::Sender<Result<SpawnResult>>,
+    },
+    Resume {
+        pid: u32,
+        response: oneshot::Sender<Result<()>>,
     },
     StopSession {
         session_id: String,
@@ -424,6 +429,7 @@ enum SessionCommand {
     },
     SetWatches {
         watches: Vec<WatchTarget>,
+        expr_watches: Vec<ExprWatchTarget>,
         response: oneshot::Sender<Result<()>>,
     },
     ReadMemory {
@@ -442,6 +448,16 @@ pub struct WatchTarget {
     pub deref_depth: u8,
     pub deref_offset: u64,
     pub type_name: Option<String>,
+    pub on_patterns: Option<Vec<String>>,
+    /// If true, address is already absolute (user-provided) — don't apply ASLR slide.
+    pub no_slide: bool,
+}
+
+#[derive(Clone)]
+pub struct ExprWatchTarget {
+    pub label: String,
+    pub expr: String,
+    pub is_global: bool,
     pub on_patterns: Option<Vec<String>>,
 }
 
@@ -569,6 +585,11 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
         };
 
         match cmd {
+            CoordinatorCommand::Resume { pid, response } => {
+                let result = device.resume(pid)
+                    .map_err(|e| crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)));
+                let _ = response.send(result);
+            }
             CoordinatorCommand::Spawn {
                 session_id,
                 command,
@@ -576,6 +597,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                 cwd,
                 env,
                 event_tx,
+                defer_resume,
                 response,
             } => {
                 let result = (|| -> Result<SpawnResult> {
@@ -671,11 +693,15 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             .map_err(|e| crate::Error::FridaAttachFailed(format!("Init message failed: {}", e)))?;
                     }
 
-                    // Resume process — hooks are installed later via session worker
-                    let t = std::time::Instant::now();
-                    device.resume(pid)
-                        .map_err(|e| crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)))?;
-                    tracing::debug!("PERF: device.resume() took {:?}", t.elapsed());
+                    // Resume process unless caller deferred it (e.g., to install hooks first)
+                    if !defer_resume {
+                        let t = std::time::Instant::now();
+                        device.resume(pid)
+                            .map_err(|e| crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)))?;
+                        tracing::debug!("PERF: device.resume() took {:?}", t.elapsed());
+                    } else {
+                        tracing::info!("Process {} spawned with deferred resume", pid);
+                    }
                     tracing::debug!("PERF: Total coordinator spawn took {:?}", spawn_start.elapsed());
 
                     Ok(SpawnResult {
@@ -752,8 +778,8 @@ fn session_worker(
                 let _ = response.send(result);
             }
 
-            SessionCommand::SetWatches { watches, response } => {
-                let result = handle_set_watches(raw_ptr, &hooks_ready, &session_id, pid, &watches);
+            SessionCommand::SetWatches { watches, expr_watches, response } => {
+                let result = handle_set_watches(raw_ptr, &hooks_ready, &session_id, pid, &watches, &expr_watches);
                 let _ = response.send(result);
             }
 
@@ -878,6 +904,7 @@ fn handle_set_watches(
     session_id: &str,
     pid: u32,
     watches: &[WatchTarget],
+    expr_watches: &[ExprWatchTarget],
 ) -> Result<()> {
     let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
     if !is_alive {
@@ -887,8 +914,8 @@ fn handle_set_watches(
     }
 
     tracing::info!(
-        "SetWatches for session {}: {} watches, PID {} alive",
-        session_id, watches.len(), pid
+        "SetWatches for session {}: {} native + {} expr watches, PID {} alive",
+        session_id, watches.len(), expr_watches.len(), pid
     );
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -898,7 +925,7 @@ fn handle_set_watches(
     }
 
     let watch_list: Vec<serde_json::Value> = watches.iter().map(|w| {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "label": w.label,
             "address": format!("0x{:x}", w.address),
             "size": w.size,
@@ -907,13 +934,29 @@ fn handle_set_watches(
             "derefOffset": w.deref_offset,
             "typeName": w.type_name,
             "onPatterns": w.on_patterns,
+        });
+        if w.no_slide {
+            obj["noSlide"] = serde_json::json!(true);
+        }
+        obj
+    }).collect();
+
+    let expr_watch_list: Vec<serde_json::Value> = expr_watches.iter().map(|e| {
+        serde_json::json!({
+            "label": e.label,
+            "expr": e.expr,
+            "isGlobal": e.is_global,
+            "onPatterns": e.on_patterns,
         })
     }).collect();
 
-    let watches_msg = serde_json::json!({
+    let mut watches_msg = serde_json::json!({
         "type": "watches",
         "watches": watch_list,
     });
+    if !expr_watch_list.is_empty() {
+        watches_msg["exprWatches"] = serde_json::json!(expr_watch_list);
+    }
 
     tracing::debug!("Posting watches message to agent");
     unsafe {
@@ -1225,6 +1268,7 @@ impl FridaSpawner {
         dwarf_handle: DwarfHandle,
         image_base: u64,
         event_sender: mpsc::Sender<Event>,
+        defer_resume: bool,
     ) -> Result<u32> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -1235,6 +1279,7 @@ impl FridaSpawner {
             cwd: cwd.map(|s| s.to_string()),
             env: env.cloned(),
             event_tx: event_sender,
+            defer_resume,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
 
@@ -1261,6 +1306,18 @@ impl FridaSpawner {
         self.sessions.insert(session_id.to_string(), session);
 
         Ok(pid)
+    }
+
+    /// Resume a previously suspended process (used with defer_resume=true).
+    pub async fn resume(&self, pid: u32) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.coordinator_tx.send(CoordinatorCommand::Resume {
+            pid,
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?
     }
 
     pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String], serialization_depth: Option<u32>) -> Result<HookResult> {
@@ -1424,7 +1481,12 @@ impl FridaSpawner {
             .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?
     }
 
-    pub async fn set_watches(&mut self, session_id: &str, watches: Vec<WatchTarget>) -> Result<()> {
+    pub async fn set_watches(
+        &mut self,
+        session_id: &str,
+        watches: Vec<WatchTarget>,
+        expr_watches: Vec<ExprWatchTarget>,
+    ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let worker_tx = self.session_workers.get(session_id)
@@ -1432,6 +1494,7 @@ impl FridaSpawner {
 
         worker_tx.send(SessionCommand::SetWatches {
             watches,
+            expr_watches,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
 

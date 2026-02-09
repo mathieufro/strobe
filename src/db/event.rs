@@ -403,7 +403,7 @@ impl Database {
             params_vec.push(Box::new(min_dur));
         }
 
-        sql.push_str(" ORDER BY timestamp_ns ASC");
+        sql.push_str(" ORDER BY timestamp_ns DESC");
         sql.push_str(" LIMIT ? OFFSET ?");
         params_vec.push(Box::new(query.limit as i64));
         params_vec.push(Box::new(query.offset as i64));
