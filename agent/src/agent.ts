@@ -129,6 +129,10 @@ class StrobeAgent {
     // Periodic flush for output events
     this.outputFlushTimer = setInterval(() => this.flushOutput(), this.outputFlushInterval);
 
+    // Install crash/exception handler early — before process resumes —
+    // so crashes are caught even if the "initialize" message hasn't arrived yet.
+    this.installExceptionHandler();
+
     // Intercept write(2) for stdout/stderr capture (non-fatal if it fails,
     // e.g. with ASAN-instrumented binaries where write() isn't hookable)
     try {
@@ -171,9 +175,6 @@ class StrobeAgent {
         send({ type: 'sampling_stats', stats });
       }
     }, 1000);
-
-    // Install crash/exception handler
-    this.installExceptionHandler();
 
     send({ type: 'initialized', sessionId });
   }
@@ -269,16 +270,47 @@ class StrobeAgent {
   private installExceptionHandler(): void {
     Process.setExceptionHandler((details) => {
       const crashEvent = this.buildCrashEvent(details);
+
+      // Write crash data to a temp file using synchronous native I/O.
+      // This bypasses GLib's async message delivery which may not flush
+      // before the OS kills the process (especially on Linux).
+      this.writeCrashFile(crashEvent);
+
+      // Also try the normal async path (best effort)
       send({ type: 'events', events: [crashEvent] });
 
-      // send() queues the message for GLib main loop delivery to the host.
-      // Sleep the crashing thread to give GLib time to flush before the OS
-      // terminates the process when we return false.
+      // Sleep the crashing thread to give GLib time to flush.
       Thread.sleep(0.1);
 
       // Return false to let the OS handle the crash (terminate the process)
       return false;
     });
+  }
+
+  private writeCrashFile(crashEvent: CrashEvent): void {
+    try {
+      const data = JSON.stringify({ type: 'events', events: [crashEvent] });
+      const crashPath = `/tmp/.strobe-crash-${Process.id}.json`;
+      const pathBuf = Memory.allocUtf8String(crashPath);
+      const dataBuf = Memory.allocUtf8String(data);
+
+      const openFn = new NativeFunction(
+        Module.getExportByName(null, 'open'), 'int', ['pointer', 'int', 'int']);
+      const writeFn = new NativeFunction(
+        Module.getExportByName(null, 'write'), 'long', ['int', 'pointer', 'long']);
+      const closeFn = new NativeFunction(
+        Module.getExportByName(null, 'close'), 'int', ['int']);
+
+      // O_WRONLY | O_CREAT | O_TRUNC
+      const flags = Process.platform === 'linux' ? 0x241 : 0x601;
+      const fd = openFn(pathBuf, flags, 0o644) as number;
+      if (fd >= 0) {
+        writeFn(fd, dataBuf, data.length);
+        closeFn(fd);
+      }
+    } catch (e) {
+      // Best effort — crash file write may fail
+    }
   }
 
   private buildCrashEvent(details: ExceptionDetails): CrashEvent {

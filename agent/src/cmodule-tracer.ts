@@ -348,19 +348,24 @@ export class CModuleTracer {
 
     // --- Create CModule with platform-specific timing preamble ---
     const fullSource = platform.getCModuleTimingPreamble() + CMODULE_SOURCE;
-    this.cm = new CModule(fullSource, {
-      ...platform.getCModuleTimingSymbols(),
-      write_idx:            this.writeIdxPtr,
-      overflow_count:       this.overflowCountPtr,
-      sample_interval:      this.sampleIntervalPtr,
-      global_counter:       this.globalCounterPtr,
-      ring_data:            this.ringDataPtrHolder,
-      watch_count:          this.watchCountPtr,
-      watch_addrs:          this.watchAddrsPtr,
-      watch_sizes:          this.watchSizesPtr,
-      watch_deref_depths:   this.watchDerefDepthsPtr,
-      watch_deref_offsets:  this.watchDerefOffsetsPtr,
-    });
+    try {
+      this.cm = new CModule(fullSource, {
+        ...platform.getCModuleTimingSymbols(),
+        write_idx:            this.writeIdxPtr,
+        overflow_count:       this.overflowCountPtr,
+        sample_interval:      this.sampleIntervalPtr,
+        global_counter:       this.globalCounterPtr,
+        ring_data:            this.ringDataPtrHolder,
+        watch_count:          this.watchCountPtr,
+        watch_addrs:          this.watchAddrsPtr,
+        watch_sizes:          this.watchSizesPtr,
+        watch_deref_depths:   this.watchDerefDepthsPtr,
+        watch_deref_offsets:  this.watchDerefOffsetsPtr,
+      });
+    } catch (e) {
+      send({ type: 'log', message: `CModule creation failed, using JS fallback: ${e}` });
+      this.cm = null;
+    }
 
     // --- Start drain timer ---
     this.drainTimer = setInterval(() => this.drain(), DRAIN_INTERVAL_MS);
@@ -400,7 +405,6 @@ export class CModuleTracer {
     if (existing) {
       return existing.funcId; // Already hooked
     }
-    if (!this.cm) return null;
 
     const funcId = this.nextFuncId++;
 
@@ -417,14 +421,17 @@ export class CModuleTracer {
     const addr = ptr(func.address).add(this.aslrSlide);
 
     try {
-      // Encode mode in data pointer: data = (funcId << 1) | is_light
-      // The CModule's onEnter/onLeave decode this to get func_id and mode.
-      const isLight = mode === 'light' ? 1 : 0;
-      const data = ptr((funcId << 1) | isLight);
+      let listener: InvocationListener;
 
-      // Pass CModule directly — Frida uses its exported onEnter/onLeave natively.
-      // Type definitions don't include the CModule overload, but it works at runtime.
-      const listener = Interceptor.attach(addr, this.cm as any, data);
+      if (this.cm) {
+        // Native CModule path — high performance
+        const isLight = mode === 'light' ? 1 : 0;
+        const data = ptr((funcId << 1) | isLight);
+        listener = Interceptor.attach(addr, this.cm as any, data);
+      } else {
+        // JS fallback path — used when CModule is unavailable
+        listener = this.installJsHook(addr, funcId, mode);
+      }
 
       this.hooks.set(func.address, { listener, funcId, funcName: func.name });
       return funcId;
@@ -433,6 +440,58 @@ export class CModuleTracer {
       this.funcRegistry.delete(funcId);
       return null;
     }
+  }
+
+  /** JS-based hook fallback: writes to the same ring buffer as CModule. */
+  private installJsHook(addr: NativePointer, funcId: number, mode: HookMode): InvocationListener {
+    const writeIdxPtr = this.writeIdxPtr;
+    const ringDataPtr = this.ringDataPtr;
+    const isLight = mode === 'light';
+
+    return Interceptor.attach(addr, {
+      onEnter(args) {
+        const idx = (writeIdxPtr.readU32() % RING_CAPACITY);
+        const entryPtr = ringDataPtr.add(idx * ENTRY_SIZE);
+        const now = uint64(Date.now() * 1000000);  // ms -> ns
+
+        entryPtr.writeU64(now);                                   // timestamp
+        entryPtr.add(8).writePointer(args[0]);                    // arg0
+        entryPtr.add(16).writePointer(args[1]);                   // arg1
+        entryPtr.add(24).writeU64(uint64(0));                     // retval (filled on exit)
+        entryPtr.add(32).writeU32(funcId);                        // funcId
+        entryPtr.add(36).writeU32(Process.getCurrentThreadId());  // threadId
+        entryPtr.add(40).writeU32(0);              // depth (not tracked in JS mode)
+        entryPtr.add(44).writeU8(0);               // eventType = enter
+        entryPtr.add(45).writeU8(0);               // sampled
+        entryPtr.add(46).writeU8(0);               // watchEntryCount
+
+        writeIdxPtr.writeU32(writeIdxPtr.readU32() + 1);
+
+        if (!isLight) {
+          (this as any)._strobeEntryIdx = idx;
+        }
+      },
+      onLeave(retval) {
+        if (isLight) return;
+
+        const idx = (writeIdxPtr.readU32() % RING_CAPACITY);
+        const entryPtr = ringDataPtr.add(idx * ENTRY_SIZE);
+        const now = uint64(Date.now() * 1000000);
+
+        entryPtr.writeU64(now);
+        entryPtr.add(8).writePointer(NULL);
+        entryPtr.add(16).writePointer(NULL);
+        entryPtr.add(24).writePointer(retval);
+        entryPtr.add(32).writeU32(funcId);
+        entryPtr.add(36).writeU32(Process.getCurrentThreadId());
+        entryPtr.add(40).writeU32(0);
+        entryPtr.add(44).writeU8(1);               // eventType = exit
+        entryPtr.add(45).writeU8(0);
+        entryPtr.add(46).writeU8(0);
+
+        writeIdxPtr.writeU32(writeIdxPtr.readU32() + 1);
+      }
+    });
   }
 
   removeHook(address: string): void {
@@ -683,20 +742,15 @@ export class CModuleTracer {
         if (!shouldRecord) continue;
       }
 
-      // Resolve thread name (cached)
+      // Resolve thread name (cached).
+      // Avoid Process.enumerateThreads() — it triggers gum_detect_pthread_internals()
+      // which is fatal on ASAN-instrumented binaries. Read /proc directly instead.
       let threadName: string | null | undefined;
       if (this.threadNames.has(threadId)) {
         threadName = this.threadNames.get(threadId);
       } else {
-        try {
-          const found = Process.enumerateThreads()
-            .find(t => t.id === threadId)?.name || null;
-          this.threadNames.set(threadId, found);
-          threadName = found;
-        } catch {
-          threadName = null;
-          this.threadNames.set(threadId, null);
-        }
+        threadName = this.readThreadName(threadId);
+        this.threadNames.set(threadId, threadName ?? null);
       }
 
       const eventId = this.generateEventId();
@@ -885,6 +939,34 @@ export class CModuleTracer {
       this.objectSerializer.reset();
     }
     return results;
+  }
+
+  /** Read thread name from /proc without calling Process.enumerateThreads(). */
+  private readThreadName(threadId: number): string | null {
+    if (Process.platform !== 'linux') {
+      // On non-Linux, fall back to Process.enumerateThreads()
+      try {
+        return Process.enumerateThreads()
+          .find(t => t.id === threadId)?.name || null;
+      } catch { return null; }
+    }
+    // Linux: read /proc/self/task/<tid>/comm directly via syscalls
+    try {
+      const path = Memory.allocUtf8String(`/proc/self/task/${threadId}/comm`);
+      const open = new NativeFunction(
+        Module.getExportByName(null, 'open'), 'int', ['pointer', 'int']);
+      const read = new NativeFunction(
+        Module.getExportByName(null, 'read'), 'int', ['int', 'pointer', 'int']);
+      const close = new NativeFunction(
+        Module.getExportByName(null, 'close'), 'int', ['int']);
+      const fd = open(path, 0 /* O_RDONLY */);
+      if (fd < 0) return null;
+      const buf = Memory.alloc(64);
+      const n = read(fd, buf, 63);
+      close(fd);
+      if (n <= 0) return null;
+      return buf.readUtf8String(n)!.trim() || null;
+    } catch { return null; }
   }
 
   private generateEventId(): string {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
 use crate::db::{Event, EventType};
@@ -9,6 +9,11 @@ use crate::dwarf::{DwarfParser, DwarfHandle, FunctionInfo};
 use crate::Result;
 use super::{HookManager, HookMode};
 use libc;
+
+extern "C" {
+    #[link_name = "_frida_g_error_free"]
+    fn g_error_free(error: *mut frida_sys::GError);
+}
 
 /// Check a GLib error pointer. Returns Ok(()) if null, or the error message if set.
 /// Frees the GError after extracting the message.
@@ -20,7 +25,7 @@ unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(),
         .to_str()
         .unwrap_or("unknown error")
         .to_string();
-    frida_sys::g_error_free(error);
+    g_error_free(error);
     Err(msg)
 }
 
@@ -285,6 +290,7 @@ struct AgentMessageHandler {
     session_id: String,
     hooks_ready: HooksReadySignal,
     read_response: ReadResponseSignal,
+    crash_reported: Arc<AtomicBool>,
 }
 
 impl AgentMessageHandler {
@@ -296,6 +302,10 @@ impl AgentMessageHandler {
                     tracing::info!("Received {} events from agent [{}]", events.len(), self.session_id);
                     for event_json in events {
                         if let Some(event) = parse_event(&self.session_id, event_json) {
+                            if event.event_type == EventType::Crash {
+                                self.crash_reported.store(true, Ordering::Release);
+                                tracing::info!("Crash event received from agent [{}]", self.session_id);
+                            }
                             let _ = self.event_tx.try_send(event);
                         }
                     }
@@ -620,7 +630,14 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     }
 
                     if let Some(ref env_vars) = env {
-                        let env_tuples: Vec<(&str, &str)> = env_vars
+                        // Merge user-provided env vars with the parent environment.
+                        // envp() replaces the entire environment, so we must include
+                        // all existing vars plus user overrides.
+                        let mut merged: std::collections::HashMap<String, String> = std::env::vars().collect();
+                        for (k, v) in env_vars.iter() {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        let env_tuples: Vec<(&str, &str)> = merged
                             .iter()
                             .map(|(k, v)| (k.as_str(), v.as_str()))
                             .collect();
@@ -670,12 +687,14 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
 
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
                     let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
+                    let crash_reported = Arc::new(AtomicBool::new(false));
 
                     let handler = AgentMessageHandler {
                         event_tx: event_tx.clone(),
                         session_id: session_id.clone(),
                         hooks_ready: hooks_ready.clone(),
                         read_response: read_response.clone(),
+                        crash_reported: crash_reported.clone(),
                     };
 
                     unsafe { register_handler_raw(script_ptr, handler) };
@@ -703,6 +722,26 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         tracing::info!("Process {} spawned with deferred resume", pid);
                     }
                     tracing::debug!("PERF: Total coordinator spawn took {:?}", spawn_start.elapsed());
+
+                    // Start process death monitor for crash detection fallback
+                    let monitor_pid = pid;
+                    let monitor_session_id = session_id.clone();
+                    let monitor_event_tx = event_tx.clone();
+                    let monitor_crash_reported = crash_reported;
+                    let monitor_start_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as i64;
+
+                    thread::spawn(move || {
+                        process_death_monitor(
+                            monitor_pid,
+                            monitor_session_id,
+                            monitor_event_tx,
+                            monitor_crash_reported,
+                            monitor_start_ns,
+                        );
+                    });
 
                     Ok(SpawnResult {
                         pid,
@@ -784,7 +823,7 @@ fn session_worker(
             }
 
             SessionCommand::ReadMemory { recipes_json, response } => {
-                let result = handle_read_memory(raw_ptr, &read_response, &recipes_json);
+                let result = handle_read_memory(raw_ptr, &read_response, &recipes_json, pid);
                 let _ = response.send(result);
             }
 
@@ -989,6 +1028,7 @@ fn handle_read_memory(
     script_ptr: *mut frida_sys::_FridaScript,
     read_response: &ReadResponseSignal,
     recipes_json: &str,
+    pid: u32,
 ) -> Result<serde_json::Value> {
     let msg: serde_json::Value = serde_json::from_str(recipes_json)
         .map_err(|e| crate::Error::Frida(format!("Invalid recipes JSON: {}", e)))?;
@@ -1014,10 +1054,26 @@ fn handle_read_memory(
             .map_err(|e| crate::Error::Frida(format!("Failed to send read_memory: {}", e)))?;
     }
 
-    match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(response) => Ok(response),
-        Err(_) => Err(crate::Error::Frida("Memory read timed out (5s)".to_string())),
+    // Wait for response with periodic process-liveness checks.
+    // If the process dies, the Frida agent dies too and no response will come.
+    // Detect this early instead of waiting the full timeout.
+    for _ in 0..10 {
+        match signal_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(response) => return Ok(response),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(crate::Error::ReadFailed("Response channel closed".to_string()));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                if !alive {
+                    return Err(crate::Error::ReadFailed(
+                        "Process exited before memory read completed".to_string()
+                    ));
+                }
+            }
+        }
     }
+    Err(crate::Error::Frida("Memory read timed out (5s)".to_string()))
 }
 
 /// Handle a child process spawned via fork/exec.
@@ -1082,6 +1138,7 @@ fn handle_child_spawn(
                         session_id: session_id.clone(),
                         hooks_ready: hooks_ready.clone(),
                         read_response: read_response.clone(),
+                        crash_reported: Arc::new(AtomicBool::new(false)),
                     };
                     unsafe {
                         register_handler_raw(script_ptr, handler);
@@ -1224,6 +1281,104 @@ fn resolve_pattern<'a>(
         dwarf.find_by_source_file(file_pat)
     } else {
         dwarf.find_by_pattern(pattern)
+    }
+}
+
+/// Monitor a spawned process for crash detection.
+/// When the process dies, checks for a crash file written by the agent's
+/// exception handler (synchronous native I/O). Falls back to waitpid
+/// for basic signal info. This ensures crash events are captured even when
+/// GLib can't flush the agent's async send() before the OS kills the process.
+fn process_death_monitor(
+    pid: u32,
+    session_id: String,
+    event_tx: mpsc::Sender<Event>,
+    crash_reported: Arc<AtomicBool>,
+    start_ns: i64,
+) {
+    // Poll until process is dead
+    loop {
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        if !alive { break; }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Give the agent's async crash event time to arrive via GLib
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // If agent already reported the crash via the normal GLib path, just clean up
+    if crash_reported.load(Ordering::Acquire) {
+        let crash_file = format!("/tmp/.strobe-crash-{}.json", pid);
+        let _ = std::fs::remove_file(&crash_file);
+        tracing::debug!("Process {} died, agent crash event already received", pid);
+        return;
+    }
+
+    // Try to read crash data from the file written by the agent's exception handler
+    let crash_file = format!("/tmp/.strobe-crash-{}.json", pid);
+    if let Ok(data) = std::fs::read_to_string(&crash_file) {
+        let _ = std::fs::remove_file(&crash_file);
+
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(events) = parsed.get("events").and_then(|v| v.as_array()) {
+                tracing::info!("Recovered crash event from file for PID {} [{}]", pid, session_id);
+                for event_json in events {
+                    if let Some(event) = parse_event(&session_id, event_json) {
+                        let _ = event_tx.try_send(event);
+                    }
+                }
+                return;
+            }
+        }
+        tracing::warn!("Crash file for PID {} exists but couldn't be parsed", pid);
+    }
+
+    // Last resort: check waitpid for signal-based termination
+    let mut status: i32 = 0;
+    let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+
+    if result > 0 {
+        let killed_by_signal = libc::WIFSIGNALED(status);
+        if killed_by_signal {
+            let sig = libc::WTERMSIG(status);
+            // Don't report SIGKILL/SIGTERM as crashes (usually intentional)
+            if sig == libc::SIGKILL || sig == libc::SIGTERM {
+                tracing::debug!("Process {} killed by signal {} (intentional)", pid, sig);
+                return;
+            }
+            let signal_name = match sig {
+                libc::SIGSEGV => "access-violation",
+                libc::SIGABRT => "abort",
+                libc::SIGBUS => "bus-error",
+                libc::SIGFPE => "arithmetic",
+                libc::SIGILL => "illegal-instruction",
+                _ => "unknown-signal",
+            };
+
+            let now_ns = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64) - start_ns;
+
+            tracing::info!(
+                "Host-side crash detection: PID {} killed by {} [{}]",
+                pid, signal_name, session_id
+            );
+
+            let event = Event {
+                id: format!("{}-crash-host-{}", session_id, chrono::Utc::now().timestamp_millis()),
+                session_id: session_id.clone(),
+                timestamp_ns: now_ns,
+                event_type: EventType::Crash,
+                signal: Some(signal_name.to_string()),
+                pid: Some(pid),
+                thread_id: 0,
+                ..Event::default()
+            };
+            let _ = event_tx.try_send(event);
+        }
+    } else {
+        tracing::debug!("Process {} already reaped (waitpid returned {})", pid, result);
     }
 }
 
@@ -1717,6 +1872,7 @@ mod tests {
             session_id: "test-session".to_string(),
             hooks_ready: hooks_ready.clone(),
             read_response,
+            crash_reported: Arc::new(AtomicBool::new(false)),
         };
         (handler, event_rx, hooks_ready)
     }

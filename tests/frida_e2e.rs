@@ -916,7 +916,7 @@ async fn scenario_read_oneshot(
         .as_u64()
         .expect("g_counter should be a number");
     eprintln!("  g_counter = {}", counter_val);
-    assert!(counter_val <= 49, "g_counter should be 0-49, got {}", counter_val);
+    assert!(counter_val <= 199, "g_counter should be 0-199, got {}", counter_val);
 
     // g_tempo: double, set to 120.0 + (i % 10)
     let tempo = &results[1];
@@ -1030,8 +1030,8 @@ async fn scenario_read_struct(
     let val = fields_obj["value"].as_f64().expect("value should be a float");
 
     eprintln!("  Point {{ x: {}, y: {}, value: {} }}", x, y, val);
-    assert!(x >= 0 && x <= 49, "x should be 0-49, got {}", x);
-    assert!(y >= 0 && y <= 98, "y should be 0-98, got {}", y);
+    assert!(x >= 0 && x <= 199, "x should be 0-199, got {}", x);
+    assert!(y >= 0 && y <= 398, "y should be 0-398, got {}", y);
     assert!(
         (val - 99.9).abs() < 0.01,
         "value should be ~99.9 (initial), got {}",

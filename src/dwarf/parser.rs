@@ -136,7 +136,7 @@ impl DwarfParser {
         let object = object::File::parse(&*mmap)
             .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
 
-        // Find the first executable segment (typically __TEXT on Mach-O, LOAD on ELF)
+        // Mach-O: use the __TEXT segment address directly
         for segment in object.segments() {
             if let Some(name) = segment.name().ok().flatten() {
                 if name == "__TEXT" {
@@ -145,12 +145,25 @@ impl DwarfParser {
             }
         }
 
-        // Fallback: use the first segment with a non-zero address
+        // ELF: find the minimum virtual address among loadable segments.
+        // For PIE binaries this is typically 0x0; for non-PIE it's 0x400000.
+        // We identify loadable segments by having non-zero size and being
+        // page-aligned (distinguishes PT_LOAD from PT_PHDR, PT_INTERP, etc.).
+        let mut min_load_addr: Option<u64> = None;
         for segment in object.segments() {
             let addr = segment.address();
-            if addr > 0 {
-                return Ok(addr);
+            let size = segment.size();
+            let align = segment.align();
+            // PT_LOAD segments have page-sized alignment (>= 0x1000)
+            if size > 0 && align >= 0x1000 {
+                min_load_addr = Some(match min_load_addr {
+                    Some(prev) => prev.min(addr),
+                    None => addr,
+                });
             }
+        }
+        if let Some(addr) = min_load_addr {
+            return Ok(addr);
         }
 
         Ok(0)
@@ -209,7 +222,14 @@ impl DwarfParser {
                             if let Ok(Some(var)) = Self::parse_variable(&dwarf, &unit, entry) {
                                 // For pointer variables, store type offset for lazy struct resolution
                                 if matches!(var.type_kind, TypeKind::Pointer) {
-                                    let type_unit_off = match entry.attr_value(gimli::DW_AT_type).ok().flatten() {
+                                    // Get DW_AT_type — fall back to referenced declaration entry
+                                    // for C++ extern vars where definition has DW_AT_specification only
+                                    let type_attr = entry.attr_value(gimli::DW_AT_type).ok().flatten()
+                                        .or_else(|| {
+                                            Self::resolve_reference(&unit, entry)
+                                                .and_then(|ref_e| ref_e.attr_value(gimli::DW_AT_type).ok().flatten())
+                                        });
+                                    let type_unit_off = match type_attr {
                                         Some(gimli::AttributeValue::UnitRef(off)) => Some(off),
                                         Some(gimli::AttributeValue::DebugInfoRef(off)) => off.to_unit_offset(&unit.header),
                                         _ => None,
@@ -276,6 +296,34 @@ impl DwarfParser {
         })
     }
 
+    /// Resolve a string attribute from an entry, handling DWARF v4/v5 string forms.
+    fn resolve_string_attr<R: gimli::Reader>(
+        dwarf: &gimli::Dwarf<R>,
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+        attr: gimli::DwAt,
+    ) -> Option<String> {
+        entry.attr_value(attr).ok().flatten()
+            .and_then(|v| dwarf.attr_string(unit, v).ok())
+            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()))
+    }
+
+    /// Follow DW_AT_specification or DW_AT_abstract_origin to get the referenced entry.
+    fn resolve_reference<'a, R: gimli::Reader>(
+        unit: &'a gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Option<gimli::DebuggingInformationEntry<'a, 'a, R>> {
+        let ref_offset = entry.attr_value(gimli::DW_AT_specification).ok().flatten()
+            .or_else(|| entry.attr_value(gimli::DW_AT_abstract_origin).ok().flatten());
+
+        match ref_offset {
+            Some(gimli::AttributeValue::UnitRef(offset)) => {
+                unit.entry(offset).ok()
+            }
+            _ => None,
+        }
+    }
+
     fn parse_function<R: gimli::Reader>(
         dwarf: &gimli::Dwarf<R>,
         unit: &gimli::Unit<R>,
@@ -283,13 +331,20 @@ impl DwarfParser {
     ) -> Result<Option<FunctionInfo>> {
         // Get function name: prefer DW_AT_linkage_name (fully qualified mangled name) over
         // DW_AT_name (short name). Handles DWARF v4 and v5 string forms.
-        let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
-            .and_then(|v| dwarf.attr_string(unit, v).ok())
-            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+        let mut linkage_name = Self::resolve_string_attr(dwarf, unit, entry, gimli::DW_AT_linkage_name);
+        let mut short_name = Self::resolve_string_attr(dwarf, unit, entry, gimli::DW_AT_name);
 
-        let short_name = entry.attr_value(gimli::DW_AT_name).ok().flatten()
-            .and_then(|v| dwarf.attr_string(unit, v).ok())
-            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+        // If no name found, follow DW_AT_specification / DW_AT_abstract_origin to the
+        // referenced declaration entry (common in C++ where namespace members are declared
+        // inside DW_TAG_namespace and defined separately with DW_AT_specification).
+        let ref_entry;
+        if linkage_name.is_none() && short_name.is_none() {
+            ref_entry = Self::resolve_reference(unit, entry);
+            if let Some(ref ref_e) = ref_entry {
+                linkage_name = Self::resolve_string_attr(dwarf, unit, ref_e, gimli::DW_AT_linkage_name);
+                short_name = Self::resolve_string_attr(dwarf, unit, ref_e, gimli::DW_AT_name);
+            }
+        }
 
         // Use linkage name for demangling (gives qualified names), fall back to short name
         let name = match linkage_name.or(short_name) {
@@ -320,12 +375,22 @@ impl DwarfParser {
             _ => low_pc + 1, // Minimal range if not specified
         };
 
-        // Get source file and line number
-        let source_file = Self::parse_source_file(dwarf, unit, entry);
+        // Get source file and line number (fall back to referenced entry)
+        let source_file = Self::parse_source_file(dwarf, unit, entry)
+            .or_else(|| {
+                Self::resolve_reference(unit, entry)
+                    .and_then(|ref_e| Self::parse_source_file(dwarf, unit, &ref_e))
+            });
 
         let line_number = match entry.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
             Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
-            _ => None,
+            _ => {
+                Self::resolve_reference(unit, entry)
+                    .and_then(|ref_e| match ref_e.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
+                        Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
+                        _ => None,
+                    })
+            }
         };
 
         // Demangle the name
@@ -349,14 +414,23 @@ impl DwarfParser {
         unit: &gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
     ) -> Result<Option<VariableInfo>> {
-        // Get name: prefer linkage_name over short name for demangling
-        let linkage_name = entry.attr_value(gimli::DW_AT_linkage_name).ok().flatten()
-            .and_then(|v| dwarf.attr_string(unit, v).ok())
-            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+        // Get name: prefer linkage_name over short name for demangling.
+        // Follow DW_AT_specification/DW_AT_abstract_origin for C++ extern
+        // variable definitions that have no name on the definition entry.
+        let linkage_name = Self::resolve_string_attr(dwarf, unit, entry, gimli::DW_AT_linkage_name);
+        let short_name = Self::resolve_string_attr(dwarf, unit, entry, gimli::DW_AT_name);
 
-        let short_name = entry.attr_value(gimli::DW_AT_name).ok().flatten()
-            .and_then(|v| dwarf.attr_string(unit, v).ok())
-            .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
+        let (linkage_name, short_name) = if linkage_name.is_none() && short_name.is_none() {
+            if let Some(ref_entry) = Self::resolve_reference(unit, entry) {
+                let ln = Self::resolve_string_attr(dwarf, unit, &ref_entry, gimli::DW_AT_linkage_name);
+                let sn = Self::resolve_string_attr(dwarf, unit, &ref_entry, gimli::DW_AT_name);
+                (ln, sn)
+            } else {
+                (None, None)
+            }
+        } else {
+            (linkage_name, short_name)
+        };
 
         let name = match linkage_name.or(short_name.clone()) {
             Some(n) => n,
@@ -369,8 +443,12 @@ impl DwarfParser {
             None => return Ok(None),
         };
 
-        // Get type info
+        // Get type info — fall back to referenced entry if not on this entry
         let (byte_size, type_kind, type_name) = Self::resolve_type_info(dwarf, unit, entry)
+            .or_else(|| {
+                Self::resolve_reference(unit, entry)
+                    .and_then(|ref_entry| Self::resolve_type_info(dwarf, unit, &ref_entry))
+            })
             .unwrap_or((0, TypeKind::Unknown, None));
 
         // Skip if size is not 1, 2, 4, or 8
