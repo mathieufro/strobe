@@ -7,4 +7,4 @@
 .strobe/
 tests/**/target/
 tests/**/build/
-tests/**/*.dSYM/
+tests/**/*.dSYM/.worktrees/

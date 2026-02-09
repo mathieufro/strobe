@@ -111,7 +111,7 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
 }
 
 /// Parse a type hint string (e.g. "u32", "f64", "pointer") into (size_bytes, type_kind_str).
-fn parse_type_hint(hint: &str) -> (u8, String) {
+pub fn parse_type_hint(hint: &str) -> (u8, String) {
     match hint {
         "i8"  => (1, "int".to_string()),
         "u8"  => (1, "uint".to_string()),
@@ -732,6 +732,30 @@ Validation Limits (enforced):
                 }),
             },
             McpTool {
+                name: "debug_write".to_string(),
+                description: "Write to global variables or raw memory addresses while the process is running (or paused at a breakpoint). Supports named DWARF variables and raw hex addresses.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "variable": { "type": "string", "description": "DWARF variable name (e.g. 'g_counter', 'g_tempo')" },
+                                    "address": { "type": "string", "description": "Raw hex address (e.g. '0x7ff800')" },
+                                    "value": { "description": "Value to write (number or boolean)" },
+                                    "type": { "type": "string", "enum": ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "pointer"], "description": "Type hint (required for raw address)" }
+                                },
+                                "required": ["value"]
+                            }
+                        }
+                    },
+                    "required": ["sessionId", "targets"]
+                }),
+            },
+            McpTool {
                 name: "debug_breakpoint".to_string(),
                 description: "Set or remove breakpoints. Pauses execution when hit. Use debug_continue to resume. Supports function names, file:line, conditions, and hit counts.".to_string(),
                 input_schema: serde_json::json!({
@@ -821,6 +845,7 @@ Validation Limits (enforced):
             "debug_test" => self.tool_debug_test(&call.arguments, connection_id).await,
             "debug_test_status" => self.tool_debug_test_status(&call.arguments).await,
             "debug_read" => self.tool_debug_read(&call.arguments).await,
+            "debug_write" => self.tool_debug_write(&call.arguments).await,
             "debug_breakpoint" => self.tool_debug_breakpoint(&call.arguments).await,
             "debug_continue" => self.tool_debug_continue(&call.arguments).await,
             "debug_logpoint" => self.tool_debug_logpoint(&call.arguments).await,
@@ -1470,6 +1495,10 @@ Validation Limits (enforced):
 
     async fn tool_debug_read(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         self.session_manager.execute_debug_read(args).await
+    }
+
+    async fn tool_debug_write(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        self.session_manager.execute_debug_write(args).await
     }
 
     async fn tool_debug_stop(&self, args: &serde_json::Value) -> Result<serde_json::Value> {

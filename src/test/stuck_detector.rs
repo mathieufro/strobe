@@ -41,16 +41,27 @@ impl SuspicionState {
 /// deadlock. If a thread is paused at a breakpoint (recv().wait()), 0% CPU is
 /// expected and not a stuck condition. Requires session_manager reference to
 /// check SessionManager::get_all_paused_threads().
+/// Phase 2: Checks for active breakpoint pauses before diagnosing deadlock.
+/// If any thread is paused at a breakpoint (recv().wait()), 0% CPU is expected
+/// and not a stuck condition.
 pub struct StuckDetector {
     pid: u32,
     hard_timeout_ms: u64,
     progress: Arc<Mutex<TestProgress>>,
     // TODO Phase 2: Add session_manager: Option<Arc<SessionManager>> to check pause state
+    /// Returns true if any threads are paused at breakpoints for this session.
+    /// When set, suppresses deadlock diagnosis when breakpoints are active.
+    has_paused_threads: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl StuckDetector {
     pub fn new(pid: u32, hard_timeout_ms: u64, progress: Arc<Mutex<TestProgress>>) -> Self {
-        Self { pid, hard_timeout_ms, progress }
+        Self { pid, hard_timeout_ms, progress, has_paused_threads: None }
+    }
+
+    pub fn with_pause_check(mut self, check: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.has_paused_threads = Some(check);
+        self
     }
 
     fn current_phase(&self) -> super::TestPhase {
@@ -147,6 +158,15 @@ impl StuckDetector {
                 // threads are paused at breakpoints (recv().wait()). A paused breakpoint
                 // shows 0% CPU but is not stuck. TODO: Add check:
                 // if session_manager.get_all_paused_threads(session_id).is_empty() { ...
+                // threads are paused at breakpoints. A paused breakpoint shows 0% CPU
+                // but is not stuck — suppress the warning.
+                if delta == 0 && self.has_paused_threads.as_ref().map_or(false, |f| f()) {
+                    // Threads are paused at breakpoints — zero CPU is expected
+                    suspicion.reset();
+                    prev_cpu_ns = Some(cpu_ns);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
                 if delta == 0 {
                     suspicion.zero_delta_count += 1;
                     suspicion.constant_high_count = 0;
@@ -488,5 +508,14 @@ mod tests {
         let pid = std::process::id();
         let time = get_process_cpu_ns(pid);
         assert!(time > 0, "Should get non-zero CPU time for current process");
+    }
+
+    #[test]
+    fn test_stuck_detector_with_pause_check() {
+        let progress = Arc::new(Mutex::new(super::super::TestProgress::new()));
+        let detector = StuckDetector::new(1, 5000, Arc::clone(&progress))
+            .with_pause_check(Arc::new(|| true));
+        assert!(detector.has_paused_threads.is_some());
+        assert!(detector.has_paused_threads.as_ref().unwrap()());
     }
 }

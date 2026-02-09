@@ -711,6 +711,168 @@ impl SessionManager {
         })?)
     }
 
+    async fn send_write_memory(
+        &self,
+        session_id: &str,
+        recipes_json: String,
+    ) -> Result<serde_json::Value> {
+        let guard = self.frida_spawner.read().await;
+        let spawner = guard.as_ref()
+            .ok_or_else(|| crate::Error::Frida("No Frida spawner available".to_string()))?;
+
+        spawner.write_memory(session_id, recipes_json).await
+    }
+
+    /// Execute a debug_write request end-to-end: validate, resolve DWARF, build recipes,
+    /// send to agent, format response.
+    pub async fn execute_debug_write(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use crate::mcp::*;
+
+        let req: DebugWriteRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        // Verify session exists and is running
+        let session = self.get_session(&req.session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
+        if session.status != crate::db::SessionStatus::Running {
+            return Err(crate::Error::WriteFailed(
+                "Process exited — session still queryable but writes unavailable".to_string()
+            ));
+        }
+
+        let mut recipes: Vec<serde_json::Value> = Vec::new();
+        let mut response_results: Vec<WriteResult> = Vec::new();
+
+        let dwarf = self.get_dwarf(&req.session_id).await?;
+
+        for target in &req.targets {
+            if let Some(ref var_name) = target.variable {
+                let dwarf_ref = match dwarf.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        response_results.push(WriteResult {
+                            variable: Some(var_name.clone()),
+                            address: "unknown".to_string(),
+                            previous_value: None,
+                            new_value: target.value.clone(),
+                            error: Some("No debug symbols available".to_string()),
+                        });
+                        continue;
+                    }
+                };
+
+                match dwarf_ref.resolve_read_target(var_name, 1) {
+                    Ok((recipe, _struct_fields)) => {
+                        let type_kind_str = type_kind_to_agent_str(&recipe.type_kind);
+                        let numeric_value = match &target.value {
+                            serde_json::Value::Number(n) => {
+                                n.as_f64().unwrap_or(0.0)
+                            }
+                            serde_json::Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                            _ => {
+                                response_results.push(WriteResult {
+                                    variable: Some(var_name.clone()),
+                                    address: format!("0x{:x}", recipe.base_address),
+                                    previous_value: None,
+                                    new_value: target.value.clone(),
+                                    error: Some("Value must be a number or boolean".to_string()),
+                                });
+                                continue;
+                            }
+                        };
+
+                        recipes.push(serde_json::json!({
+                            "label": var_name,
+                            "address": format!("0x{:x}", recipe.base_address),
+                            "size": recipe.final_size,
+                            "typeKind": type_kind_str,
+                            "value": numeric_value,
+                        }));
+                    }
+                    Err(e) => {
+                        response_results.push(WriteResult {
+                            variable: Some(var_name.clone()),
+                            address: "unknown".to_string(),
+                            previous_value: None,
+                            new_value: target.value.clone(),
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            } else if let Some(ref addr) = target.address {
+                let type_hint = target.type_hint.clone().unwrap_or_else(|| "u32".to_string());
+                let (size, type_kind) = crate::daemon::server::parse_type_hint(&type_hint);
+                let numeric_value = match &target.value {
+                    serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                    serde_json::Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                    _ => {
+                        response_results.push(WriteResult {
+                            variable: None,
+                            address: addr.clone(),
+                            previous_value: None,
+                            new_value: target.value.clone(),
+                            error: Some("Value must be a number or boolean".to_string()),
+                        });
+                        continue;
+                    }
+                };
+
+                recipes.push(serde_json::json!({
+                    "label": addr,
+                    "address": addr,
+                    "size": size,
+                    "typeKind": type_kind,
+                    "value": numeric_value,
+                    "noSlide": true,
+                }));
+            }
+        }
+
+        if recipes.is_empty() && !response_results.is_empty() {
+            return Ok(serde_json::to_value(DebugWriteResponse {
+                results: response_results,
+            })?);
+        }
+
+        let mut msg = serde_json::json!({
+            "type": "write_memory",
+            "recipes": recipes,
+        });
+
+        if let Some(ref d) = dwarf {
+            msg["imageBase"] = serde_json::json!(format!("0x{:x}", d.image_base));
+        }
+
+        let msg_str = serde_json::to_string(&msg)?;
+        let agent_response = self.send_write_memory(&req.session_id, msg_str).await?;
+
+        if let Some(results) = agent_response.get("results").and_then(|v| v.as_array()) {
+            for result in results {
+                let label = result.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let mut write_result = WriteResult {
+                    variable: if label.starts_with("0x") { None } else { Some(label.to_string()) },
+                    address: result.get("address").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                    previous_value: result.get("previousValue").cloned(),
+                    new_value: result.get("newValue").cloned().unwrap_or(serde_json::Value::Null),
+                    error: None,
+                };
+
+                if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+                    write_result.error = Some(err.to_string());
+                }
+
+                response_results.push(write_result);
+            }
+        }
+
+        Ok(serde_json::to_value(DebugWriteResponse {
+            results: response_results,
+        })?)
+    }
+
     /// Stop Frida session
     pub async fn stop_frida(&self, session_id: &str) -> Result<()> {
         let mut guard = self.frida_spawner.write().await;
@@ -994,6 +1156,41 @@ impl SessionManager {
                         tracing::warn!("step-into: no next line for 0x{:x}", current_address);
                     }
 
+                    let mut addresses = Vec::new();
+
+                    // Next line in same function (like step-over)
+                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
+                        addresses.push(next_addr);
+                        tracing::debug!("step-into: next line at 0x{:x}", next_addr);
+                    }
+
+                    // Also hook return address as fallback (end of function)
+                    if let Some(ret_addr) = pause_info.return_address {
+                        if !addresses.contains(&ret_addr) {
+                            addresses.push(ret_addr);
+                            tracing::debug!("step-into: return address fallback at 0x{:x}", ret_addr);
+                        }
+                    }
+
+                    // Callee resolution: hook entry points of functions that
+                    // could be called from the current line. First one to fire
+                    // wins (either next line or callee entry).
+                    let callee_addresses = dwarf.callee_entry_addresses(current_address);
+                    let callee_count = callee_addresses.len();
+
+                    // Limit to 20 callee hooks to avoid overwhelming the target
+                    for callee_addr in callee_addresses.into_iter().take(20) {
+                        if !addresses.contains(&callee_addr) {
+                            addresses.push(callee_addr);
+                        }
+                    }
+
+                    tracing::debug!(
+                        "step-into: {} one-shot addresses ({} callees, capped at 20 from {})",
+                        addresses.len(),
+                        addresses.len().saturating_sub(2), // minus next-line and return
+                        callee_count
+                    );
                     addresses
                 }
                 "step-out" => {
@@ -1223,6 +1420,11 @@ impl SessionManager {
         guard.get(session_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Get a reference to the paused_threads map for external use (e.g., stuck detector).
+    pub fn paused_threads_ref(&self) -> Arc<RwLock<HashMap<String, HashMap<u64, PauseInfo>>>> {
+        Arc::clone(&self.paused_threads)
     }
 }
 

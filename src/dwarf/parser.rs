@@ -1211,6 +1211,28 @@ impl DwarfParser {
             .map(|e| (e.address, e.file.clone(), e.line))
     }
 
+    /// Get entry addresses of all functions callable from the current line.
+    /// Uses a heuristic: returns entry addresses of all known functions that
+    /// are NOT the function containing `address` itself. The caller should
+    /// intersect this with currently-traced functions if available.
+    pub fn callee_entry_addresses(&self, address: u64) -> Vec<u64> {
+        // Find the function containing `address`
+        let current_func = self.functions.iter().find(|f| address >= f.low_pc && address < f.high_pc);
+
+        self.functions
+            .iter()
+            .filter(|f| {
+                // Exclude the current function
+                if let Some(cf) = current_func {
+                    f.low_pc != cf.low_pc
+                } else {
+                    true
+                }
+            })
+            .filter(|f| f.low_pc > 0)
+            .map(|f| f.low_pc)
+            .collect()
+    }
     /// Parse line table on first access (lazy initialization)
     fn ensure_line_table(&self) {
         let mut guard = self.line_table.lock().unwrap();

@@ -599,6 +599,7 @@ pub enum ErrorCode {
     TestRunNotFound,
     ValidationError,
     ReadFailed,
+    WriteFailed,
     InternalError,
 }
 
@@ -622,6 +623,7 @@ impl From<crate::Error> for McpError {
             crate::Error::ValidationError(_) => ErrorCode::ValidationError,
             crate::Error::TestRunNotFound(_) => ErrorCode::TestRunNotFound,
             crate::Error::ReadFailed(_) => ErrorCode::ReadFailed,
+            crate::Error::WriteFailed(_) => ErrorCode::WriteFailed,
             _ => ErrorCode::InternalError,
         };
 
@@ -630,6 +632,98 @@ impl From<crate::Error> for McpError {
             message: err.to_string(),
         }
     }
+}
+
+// ============ debug_write ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteTarget {
+    /// DWARF variable name (e.g. "g_counter", "g_tempo")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
+    /// Raw hex address (e.g. "0x7ff800")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Value to write
+    pub value: serde_json::Value,
+    /// Type hint: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugWriteRequest {
+    pub session_id: String,
+    pub targets: Vec<WriteTarget>,
+}
+
+const VALID_WRITE_TYPE_HINTS: &[&str] = &[
+    "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
+    "f32", "f64", "pointer",
+];
+
+impl DebugWriteRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.session_id.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "sessionId must not be empty".to_string()
+            ));
+        }
+        if self.targets.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "targets must not be empty".to_string()
+            ));
+        }
+        if self.targets.len() > MAX_READ_TARGETS {
+            return Err(crate::Error::ValidationError(
+                format!("Too many targets ({}, max {})", self.targets.len(), MAX_READ_TARGETS)
+            ));
+        }
+        for target in &self.targets {
+            if target.variable.is_none() && target.address.is_none() {
+                return Err(crate::Error::ValidationError(
+                    "Each target must have either 'variable' or 'address'".to_string()
+                ));
+            }
+            if target.address.is_some() && target.type_hint.is_none() {
+                return Err(crate::Error::ValidationError(
+                    "Raw address targets require 'type'".to_string()
+                ));
+            }
+            if let Some(ref type_hint) = target.type_hint {
+                if !VALID_WRITE_TYPE_HINTS.contains(&type_hint.as_str()) {
+                    return Err(crate::Error::ValidationError(
+                        format!("Invalid type '{}'. Valid: {}", type_hint, VALID_WRITE_TYPE_HINTS.join(", "))
+                    ));
+                }
+            }
+            if let Some(ref var) = target.variable {
+                validate_watch_field(var, "variable")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
+    pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_value: Option<serde_json::Value>,
+    pub new_value: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugWriteResponse {
+    pub results: Vec<WriteResult>,
 }
 
 // ============ debug_breakpoint ============
@@ -839,6 +933,90 @@ pub struct LogpointInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
     pub address: String,
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_write_request_validation_valid_variable() {
+        let req = DebugWriteRequest {
+            session_id: "s1".to_string(),
+            targets: vec![WriteTarget {
+                variable: Some("g_counter".to_string()),
+                address: None,
+                value: serde_json::json!(42),
+                type_hint: None,
+            }],
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_debug_write_request_validation_valid_address() {
+        let req = DebugWriteRequest {
+            session_id: "s1".to_string(),
+            targets: vec![WriteTarget {
+                variable: None,
+                address: Some("0x7ff800".to_string()),
+                value: serde_json::json!(100),
+                type_hint: Some("u32".to_string()),
+            }],
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_debug_write_request_validation_empty_targets() {
+        let req = DebugWriteRequest {
+            session_id: "s1".to_string(),
+            targets: vec![],
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_write_request_validation_no_variable_or_address() {
+        let req = DebugWriteRequest {
+            session_id: "s1".to_string(),
+            targets: vec![WriteTarget {
+                variable: None,
+                address: None,
+                value: serde_json::json!(42),
+                type_hint: None,
+            }],
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_write_request_validation_address_requires_type() {
+        let req = DebugWriteRequest {
+            session_id: "s1".to_string(),
+            targets: vec![WriteTarget {
+                variable: None,
+                address: Some("0x1000".to_string()),
+                value: serde_json::json!(42),
+                type_hint: None, // missing
+            }],
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_write_request_validation_invalid_type() {
+        let req = DebugWriteRequest {
+            session_id: "s1".to_string(),
+            targets: vec![WriteTarget {
+                variable: None,
+                address: Some("0x1000".to_string()),
+                value: serde_json::json!(42),
+                type_hint: Some("bytes".to_string()), // not valid for writes
+            }],
+        };
+        assert!(req.validate().is_err());
+    }
 }
 
 #[cfg(test)]

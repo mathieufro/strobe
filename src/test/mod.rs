@@ -241,7 +241,20 @@ impl TestRunner {
 
         // Spawn stuck detector as background monitor
         let detector_progress = Arc::clone(&progress);
-        let detector = StuckDetector::new(pid, hard_timeout, detector_progress);
+        let mut detector = StuckDetector::new(pid, hard_timeout, detector_progress);
+
+        // Phase 2: Wire up breakpoint pause awareness so the stuck detector
+        // doesn't false-positive on threads paused at breakpoints.
+        {
+            let paused = session_manager.paused_threads_ref();
+            let sid = session_id.to_string();
+            detector = detector.with_pause_check(Arc::new(move || {
+                paused.read().unwrap_or_else(|e| e.into_inner())
+                    .get(&sid)
+                    .map_or(false, |m| !m.is_empty())
+            }));
+        }
+
         let detector_handle = tokio::spawn(async move { detector.run().await });
 
         // Progress-aware polling loop — poll DB for stdout events

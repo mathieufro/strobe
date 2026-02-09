@@ -295,11 +295,14 @@ pub type PauseNotifyTx = mpsc::Sender<PauseNotification>;
 
 /// Message handler passed as user_data to the raw GLib signal callback.
 /// No longer implements `ScriptHandler` — messages are parsed directly in `raw_on_message`.
+type WriteResponseSignal = Arc<Mutex<Option<std::sync::mpsc::Sender<serde_json::Value>>>>;
+
 struct AgentMessageHandler {
     event_tx: mpsc::Sender<Event>,
     session_id: String,
     hooks_ready: HooksReadySignal,
     read_response: ReadResponseSignal,
+    write_response: WriteResponseSignal,
     crash_reported: Arc<AtomicBool>,
     pause_notify_tx: Option<PauseNotifyTx>,
 }
@@ -369,6 +372,13 @@ impl AgentMessageHandler {
             }
             "read_response" => {
                 if let Ok(mut guard) = self.read_response.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(payload.clone());
+                    }
+                }
+            }
+            "write_response" => {
+                if let Ok(mut guard) = self.write_response.lock() {
                     if let Some(tx) = guard.take() {
                         let _ = tx.send(payload.clone());
                     }
@@ -463,6 +473,7 @@ struct SpawnResult {
     script_ptr: SendScriptPtr,
     hooks_ready: HooksReadySignal,
     read_response: ReadResponseSignal,
+    write_response: WriteResponseSignal,
 }
 
 /// Commands for the coordinator thread (device-level operations).
@@ -507,6 +518,10 @@ enum SessionCommand {
         response: oneshot::Sender<Result<()>>,
     },
     ReadMemory {
+        recipes_json: String,
+        response: oneshot::Sender<Result<serde_json::Value>>,
+    },
+    WriteMemory {
         recipes_json: String,
         response: oneshot::Sender<Result<serde_json::Value>>,
     },
@@ -761,6 +776,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
 
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
                     let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
+                    let write_response: WriteResponseSignal = Arc::new(Mutex::new(None));
                     let crash_reported = Arc::new(AtomicBool::new(false));
 
                     let handler = AgentMessageHandler {
@@ -768,6 +784,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         session_id: session_id.clone(),
                         hooks_ready: hooks_ready.clone(),
                         read_response: read_response.clone(),
+                        write_response: write_response.clone(),
                         crash_reported: crash_reported.clone(),
                         pause_notify_tx,
                     };
@@ -823,6 +840,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         script_ptr: SendScriptPtr(script_ptr),
                         hooks_ready,
                         read_response,
+                        write_response,
                     })
                 })();
 
@@ -864,6 +882,7 @@ fn session_worker(
     script_ptr: SendScriptPtr,
     hooks_ready: HooksReadySignal,
     read_response: ReadResponseSignal,
+    write_response: WriteResponseSignal,
     pid: u32,
     cmd_rx: std::sync::mpsc::Receiver<SessionCommand>,
 ) {
@@ -899,6 +918,11 @@ fn session_worker(
 
             SessionCommand::ReadMemory { recipes_json, response } => {
                 let result = handle_read_memory(raw_ptr, &read_response, &recipes_json, pid);
+                let _ = response.send(result);
+            }
+
+            SessionCommand::WriteMemory { recipes_json, response } => {
+                let result = handle_write_memory(raw_ptr, &write_response, &recipes_json, pid);
                 let _ = response.send(result);
             }
 
@@ -1188,6 +1212,42 @@ fn handle_read_memory(
     Err(crate::Error::Frida("Memory read timed out (5s)".to_string()))
 }
 
+fn handle_write_memory(
+    script_ptr: *mut frida_sys::_FridaScript,
+    write_response: &WriteResponseSignal,
+    recipes_json: &str,
+    pid: u32,
+) -> Result<serde_json::Value> {
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+    {
+        let mut guard = write_response.lock().unwrap();
+        *guard = Some(signal_tx);
+    }
+
+    unsafe {
+        post_message_raw(script_ptr, recipes_json)
+            .map_err(|e| crate::Error::WriteFailed(format!("Failed to send write_memory: {}", e)))?;
+    }
+
+    for _ in 0..10 {
+        match signal_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(response) => return Ok(response),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(crate::Error::WriteFailed("Response channel closed".to_string()));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                if !alive {
+                    return Err(crate::Error::WriteFailed(
+                        "Process exited before memory write completed".to_string()
+                    ));
+                }
+            }
+        }
+    }
+    Err(crate::Error::WriteFailed("Memory write timed out (5s)".to_string()))
+}
+
 /// Handle a child process spawned via fork/exec.
 /// Attaches Frida to the child, loads the agent, and registers it for output capture.
 fn handle_child_spawn(
@@ -1245,11 +1305,13 @@ fn handle_child_spawn(
                 Ok(script_ptr) => {
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
                     let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
+                    let write_response: WriteResponseSignal = Arc::new(Mutex::new(None));
                     let handler = AgentMessageHandler {
                         event_tx: event_tx.clone(),
                         session_id: session_id.clone(),
                         hooks_ready: hooks_ready.clone(),
                         read_response: read_response.clone(),
+                        write_response: write_response.clone(),
                         crash_reported: Arc::new(AtomicBool::new(false)),
                         pause_notify_tx: None,
                     };
@@ -1584,7 +1646,7 @@ impl FridaSpawner {
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let sid = session_id.to_string();
         thread::spawn(move || {
-            session_worker(sid, spawn_result.script_ptr, spawn_result.hooks_ready, spawn_result.read_response, pid, session_rx);
+            session_worker(sid, spawn_result.script_ptr, spawn_result.hooks_ready, spawn_result.read_response, spawn_result.write_response, pid, session_rx);
         });
         self.session_workers.insert(session_id.to_string(), session_tx);
 
@@ -1746,6 +1808,21 @@ impl FridaSpawner {
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
         worker_tx.send(SessionCommand::ReadMemory {
+            recipes_json,
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
+
+    pub async fn write_memory(&self, session_id: &str, recipes_json: String) -> Result<serde_json::Value> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let worker_tx = self.session_workers.get(session_id)
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        worker_tx.send(SessionCommand::WriteMemory {
             recipes_json,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
@@ -2055,11 +2132,13 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(1000);
         let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
         let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
+        let write_response: WriteResponseSignal = Arc::new(Mutex::new(None));
         let handler = AgentMessageHandler {
             event_tx,
             session_id: "test-session".to_string(),
             hooks_ready: hooks_ready.clone(),
             read_response,
+            write_response,
             crash_reported: Arc::new(AtomicBool::new(false)),
             pause_notify_tx: None,
         };
@@ -2143,11 +2222,13 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(1000);
         let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
         let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
+        let write_response: WriteResponseSignal = Arc::new(Mutex::new(None));
         let handler = AgentMessageHandler {
             event_tx,
             session_id: "pause-test".to_string(),
             hooks_ready,
             read_response,
+            write_response,
             crash_reported: Arc::new(AtomicBool::new(false)),
             pause_notify_tx: Some(pause_tx),
         };

@@ -104,6 +104,20 @@ interface BreakpointState {
   line?: number;
 }
 
+interface WriteMemoryRecipe {
+  label: string;
+  address: string;  // hex
+  size: number;
+  typeKind: string;  // "int", "uint", "float", "pointer"
+  value: number;     // numeric value to write
+  noSlide?: boolean; // true for raw user-provided addresses
+}
+
+interface WriteMemoryMessage {
+  recipes: WriteMemoryRecipe[];
+  imageBase?: string;
+}
+
 interface SetBreakpointMessage {
   address: string;
   id: string;
@@ -596,6 +610,74 @@ class StrobeAgent {
     }
   }
 
+  handleWriteMemory(message: WriteMemoryMessage): void {
+    if (message.imageBase) {
+      this.tracer.setImageBase(message.imageBase);
+    }
+    const slide = this.tracer.getSlide();
+
+    const results = message.recipes.map(recipe => this.writeSingleTarget(recipe, slide));
+    send({ type: 'write_response', results });
+  }
+
+  private writeSingleTarget(recipe: WriteMemoryRecipe, slide: NativePointer): any {
+    try {
+      const addr = recipe.noSlide
+        ? ptr(recipe.address)
+        : ptr(recipe.address).add(slide);
+
+      // Read previous value first
+      const previousValue = this.readTypedValue(addr, recipe.size, recipe.typeKind);
+
+      // Write new value
+      this.writeTypedValue(addr, recipe.size, recipe.typeKind, recipe.value);
+
+      // Read back to confirm
+      const newValue = this.readTypedValue(addr, recipe.size, recipe.typeKind);
+
+      return { label: recipe.label, address: addr.toString(), previousValue, newValue };
+    } catch (e: any) {
+      return { label: recipe.label, error: `Write failed: ${e.message}` };
+    }
+  }
+
+  private writeTypedValue(addr: NativePointer, size: number, typeKind: string, value: number): void {
+    const range = Process.findRangeByAddress(addr);
+    if (!range || !range.protection.includes('w')) {
+      throw new Error(`Address ${addr} not writable (protection: ${range?.protection || 'unmapped'})`);
+    }
+
+    switch (typeKind) {
+      case 'float':
+        if (size === 4) addr.writeFloat(value);
+        else addr.writeDouble(value);
+        break;
+      case 'int':
+        switch (size) {
+          case 1: addr.writeS8(value); break;
+          case 2: addr.writeS16(value); break;
+          case 4: addr.writeS32(value); break;
+          case 8: addr.writeS64(value); break;
+          default: addr.writeS32(value);
+        }
+        break;
+      case 'uint':
+        switch (size) {
+          case 1: addr.writeU8(value); break;
+          case 2: addr.writeU16(value); break;
+          case 4: addr.writeU32(value); break;
+          case 8: addr.writeU64(value); break;
+          default: addr.writeU32(value);
+        }
+        break;
+      case 'pointer':
+        addr.writePointer(ptr(value));
+        break;
+      default:
+        addr.writeU64(value);
+    }
+  }
+
   private startReadPoll(
     recipes: ReadRecipe[],
     slide: NativePointer,
@@ -1003,6 +1085,13 @@ function onReadMemoryMessage(message: ReadMemoryMessage): void {
   agent.handleReadMemory(message);
 }
 recv('read_memory', onReadMemoryMessage);
+
+// Phase 2a: Write memory message handler
+function onWriteMemoryMessage(message: WriteMemoryMessage): void {
+  recv('write_memory', onWriteMemoryMessage);
+  agent.handleWriteMemory(message);
+}
+recv('write_memory', onWriteMemoryMessage);
 
 // Phase 2: Breakpoint message handlers
 function onSetBreakpointMessage(message: SetBreakpointMessage): void {

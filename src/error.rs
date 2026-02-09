@@ -32,6 +32,9 @@ pub enum Error {
     #[error("READ_FAILED: {0}")]
     ReadFailed(String),
 
+    #[error("WRITE_FAILED: {0}")]
+    WriteFailed(String),
+
     #[error("TEST_RUN_NOT_FOUND: No test run found with ID '{0}'.")]
     TestRunNotFound(String),
 
