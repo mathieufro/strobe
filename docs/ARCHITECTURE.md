@@ -39,11 +39,11 @@ Tracing scope depends on context. "Trace everything" is wrong for TDD workflows 
 
 | Context | Default Tracing | Rationale |
 |---------|----------------|-----------|
-| `debug_launch` (general) | User code | Broad observation for unknown bugs |
+| `debug_launch` (general) | None (stdout/stderr only) | Output-first is usually enough; add traces only if needed |
 | `debug_test` (test run) | Minimal/none | Wait for failure, then trace targeted |
 | `debug_test` (rerun failed) | Suggested patterns | Stack trace tells us what to trace |
 
-**User code heuristic:** Trace functions whose source file is within the project directory.
+**User code heuristic:** When tracing user code (e.g., `@usercode`), trace functions whose source file is within the project directory.
 
 | Language | Debug Info | How We Determine Source |
 |----------|-----------|------------------------|
@@ -60,8 +60,8 @@ The LLM can expand or narrow scope at runtime via `debug_trace`.
 ### Test Instrumentation: First-Class TDD Support
 Test debugging is a core workflow, not an afterthought. The `debug_test` tool:
 
-1. Runs test suite with minimal tracing overhead
-2. On failure, returns structured data with **rule-based hints**
+1. Starts an async test run with minimal tracing overhead
+2. `debug_test_status` returns structured data with **rule-based hints**
 3. LLM uses hints to rerun with targeted tracing
 
 **Key insight:** The MCP server is dumb, the calling LLM is smart. We don't need AI in the server - just good structured data.
@@ -88,7 +88,7 @@ The hints are simple rules:
 ### Dynamic Tracing: No Restart Required
 Frida supports adding/removing hooks at runtime. The LLM adjusts observation scope while the app runs:
 
-1. App running with default tracing
+1. App running with output capture only (no tracing)
 2. User reports bug in graphics
 3. LLM: `debug_trace({ add: ["render::*"] })`
 4. Hooks injected instantly, no restart
@@ -174,7 +174,7 @@ Trace patterns use glob syntax (familiar from .gitignore, shell):
 - `*` matches any characters except `::`
 - `**` matches any characters including `::`
 - Examples: `render::*`, `*::draw`, `auth::**::validate`
-- File-based patterns: `file:src/render/*.rs`
+- File-based patterns: `@file:src/render/*.rs`
 
 ### Daemon Lifecycle
 Single global daemon per user:
@@ -189,7 +189,7 @@ SQLite database with automatic cleanup:
 - **Retain option:** `debug_stop({ retain: true })` preserves for later analysis
 - **Auto-purge:** Retained sessions deleted after 7 days
 - **Hard limit:** 10GB total storage, oldest sessions purged first
-- **Configurable:** Override via `~/.strobe/config.toml`
+- **Configurable:** Override via `~/.strobe/settings.json` (`events.maxPerSession`)
 
 ### Process Forking
 When target process calls `fork()` or `exec()`:
@@ -276,7 +276,8 @@ Errors are opportunities for LLM-guided resolution:
 │  │                   Frida Agent (JS)                          │ │
 │  │   - Hooks functions based on daemon instructions            │ │
 │  │   - Serializes arguments/returns                            │ │
-│  │   - Captures stdout/stderr via write(2) interception       │ │
+│  │   - stdout/stderr capture is at Frida Device level          │ │
+│  │     (FRIDA_STDIO_PIPE); agent has write(2) fallback         │ │
 │  │   - Sends events back to daemon                             │ │
 │  │   - Intercepts crash signals                                │ │
 │  └────────────────────────────────────────────────────────────┘ │
@@ -431,6 +432,7 @@ debug_launch({
 - `projectRoot` is required for user code detection via DWARF
 - Session ID is human-readable for easy reference in conversation
 - stdout/stderr automatically captured - check output before adding trace patterns
+- No default tracing; add patterns with `debug_trace` only when needed
 - `nextSteps` provides workflow guidance (e.g., "Query stderr/stdout with debug_query first")
 
 ### debug_stop (Phase 1a)
@@ -449,7 +451,7 @@ debug_stop({
 
 ### debug_test (Phase 1d)
 
-Run tests with universal structured output. Auto-detects framework, smart stuck detection, automatic switching between direct subprocess (fast) and Frida (instrumented) paths.
+Start a test run asynchronously. Auto-detects framework, uses smart stuck detection, and switches between direct subprocess (fast) and Frida (instrumented) paths based on whether tracing is requested.
 
 ```typescript
 debug_test({
@@ -460,35 +462,32 @@ debug_test({
   command?: string,             // Binary path (required for Catch2)
   tracePatterns?: string[],     // Presence triggers Frida path
   watches?: Watch[],            // Presence triggers Frida path
-  env?: Record<string, string>,
-  timeout?: number              // Hard timeout ms (default per level)
+  env?: Record<string, string>
 }) → {
-  framework: string,
-  summary: { passed, failed, skipped, stuck?, duration_ms },
-  failures?: TestFailure[],
-  stuck?: StuckTest[],          // Deadlocks/infinite loops caught by detector
-  sessionId?: string,           // Present on Frida path (for debug_query)
-  details: string,              // Path to full details temp file
-  // When no tests exist:
-  no_tests?: boolean,
-  project?: { language, build_system },
-  hint?: string
+  testRunId: string,            // Poll via debug_test_status
+  status: "running",
+  framework: string
 }
+```
 
-interface TestFailure {
-  name: string,
-  file?: string,
-  line?: number,
-  message: string,
-  suggested_traces: string[]
-}
+Poll for progress and results:
 
-interface StuckTest {
-  name: string,
-  elapsed_ms: number,
-  diagnosis: string,            // "Deadlock: 0% CPU, identical stacks"
-  threads: { name: string, stack: string[] }[],
-  suggested_traces: string[]
+```typescript
+debug_test_status({ testRunId }) → {
+  status: "running" | "completed" | "failed",
+  sessionId?: string,           // Present on Frida path
+  progress?: { elapsedMs, passed, failed, skipped, currentTest?, warnings? },
+  result?: {
+    framework: string,
+    summary: { passed, failed, skipped, stuck?, durationMs },
+    failures?: TestFailure[],
+    stuck?: StuckTest[],
+    details?: string,
+    noTests?: boolean,
+    project?: { language, buildSystem, testFiles },
+    hint?: string
+  },
+  error?: string
 }
 ```
 
@@ -789,30 +788,34 @@ debug_test_scenario({
 
 2. Daemon spawns process via Frida
    - Frida agent injected
-   - Agent reads DWARF, identifies user code functions
-   - Hooks installed on user code
+   - Agent initialized, no trace hooks installed
 
-3. App runs, function called: process_request(data)
+3. App runs, output captured (stdout/stderr)
 
-4. Frida hook fires
+4. LLM queries stderr/stdout; if needed, calls debug_trace({ add: ["process::*"] })
+
+5. Hooks installed for matching functions
+
+6. Traced function called: process_request(data)
+   - Frida hook fires
    - Captures: timestamp, thread, function name, arguments
    - Serializes arguments to JSON
    - Sends message to daemon
 
-5. Daemon receives message
+7. Daemon receives message
    - Assigns event ID
    - Determines parent event (per-thread stack)
    - Writes to SQLite (batched for performance)
 
-6. LLM calls debug_query({ function: { contains: "process" } })
+8. LLM calls debug_query({ function: { contains: "process" } })
 
-7. Daemon queries SQLite, returns matching events
+9. Daemon queries SQLite, returns matching events
 ```
 
 ### Dynamic Trace Adjustment
 
 ```
-1. App running with user code tracing
+1. App running with output capture only (no tracing)
 
 2. LLM calls debug_trace({ add: ["tokio::*"] })
 
@@ -874,7 +877,7 @@ Deep struct serialization is expensive. Mitigations:
 ### Memory in Target Process
 
 Frida agent adds memory overhead. Minimized by:
-- **Selective hooking:** Only hook user code by default
+- **Selective hooking:** When tracing, default to user code only
 - **Streaming events:** Don't buffer large amounts in agent
 - **Compiled agent:** TypeScript compiled to optimized JS
 

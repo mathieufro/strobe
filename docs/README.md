@@ -106,7 +106,7 @@ Pause only when it matters. Set conditions on field values, hit counts. The LLM 
 
 ### Test Instrumentation (TDD Workflow)
 
-Universal, machine-readable test output for any framework. `debug_test` auto-detects the test framework (cargo, Catch2, or custom), runs tests via direct subprocess for speed, and returns structured results: failures with file:line, error messages, and suggested trace patterns.
+Universal, machine-readable test output for any framework. `debug_test` auto-detects the test framework (cargo, Catch2, or custom) and starts an **async** test run (fast direct subprocess when no tracing is requested). It returns a `testRunId`; `debug_test_status` returns structured results: failures with file:line, error messages, and suggested trace patterns.
 
 On failure, the LLM reruns a single test with tracing (Frida path activates automatically). Smart stuck detection catches deadlocks and infinite loops in ~8 seconds via multi-signal analysis (CPU + stack sampling), captures thread backtraces before killing, so the LLM sees the deadlock graph directly. No more waiting 10 minutes for a stuck test to timeout.
 
