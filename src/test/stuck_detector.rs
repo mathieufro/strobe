@@ -36,10 +36,16 @@ impl SuspicionState {
 ///
 /// Writes advisory warnings to shared TestProgress instead of killing.
 /// The LLM decides when to kill via debug_stop(sessionId).
+///
+/// **Phase 2 Note:** Should check for active breakpoint pauses before diagnosing
+/// deadlock. If a thread is paused at a breakpoint (recv().wait()), 0% CPU is
+/// expected and not a stuck condition. Requires session_manager reference to
+/// check SessionManager::get_all_paused_threads().
 pub struct StuckDetector {
     pid: u32,
     hard_timeout_ms: u64,
     progress: Arc<Mutex<TestProgress>>,
+    // TODO Phase 2: Add session_manager: Option<Arc<SessionManager>> to check pause state
 }
 
 impl StuckDetector {
@@ -137,6 +143,10 @@ impl StuckDetector {
                 let delta = cpu_ns.saturating_sub(prev);
                 let sample_interval_ns = 2_000_000_000u64; // 2 seconds
 
+                // Phase 2: Before diagnosing deadlock on zero CPU delta, check if any
+                // threads are paused at breakpoints (recv().wait()). A paused breakpoint
+                // shows 0% CPU but is not stuck. TODO: Add check:
+                // if session_manager.get_all_paused_threads(session_id).is_empty() { ...
                 if delta == 0 {
                     suspicion.zero_delta_count += 1;
                     suspicion.constant_high_count = 0;

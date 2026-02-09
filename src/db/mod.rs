@@ -414,4 +414,32 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["name"], "counter");
     }
+
+    #[test]
+    fn test_breakpoint_event_columns() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.db")).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        // Verify breakpoint_id column exists
+        let result: rusqlite::Result<String> = conn.query_row(
+            "SELECT breakpoint_id FROM events WHERE 1=0",
+            [],
+            |_| Ok(String::new()),
+        );
+        // Should error with "no rows" not "no such column"
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(!err_msg.contains("no such column"), "Column breakpoint_id should exist");
+
+        // Verify logpoint_message column exists
+        let result: rusqlite::Result<String> = conn.query_row(
+            "SELECT logpoint_message FROM events WHERE 1=0",
+            [],
+            |_| Ok(String::new()),
+        );
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(!err_msg.contains("no such column"), "Column logpoint_message should exist");
+    }
 }

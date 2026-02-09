@@ -12,6 +12,9 @@ pub enum EventType {
     Stderr,
     Crash,
     VariableSnapshot,
+    Pause,
+    Logpoint,
+    ConditionError,
 }
 
 impl EventType {
@@ -23,6 +26,9 @@ impl EventType {
             Self::Stderr => "stderr",
             Self::Crash => "crash",
             Self::VariableSnapshot => "variable_snapshot",
+            Self::Pause => "pause",
+            Self::Logpoint => "logpoint",
+            Self::ConditionError => "condition_error",
         }
     }
 
@@ -34,6 +40,9 @@ impl EventType {
             "stderr" => Some(Self::Stderr),
             "crash" => Some(Self::Crash),
             "variable_snapshot" => Some(Self::VariableSnapshot),
+            "pause" => Some(Self::Pause),
+            "logpoint" => Some(Self::Logpoint),
+            "condition_error" => Some(Self::ConditionError),
             _ => None,
         }
     }
@@ -64,6 +73,8 @@ pub struct Event {
     pub registers: Option<serde_json::Value>,
     pub backtrace: Option<serde_json::Value>,
     pub locals: Option<serde_json::Value>,
+    pub breakpoint_id: Option<String>,
+    pub logpoint_message: Option<String>,
 }
 
 impl Default for Event {
@@ -92,6 +103,8 @@ impl Default for Event {
             registers: None,
             backtrace: None,
             locals: None,
+            breakpoint_id: None,
+            logpoint_message: None,
         }
     }
 }
@@ -223,8 +236,8 @@ const INSERT_EVENT_SQL: &str =
     "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
      event_type, function_name, function_name_raw, source_file, line_number,
      arguments, return_value, duration_ns, text, sampled, watch_values, pid,
-     signal, fault_address, registers, backtrace, locals)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+     signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 /// Insert a single event row using a connection or transaction.
 fn insert_event_row(conn: &rusqlite::Connection, event: &Event) -> std::result::Result<(), rusqlite::Error> {
@@ -254,6 +267,8 @@ fn insert_event_row(conn: &rusqlite::Connection, event: &Event) -> std::result::
             event.registers.as_ref().map(|v| v.to_string()),
             event.backtrace.as_ref().map(|v| v.to_string()),
             event.locals.as_ref().map(|v| v.to_string()),
+            &event.breakpoint_id,
+            &event.logpoint_message,
         ],
     )?;
     Ok(())
@@ -283,7 +298,7 @@ fn read_json_text(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<Option<se
     }
 }
 
-/// Parse an Event from a row with the standard 23-column SELECT order.
+/// Parse an Event from a row with the standard 25-column SELECT order.
 fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
     let event_type_str: String = row.get(6)?;
     Ok(Event {
@@ -310,6 +325,8 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         registers: read_json_text(row, 20)?,
         backtrace: read_json_text(row, 21)?,
         locals: read_json_text(row, 22)?,
+        breakpoint_id: row.get(23)?,
+        logpoint_message: row.get(24)?,
     })
 }
 
@@ -341,7 +358,7 @@ impl Database {
             "SELECT id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
              arguments, return_value, duration_ns, text, sampled, watch_values, pid,
-             signal, fault_address, registers, backtrace, locals
+             signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message
              FROM events WHERE session_id = ?"
         );
 

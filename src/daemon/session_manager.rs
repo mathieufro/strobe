@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Instant;
 use chrono::{Utc, Timelike};
 use tokio::sync::mpsc;
 use crate::db::{Database, Session, SessionStatus, Event};
@@ -88,6 +89,12 @@ pub struct SessionManager {
     child_pids: Arc<RwLock<HashMap<String, Vec<u32>>>>,
     /// Cancellation tokens for database writer tasks per session
     writer_cancel_tokens: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    /// Breakpoints per session
+    breakpoints: Arc<RwLock<HashMap<String, HashMap<String, Breakpoint>>>>,
+    /// Logpoints per session
+    logpoints: Arc<RwLock<HashMap<String, HashMap<String, Logpoint>>>>,
+    /// Paused threads per session
+    paused_threads: Arc<RwLock<HashMap<String, HashMap<u64, PauseInfo>>>>,
 }
 
 impl SessionManager {
@@ -107,6 +114,9 @@ impl SessionManager {
             frida_spawner: Arc::new(tokio::sync::RwLock::new(None)),
             child_pids: Arc::new(RwLock::new(HashMap::new())),
             writer_cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+            breakpoints: Arc::new(RwLock::new(HashMap::new())),
+            logpoints: Arc::new(RwLock::new(HashMap::new())),
+            paused_threads: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -405,6 +415,29 @@ impl SessionManager {
             }
         });
 
+        // Create pause notification channel for breakpoint support
+        let (pause_tx, mut pause_rx) = mpsc::channel::<crate::frida_collector::PauseNotification>(100);
+        let paused_threads = Arc::clone(&self.paused_threads);
+        let sid = session_id.to_string();
+
+        // Spawn receiver task that bridges pause notifications to SessionManager state
+        tokio::spawn(async move {
+            while let Some(notification) = pause_rx.recv().await {
+                let info = PauseInfo {
+                    breakpoint_id: notification.breakpoint_id,
+                    func_name: notification.func_name,
+                    file: notification.file,
+                    line: notification.line,
+                    paused_at: Instant::now(),
+                    return_address: notification.return_address,
+                };
+                write_lock(&paused_threads)
+                    .entry(sid.clone())
+                    .or_insert_with(HashMap::new)
+                    .insert(notification.thread_id, info);
+            }
+        });
+
         // Spawn process (lazily initialize FridaSpawner)
         let mut guard = self.frida_spawner.write().await;
         let spawner = guard.get_or_insert_with(FridaSpawner::new);
@@ -419,6 +452,7 @@ impl SessionManager {
             image_base,
             tx,
             defer_resume,
+            Some(pause_tx),
         ).await
     }
 
@@ -783,5 +817,592 @@ impl SessionManager {
             }
         }
         Ok(())
+    }
+
+    // ========== Phase 2: Active debugging (async API) ==========
+
+    /// Set a breakpoint at a function or source line
+    pub async fn set_breakpoint_async(
+        &self,
+        session_id: &str,
+        id: Option<String>,
+        function: Option<String>,
+        file: Option<String>,
+        line: Option<u32>,
+        condition: Option<String>,
+        hit_count: Option<u32>,
+    ) -> Result<crate::mcp::BreakpointInfo> {
+        // Validate session exists
+        let session = self.db.get_session(session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        // Get DWARF parser for address resolution
+        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
+        let dwarf = dwarf_handle.get().await?;
+
+        let breakpoint_id = id.unwrap_or_else(|| format!("bp-{}", uuid::Uuid::new_v4().to_string()));
+
+        // Save function name for later use (before it's moved into the match)
+        let function_name_for_target = function.clone();
+
+        // Resolve target to address
+        let (address, resolved_function, resolved_file, resolved_line) = if let Some(func_pattern) = function {
+            // Function breakpoint: resolve via DWARF function table
+            let matches = dwarf.find_by_pattern(&func_pattern);
+            if matches.is_empty() {
+                return Err(crate::Error::ValidationError(
+                    format!("No function matching pattern '{}'", func_pattern)
+                ));
+            }
+            let func = &matches[0];
+            (
+                func.low_pc,
+                Some(func.name.clone()),
+                func.source_file.clone(),
+                func.line_number.map(|l| l as u32),
+            )
+        } else if let (Some(file_path), Some(line_num)) = (file, line) {
+            // Line breakpoint: resolve via DWARF line table
+            let result = dwarf.resolve_line(&file_path, line_num)
+                .ok_or_else(|| {
+                    let nearest = dwarf.find_nearest_lines(&file_path, line_num, 5);
+                    crate::Error::NoCodeAtLine {
+                        file: file_path.clone(),
+                        line: line_num,
+                        nearest_lines: nearest,
+                    }
+                })?;
+            (result.0, None, Some(file_path), Some(result.1))
+        } else {
+            return Err(crate::Error::ValidationError(
+                "Breakpoint must specify either function or file+line".to_string()
+            ));
+        };
+
+        let runtime_address = address;
+
+        // Send setBreakpoint message to agent
+        let mut spawner_guard = self.frida_spawner.write().await;
+        let spawner = spawner_guard.as_mut()
+            .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
+
+        let message = serde_json::json!({
+            "type": "setBreakpoint",
+            "address": format!("0x{:x}", runtime_address),
+            "id": breakpoint_id,
+            "condition": condition,
+            "hitCount": hit_count.unwrap_or(0),
+            "funcName": resolved_function,
+            "file": resolved_file,
+            "line": resolved_line,
+        });
+
+        spawner.set_breakpoint(session_id, message).await?;
+
+        // Store breakpoint in session state
+        let bp = Breakpoint {
+            id: breakpoint_id.clone(),
+            target: if let Some(f) = function_name_for_target {
+                BreakpointTarget::Function(f)
+            } else {
+                BreakpointTarget::Line {
+                    file: resolved_file.clone().unwrap(),
+                    line: resolved_line.unwrap(),
+                }
+            },
+            address: runtime_address,
+            condition,
+            hit_count: hit_count.unwrap_or(0),
+            hits: 0,
+        };
+
+        self.add_breakpoint(session_id, bp);
+
+        Ok(crate::mcp::BreakpointInfo {
+            id: breakpoint_id,
+            function: resolved_function,
+            file: resolved_file,
+            line: resolved_line,
+            address: format!("0x{:x}", runtime_address),
+        })
+    }
+
+    /// Continue execution after a breakpoint pause
+    pub async fn debug_continue_async(
+        &self,
+        session_id: &str,
+        action: Option<String>,
+    ) -> Result<crate::mcp::DebugContinueResponse> {
+        // Get all paused threads for this session
+        let paused = self.get_all_paused_threads(session_id);
+
+        if paused.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "No paused threads in this session".to_string()
+            ));
+        }
+
+        let action = action.unwrap_or_else(|| "continue".to_string());
+
+        // Get session info for DWARF access
+        let session = self.db.get_session(session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        // For stepping actions, we need DWARF info
+        let one_shot_addresses = if action != "continue" {
+            let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
+            let dwarf = dwarf_handle.get().await?;
+
+            // Get the first paused thread (stepping is single-threaded)
+            let (_thread_id, pause_info) = paused.iter().next()
+                .ok_or_else(|| crate::Error::ValidationError("No paused thread".to_string()))?;
+
+            // Get the breakpoint to find current address
+            let bp = self.get_breakpoint(session_id, &pause_info.breakpoint_id);
+            let current_address = bp.map(|b| b.address).unwrap_or(0);
+
+            match action.as_str() {
+                "step-over" => {
+                    let mut addresses = Vec::new();
+
+                    // Find next line in same function
+                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
+                        addresses.push(next_addr);
+                        tracing::debug!("step-over: next line at 0x{:x}", next_addr);
+                    } else {
+                        tracing::warn!("step-over: no next line for 0x{:x}", current_address);
+                    }
+
+                    // Also hook return address as fallback (end of function)
+                    if let Some(ret_addr) = pause_info.return_address {
+                        if !addresses.contains(&ret_addr) {
+                            addresses.push(ret_addr);
+                            tracing::debug!("step-over: return address fallback at 0x{:x}", ret_addr);
+                        }
+                    }
+
+                    addresses
+                }
+                "step-into" => {
+                    // Same as step-over for now (full step-into requires call target resolution)
+                    let mut addresses = Vec::new();
+
+                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
+                        addresses.push(next_addr);
+                        tracing::debug!("step-into: next line at 0x{:x}", next_addr);
+                    } else {
+                        tracing::warn!("step-into: no next line for 0x{:x}", current_address);
+                    }
+
+                    addresses
+                }
+                "step-out" => {
+                    // Set one-shot at return address
+                    let mut addresses = Vec::new();
+
+                    if let Some(ret_addr) = pause_info.return_address {
+                        addresses.push(ret_addr);
+                        tracing::debug!("step-out: hooking return address 0x{:x}", ret_addr);
+                    } else {
+                        tracing::warn!("step-out: no return address available, resuming normally");
+                    }
+
+                    addresses
+                }
+                _ => {
+                    return Err(crate::Error::ValidationError(
+                        format!("Unknown action: '{}'. Valid: continue, step-over, step-into, step-out", action)
+                    ));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Send resume message to each paused thread
+        let mut spawner_guard = self.frida_spawner.write().await;
+        let spawner = spawner_guard.as_mut()
+            .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
+
+        for (thread_id, _pause_info) in paused {
+            spawner.resume_thread_with_step(session_id, thread_id, one_shot_addresses.clone()).await?;
+            self.remove_paused_thread(session_id, thread_id);
+        }
+
+        Ok(crate::mcp::DebugContinueResponse {
+            status: "running".to_string(),
+            breakpoint_id: None,
+            file: None,
+            line: None,
+            function: None,
+        })
+    }
+
+    /// Set a logpoint at a function or source line (non-blocking breakpoint)
+    pub async fn set_logpoint_async(
+        &self,
+        session_id: &str,
+        id: Option<String>,
+        function: Option<String>,
+        file: Option<String>,
+        line: Option<u32>,
+        message: String,
+        condition: Option<String>,
+    ) -> Result<crate::mcp::LogpointInfo> {
+        let session = self.db.get_session(session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
+        let dwarf = dwarf_handle.get().await?;
+
+        let logpoint_id = id.unwrap_or_else(|| format!("lp-{}", uuid::Uuid::new_v4().to_string()));
+        let function_name_for_target = function.clone();
+
+        let (address, resolved_function, resolved_file, resolved_line) = if let Some(func_pattern) = function {
+            let matches = dwarf.find_by_pattern(&func_pattern);
+            if matches.is_empty() {
+                return Err(crate::Error::ValidationError(
+                    format!("No function matching pattern '{}'", func_pattern)
+                ));
+            }
+            let func = &matches[0];
+            (
+                func.low_pc,
+                Some(func.name.clone()),
+                func.source_file.clone(),
+                func.line_number.map(|l| l as u32),
+            )
+        } else if let (Some(file_path), Some(line_num)) = (file, line) {
+            let result = dwarf.resolve_line(&file_path, line_num)
+                .ok_or_else(|| {
+                    let nearest = dwarf.find_nearest_lines(&file_path, line_num, 5);
+                    crate::Error::NoCodeAtLine {
+                        file: file_path.clone(),
+                        line: line_num,
+                        nearest_lines: nearest,
+                    }
+                })?;
+            (result.0, None, Some(file_path), Some(result.1))
+        } else {
+            return Err(crate::Error::ValidationError(
+                "Logpoint must specify either function or file+line".to_string()
+            ));
+        };
+
+        let runtime_address = address;
+
+        // Send setLogpoint message to agent
+        let mut spawner_guard = self.frida_spawner.write().await;
+        let spawner = spawner_guard.as_mut()
+            .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
+
+        let msg = serde_json::json!({
+            "type": "setLogpoint",
+            "address": format!("0x{:x}", runtime_address),
+            "id": logpoint_id,
+            "message": message,
+            "condition": condition,
+            "funcName": resolved_function,
+            "file": resolved_file,
+            "line": resolved_line,
+        });
+
+        spawner.set_breakpoint(session_id, msg).await?;
+
+        // Store logpoint in session state
+        let lp = Logpoint {
+            id: logpoint_id.clone(),
+            target: if let Some(f) = function_name_for_target {
+                BreakpointTarget::Function(f)
+            } else {
+                BreakpointTarget::Line {
+                    file: resolved_file.clone().unwrap(),
+                    line: resolved_line.unwrap(),
+                }
+            },
+            address: runtime_address,
+            message: message.clone(),
+            condition,
+        };
+
+        self.add_logpoint(session_id, lp);
+
+        Ok(crate::mcp::LogpointInfo {
+            id: logpoint_id,
+            message,
+            function: resolved_function,
+            file: resolved_file,
+            line: resolved_line,
+            address: format!("0x{:x}", runtime_address),
+        })
+    }
+
+    // ========== Phase 2: Breakpoint management (sync helpers) ==========
+
+    pub fn add_breakpoint(&self, session_id: &str, breakpoint: Breakpoint) {
+        let mut guard = write_lock(&self.breakpoints);
+        guard.entry(session_id.to_string())
+            .or_insert_with(HashMap::new)
+            .insert(breakpoint.id.clone(), breakpoint);
+    }
+
+    pub fn remove_breakpoint(&self, session_id: &str, breakpoint_id: &str) {
+        let mut guard = write_lock(&self.breakpoints);
+        if let Some(session_bps) = guard.get_mut(session_id) {
+            session_bps.remove(breakpoint_id);
+        }
+    }
+
+    pub fn get_breakpoints(&self, session_id: &str) -> Vec<Breakpoint> {
+        let guard = read_lock(&self.breakpoints);
+        guard.get(session_id)
+            .map(|bps| bps.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_breakpoint(&self, session_id: &str, breakpoint_id: &str) -> Option<Breakpoint> {
+        let guard = read_lock(&self.breakpoints);
+        guard.get(session_id)
+            .and_then(|bps| bps.get(breakpoint_id))
+            .cloned()
+    }
+
+    // Logpoint management
+    pub fn add_logpoint(&self, session_id: &str, logpoint: Logpoint) {
+        let mut guard = write_lock(&self.logpoints);
+        guard.entry(session_id.to_string())
+            .or_insert_with(HashMap::new)
+            .insert(logpoint.id.clone(), logpoint);
+    }
+
+    pub fn remove_logpoint(&self, session_id: &str, logpoint_id: &str) {
+        let mut guard = write_lock(&self.logpoints);
+        if let Some(session_lps) = guard.get_mut(session_id) {
+            session_lps.remove(logpoint_id);
+        }
+    }
+
+    pub fn get_logpoints(&self, session_id: &str) -> Vec<Logpoint> {
+        let guard = read_lock(&self.logpoints);
+        guard.get(session_id)
+            .map(|lps| lps.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    // Pause state management
+    pub fn add_paused_thread(&self, session_id: &str, thread_id: u64, info: PauseInfo) {
+        let mut guard = write_lock(&self.paused_threads);
+        guard.entry(session_id.to_string())
+            .or_insert_with(HashMap::new)
+            .insert(thread_id, info);
+    }
+
+    pub fn remove_paused_thread(&self, session_id: &str, thread_id: u64) {
+        let mut guard = write_lock(&self.paused_threads);
+        if let Some(session_threads) = guard.get_mut(session_id) {
+            session_threads.remove(&thread_id);
+        }
+    }
+
+    pub fn is_thread_paused(&self, session_id: &str, thread_id: u64) -> bool {
+        let guard = read_lock(&self.paused_threads);
+        guard.get(session_id)
+            .and_then(|threads| threads.get(&thread_id))
+            .is_some()
+    }
+
+    pub fn get_pause_info(&self, session_id: &str, thread_id: u64) -> Option<PauseInfo> {
+        let guard = read_lock(&self.paused_threads);
+        guard.get(session_id)
+            .and_then(|threads| threads.get(&thread_id))
+            .cloned()
+    }
+
+    pub fn get_all_paused_threads(&self, session_id: &str) -> HashMap<u64, PauseInfo> {
+        let guard = read_lock(&self.paused_threads);
+        guard.get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+// ========== Phase 2: Breakpoint types ==========
+
+#[derive(Debug, Clone)]
+pub struct Breakpoint {
+    pub id: String,
+    pub target: BreakpointTarget,
+    pub address: u64,
+    pub condition: Option<String>,
+    pub hit_count: u32,
+    pub hits: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum BreakpointTarget {
+    Function(String),
+    Line { file: String, line: u32 },
+}
+
+#[derive(Debug, Clone)]
+pub struct Logpoint {
+    pub id: String,
+    pub target: BreakpointTarget, // Reuse same target enum
+    pub address: u64,
+    pub message: String,
+    pub condition: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PauseInfo {
+    pub breakpoint_id: String,
+    pub func_name: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub paused_at: Instant,
+    pub return_address: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_breakpoint_state_management() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("strobe_test_bp.db");
+        let _ = std::fs::remove_file(&db_path); // Clean start
+
+        let sm = SessionManager::new(&db_path).unwrap();
+
+        let session_id = "test-bp";
+        let bp = Breakpoint {
+            id: "bp1".to_string(),
+            target: BreakpointTarget::Line {
+                file: "main.cpp".to_string(),
+                line: 42,
+            },
+            address: 0x1000,
+            condition: None,
+            hit_count: 0,
+            hits: 0,
+        };
+
+        // Add breakpoint
+        sm.add_breakpoint(session_id, bp.clone());
+
+        // Retrieve breakpoint
+        let breakpoints = sm.get_breakpoints(session_id);
+        assert_eq!(breakpoints.len(), 1);
+        assert_eq!(breakpoints[0].id, "bp1");
+
+        // Remove breakpoint
+        sm.remove_breakpoint(session_id, "bp1");
+        let breakpoints = sm.get_breakpoints(session_id);
+        assert_eq!(breakpoints.len(), 0);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_pause_state_management() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("strobe_test_pause.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let sm = SessionManager::new(&db_path).unwrap();
+
+        let session_id = "test-pause";
+        let thread_id = 1234u64;
+        let pause_info = PauseInfo {
+            breakpoint_id: "bp1".to_string(),
+            func_name: Some("foo".to_string()),
+            file: Some("main.cpp".to_string()),
+            line: Some(42),
+            paused_at: Instant::now(),
+            return_address: Some(0x1234),
+        };
+
+        // Add paused thread
+        sm.add_paused_thread(session_id, thread_id, pause_info.clone());
+
+        // Check if paused
+        assert!(sm.is_thread_paused(session_id, thread_id));
+
+        // Get pause info
+        let info = sm.get_pause_info(session_id, thread_id);
+        assert!(info.is_some());
+        assert_eq!(info.unwrap().breakpoint_id, "bp1");
+
+        // Resume thread
+        sm.remove_paused_thread(session_id, thread_id);
+        assert!(!sm.is_thread_paused(session_id, thread_id));
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_logpoint_state_management() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("strobe_test_lp.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let sm = SessionManager::new(&db_path).unwrap();
+
+        let session_id = "test-lp";
+        let lp = Logpoint {
+            id: "lp1".to_string(),
+            target: BreakpointTarget::Function("foo".to_string()),
+            address: 0x2000,
+            message: "hit: {args[0]}".to_string(),
+            condition: None,
+        };
+
+        // Add logpoint
+        sm.add_logpoint(session_id, lp);
+
+        // Retrieve
+        let logpoints = sm.get_logpoints(session_id);
+        assert_eq!(logpoints.len(), 1);
+        assert_eq!(logpoints[0].id, "lp1");
+        assert_eq!(logpoints[0].message, "hit: {args[0]}");
+
+        // Remove
+        sm.remove_logpoint(session_id, "lp1");
+        let logpoints = sm.get_logpoints(session_id);
+        assert_eq!(logpoints.len(), 0);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_pause_with_return_address() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("strobe_test_pause_ret.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let sm = SessionManager::new(&db_path).unwrap();
+
+        let session_id = "test-ret";
+        let pause_info = PauseInfo {
+            breakpoint_id: "bp1".to_string(),
+            func_name: Some("inner_func".to_string()),
+            file: Some("lib.cpp".to_string()),
+            line: Some(100),
+            paused_at: Instant::now(),
+            return_address: Some(0xdeadbeef),
+        };
+
+        sm.add_paused_thread(session_id, 99, pause_info);
+
+        let info = sm.get_pause_info(session_id, 99).unwrap();
+        assert_eq!(info.return_address, Some(0xdeadbeef));
+        assert_eq!(info.func_name, Some("inner_func".to_string()));
+
+        let all_paused = sm.get_all_paused_threads(session_id);
+        assert_eq!(all_paused.len(), 1);
+        assert!(all_paused.contains_key(&99));
+
+        let _ = std::fs::remove_file(&db_path);
     }
 }

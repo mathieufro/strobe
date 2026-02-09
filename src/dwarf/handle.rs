@@ -73,6 +73,7 @@ mod tests {
             variables_by_name: std::collections::HashMap::new(),
             struct_members: std::sync::Mutex::new(std::collections::HashMap::new()),
             lazy_struct_info: std::collections::HashMap::new(),
+            line_table: std::sync::Mutex::new(None),
             image_base: 0x100000,
             binary_path: None,
         })

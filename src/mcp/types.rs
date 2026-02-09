@@ -632,6 +632,384 @@ impl From<crate::Error> for McpError {
     }
 }
 
+// ============ debug_breakpoint ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugBreakpointRequest {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add: Option<Vec<BreakpointTarget>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove: Option<Vec<String>>, // Breakpoint IDs
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BreakpointTarget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hit_count: Option<u32>,
+}
+
+impl DebugBreakpointRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.session_id.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "sessionId must not be empty".to_string()
+            ));
+        }
+
+        if let Some(targets) = &self.add {
+            for target in targets {
+                // Must specify either function OR file:line
+                let has_function = target.function.is_some();
+                let has_file_line = target.file.is_some() && target.line.is_some();
+
+                if !has_function && !has_file_line {
+                    return Err(crate::Error::ValidationError(
+                        "Breakpoint target must specify either 'function' or 'file'+'line'".to_string()
+                    ));
+                }
+
+                if has_function && has_file_line {
+                    return Err(crate::Error::ValidationError(
+                        "Breakpoint target cannot specify both 'function' and 'file'+'line'".to_string()
+                    ));
+                }
+
+                if target.file.is_some() && target.line.is_none() {
+                    return Err(crate::Error::ValidationError(
+                        "Breakpoint with 'file' must also specify 'line'".to_string()
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugBreakpointResponse {
+    pub breakpoints: Vec<BreakpointInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BreakpointInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub address: String, // Hex
+}
+
+// ============ debug_continue ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugContinueRequest {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>, // "continue", "step-over", "step-into", "step-out"
+}
+
+impl DebugContinueRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.session_id.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "sessionId must not be empty".to_string()
+            ));
+        }
+
+        if let Some(action) = &self.action {
+            match action.as_str() {
+                "continue" | "step-over" | "step-into" | "step-out" => {}
+                _ => {
+                    return Err(crate::Error::ValidationError(
+                        format!("Invalid action '{}'. Must be: continue, step-over, step-into, step-out", action)
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugContinueResponse {
+    pub status: String, // "paused", "running", "exited"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+}
+
+// ============ debug_logpoint ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugLogpointRequest {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add: Option<Vec<LogpointTarget>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove: Option<Vec<String>>, // Logpoint IDs
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogpointTarget {
+    /// Log message template. Use `{args[0]}`, `{args[1]}` etc for arguments.
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+}
+
+impl DebugLogpointRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.session_id.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "sessionId must not be empty".to_string()
+            ));
+        }
+
+        if let Some(targets) = &self.add {
+            for target in targets {
+                let has_function = target.function.is_some();
+                let has_file_line = target.file.is_some() && target.line.is_some();
+
+                if !has_function && !has_file_line {
+                    return Err(crate::Error::ValidationError(
+                        "Logpoint target must specify either 'function' or 'file'+'line'".to_string()
+                    ));
+                }
+
+                if target.message.is_empty() {
+                    return Err(crate::Error::ValidationError(
+                        "Logpoint message must not be empty".to_string()
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugLogpointResponse {
+    pub logpoints: Vec<LogpointInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogpointInfo {
+    pub id: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub address: String,
+}
+
+#[cfg(test)]
+mod breakpoint_tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_breakpoint_request_validation() {
+        // Valid: function target
+        let req = DebugBreakpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![BreakpointTarget {
+                function: Some("foo".to_string()),
+                file: None,
+                line: None,
+                condition: None,
+                hit_count: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_ok());
+
+        // Valid: file:line target
+        let req = DebugBreakpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![BreakpointTarget {
+                function: None,
+                file: Some("main.cpp".to_string()),
+                line: Some(42),
+                condition: None,
+                hit_count: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_ok());
+
+        // Invalid: neither function nor file:line
+        let req = DebugBreakpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![BreakpointTarget {
+                function: None,
+                file: None,
+                line: None,
+                condition: None,
+                hit_count: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_err());
+
+        // Invalid: file without line
+        let req = DebugBreakpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![BreakpointTarget {
+                function: None,
+                file: Some("main.cpp".to_string()),
+                line: None,
+                condition: None,
+                hit_count: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_continue_request_validation() {
+        // Valid: no action (defaults to continue)
+        let req = DebugContinueRequest {
+            session_id: "test".to_string(),
+            action: None,
+        };
+        assert!(req.validate().is_ok());
+
+        // Valid: continue action
+        let req = DebugContinueRequest {
+            session_id: "test".to_string(),
+            action: Some("continue".to_string()),
+        };
+        assert!(req.validate().is_ok());
+
+        // Valid: step-over action (for Phase 2b)
+        let req = DebugContinueRequest {
+            session_id: "test".to_string(),
+            action: Some("step-over".to_string()),
+        };
+        assert!(req.validate().is_ok());
+
+        // Invalid: empty session_id
+        let req = DebugContinueRequest {
+            session_id: "".to_string(),
+            action: None,
+        };
+        assert!(req.validate().is_err());
+
+        // Invalid: unknown action
+        let req = DebugContinueRequest {
+            session_id: "test".to_string(),
+            action: Some("invalid-action".to_string()),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_logpoint_request_validation() {
+        // Valid: function logpoint
+        let req = DebugLogpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![LogpointTarget {
+                message: "hit: {args[0]}".to_string(),
+                function: Some("foo".to_string()),
+                file: None,
+                line: None,
+                condition: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_ok());
+
+        // Valid: file:line logpoint
+        let req = DebugLogpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![LogpointTarget {
+                message: "reached line 42".to_string(),
+                function: None,
+                file: Some("main.cpp".to_string()),
+                line: Some(42),
+                condition: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_ok());
+
+        // Invalid: empty message
+        let req = DebugLogpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![LogpointTarget {
+                message: "".to_string(),
+                function: Some("foo".to_string()),
+                file: None,
+                line: None,
+                condition: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_err());
+
+        // Invalid: no function or file:line
+        let req = DebugLogpointRequest {
+            session_id: "test".to_string(),
+            add: Some(vec![LogpointTarget {
+                message: "hello".to_string(),
+                function: None,
+                file: None,
+                line: None,
+                condition: None,
+            }]),
+            remove: None,
+        };
+        assert!(req.validate().is_err());
+
+        // Invalid: empty session_id
+        let req = DebugLogpointRequest {
+            session_id: "".to_string(),
+            add: None,
+            remove: None,
+        };
+        assert!(req.validate().is_err());
+    }
+}
+
 #[cfg(test)]
 mod read_tests {
     use super::*;

@@ -13,7 +13,7 @@ fn add_column_if_not_exists(conn: &Connection, table: &str, column: &str, col_ty
 }
 
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl Database {
@@ -92,6 +92,10 @@ impl Database {
         add_column_if_not_exists(&conn, "events", "registers", "JSON")?;
         add_column_if_not_exists(&conn, "events", "backtrace", "JSON")?;
         add_column_if_not_exists(&conn, "events", "locals", "JSON")?;
+
+        // Phase 2: Active debugging columns
+        add_column_if_not_exists(&conn, "events", "breakpoint_id", "TEXT")?;
+        add_column_if_not_exists(&conn, "events", "logpoint_message", "TEXT")?;
 
         // Test baselines table for historical per-test durations
         conn.execute(

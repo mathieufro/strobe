@@ -10,11 +10,6 @@ use crate::Result;
 use super::{HookManager, HookMode};
 use libc;
 
-extern "C" {
-    #[link_name = "_frida_g_error_free"]
-    fn g_error_free(error: *mut frida_sys::GError);
-}
-
 /// Check a GLib error pointer. Returns Ok(()) if null, or the error message if set.
 /// Frees the GError after extracting the message.
 unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(), String> {
@@ -25,7 +20,7 @@ unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(),
         .to_str()
         .unwrap_or("unknown error")
         .to_string();
-    g_error_free(error);
+    frida_sys::g_error_free(error);
     Err(msg)
 }
 
@@ -283,6 +278,21 @@ fn signal_ready(hooks_ready: &HooksReadySignal, label: &str, session_id: &str, p
     }
 }
 
+/// Pause notification sent from agent message handler to daemon
+#[derive(Debug, Clone)]
+pub struct PauseNotification {
+    pub session_id: String,
+    pub thread_id: u64,
+    pub breakpoint_id: String,
+    pub func_name: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub return_address: Option<u64>,
+}
+
+/// Channel for pause notifications from agent to daemon
+pub type PauseNotifyTx = mpsc::Sender<PauseNotification>;
+
 /// Message handler passed as user_data to the raw GLib signal callback.
 /// No longer implements `ScriptHandler` — messages are parsed directly in `raw_on_message`.
 struct AgentMessageHandler {
@@ -291,6 +301,7 @@ struct AgentMessageHandler {
     hooks_ready: HooksReadySignal,
     read_response: ReadResponseSignal,
     crash_reported: Arc<AtomicBool>,
+    pause_notify_tx: Option<PauseNotifyTx>,
 }
 
 impl AgentMessageHandler {
@@ -366,6 +377,58 @@ impl AgentMessageHandler {
             "poll_complete" => {
                 tracing::info!("Poll complete for session {}", self.session_id);
             }
+            "paused" => {
+                // Phase 2: Breakpoint pause event
+                let thread_id = payload.get("threadId").and_then(|v| v.as_u64()).unwrap_or(0);
+                let breakpoint_id_str = payload.get("breakpointId").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let func_name = payload.get("funcName").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let file = payload.get("file").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let line = payload.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let return_address = payload.get("returnAddress")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+
+                tracing::info!(
+                    "[{}] Thread {} paused at breakpoint {} (ret=0x{:x?})",
+                    self.session_id, thread_id, breakpoint_id_str,
+                    return_address.unwrap_or(0)
+                );
+
+                // Create a Pause event for the database
+                let timestamp_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64;
+
+                let event = Event {
+                    id: format!("{}-pause-{}-{}", self.session_id, thread_id, timestamp_ns),
+                    session_id: self.session_id.clone(),
+                    timestamp_ns,
+                    thread_id: thread_id as i64,
+                    event_type: EventType::Pause,
+                    breakpoint_id: Some(breakpoint_id_str.to_string()),
+                    function_name: func_name.clone().unwrap_or_default(),
+                    source_file: file.clone(),
+                    line_number: line.map(|n| n as i32),
+                    ..Event::default()
+                };
+
+                let _ = self.event_tx.try_send(event);
+
+                // Notify SessionManager of the pause (critical for stepping/continue)
+                if let Some(ref tx) = self.pause_notify_tx {
+                    let notification = PauseNotification {
+                        session_id: self.session_id.clone(),
+                        thread_id,
+                        breakpoint_id: breakpoint_id_str.to_string(),
+                        func_name,
+                        file,
+                        line,
+                        return_address,
+                    };
+                    let _ = tx.try_send(notification);
+                }
+            }
             _ => {
                 tracing::debug!("Unknown message type from agent: {}", msg_type);
             }
@@ -412,6 +475,7 @@ enum CoordinatorCommand {
         env: Option<HashMap<String, String>>,
         event_tx: mpsc::Sender<Event>,
         defer_resume: bool,
+        pause_notify_tx: Option<PauseNotifyTx>,
         response: oneshot::Sender<Result<SpawnResult>>,
     },
     Resume {
@@ -445,6 +509,15 @@ enum SessionCommand {
     ReadMemory {
         recipes_json: String,
         response: oneshot::Sender<Result<serde_json::Value>>,
+    },
+    SetBreakpoint {
+        message: serde_json::Value,
+        response: oneshot::Sender<Result<()>>,
+    },
+    ResumeThread {
+        thread_id: u64,
+        one_shot_addresses: Vec<u64>,
+        response: oneshot::Sender<Result<()>>,
     },
     Shutdown,
 }
@@ -608,6 +681,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                 env,
                 event_tx,
                 defer_resume,
+                pause_notify_tx,
                 response,
             } => {
                 let result = (|| -> Result<SpawnResult> {
@@ -695,6 +769,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         hooks_ready: hooks_ready.clone(),
                         read_response: read_response.clone(),
                         crash_reported: crash_reported.clone(),
+                        pause_notify_tx,
                     };
 
                     unsafe { register_handler_raw(script_ptr, handler) };
@@ -824,6 +899,26 @@ fn session_worker(
 
             SessionCommand::ReadMemory { recipes_json, response } => {
                 let result = handle_read_memory(raw_ptr, &read_response, &recipes_json, pid);
+                let _ = response.send(result);
+            }
+
+            SessionCommand::SetBreakpoint { message, response } => {
+                let result = unsafe {
+                    post_message_raw(raw_ptr, &serde_json::to_string(&message).unwrap())
+                        .map_err(|e| crate::Error::Frida(format!("Failed to send breakpoint: {}", e)))
+                };
+                let _ = response.send(result);
+            }
+
+            SessionCommand::ResumeThread { thread_id, one_shot_addresses, response } => {
+                let resume_msg = serde_json::json!({
+                    "type": format!("resume-{}", thread_id),
+                    "oneShot": one_shot_addresses.iter().map(|addr| format!("0x{:x}", addr)).collect::<Vec<_>>(),
+                });
+                let result = unsafe {
+                    post_message_raw(raw_ptr, &serde_json::to_string(&resume_msg).unwrap())
+                        .map_err(|e| crate::Error::Frida(format!("Failed to send resume: {}", e)))
+                };
                 let _ = response.send(result);
             }
 
@@ -1156,6 +1251,7 @@ fn handle_child_spawn(
                         hooks_ready: hooks_ready.clone(),
                         read_response: read_response.clone(),
                         crash_reported: Arc::new(AtomicBool::new(false)),
+                        pause_notify_tx: None,
                     };
                     unsafe {
                         register_handler_raw(script_ptr, handler);
@@ -1199,6 +1295,9 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         "stderr" => EventType::Stderr,
         "crash" => EventType::Crash,
         "variable_snapshot" => EventType::VariableSnapshot,
+        "pause" => EventType::Pause,
+        "logpoint" => EventType::Logpoint,
+        "condition_error" => EventType::ConditionError,
         _ => return None,
     };
 
@@ -1259,6 +1358,25 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
             event_type,
             text: json.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            pid,
+            ..Event::default()
+        });
+    }
+
+    // Phase 2: Breakpoint events (Pause, Logpoint, ConditionError)
+    if event_type == EventType::Pause || event_type == EventType::Logpoint || event_type == EventType::ConditionError {
+        return Some(Event {
+            id: json.get("id")?.as_str()?.to_string(),
+            session_id: session_id.to_string(),
+            timestamp_ns: json.get("timestampNs")?.as_i64()?,
+            thread_id: json.get("threadId")?.as_i64()?,
+            thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            event_type,
+            breakpoint_id: json.get("breakpointId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            logpoint_message: json.get("message").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            function_name: json.get("functionName").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default(),
+            source_file: json.get("file").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            line_number: json.get("line").and_then(|v| v.as_i64()).map(|n| n as i32),
             pid,
             ..Event::default()
         });
@@ -1441,6 +1559,7 @@ impl FridaSpawner {
         image_base: u64,
         event_sender: mpsc::Sender<Event>,
         defer_resume: bool,
+        pause_notify_tx: Option<PauseNotifyTx>,
     ) -> Result<u32> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -1452,6 +1571,7 @@ impl FridaSpawner {
             env: env.cloned(),
             event_tx: event_sender,
             defer_resume,
+            pause_notify_tx,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
 
@@ -1681,6 +1801,56 @@ impl FridaSpawner {
             .map(|s| s.hook_manager.active_patterns())
             .unwrap_or_default()
     }
+
+    // Phase 2: Breakpoint support
+    pub async fn set_breakpoint(
+        &mut self,
+        session_id: &str,
+        message: serde_json::Value,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let worker_tx = self.session_workers.get(session_id)
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        worker_tx.send(SessionCommand::SetBreakpoint {
+            message,
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
+
+    pub async fn resume_thread(
+        &mut self,
+        session_id: &str,
+        thread_id: u64,
+    ) -> Result<()> {
+        self.resume_thread_with_step(session_id, thread_id, Vec::new()).await
+    }
+
+    /// Resume thread with optional one-shot breakpoints for stepping
+    pub async fn resume_thread_with_step(
+        &mut self,
+        session_id: &str,
+        thread_id: u64,
+        one_shot_addresses: Vec<u64>,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let worker_tx = self.session_workers.get(session_id)
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        worker_tx.send(SessionCommand::ResumeThread {
+            thread_id,
+            one_shot_addresses,
+            response: response_tx,
+        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+
+        response_rx.await
+            .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
 }
 
 impl Default for FridaSpawner {
@@ -1891,6 +2061,7 @@ mod tests {
             hooks_ready: hooks_ready.clone(),
             read_response,
             crash_reported: Arc::new(AtomicBool::new(false)),
+            pause_notify_tx: None,
         };
         (handler, event_rx, hooks_ready)
     }
@@ -1962,6 +2133,71 @@ mod tests {
         assert_eq!(ev2.id, "e2");
         assert_eq!(ev2.event_type, EventType::Stdout);
         assert_eq!(ev2.text.as_deref(), Some("hello\n"));
+    }
+
+    // --- Pause notification tests ---
+
+    #[tokio::test]
+    async fn test_handler_paused_creates_event_and_notification() {
+        let (pause_tx, mut pause_rx) = mpsc::channel(10);
+        let (event_tx, mut event_rx) = mpsc::channel(1000);
+        let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
+        let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
+        let handler = AgentMessageHandler {
+            event_tx,
+            session_id: "pause-test".to_string(),
+            hooks_ready,
+            read_response,
+            crash_reported: Arc::new(AtomicBool::new(false)),
+            pause_notify_tx: Some(pause_tx),
+        };
+
+        // Simulate a "paused" message from agent
+        let payload = json!({
+            "type": "paused",
+            "threadId": 42,
+            "breakpointId": "bp-1",
+            "funcName": "main",
+            "file": "main.cpp",
+            "line": 10,
+            "returnAddress": "0x1234abcd"
+        });
+
+        handler.handle_payload("paused", &payload);
+
+        // Should receive a Pause event on the event channel
+        let event = event_rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::Pause);
+        assert_eq!(event.breakpoint_id, Some("bp-1".to_string()));
+        assert_eq!(event.thread_id, 42);
+
+        // Should also receive a PauseNotification
+        let notification = pause_rx.recv().await.unwrap();
+        assert_eq!(notification.session_id, "pause-test");
+        assert_eq!(notification.thread_id, 42);
+        assert_eq!(notification.breakpoint_id, "bp-1");
+        assert_eq!(notification.func_name, Some("main".to_string()));
+        assert_eq!(notification.file, Some("main.cpp".to_string()));
+        assert_eq!(notification.line, Some(10));
+        assert_eq!(notification.return_address, Some(0x1234abcd));
+    }
+
+    #[tokio::test]
+    async fn test_handler_paused_without_notification_channel() {
+        let (handler, mut event_rx, _hooks_ready) = make_handler();
+
+        // Should still work without pause_notify_tx (None)
+        let payload = json!({
+            "type": "paused",
+            "threadId": 1,
+            "breakpointId": "bp-1"
+        });
+
+        handler.handle_payload("paused", &payload);
+
+        // Event should still be created
+        let event = event_rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::Pause);
     }
 
     // --- @usercode pattern resolution ---

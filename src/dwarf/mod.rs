@@ -2,7 +2,7 @@ mod parser;
 mod function;
 mod handle;
 
-pub use parser::DwarfParser;
+pub use parser::{DwarfParser, LineEntry};
 pub use function::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation, StructFieldRecipe};
 pub use handle::DwarfHandle;
 

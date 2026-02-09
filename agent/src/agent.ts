@@ -91,6 +91,58 @@ interface WatchInstruction {
   }>;
 }
 
+// Phase 2: Breakpoint interfaces
+interface BreakpointState {
+  id: string;
+  address: NativePointer;
+  condition?: string;
+  hitCount: number;
+  hits: number;
+  listener: InvocationListener;
+  funcName?: string;
+  file?: string;
+  line?: number;
+}
+
+interface SetBreakpointMessage {
+  address: string;
+  id: string;
+  condition?: string;
+  hitCount?: number;
+  funcName?: string;
+  file?: string;
+  line?: number;
+}
+
+interface RemoveBreakpointMessage {
+  id: string;
+}
+
+interface SetLogpointMessage {
+  address: string;
+  id: string;
+  message: string;
+  condition?: string;
+  funcName?: string;
+  file?: string;
+  line?: number;
+}
+
+interface LogpointState {
+  id: string;
+  address: NativePointer;
+  message: string;
+  condition?: string;
+  listener: InvocationListener;
+  funcName?: string;
+  file?: string;
+  line?: number;
+}
+
+interface ResumeMessage {
+  oneShot?: string[]; // Addresses for one-shot step breakpoints
+}
+
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
@@ -98,6 +150,12 @@ class StrobeAgent {
   private tracer: CModuleTracer;
   private rateTracker: RateTracker | null = null;
   private funcIdToName: Map<number, string> = new Map();
+
+  // Phase 2: Breakpoint management
+  private breakpoints: Map<string, BreakpointState> = new Map(); // id → state
+  private breakpointsByAddress: Map<string, string> = new Map(); // address → id
+  private pausedThreads: Map<number, string> = new Map(); // threadId → breakpointId
+  private logpoints: Map<string, LogpointState> = new Map(); // id → state
 
   // Output event buffering (low-frequency, stays in JS)
   private outputBuffer: OutputEvent[] = [];
@@ -660,6 +718,244 @@ class StrobeAgent {
       }
     });
   }
+
+  // ========== Phase 2: Breakpoint methods ==========
+
+  setBreakpoint(msg: SetBreakpointMessage): void {
+    const address = ptr(msg.address);
+    const self = this;
+
+    const listener = Interceptor.attach(address, {
+      onEnter(args) {
+        const bp = self.breakpoints.get(msg.id);
+        if (!bp) return;
+
+        // Evaluate condition if present
+        if (bp.condition && !self.evaluateCondition(bp.condition, args, bp.id)) {
+          return;
+        }
+
+        // Hit count logic
+        bp.hits++;
+        if (bp.hitCount > 0 && bp.hits < bp.hitCount) {
+          return;
+        }
+
+        // Notify daemon of pause
+        const threadId = Process.getCurrentThreadId();
+        self.pausedThreads.set(threadId, bp.id);
+
+        // Capture return address for step-out support
+        // ARM64: LR register, x86_64: [RBP+8] - Frida's returnAddress handles both
+        const returnAddr = this.returnAddress;
+
+        send({
+          type: 'paused',
+          threadId,
+          breakpointId: bp.id,
+          funcName: bp.funcName,
+          file: bp.file,
+          line: bp.line,
+          returnAddress: returnAddr ? returnAddr.strip().toString() : null,
+        });
+
+        // Block this thread until resume message
+        const op = recv(`resume-${threadId}`, (resumeMsg: ResumeMessage) => {
+          // Phase 2b: Install one-shot stepping breakpoints
+          if (resumeMsg.oneShot && resumeMsg.oneShot.length > 0) {
+            const stepId = `step-${threadId}-${Date.now()}`;
+            const listeners: InvocationListener[] = [];
+
+            for (const addressStr of resumeMsg.oneShot) {
+              const addr = ptr(addressStr);
+              const stepListener = Interceptor.attach(addr, {
+                onEnter() {
+                  // Clean up all one-shot hooks from this step operation
+                  for (const l of listeners) {
+                    l.detach();
+                  }
+
+                  // Send pause event with return address
+                  send({
+                    type: 'paused',
+                    threadId: Process.getCurrentThreadId(),
+                    breakpointId: stepId,
+                    funcName: null,
+                    file: null,
+                    line: null,
+                    returnAddress: this.returnAddress ? this.returnAddress.strip().toString() : null,
+                  });
+
+                  // Block again for next resume
+                  const nextOp = recv(`resume-${Process.getCurrentThreadId()}`, () => {});
+                  nextOp.wait();
+                },
+              });
+              listeners.push(stepListener);
+            }
+          }
+        });
+        op.wait(); // CRITICAL: Blocks native thread, releases JS lock
+
+        self.pausedThreads.delete(threadId);
+      },
+    });
+
+    const breakpointState: BreakpointState = {
+      id: msg.id,
+      address,
+      condition: msg.condition,
+      hitCount: msg.hitCount || 0,
+      hits: 0,
+      listener,
+      funcName: msg.funcName,
+      file: msg.file,
+      line: msg.line,
+    };
+
+    this.breakpoints.set(msg.id, breakpointState);
+    this.breakpointsByAddress.set(address.toString(), msg.id);
+
+    send({
+      type: 'breakpointSet',
+      id: msg.id,
+      address: address.toString(),
+    });
+  }
+
+  setLogpoint(msg: SetLogpointMessage): void {
+    const address = ptr(msg.address);
+
+    const listener = Interceptor.attach(address, {
+      onEnter: (args) => {
+        const lp = this.logpoints.get(msg.id);
+        if (!lp) return;
+
+        // Evaluate condition if present
+        if (lp.condition) {
+          try {
+            const argsArray: any[] = [];
+            for (let i = 0; i < 10; i++) {
+              try { argsArray.push(args[i]); } catch { break; }
+            }
+            const result = new Function('args', `return (${lp.condition})`)(argsArray);
+            if (!Boolean(result)) return;
+          } catch {
+            return; // Condition evaluation failed, skip
+          }
+        }
+
+        // Evaluate message template
+        let evaluatedMessage = lp.message;
+        try {
+          const argsArray: any[] = [];
+          for (let i = 0; i < 10; i++) {
+            try { argsArray.push(args[i]); } catch { break; }
+          }
+          // Replace {args[N]} placeholders with actual values
+          evaluatedMessage = lp.message.replace(/\{args\[(\d+)\]\}/g, (_match, idx) => {
+            const i = parseInt(idx);
+            return i < argsArray.length ? String(argsArray[i]) : '<undefined>';
+          });
+          // Replace {threadId} placeholder
+          evaluatedMessage = evaluatedMessage.replace(/\{threadId\}/g, String(Process.getCurrentThreadId()));
+        } catch (e) {
+          evaluatedMessage = `[logpoint eval error: ${e}]`;
+        }
+
+        // Send as logpoint event (non-blocking - does NOT pause)
+        send({
+          type: 'events',
+          events: [{
+            id: `${this.sessionId}-logpoint-${Date.now()}`,
+            timestampNs: this.getTimestampNs(),
+            threadId: Process.getCurrentThreadId(),
+            eventType: 'logpoint',
+            breakpointId: lp.id,
+            message: evaluatedMessage,
+            functionName: lp.funcName,
+            file: lp.file,
+            line: lp.line,
+          }],
+        });
+      },
+    });
+
+    const logpointState: LogpointState = {
+      id: msg.id,
+      address,
+      message: msg.message,
+      condition: msg.condition,
+      listener,
+      funcName: msg.funcName,
+      file: msg.file,
+      line: msg.line,
+    };
+
+    this.logpoints.set(msg.id, logpointState);
+
+    send({
+      type: 'logpointSet',
+      id: msg.id,
+      address: address.toString(),
+    });
+  }
+
+  removeLogpoint(id: string): void {
+    const lp = this.logpoints.get(id);
+    if (!lp) return;
+
+    lp.listener.detach();
+    this.logpoints.delete(id);
+
+    send({ type: 'logpointRemoved', id });
+  }
+
+  removeBreakpoint(id: string): void {
+    const bp = this.breakpoints.get(id);
+    if (!bp) {
+      send({ type: 'error', message: `Breakpoint ${id} not found` });
+      return;
+    }
+
+    // If thread is paused on this breakpoint, resume it first
+    for (const [threadId, bpId] of this.pausedThreads.entries()) {
+      if (bpId === id) {
+        send({ type: `resume-${threadId}`, payload: {} });
+      }
+    }
+
+    bp.listener.detach();
+    this.breakpoints.delete(id);
+    this.breakpointsByAddress.delete(bp.address.toString());
+
+    send({ type: 'breakpointRemoved', id });
+  }
+
+  private evaluateCondition(condition: string, args: InvocationArguments, breakpointId?: string): boolean {
+    try {
+      // Convert args to array for Function context
+      const argsArray: any[] = [];
+      for (let i = 0; i < 10; i++) {
+        try {
+          argsArray.push(args[i]);
+        } catch {
+          break;
+        }
+      }
+
+      const result = new Function('args', `return (${condition})`)(argsArray);
+      return Boolean(result);
+    } catch (e) {
+      send({
+        type: 'conditionError',
+        breakpointId: breakpointId || 'unknown',
+        condition,
+        error: String(e),
+      });
+      return false;
+    }
+  }
 }
 
 function _arrayBufferToHex(buffer: ArrayBuffer): string {
@@ -707,6 +1003,31 @@ function onReadMemoryMessage(message: ReadMemoryMessage): void {
   agent.handleReadMemory(message);
 }
 recv('read_memory', onReadMemoryMessage);
+
+// Phase 2: Breakpoint message handlers
+function onSetBreakpointMessage(message: SetBreakpointMessage): void {
+  recv('setBreakpoint', onSetBreakpointMessage);
+  agent.setBreakpoint(message);
+}
+recv('setBreakpoint', onSetBreakpointMessage);
+
+function onRemoveBreakpointMessage(message: RemoveBreakpointMessage): void {
+  recv('removeBreakpoint', onRemoveBreakpointMessage);
+  agent.removeBreakpoint(message.id);
+}
+recv('removeBreakpoint', onRemoveBreakpointMessage);
+
+function onSetLogpointMessage(message: SetLogpointMessage): void {
+  recv('setLogpoint', onSetLogpointMessage);
+  agent.setLogpoint(message);
+}
+recv('setLogpoint', onSetLogpointMessage);
+
+function onRemoveLogpointMessage(message: RemoveBreakpointMessage): void {
+  recv('removeLogpoint', onRemoveLogpointMessage);
+  agent.removeLogpoint(message.id);
+}
+recv('removeLogpoint', onRemoveLogpointMessage);
 
 // Frida calls rpc.exports.dispose() before script unload — ensures all
 // buffered trace events (CModule ring buffer) and output events are flushed.

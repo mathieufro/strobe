@@ -66,6 +66,15 @@ impl LoadedDwarf {
 }
 
 #[derive(Debug, Clone)]
+pub struct LineEntry {
+    pub address: u64,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    pub is_statement: bool,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct StructMember {
     pub name: String,
     pub offset: u64,
@@ -92,6 +101,8 @@ pub struct DwarfParser {
     pub image_base: u64,
     /// Path to the binary (or dSYM) for re-parsing on demand (e.g., crash locals)
     pub(crate) binary_path: Option<std::path::PathBuf>,
+    /// Parsed line table entries, sorted by address. Lazily populated on first line query.
+    pub(crate) line_table: Mutex<Option<Vec<LineEntry>>>,
 }
 
 impl DwarfParser {
@@ -293,6 +304,7 @@ impl DwarfParser {
             lazy_struct_info,
             image_base: 0, // Set by parse() from the actual binary
             binary_path: Some(path.to_path_buf()),
+            line_table: Mutex::new(None),
         })
     }
 
@@ -1102,6 +1114,187 @@ impl DwarfParser {
             type_name,
             location,
         })
+    }
+
+    // ========== Phase 2: Line table support ==========
+
+    /// Resolve file:line to instruction address. Snaps to nearest is_statement line.
+    /// Returns (address, actual_line) or None if no code at that location.
+    pub fn resolve_line(&self, file: &str, line: u32) -> Option<(u64, u32)> {
+        self.ensure_line_table();
+        let table = self.line_table.lock().unwrap();
+        let entries = table.as_ref()?;
+
+        // Find entries matching file
+        let mut matches: Vec<_> = entries
+            .iter()
+            .filter(|e| e.is_statement && e.file.ends_with(file))
+            .collect();
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        // Find closest line >= requested line
+        matches.sort_by_key(|e| e.line);
+        matches
+            .iter()
+            .find(|e| e.line >= line)
+            .map(|e| (e.address, e.line))
+    }
+
+    /// Find nearest valid line numbers for error messages
+    pub fn find_nearest_lines(&self, file: &str, target_line: u32, count: usize) -> String {
+        self.ensure_line_table();
+        let table = self.line_table.lock().unwrap();
+        let entries = match table.as_ref() {
+            Some(e) => e,
+            None => return "unknown".to_string(),
+        };
+
+        // Get all unique statement lines for this file
+        let mut lines: Vec<u32> = entries
+            .iter()
+            .filter(|e| e.is_statement && e.file.ends_with(file))
+            .map(|e| e.line)
+            .collect();
+
+        lines.sort_unstable();
+        lines.dedup();
+
+        if lines.is_empty() {
+            return "none".to_string();
+        }
+
+        // Find nearest lines (before and after target)
+        let mut nearest: Vec<(u32, u32)> = lines
+            .iter()
+            .map(|&l| ((l as i64 - target_line as i64).unsigned_abs() as u32, l))
+            .collect();
+
+        nearest.sort_unstable();
+        let result: Vec<String> = nearest
+            .iter()
+            .take(count)
+            .map(|(_, l)| l.to_string())
+            .collect();
+
+        result.join(", ")
+    }
+
+    /// Reverse lookup: address → (file, line, column)
+    pub fn resolve_address(&self, address: u64) -> Option<(String, u32, u32)> {
+        self.ensure_line_table();
+        let table = self.line_table.lock().unwrap();
+        let entries = table.as_ref()?;
+
+        // Binary search for address (entries are sorted)
+        let idx = entries.binary_search_by_key(&address, |e| e.address).ok()?;
+        let entry = &entries[idx];
+        Some((entry.file.clone(), entry.line, entry.column))
+    }
+
+    /// Find next statement line in the same function. Used for step-over.
+    pub fn next_line_in_function(&self, address: u64) -> Option<(u64, String, u32)> {
+        self.ensure_line_table();
+        let table = self.line_table.lock().unwrap();
+        let entries = table.as_ref()?;
+
+        // Find current entry
+        let idx = entries.binary_search_by_key(&address, |e| e.address).ok()?;
+        let current = &entries[idx];
+
+        // Find next is_statement line with different line number, same file
+        entries[idx + 1..]
+            .iter()
+            .find(|e| e.is_statement && e.file == current.file && e.line != current.line)
+            .map(|e| (e.address, e.file.clone(), e.line))
+    }
+
+    /// Parse line table on first access (lazy initialization)
+    fn ensure_line_table(&self) {
+        let mut guard = self.line_table.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+
+        let binary_path = match &self.binary_path {
+            Some(p) => p,
+            None => {
+                tracing::warn!("No binary path for line table parsing");
+                return;
+            }
+        };
+
+        match self.parse_line_table(binary_path) {
+            Ok(entries) => {
+                tracing::info!("Parsed {} line table entries", entries.len());
+                *guard = Some(entries);
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse line table: {}", e);
+            }
+        }
+    }
+
+    /// Parse DWARF .debug_line section via gimli
+    fn parse_line_table(&self, binary_path: &Path) -> Result<Vec<LineEntry>> {
+        let loaded = load_dwarf_sections(binary_path)?;
+        let dwarf = loaded.borrow();
+
+        let mut entries = Vec::new();
+
+        let mut units_iter = dwarf.units();
+        while let Ok(Some(header)) = units_iter.next() {
+            let unit = match dwarf.unit(header) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+
+            // Get line program for this CU
+            let line_program = match unit.line_program {
+                Some(ref program) => program.clone(),
+                None => continue,
+            };
+
+            let mut rows = line_program.rows();
+            while let Ok(Some((header, row))) = rows.next_row() {
+                if !row.is_stmt() {
+                    continue; // Skip non-statement lines
+                }
+
+                let address = row.address();
+                let line = row.line().map(|l| l.get() as u32).unwrap_or(0);
+                let column = match row.column() {
+                    gimli::ColumnType::LeftEdge => 0,
+                    gimli::ColumnType::Column(c) => c.get() as u32,
+                };
+
+                // Resolve file path
+                let file = match row.file(header) {
+                    Some(file_entry) => {
+                        let path_attr = file_entry.path_name();
+                        dwarf.attr_string(&unit, path_attr)
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "<unknown>".to_string())
+                    }
+                    None => "<unknown>".to_string(),
+                };
+
+                entries.push(LineEntry {
+                    address,
+                    file,
+                    line,
+                    column,
+                    is_statement: true,
+                });
+            }
+        }
+
+        // Sort by address for binary search
+        entries.sort_by_key(|e| e.address);
+
+        Ok(entries)
     }
 }
 

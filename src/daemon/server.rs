@@ -731,6 +731,77 @@ Validation Limits (enforced):
                     "required": ["sessionId", "targets"]
                 }),
             },
+            McpTool {
+                name: "debug_breakpoint".to_string(),
+                description: "Set or remove breakpoints. Pauses execution when hit. Use debug_continue to resume. Supports function names, file:line, conditions, and hit counts.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "add": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "function": { "type": "string", "description": "Function name or pattern" },
+                                    "file": { "type": "string", "description": "Source file path" },
+                                    "line": { "type": "integer", "description": "Line number (required with file)" },
+                                    "condition": { "type": "string", "description": "JS condition: e.g. 'args[0] > 100'" },
+                                    "hitCount": { "type": "integer", "description": "Break after N hits" }
+                                }
+                            }
+                        },
+                        "remove": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Breakpoint IDs to remove"
+                        }
+                    },
+                    "required": ["sessionId"]
+                }),
+            },
+            McpTool {
+                name: "debug_continue".to_string(),
+                description: "Resume execution after a breakpoint pause. Supports stepping: continue (resume all), step-over (next line), step-into (into calls), step-out (to caller).".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "action": { "type": "string", "enum": ["continue", "step-over", "step-into", "step-out"], "description": "Default: continue" }
+                    },
+                    "required": ["sessionId"]
+                }),
+            },
+            McpTool {
+                name: "debug_logpoint".to_string(),
+                description: "Set or remove logpoints. Like breakpoints but non-blocking — logs a message template on each hit without pausing. Use {args[0]}, {args[1]} for arguments, {threadId} for thread ID.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "add": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "message": { "type": "string", "description": "Log message template. Use {args[0]} etc for arguments." },
+                                    "function": { "type": "string", "description": "Function name or pattern" },
+                                    "file": { "type": "string", "description": "Source file path" },
+                                    "line": { "type": "integer", "description": "Line number (required with file)" },
+                                    "condition": { "type": "string", "description": "JS condition" }
+                                },
+                                "required": ["message"]
+                            }
+                        },
+                        "remove": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Logpoint IDs to remove"
+                        }
+                    },
+                    "required": ["sessionId"]
+                }),
+            },
         ];
 
         let response = McpToolsListResponse { tools };
@@ -750,6 +821,9 @@ Validation Limits (enforced):
             "debug_test" => self.tool_debug_test(&call.arguments, connection_id).await,
             "debug_test_status" => self.tool_debug_test_status(&call.arguments).await,
             "debug_read" => self.tool_debug_read(&call.arguments).await,
+            "debug_breakpoint" => self.tool_debug_breakpoint(&call.arguments).await,
+            "debug_continue" => self.tool_debug_continue(&call.arguments).await,
+            "debug_logpoint" => self.tool_debug_logpoint(&call.arguments).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -1740,6 +1814,138 @@ Validation Limits (enforced):
                 }
             }
         });
+    }
+
+    // Phase 2: Active debugging tools
+
+    async fn tool_debug_breakpoint(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugBreakpointRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        let mut all_breakpoints = Vec::new();
+
+        // Handle additions
+        if let Some(targets) = req.add {
+            for target in targets {
+                let breakpoint = self.session_manager
+                    .set_breakpoint_async(
+                        &req.session_id,
+                        None, // auto-generate ID
+                        target.function,
+                        target.file,
+                        target.line,
+                        target.condition,
+                        target.hit_count,
+                    )
+                    .await?;
+                all_breakpoints.push(breakpoint);
+            }
+        }
+
+        // Handle removals
+        if let Some(ids) = req.remove {
+            for id in ids {
+                self.session_manager.remove_breakpoint(&req.session_id, &id);
+            }
+        }
+
+        // Return current breakpoints
+        if all_breakpoints.is_empty() {
+            all_breakpoints = self.session_manager
+                .get_breakpoints(&req.session_id)
+                .into_iter()
+                .map(|bp| crate::mcp::BreakpointInfo {
+                    id: bp.id,
+                    function: match &bp.target {
+                        crate::daemon::session_manager::BreakpointTarget::Function(f) => Some(f.clone()),
+                        _ => None,
+                    },
+                    file: match &bp.target {
+                        crate::daemon::session_manager::BreakpointTarget::Line { file, .. } => Some(file.clone()),
+                        _ => None,
+                    },
+                    line: match &bp.target {
+                        crate::daemon::session_manager::BreakpointTarget::Line { line, .. } => Some(*line),
+                        _ => None,
+                    },
+                    address: format!("0x{:x}", bp.address),
+                })
+                .collect();
+        }
+
+        Ok(serde_json::to_value(crate::mcp::DebugBreakpointResponse {
+            breakpoints: all_breakpoints,
+        })?)
+    }
+
+    async fn tool_debug_continue(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugContinueRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        let response = self.session_manager.debug_continue_async(&req.session_id, req.action).await?;
+
+        Ok(serde_json::to_value(response)?)
+    }
+
+    async fn tool_debug_logpoint(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugLogpointRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        let mut all_logpoints = Vec::new();
+
+        // Handle additions
+        if let Some(targets) = req.add {
+            for target in targets {
+                let logpoint = self.session_manager
+                    .set_logpoint_async(
+                        &req.session_id,
+                        None,
+                        target.function,
+                        target.file,
+                        target.line,
+                        target.message,
+                        target.condition,
+                    )
+                    .await?;
+                all_logpoints.push(logpoint);
+            }
+        }
+
+        // Handle removals
+        if let Some(ids) = req.remove {
+            for id in ids {
+                self.session_manager.remove_logpoint(&req.session_id, &id);
+            }
+        }
+
+        // Return current logpoints
+        if all_logpoints.is_empty() {
+            all_logpoints = self.session_manager
+                .get_logpoints(&req.session_id)
+                .into_iter()
+                .map(|lp| crate::mcp::LogpointInfo {
+                    id: lp.id,
+                    message: lp.message,
+                    function: match &lp.target {
+                        crate::daemon::session_manager::BreakpointTarget::Function(f) => Some(f.clone()),
+                        _ => None,
+                    },
+                    file: match &lp.target {
+                        crate::daemon::session_manager::BreakpointTarget::Line { file, .. } => Some(file.clone()),
+                        _ => None,
+                    },
+                    line: match &lp.target {
+                        crate::daemon::session_manager::BreakpointTarget::Line { line, .. } => Some(*line),
+                        _ => None,
+                    },
+                    address: format!("0x{:x}", lp.address),
+                })
+                .collect();
+        }
+
+        Ok(serde_json::to_value(crate::mcp::DebugLogpointResponse {
+            logpoints: all_logpoints,
+        })?)
     }
 }
 

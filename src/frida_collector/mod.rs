@@ -5,6 +5,8 @@ pub use spawner::FridaSpawner;
 pub use spawner::HookResult;
 pub use spawner::WatchTarget;
 pub use spawner::ExprWatchTarget;
+pub use spawner::PauseNotification;
+pub use spawner::PauseNotifyTx;
 pub use hooks::HookManager;
 pub use hooks::HookMode;
 

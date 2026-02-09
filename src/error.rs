@@ -35,6 +35,12 @@ pub enum Error {
     #[error("TEST_RUN_NOT_FOUND: No test run found with ID '{0}'.")]
     TestRunNotFound(String),
 
+    #[error("NO_CODE_AT_LINE: No executable code at {file}:{line}. Valid lines: {nearest_lines}")]
+    NoCodeAtLine { file: String, line: u32, nearest_lines: String },
+
+    #[error("OPTIMIZED_OUT: Variable '{variable}' is optimized out at this PC. Recompile with -O0.")]
+    OptimizedOut { variable: String },
+
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 
@@ -70,5 +76,24 @@ mod tests {
             reason: "bad pattern".to_string(),
         };
         assert!(err.to_string().contains("**"));
+    }
+
+    #[test]
+    fn test_breakpoint_error_types() {
+        let err = Error::NoCodeAtLine {
+            file: "test.cpp".to_string(),
+            line: 100,
+            nearest_lines: "98, 102, 105".to_string(),
+        };
+        assert!(err.to_string().contains("NO_CODE_AT_LINE"));
+        assert!(err.to_string().contains("test.cpp:100"));
+        assert!(err.to_string().contains("98, 102, 105"));
+
+        let err = Error::OptimizedOut {
+            variable: "x".to_string(),
+        };
+        assert!(err.to_string().contains("OPTIMIZED_OUT"));
+        assert!(err.to_string().contains("Variable 'x'"));
+        assert!(err.to_string().contains("-O0"));
     }
 }
