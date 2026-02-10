@@ -1,9 +1,11 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import {
   identifyFunctionAtCursor,
   formatPattern,
 } from './function-identifier';
 import { detectProfile } from '../profiles/language-profile';
+import { StrobeClient } from '../client/strobe-client';
 
 export interface TraceCommandDeps {
   getSessionId: () => string | undefined;
@@ -50,4 +52,68 @@ export function registerContextMenuCommands(
       }
     }),
   );
+}
+
+export async function setBreakpointAtCursor(
+  client: StrobeClient,
+  sessionId: string | undefined,
+): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return;
+
+  const filePath = editor.document.uri.fsPath;
+  const line = editor.selection.active.line + 1;
+
+  if (!sessionId) {
+    vscode.window.showWarningMessage('No active Strobe session. Launch a program first.');
+    return;
+  }
+
+  try {
+    await client.setBreakpoints({
+      sessionId,
+      add: [{ file: filePath, line }],
+    });
+    vscode.window.showInformationMessage(
+      `Breakpoint set at ${path.basename(filePath)}:${line}`,
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Failed to set breakpoint: ${msg}`);
+  }
+}
+
+export async function addLogpointAtCursor(
+  client: StrobeClient,
+  sessionId: string | undefined,
+): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return;
+
+  const filePath = editor.document.uri.fsPath;
+  const line = editor.selection.active.line + 1;
+
+  if (!sessionId) {
+    vscode.window.showWarningMessage('No active Strobe session. Launch a program first.');
+    return;
+  }
+
+  const message = await vscode.window.showInputBox({
+    prompt: 'Logpoint message (use {args[0]}, {args[1]}, {threadId} for values)',
+    placeHolder: 'value={args[0]}, thread={threadId}',
+  });
+  if (!message) return;
+
+  try {
+    await client.setBreakpoints({
+      sessionId,
+      add: [{ file: filePath, line, message }],
+    });
+    vscode.window.showInformationMessage(
+      `Logpoint added at ${path.basename(filePath)}:${line}`,
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Failed to add logpoint: ${msg}`);
+  }
 }

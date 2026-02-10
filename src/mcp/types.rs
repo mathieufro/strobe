@@ -1218,6 +1218,27 @@ impl DebugSessionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BacktraceFrame {
+    pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapturedArg {
+    pub index: u32,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PausedThreadInfo {
     pub thread_id: u64,
     pub breakpoint_id: String,
@@ -1227,6 +1248,12 @@ pub struct PausedThreadInfo {
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub backtrace: Vec<BacktraceFrame>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub arguments: Vec<CapturedArg>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2037,6 +2064,8 @@ mod session_consolidation_tests {
             function: Some("main".to_string()),
             file: None,
             line: None,
+            backtrace: Vec::new(),
+            arguments: Vec::new(),
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["threadId"], 42);

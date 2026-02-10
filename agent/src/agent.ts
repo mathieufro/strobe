@@ -847,6 +847,34 @@ class StrobeAgent {
         // ARM64: LR register, x86_64: [RBP+8] - Frida's returnAddress handles both
         const returnAddr = this.returnAddress;
 
+        // Capture backtrace (same pattern as buildCrashEvent)
+        let backtrace: BacktraceFrame[] = [];
+        try {
+          const frames = Thread.backtrace(this.context, Backtracer.ACCURATE);
+          backtrace = frames.map((addr: NativePointer) => {
+            const sym = DebugSymbol.fromAddress(addr);
+            return {
+              address: addr.toString(),
+              moduleName: sym.moduleName,
+              name: sym.name,
+              fileName: sym.fileName,
+              lineNumber: sym.lineNumber,
+            };
+          });
+        } catch (_) {
+          // Backtrace may fail in some contexts
+        }
+
+        // Capture first 8 arguments (best-effort)
+        const capturedArgs: Array<{ index: number; value: string }> = [];
+        for (let i = 0; i < 8; i++) {
+          try {
+            capturedArgs.push({ index: i, value: args[i].toString() });
+          } catch {
+            break;
+          }
+        }
+
         send({
           type: 'paused',
           threadId,
@@ -856,6 +884,8 @@ class StrobeAgent {
           file: bp.file,
           line: bp.line,
           returnAddress: returnAddr ? returnAddr.strip().toString() : null,
+          backtrace,
+          arguments: capturedArgs,
         });
 
         // Block this thread until resume message.

@@ -531,6 +531,8 @@ impl SessionManager {
                     paused_at: Instant::now(),
                     return_address: notification.return_address,
                     address: notification.address,
+                    backtrace: notification.backtrace,
+                    arguments: notification.arguments,
                 };
                 write_lock(&paused_threads)
                     .entry(sid.clone())
@@ -1572,6 +1574,8 @@ impl SessionManager {
                 function: info.func_name,
                 file: info.file,
                 line: info.line,
+                backtrace: info.backtrace,
+                arguments: info.arguments,
             })
             .collect();
         paused_threads.sort_by_key(|t| t.thread_id);
@@ -1734,6 +1738,8 @@ pub struct PauseInfo {
     pub return_address: Option<u64>,
     /// Runtime address where the thread paused (for step BP address tracking)
     pub address: Option<u64>,
+    pub backtrace: Vec<crate::mcp::BacktraceFrame>,
+    pub arguments: Vec<crate::mcp::CapturedArg>,
 }
 
 #[cfg(test)]
@@ -1795,6 +1801,8 @@ mod tests {
             paused_at: Instant::now(),
             return_address: Some(0x1234),
             address: None,
+            backtrace: Vec::new(),
+            arguments: Vec::new(),
         };
 
         // Add paused thread
@@ -1866,6 +1874,8 @@ mod tests {
             paused_at: Instant::now(),
             return_address: Some(0xdeadbeef),
             address: None,
+            backtrace: Vec::new(),
+            arguments: Vec::new(),
         };
 
         sm.add_paused_thread(session_id, 99, pause_info);
