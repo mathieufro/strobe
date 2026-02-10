@@ -8,3 +8,8 @@
 tests/**/target/
 tests/**/build/
 tests/**/*.dSYM/.worktrees/
+
+# VS Code extension
+strobe-vscode/node_modules/
+strobe-vscode/dist/
+strobe-vscode/*.vsix

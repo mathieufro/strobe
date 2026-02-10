@@ -1,0 +1,88 @@
+{
+  "name": "strobe",
+  "displayName": "Strobe",
+  "description": "Dynamic instrumentation debugger — trace any function at runtime",
+  "version": "0.1.0",
+  "publisher": "strobe",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Testing"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "strobe.launch",
+        "title": "Strobe: Launch Program"
+      },
+      {
+        "command": "strobe.stop",
+        "title": "Strobe: Stop Session"
+      },
+      {
+        "command": "strobe.addTracePattern",
+        "title": "Strobe: Add Trace Pattern"
+      },
+      {
+        "command": "strobe.traceFunction",
+        "title": "Strobe: Trace This Function"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "strobe.submenu",
+          "group": "strobe"
+        }
+      ],
+      "strobe.submenu": [
+        {
+          "command": "strobe.traceFunction",
+          "group": "1_trace"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "strobe.submenu",
+        "label": "Strobe"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "strobe",
+          "title": "Strobe",
+          "icon": "media/strobe-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "strobe": [
+        {
+          "id": "strobe.session",
+          "name": "Session"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "webpack --mode production",
+    "watch": "webpack --mode development --watch",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.33",
+    "@types/vscode": "^1.109.0",
+    "ts-loader": "^9.5.4",
+    "typescript": "^5.9.3",
+    "webpack": "^5.105.1",
+    "webpack-cli": "^5.1.4"
+  }
+}
