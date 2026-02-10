@@ -794,23 +794,24 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     }
 
                     let t = std::time::Instant::now();
+                    let max_attempts = 5u32;
                     let pid = {
                         let mut last_err = String::new();
                         let mut spawned_pid = None;
-                        for attempt in 0..3u32 {
+                        for attempt in 0..max_attempts {
                             match device.spawn(&command, &spawn_opts) {
                                 Ok(p) => { spawned_pid = Some(p); break; }
                                 Err(e) => {
                                     last_err = format!("{}", e);
-                                    if attempt < 2 {
-                                        let delay = 200 * (attempt + 1) as u64;
-                                        tracing::warn!("Spawn attempt {} failed: {}. Retrying in {}ms...", attempt + 1, e, delay);
+                                    if attempt + 1 < max_attempts {
+                                        let delay = 100 * (1u64 << attempt); // 100, 200, 400, 800ms
+                                        tracing::warn!("Spawn attempt {}/{} failed: {}. Retrying in {}ms...", attempt + 1, max_attempts, e, delay);
                                         thread::sleep(std::time::Duration::from_millis(delay));
                                     }
                                 }
                             }
                         }
-                        spawned_pid.ok_or_else(|| crate::Error::FridaAttachFailed(format!("Spawn failed after 3 attempts: {}", last_err)))?
+                        spawned_pid.ok_or_else(|| crate::Error::FridaAttachFailed(format!("Spawn failed after {} attempts: {}", max_attempts, last_err)))?
                     };
                     tracing::info!("Spawned process {} with PID {}", command, pid);
                     tracing::debug!("PERF: device.spawn() took {:?}", t.elapsed());
@@ -830,26 +831,30 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         reg.insert(pid, output_ctx);
                     }
 
+                    // Small delay after spawn to let macOS kernel fully register the process.
+                    // Frida's device.attach() can transiently fail without this.
+                    thread::sleep(std::time::Duration::from_millis(50));
+
                     let t = std::time::Instant::now();
                     let frida_session = {
                         let mut last_err = String::new();
                         let mut attached = None;
-                        for attempt in 0..3u32 {
+                        for attempt in 0..max_attempts {
                             match device.attach(pid) {
                                 Ok(s) => { attached = Some(s); break; }
                                 Err(e) => {
                                     last_err = format!("{}", e);
-                                    if attempt < 2 {
-                                        let delay = 200 * (attempt + 1) as u64;
-                                        tracing::warn!("Attach attempt {} to PID {} failed: {}. Retrying in {}ms...", attempt + 1, pid, e, delay);
+                                    if attempt + 1 < max_attempts {
+                                        let delay = 100 * (1u64 << attempt); // 100, 200, 400, 800ms
+                                        tracing::warn!("Attach attempt {}/{} to PID {} failed: {}. Retrying in {}ms...", attempt + 1, max_attempts, pid, e, delay);
                                         thread::sleep(std::time::Duration::from_millis(delay));
                                     }
                                 }
                             }
                         }
                         attached.ok_or_else(|| {
-                            tracing::error!("Attach to PID {} failed after 3 attempts: {}", pid, last_err);
-                            crate::Error::FridaAttachFailed(format!("Attach to PID {} failed after 3 attempts: {}", pid, last_err))
+                            tracing::error!("Attach to PID {} failed after {} attempts: {}", pid, max_attempts, last_err);
+                            crate::Error::FridaAttachFailed(format!("Attach to PID {} failed after {} attempts: {}", pid, max_attempts, last_err))
                         })?
                     };
                     tracing::debug!("PERF: device.attach() took {:?}", t.elapsed());
