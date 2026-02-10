@@ -65,10 +65,8 @@ async fn test_stepping_behavioral_suite() {
         let paused = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
         assert!(!paused.is_empty(), "Should pause at breakpoint");
 
-        // Remove the breakpoint so it doesn't interfere with stepping
-        sm.remove_breakpoint(session_id, "bp-step").await;
-
         // Step over — should advance to next source line within process_buffer
+        // (Don't remove breakpoint first — remove_breakpoint resumes the thread)
         let step_result = sm
             .debug_continue_async(session_id, Some("step-over".to_string()))
             .await;
@@ -114,6 +112,7 @@ async fn test_stepping_behavioral_suite() {
             "Pause events should have different breakpoint IDs: {:?}", bp_ids
         );
 
+        sm.remove_breakpoint(session_id, "bp-step").await;
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).unwrap();
@@ -147,9 +146,8 @@ async fn test_stepping_behavioral_suite() {
         let paused = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
         assert!(!paused.is_empty(), "Should pause at generate_sine");
 
-        sm.remove_breakpoint(session_id, "bp-sine").await;
-
         // Step-into — should advance (basic impl: same as step-over currently)
+        // (Don't remove breakpoint first — remove_breakpoint resumes the thread)
         let step_result = sm
             .debug_continue_async(session_id, Some("step-into".to_string()))
             .await;
@@ -165,6 +163,7 @@ async fn test_stepping_behavioral_suite() {
             );
         }
 
+        sm.remove_breakpoint(session_id, "bp-sine").await;
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).unwrap();
@@ -205,9 +204,8 @@ async fn test_stepping_behavioral_suite() {
             pause_info.return_address
         );
 
-        sm.remove_breakpoint(session_id, "bp-inner").await;
-
         // Step-out — should use return address if available, error if not
+        // (Don't remove breakpoint first — remove_breakpoint resumes the thread)
         let step_result = sm
             .debug_continue_async(session_id, Some("step-out".to_string()))
             .await;
@@ -247,6 +245,7 @@ async fn test_stepping_behavioral_suite() {
             println!("  Step-out correctly rejected: {}", err_msg);
         }
 
+        sm.remove_breakpoint(session_id, "bp-inner").await;
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).unwrap();
@@ -278,9 +277,9 @@ async fn test_stepping_behavioral_suite() {
         // Wait for initial pause
         let paused = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
         assert!(!paused.is_empty(), "Should pause at breakpoint");
-        sm.remove_breakpoint(session_id, "bp-seq").await;
 
         // Perform 3 step-overs and verify each produces a unique step-* ID
+        // (Don't remove breakpoint first — remove_breakpoint resumes the thread)
         let mut step_count = 0;
         let mut step_ids: Vec<String> = Vec::new();
         for i in 0..3 {
@@ -320,6 +319,7 @@ async fn test_stepping_behavioral_suite() {
             );
         }
 
+        sm.remove_breakpoint(session_id, "bp-seq").await;
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).unwrap();
