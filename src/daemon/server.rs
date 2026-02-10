@@ -84,9 +84,10 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
             "arguments": event.arguments,
             "returnValue": event.return_value,
             "watchValues": event.watch_values,
+            "logpointMessage": event.logpoint_message,
         })
     } else {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "id": event.id,
             "timestamp_ns": event.timestamp_ns,
             "eventType": event.event_type.as_str(),
@@ -106,7 +107,11 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
                 })
                 .unwrap_or("void"),
             "watchValues": event.watch_values,
-        })
+        });
+        if let Some(ref msg) = event.logpoint_message {
+            obj["logpointMessage"] = serde_json::Value::String(msg.clone());
+        }
+        obj
     }
 }
 

@@ -1360,7 +1360,15 @@ impl DwarfParser {
 
     /// Find next statement line in the same function. Used for step-over.
     /// Respects function boundaries using the DWARF function table (high_pc).
-    pub fn next_line_in_function(&self, address: u64) -> Option<(u64, String, u32)> {
+    /// Find the next source line address after `address` within the same function.
+    ///
+    /// `min_offset` skips line entries within N bytes of `address`. This is needed
+    /// because Frida's Interceptor.attach overwrites up to 14 bytes at the hook
+    /// address. When the thread resumes from a trampoline, it jumps past the
+    /// overwritten region, so any line entries within that region are unreachable.
+    /// Use `min_offset = 16` for step hooks, or `0` for initial breakpoints where
+    /// the trampoline is at a function entry (typically far from the next line).
+    pub fn next_line_in_function(&self, address: u64, min_offset: u64) -> Option<(u64, String, u32)> {
         self.ensure_line_table();
         let table = self.line_table.lock().unwrap();
         let entries = table.as_ref()?;
@@ -1373,15 +1381,18 @@ impl DwarfParser {
         };
         let current = &entries[idx];
 
+        // Minimum address the thread can reach after the Interceptor trampoline
+        let min_address = address + min_offset;
+
         // Find the function containing this address to enforce boundary (O(log N))
         let func_high_pc = self.function_containing(address).map(|(_, high)| high);
 
         // Find next is_statement line with different line number, same file,
-        // staying within the function boundary
+        // staying within the function boundary, and past the trampoline region
         entries[idx + 1..]
             .iter()
             .take_while(|e| func_high_pc.map_or(true, |hp| e.address < hp))
-            .find(|e| e.is_statement && e.file == current.file && e.line != current.line)
+            .find(|e| e.is_statement && e.file == current.file && e.line != current.line && e.address >= min_address)
             .map(|e| (e.address, e.file.clone(), e.line))
     }
 

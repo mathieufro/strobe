@@ -65,6 +65,7 @@ unsafe extern "C" fn raw_on_message(
     };
 
     let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    tracing::debug!("raw_on_message [{}]: envelope_type={}", handler.session_id, msg_type);
 
     match msg_type {
         "send" => {
@@ -289,6 +290,8 @@ pub struct PauseNotification {
     pub file: Option<String>,
     pub line: Option<u32>,
     pub return_address: Option<u64>,
+    /// Runtime address where the thread paused (for one-shot step BPs)
+    pub address: Option<u64>,
 }
 
 /// Channel for pause notifications from agent to daemon
@@ -314,7 +317,7 @@ impl AgentMessageHandler {
         match msg_type {
             "events" => {
                 if let Some(events) = payload.get("events").and_then(|v| v.as_array()) {
-                    tracing::info!("Received {} events from agent [{}]", events.len(), self.session_id);
+                    tracing::debug!("Received {} events from agent [{}]", events.len(), self.session_id);
                     for event_json in events {
                         if let Some(event) = parse_event(&self.session_id, event_json) {
                             if event.event_type == EventType::Crash {
@@ -399,11 +402,14 @@ impl AgentMessageHandler {
                 let return_address = payload.get("returnAddress")
                     .and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+                let address = payload.get("address")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
                 tracing::info!(
-                    "[{}] Thread {} paused at breakpoint {} (ret=0x{:x?})",
+                    "[{}] Thread {} paused at breakpoint {} (addr=0x{:x?}, ret=0x{:x?})",
                     self.session_id, thread_id, breakpoint_id_str,
-                    return_address.unwrap_or(0)
+                    address.unwrap_or(0), return_address.unwrap_or(0)
                 );
 
                 // Create a Pause event for the database
@@ -438,6 +444,7 @@ impl AgentMessageHandler {
                         file,
                         line,
                         return_address,
+                        address,
                     };
                     if let Err(e) = tx.try_send(notification) {
                         tracing::warn!(
@@ -582,6 +589,9 @@ enum SessionCommand {
         /// Each address: (addr, no_slide). no_slide=true for runtime addresses (e.g., return address).
         one_shot_addresses: Vec<(u64, bool)>,
         image_base: u64,
+        /// Original return address to carry forward during stepping.
+        /// Step hooks can't reliably capture return addresses (Frida trampoline on stack).
+        return_address: Option<u64>,
         response: oneshot::Sender<Result<()>>,
     },
     Shutdown,
@@ -1116,16 +1126,38 @@ fn session_worker(
                 let _ = response.send(result);
             }
 
-            SessionCommand::ResumeThread { thread_id, one_shot_addresses, image_base, response } => {
+            SessionCommand::ResumeThread { thread_id, one_shot_addresses, image_base, return_address, response } => {
+                // Two-message protocol for stepping:
+                // 1. Send installStepHooks (if any) — handled at top-level agent context
+                // 2. Send resume — unblocks the paused thread
+                // This ordering is guaranteed: Frida processes messages sequentially,
+                // so hooks are installed before the thread resumes.
+                if !one_shot_addresses.is_empty() {
+                    let install_msg = serde_json::json!({
+                        "type": "installStepHooks",
+                        "threadId": thread_id,
+                        "oneShot": one_shot_addresses.iter().map(|(addr, no_slide)| {
+                            serde_json::json!({
+                                "address": format!("0x{:x}", addr),
+                                "noSlide": no_slide,
+                            })
+                        }).collect::<Vec<_>>(),
+                        "imageBase": format!("0x{:x}", image_base),
+                        "returnAddress": return_address.map(|a| format!("0x{:x}", a)),
+                    });
+                    let install_result = unsafe {
+                        post_message_raw(raw_ptr, &serde_json::to_string(&install_msg).unwrap())
+                    };
+                    if let Err(e) = install_result {
+                        let _ = response.send(Err(crate::Error::Frida(
+                            format!("Failed to send installStepHooks: {}", e)
+                        )));
+                        continue;
+                    }
+                }
+
                 let resume_msg = serde_json::json!({
                     "type": format!("resume-{}", thread_id),
-                    "oneShot": one_shot_addresses.iter().map(|(addr, no_slide)| {
-                        serde_json::json!({
-                            "address": format!("0x{:x}", addr),
-                            "noSlide": no_slide,
-                        })
-                    }).collect::<Vec<_>>(),
-                    "imageBase": format!("0x{:x}", image_base),
                 });
                 let result = unsafe {
                     post_message_raw(raw_ptr, &serde_json::to_string(&resume_msg).unwrap())
@@ -2149,7 +2181,7 @@ impl FridaSpawner {
         session_id: &str,
         thread_id: u64,
     ) -> Result<()> {
-        self.resume_thread_with_step(session_id, thread_id, Vec::new(), 0).await
+        self.resume_thread_with_step(session_id, thread_id, Vec::new(), 0, None).await
     }
 
     /// Resume thread with optional one-shot breakpoints for stepping
@@ -2159,6 +2191,7 @@ impl FridaSpawner {
         thread_id: u64,
         one_shot_addresses: Vec<(u64, bool)>,
         image_base: u64,
+        return_address: Option<u64>,
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -2169,6 +2202,7 @@ impl FridaSpawner {
             thread_id,
             one_shot_addresses,
             image_base,
+            return_address,
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
 

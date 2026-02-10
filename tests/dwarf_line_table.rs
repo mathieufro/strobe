@@ -30,7 +30,7 @@ fn test_line_table_resolution() {
     assert_eq!(line, actual_line);
 
     // Test 3: Find next line in same function
-    let result = parser.next_line_in_function(address);
+    let result = parser.next_line_in_function(address, 0);
     assert!(result.is_some(), "Should find next line");
     let (next_addr, _next_file, next_line) = result.unwrap();
     assert!(next_addr > address, "Next address should be after current");

@@ -165,6 +165,13 @@ interface ResumeMessage {
   imageBase?: string;         // For ASLR slide computation
 }
 
+interface InstallStepHooksMessage {
+  threadId: number;
+  oneShot: OneShotAddress[];
+  imageBase?: string;
+  returnAddress?: string | null; // Carried forward from original BP for step-out support
+}
+
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
@@ -826,9 +833,9 @@ class StrobeAgent {
           return;
         }
 
-        // Hit count logic
+        // Hit count logic: pause only on the Nth hit, skip all others
         bp.hits++;
-        if (bp.hitCount > 0 && bp.hits < bp.hitCount) {
+        if (bp.hitCount > 0 && bp.hits !== bp.hitCount) {
           return;
         }
 
@@ -851,68 +858,11 @@ class StrobeAgent {
           returnAddress: returnAddr ? returnAddr.strip().toString() : null,
         });
 
-        // Block this thread until resume message
-        const op = recv(`resume-${threadId}`, (resumeMsg: ResumeMessage) => {
-          // Phase 2b: Install one-shot stepping breakpoints
-          if (resumeMsg.oneShot && resumeMsg.oneShot.length > 0) {
-            // Compute ASLR slide for DWARF-static addresses
-            if (resumeMsg.imageBase) {
-              self.tracer.setImageBase(resumeMsg.imageBase);
-            }
-            const stepSlide = self.tracer.getSlide();
-
-            const stepId = `step-${threadId}-${Date.now()}`;
-            const listeners: InvocationListener[] = [];
-            let fired = false;
-            let timeoutId: ReturnType<typeof setTimeout> | null = null;
-
-            const cleanupAll = () => {
-              if (fired) return;
-              fired = true;
-              if (timeoutId !== null) {
-                clearTimeout(timeoutId);
-                timeoutId = null;
-              }
-              for (const l of listeners) {
-                l.detach();
-              }
-            };
-
-            for (const entry of resumeMsg.oneShot) {
-              // noSlide=true for runtime addresses (e.g., return address)
-              const addr = entry.noSlide ? ptr(entry.address) : ptr(entry.address).add(stepSlide);
-              const stepListener = Interceptor.attach(addr, {
-                onEnter() {
-                  cleanupAll();
-
-                  // Send pause event with return address
-                  send({
-                    type: 'paused',
-                    threadId: Process.getCurrentThreadId(),
-                    breakpointId: stepId,
-                    funcName: null,
-                    file: null,
-                    line: null,
-                    returnAddress: this.returnAddress ? this.returnAddress.strip().toString() : null,
-                  });
-
-                  // Block again for next resume
-                  const nextOp = recv(`resume-${Process.getCurrentThreadId()}`, () => {});
-                  nextOp.wait();
-                },
-              });
-              listeners.push(stepListener);
-            }
-
-            // Safety timeout: clean up one-shot hooks after 30s if none fired
-            timeoutId = setTimeout(() => {
-              if (!fired) {
-                cleanupAll();
-                send({ type: 'log', message: `One-shot step hooks timed out for thread ${threadId}` });
-              }
-            }, 30000);
-          }
-        });
+        // Block this thread until resume message.
+        // One-shot step hooks (if any) are installed via a separate 'installStepHooks'
+        // message BEFORE this resume arrives. This avoids installing Interceptor hooks
+        // inside recv callbacks, which causes send() delivery failures in Frida.
+        const op = recv(`resume-${threadId}`, () => {});
         op.wait(); // CRITICAL: Blocks native thread, releases JS lock
 
         self.pausedThreads.delete(threadId);
@@ -1053,6 +1003,104 @@ class StrobeAgent {
     send({ type: 'breakpointRemoved', id });
   }
 
+  /**
+   * Install one-shot step breakpoints at specified addresses.
+   * Called from a top-level recv handler (NOT from inside another recv callback)
+   * to avoid Frida's send() delivery issues with nested Interceptor contexts.
+   *
+   * When a step hook fires, it sends a 'paused' notification and blocks with
+   * a simple recv('resume-{tid}').wait(). The daemon will send another
+   * 'installStepHooks' message before 'resume-{tid}' if further stepping is needed.
+   */
+  installStepHooks(msg: InstallStepHooksMessage): void {
+    if (!msg.oneShot || msg.oneShot.length === 0) return;
+
+    const threadId = msg.threadId;
+    // Carried-forward return address from the original breakpoint (for step-out)
+    const carriedReturnAddress = msg.returnAddress || null;
+
+    // Compute ASLR slide for DWARF-static addresses
+    if (msg.imageBase) {
+      this.tracer.setImageBase(msg.imageBase);
+    }
+    const stepSlide = this.tracer.getSlide();
+    const self = this;
+
+    const stepId = `step-${threadId}-${Date.now()}`;
+    const listeners: InvocationListener[] = [];
+    let fired = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const cleanupAll = () => {
+      if (fired) return;
+      fired = true;
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      for (const l of listeners) {
+        l.detach();
+      }
+    };
+
+    for (const entry of msg.oneShot) {
+      // noSlide=true for runtime addresses (e.g., return address)
+      const addr = entry.noSlide ? ptr(entry.address) : ptr(entry.address).add(stepSlide);
+      try {
+        const stepListener = Interceptor.attach(addr, {
+          onEnter() {
+            cleanupAll();
+
+            const tid = Process.getCurrentThreadId();
+            self.pausedThreads.set(tid, stepId);
+
+            // For noSlide entries (return addresses), convert runtime → DWARF-static
+            // so the daemon can compute next-line for further stepping.
+            const dwarfAddr = entry.noSlide
+              ? addr.sub(stepSlide).toString()
+              : entry.address;
+
+            send({
+              type: 'paused',
+              threadId: tid,
+              breakpointId: stepId,
+              funcName: null,
+              file: null,
+              line: null,
+              // Use carried-forward return address from the original breakpoint.
+              // Step hooks can't reliably capture return addresses because after
+              // recv().wait() unblocks, Frida's trampoline is on the stack.
+              returnAddress: carriedReturnAddress,
+              address: dwarfAddr,
+            });
+
+            // Block until resume. Step hooks for the next step (if any) will be
+            // installed via a separate 'installStepHooks' message before this
+            // resume arrives, keeping hook installation at top-level context.
+            const op = recv(`resume-${tid}`, () => {});
+            op.wait();
+
+            self.pausedThreads.delete(tid);
+          },
+        });
+        listeners.push(stepListener);
+      } catch (e: any) {
+        // Interceptor.attach can fail on addresses inside Frida trampolines
+        // (e.g., return address captured from a previous step hook).
+        // This is expected — just skip this address and rely on other hooks.
+        send({ type: 'log', message: `installStepHooks: skipping ${addr} (${e.message})` });
+      }
+    }
+
+    // Safety timeout: clean up one-shot hooks after 30s if none fired
+    timeoutId = setTimeout(() => {
+      if (!fired) {
+        cleanupAll();
+        send({ type: 'log', message: `One-shot step hooks timed out for thread ${threadId}` });
+      }
+    }, 30000);
+  }
+
   private evaluateCondition(condition: string, args: InvocationArguments, breakpointId?: string): boolean {
     try {
       // Convert args to array for Function context
@@ -1156,6 +1204,13 @@ function onRemoveLogpointMessage(message: RemoveBreakpointMessage): void {
   agent.removeLogpoint(message.id);
 }
 recv('removeLogpoint', onRemoveLogpointMessage);
+
+// Phase 2: Step hook installation (sent as separate message before resume)
+function onInstallStepHooksMessage(message: InstallStepHooksMessage): void {
+  recv('installStepHooks', onInstallStepHooksMessage);
+  agent.installStepHooks(message);
+}
+recv('installStepHooks', onInstallStepHooksMessage);
 
 // Frida calls rpc.exports.dispose() before script unload — ensures all
 // buffered trace events (CModule ring buffer) and output events are flushed.

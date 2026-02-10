@@ -530,6 +530,7 @@ impl SessionManager {
                     line: notification.line,
                     paused_at: Instant::now(),
                     return_address: notification.return_address,
+                    address: notification.address,
                 };
                 write_lock(&paused_threads)
                     .entry(sid.clone())
@@ -1230,16 +1231,33 @@ impl SessionManager {
             let (_thread_id, pause_info) = paused.iter().next()
                 .ok_or_else(|| crate::Error::ValidationError("No paused thread".to_string()))?;
 
-            // Get the breakpoint to find current address
+            // Get the current DWARF-static address.
+            // For user breakpoints: look up the BP's stored address (already DWARF-static).
+            // For one-shot step BPs: the agent sends the original DWARF-static address
+            // in PauseInfo.address (before ASLR slide was applied).
             let bp = self.get_breakpoint(session_id, &pause_info.breakpoint_id);
-            let current_address = bp.map(|b| b.address).unwrap_or(0);
+            let current_address = if let Some(ref bp) = bp {
+                bp.address
+            } else if let Some(addr) = pause_info.address {
+                tracing::debug!("Using step BP DWARF-static address 0x{:x} for next_line lookup", addr);
+                addr
+            } else {
+                0
+            };
+
+            // Frida's Interceptor.attach overwrites up to 14 bytes at the hook address.
+            // When resuming from a step hook's trampoline, the thread JMPs past the
+            // overwritten region, so we must skip DWARF line entries within that range.
+            // For user breakpoints at function entries, the next line is usually far enough.
+            let is_step_hook = bp.is_none() && pause_info.address.is_some();
+            let min_offset: u64 = if is_step_hook { 16 } else { 0 };
 
             let addrs = match action.as_str() {
                 "step-over" => {
                     let mut addresses: Vec<(u64, bool)> = Vec::new();
 
                     // Find next line in same function (DWARF-static → needs slide)
-                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
+                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address, min_offset) {
                         addresses.push((next_addr, false));
                         tracing::debug!("step-over: next line at 0x{:x}", next_addr);
                     } else {
@@ -1264,7 +1282,7 @@ impl SessionManager {
                     let mut addresses: Vec<(u64, bool)> = Vec::new();
 
                     // Next line in same function (DWARF-static → needs slide)
-                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address) {
+                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address, min_offset) {
                         addresses.push((next_addr, false));
                         tracing::debug!("step-into: next line at 0x{:x}", next_addr);
                     }
@@ -1310,8 +1328,11 @@ impl SessionManager {
         let spawner = spawner_guard.as_mut()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
-        for (thread_id, _pause_info) in paused {
-            spawner.resume_thread_with_step(session_id, thread_id, one_shot_addresses.clone(), image_base).await?;
+        for (thread_id, pause_info) in paused {
+            // Carry forward the return address during stepping — step hooks can't
+            // reliably capture it (Frida trampoline is on the stack after recv().wait()).
+            let carry_ret_addr = pause_info.return_address;
+            spawner.resume_thread_with_step(session_id, thread_id, one_shot_addresses.clone(), image_base, carry_ret_addr).await?;
             self.remove_paused_thread(session_id, thread_id);
         }
 
@@ -1611,6 +1632,8 @@ pub struct PauseInfo {
     pub line: Option<u32>,
     pub paused_at: Instant,
     pub return_address: Option<u64>,
+    /// Runtime address where the thread paused (for step BP address tracking)
+    pub address: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1671,6 +1694,7 @@ mod tests {
             line: Some(42),
             paused_at: Instant::now(),
             return_address: Some(0x1234),
+            address: None,
         };
 
         // Add paused thread
@@ -1741,6 +1765,7 @@ mod tests {
             line: Some(100),
             paused_at: Instant::now(),
             return_address: Some(0xdeadbeef),
+            address: None,
         };
 
         sm.add_paused_thread(session_id, 99, pause_info);
