@@ -1564,7 +1564,7 @@ impl SessionManager {
 
         // Convert paused threads
         let paused_map = self.get_all_paused_threads(session_id);
-        let paused_threads: Vec<crate::mcp::PausedThreadInfo> = paused_map
+        let mut paused_threads: Vec<crate::mcp::PausedThreadInfo> = paused_map
             .into_iter()
             .map(|(tid, info)| crate::mcp::PausedThreadInfo {
                 thread_id: tid,
@@ -1574,6 +1574,7 @@ impl SessionManager {
                 line: info.line,
             })
             .collect();
+        paused_threads.sort_by_key(|t| t.thread_id);
 
         // Determine status
         let status = if !paused_threads.is_empty() {

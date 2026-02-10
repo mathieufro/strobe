@@ -526,6 +526,28 @@ pub struct DebugTestRequest {
     pub env: Option<std::collections::HashMap<String, String>>,
 }
 
+impl DebugTestRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        match self.action.as_ref().unwrap_or(&TestAction::Run) {
+            TestAction::Status => {
+                if self.test_run_id.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(crate::Error::ValidationError(
+                        "testRunId is required for action: 'status'".to_string(),
+                    ));
+                }
+            }
+            TestAction::Run => {
+                if self.project_root.is_empty() {
+                    return Err(crate::Error::ValidationError(
+                        "projectRoot is required for action: 'run'".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugTestResponse {
@@ -1133,6 +1155,14 @@ impl DebugMemoryRequest {
                 read_req.validate()
             }
             MemoryAction::Write => {
+                // Reject write targets missing a value
+                for target in &self.targets {
+                    if target.value.is_none() {
+                        return Err(crate::Error::ValidationError(
+                            "Write targets must include 'value'".to_string(),
+                        ));
+                    }
+                }
                 // Delegate validation to DebugWriteRequest
                 let write_req = DebugWriteRequest {
                     session_id: self.session_id.clone(),

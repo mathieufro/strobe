@@ -92,7 +92,7 @@ async fn test_phase2a_gap_suite() {
     // same function simultaneously. Frida supports multiple Interceptor.attach listeners
     // at the same address — this test verifies trace events still fire AND the breakpoint
     // pauses correctly.
-    {
+    'test2: {
         println!("\n=== Test 2: CModule + Breakpoint Coexistence ===");
         let session_id = "coexist-test";
         let pid = sm
@@ -130,7 +130,7 @@ async fn test_phase2a_gap_suite() {
                 let _ = sm.stop_frida(session_id).await;
                 sm.stop_session(session_id).unwrap();
                 println!("✓ CModule+breakpoint coexistence test skipped (trace install failed)");
-                return;
+                break 'test2;
             }
         }
 

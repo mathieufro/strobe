@@ -508,6 +508,7 @@ Read/write variables in a running process without setting up traces:
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
         let tools = vec![
+            // ---- Primary tools (8) ----
             McpTool {
                 name: "debug_launch".to_string(),
                 description: "Launch a binary with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Follow the observation loop: 1) Launch clean, 2) Check stderr/stdout first, 3) Add traces only if needed. Applies any pending patterns if debug_trace was called beforehand (advanced usage).".to_string(),
@@ -521,6 +522,19 @@ Read/write variables in a running process without setting up traces:
                         "env": { "type": "object", "description": "Additional environment variables" }
                     },
                     "required": ["command", "projectRoot"]
+                }),
+            },
+            McpTool {
+                name: "debug_session".to_string(),
+                description: "Manage debug sessions: get status, stop, list retained, or delete. Use action to select operation.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["status", "stop", "list", "delete"], "description": "Action to perform" },
+                        "sessionId": { "type": "string", "description": "Session ID (required for status/stop/delete)" },
+                        "retain": { "type": "boolean", "description": "Retain session data for post-mortem debugging (default: false, only for action: 'stop')" }
+                    },
+                    "required": ["action"]
                 }),
             },
             McpTool {
@@ -647,46 +661,6 @@ Validation Limits (enforced):
                 }),
             },
             McpTool {
-                name: "debug_session".to_string(),
-                description: "Manage debug sessions: get status, stop, list retained, or delete. Use action to select operation.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "action": { "type": "string", "enum": ["status", "stop", "list", "delete"], "description": "Action to perform" },
-                        "sessionId": { "type": "string", "description": "Session ID (required for status/stop/delete)" },
-                        "retain": { "type": "boolean", "description": "Retain session data for post-mortem debugging (default: false, only for action: 'stop')" }
-                    },
-                    "required": ["action"]
-                }),
-            },
-            // ---- Primary tools (8) ----
-            McpTool {
-                name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Default action is 'run' which returns a testRunId immediately. Use action: 'status' with testRunId to poll for progress and results. Auto-detects test framework (Cargo/Catch2). Use this instead of running test commands via bash.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' polls for results" },
-                        "testRunId": { "type": "string", "description": "Test run ID (required for action: 'status')" },
-                        "projectRoot": { "type": "string", "description": "Project root for adapter detection (required for action: 'run')" },
-                        "framework": { "type": "string", "description": "Override auto-detection: \"cargo\", \"catch2\"" },
-                        "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
-                        "test": { "type": "string", "description": "Run a single test by name (substring match — e.g. 'stuck_detector' runs all tests containing that string)" },
-                        "command": { "type": "string", "description": "Test binary path (required for compiled test frameworks like Catch2)" },
-                        "tracePatterns": { "type": "array", "items": { "type": "string" }, "description": "Trace patterns to apply immediately (tests always run inside Frida)" },
-                        "watches": {
-                            "type": "object",
-                            "description": "Watch variables during test execution",
-                            "properties": {
-                                "add": { "type": "array", "items": { "type": "object" } },
-                                "remove": { "type": "array", "items": { "type": "string" } }
-                            }
-                        },
-                        "env": { "type": "object", "description": "Additional environment variables" }
-                    }
-                }),
-            },
-            McpTool {
                 name: "debug_breakpoint".to_string(),
                 description: "Set or remove breakpoints and logpoints. Pauses execution when hit (breakpoint) or logs a message without pausing (logpoint, when 'message' is present). Use debug_continue to resume after breakpoint pause. Supports function names, file:line, conditions, and hit counts.".to_string(),
                 input_schema: serde_json::json!({
@@ -760,6 +734,32 @@ Validation Limits (enforced):
                         }
                     },
                     "required": ["sessionId", "targets"]
+                }),
+            },
+            McpTool {
+                name: "debug_test".to_string(),
+                description: "Start a test run asynchronously or poll for results. Default action is 'run' which returns a testRunId immediately. Use action: 'status' with testRunId to poll for progress and results. Auto-detects test framework (Cargo/Catch2). Use this instead of running test commands via bash.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' polls for results" },
+                        "testRunId": { "type": "string", "description": "Test run ID (required for action: 'status')" },
+                        "projectRoot": { "type": "string", "description": "Project root for adapter detection (required for action: 'run')" },
+                        "framework": { "type": "string", "description": "Override auto-detection: \"cargo\", \"catch2\"" },
+                        "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
+                        "test": { "type": "string", "description": "Run a single test by name (substring match — e.g. 'stuck_detector' runs all tests containing that string)" },
+                        "command": { "type": "string", "description": "Test binary path (required for compiled test frameworks like Catch2)" },
+                        "tracePatterns": { "type": "array", "items": { "type": "string" }, "description": "Trace patterns to apply immediately (tests always run inside Frida)" },
+                        "watches": {
+                            "type": "object",
+                            "description": "Watch variables during test execution",
+                            "properties": {
+                                "add": { "type": "array", "items": { "type": "object" } },
+                                "remove": { "type": "array", "items": { "type": "string" } }
+                            }
+                        },
+                        "env": { "type": "object", "description": "Additional environment variables" }
+                    }
                 }),
             },
             // ---- Deprecated tools (7) — kept for backward compatibility ----
@@ -1645,7 +1645,7 @@ Validation Limits (enforced):
 
         let events_dropped = if let Some(after) = req.after_event_id {
             let min_rowid = self.session_manager.db().min_rowid_for_session(&req.session_id)?;
-            Some(min_rowid.map_or(false, |min| after < min))
+            Some(min_rowid.map_or(false, |min| after + 1 < min))
         } else {
             None
         };
@@ -1814,14 +1814,12 @@ Validation Limits (enforced):
 
     async fn tool_debug_test(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
 
         match req.action.as_ref().unwrap_or(&crate::mcp::TestAction::Run) {
             crate::mcp::TestAction::Run => self.tool_debug_test_run(args, connection_id).await,
             crate::mcp::TestAction::Status => {
-                let test_run_id = req.test_run_id.as_deref()
-                    .ok_or_else(|| crate::Error::ValidationError(
-                        "testRunId is required for action: 'status'".to_string()
-                    ))?;
+                let test_run_id = req.test_run_id.as_deref().unwrap();
                 let status_req = serde_json::json!({ "testRunId": test_run_id });
                 self.tool_debug_test_status(&status_req).await
             }
