@@ -41,11 +41,18 @@ export class StrobeDebugAdapter extends DebugSession {
   // Track Strobe breakpoint/logpoint IDs per source file for removal
   private trackedBreakpointIds = new Map<string, string[]>();
   private trackedLogpointIds = new Map<string, string[]>();
+  private trackedFunctionBpIds: string[] = [];
 
   // Thread tracking: maps Frida thread IDs to DAP thread IDs
   private threadMap = new Map<number, number>();
   private reverseThreadMap = new Map<number, number>();
   private nextDapThreadId = 1;
+
+  // Execution action tracking for correct StoppedEvent reason
+  private lastAction: 'continue' | 'step-over' | 'step-into' | 'step-out' = 'continue';
+
+  // Output forwarding cursor
+  private outputCursor: number | undefined;
 
   constructor(daemonManager: DaemonManager) {
     super();
@@ -184,7 +191,7 @@ export class StrobeDebugAdapter extends DebugSession {
           file: sourcePath,
           line: bp.line,
           condition: bp.condition,
-          hitCount: bp.hitCondition ? parseInt(bp.hitCondition, 10) : undefined,
+          hitCount: bp.hitCondition ? parseInt(bp.hitCondition.replace(/\D+/g, ''), 10) || undefined : undefined,
           message: bp.logMessage,
         };
       });
@@ -270,16 +277,26 @@ export class StrobeDebugAdapter extends DebugSession {
     }
 
     try {
+      // Remove old function breakpoints (DAP set = replace)
+      if (this.trackedFunctionBpIds.length > 0) {
+        await this.client.setBreakpoints({
+          sessionId: this.sessionId,
+          remove: this.trackedFunctionBpIds,
+        });
+      }
+
       const targets = args.breakpoints.map((bp) => ({
         function: bp.name,
         condition: bp.condition,
-        hitCount: bp.hitCondition ? parseInt(bp.hitCondition, 10) : undefined,
+        hitCount: bp.hitCondition ? parseInt(bp.hitCondition.replace(/\D+/g, ''), 10) || undefined : undefined,
       }));
 
       const result = await this.client.setBreakpoints({
         sessionId: this.sessionId,
         add: targets,
       });
+
+      this.trackedFunctionBpIds = (result.breakpoints || []).map((bp) => bp.id);
 
       response.body = {
         breakpoints: (result.breakpoints || []).map((bp) => ({
@@ -339,6 +356,7 @@ export class StrobeDebugAdapter extends DebugSession {
   private async doStep(action: 'continue' | 'step-over' | 'step-into' | 'step-out'): Promise<void> {
     if (!this.client || !this.sessionId) return;
     try {
+      this.lastAction = action;
       await this.client.continue(this.sessionId, action);
       this.pausedThreads = [];
       this.resetVarRefs();
@@ -576,9 +594,11 @@ export class StrobeDebugAdapter extends DebugSession {
           // Send StoppedEvent with allThreadsStopped so VS Code shows all threads
           const firstPaused = this.pausedThreads[0];
           const dapThreadId = this.getDapThreadId(firstPaused.threadId);
-          const evt = new StoppedEvent('breakpoint', dapThreadId);
+          const reason = this.lastAction === 'continue' ? 'breakpoint' : 'step';
+          const evt = new StoppedEvent(reason, dapThreadId);
           (evt.body as Record<string, unknown>).allThreadsStopped = true;
           this.sendEvent(evt);
+          this.lastAction = 'continue';
         }
       } else if (status.status === 'running') {
         if (this.pausedThreads.length > 0) {
@@ -588,6 +608,27 @@ export class StrobeDebugAdapter extends DebugSession {
       } else if (status.status === 'exited') {
         this.stopPolling();
         this.sendEvent(new TerminatedEvent());
+      }
+
+      // Forward stdout/stderr to Debug Console
+      try {
+        const outputResp = await this.client.query({
+          sessionId: this.sessionId,
+          afterEventId: this.outputCursor,
+          limit: 100,
+        });
+        if (outputResp.lastEventId != null) {
+          this.outputCursor = outputResp.lastEventId;
+        }
+        for (const event of outputResp.events) {
+          if (event.eventType === 'stdout' && event.text) {
+            this.sendEvent(new OutputEvent(event.text + '\n', 'stdout'));
+          } else if (event.eventType === 'stderr' && event.text) {
+            this.sendEvent(new OutputEvent(event.text + '\n', 'stderr'));
+          }
+        }
+      } catch {
+        // Output forwarding is best-effort
       }
     } catch {
       this.stopPolling();
@@ -662,6 +703,13 @@ export class StrobeDebugAdapter extends DebugSession {
       }
       this.sessionId = undefined;
     }
+    // Clean up all tracking state
+    this.threadMap.clear();
+    this.reverseThreadMap.clear();
+    this.nextDapThreadId = 1;
+    this.trackedBreakpointIds.clear();
+    this.trackedLogpointIds.clear();
+    this.trackedFunctionBpIds = [];
   }
 
   /** Returns the Strobe session ID, used by extension.ts to sync UI state */

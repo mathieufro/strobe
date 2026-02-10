@@ -7,6 +7,14 @@ import {
 import { detectProfile } from '../profiles/language-profile';
 import { StrobeClient } from '../client/strobe-client';
 
+function requireLocalFile(editor: vscode.TextEditor): string | undefined {
+  if (editor.document.uri.scheme !== 'file') {
+    vscode.window.showWarningMessage('Strobe: Only local files are supported.');
+    return undefined;
+  }
+  return editor.document.uri.fsPath;
+}
+
 export interface TraceCommandDeps {
   getSessionId: () => string | undefined;
   addPattern: (pattern: string) => Promise<void>;
@@ -22,6 +30,7 @@ export function registerContextMenuCommands(
       try {
         const editor = vscode.window.activeTextEditor;
         if (!editor) return;
+        if (!requireLocalFile(editor)) return;
 
         const fn = await identifyFunctionAtCursor(
           editor.document,
@@ -61,7 +70,8 @@ export async function setBreakpointAtCursor(
   const editor = vscode.window.activeTextEditor;
   if (!editor) return;
 
-  const filePath = editor.document.uri.fsPath;
+  const filePath = requireLocalFile(editor);
+  if (!filePath) return;
   const line = editor.selection.active.line + 1;
 
   if (!sessionId) {
@@ -90,7 +100,8 @@ export async function addLogpointAtCursor(
   const editor = vscode.window.activeTextEditor;
   if (!editor) return;
 
-  const filePath = editor.document.uri.fsPath;
+  const filePath = requireLocalFile(editor);
+  if (!filePath) return;
   const line = editor.selection.active.line + 1;
 
   if (!sessionId) {

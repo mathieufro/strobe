@@ -47,7 +47,12 @@ export class CargoDiscoverer implements TestDiscoverer {
         /* discard compilation output */
       });
 
+      const timeout = setTimeout(() => {
+        proc.kill();
+      }, 30_000); // 30s timeout for cargo build + list
+
       proc.on('close', (code) => {
+        clearTimeout(timeout);
         if (code !== 0) {
           // Compilation may fail — return empty list, not an error.
           // The actual failure will surface when tests are run.
@@ -67,6 +72,7 @@ export class CargoDiscoverer implements TestDiscoverer {
       });
 
       proc.on('error', () => {
+        clearTimeout(timeout);
         // cargo not in PATH — return empty
         resolve([]);
       });
@@ -98,7 +104,12 @@ export class GoTestDiscoverer implements TestDiscoverer {
       proc.stdout.on('data', (d: Buffer) => { stdout += d; });
       proc.stderr.on('data', () => { /* discard */ });
 
+      const timeout = setTimeout(() => {
+        proc.kill();
+      }, 30_000); // 30s timeout for go test -list
+
       proc.on('close', (code) => {
+        clearTimeout(timeout);
         if (code !== 0) {
           resolve([]);
           return;
@@ -115,7 +126,10 @@ export class GoTestDiscoverer implements TestDiscoverer {
         resolve(tests);
       });
 
-      proc.on('error', () => resolve([]));
+      proc.on('error', () => {
+        clearTimeout(timeout);
+        resolve([]);
+      });
     });
   }
 }

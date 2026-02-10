@@ -139,9 +139,20 @@ export interface TraceResponse {
 
 // ---- debug_query ----
 
+export type EventTypeFilter =
+  | 'function_enter'
+  | 'function_exit'
+  | 'stdout'
+  | 'stderr'
+  | 'crash'
+  | 'variable_snapshot'
+  | 'pause'
+  | 'logpoint'
+  | 'condition_error';
+
 export interface QueryRequest {
   sessionId: string;
-  eventType?: string;
+  eventType?: EventTypeFilter;
   function?: { equals?: string; contains?: string; matches?: string };
   sourceFile?: { equals?: string; contains?: string };
   returnValue?: { equals?: unknown; isNull?: boolean };
@@ -270,8 +281,10 @@ export interface MemoryWriteRequest {
 
 export interface WriteMemoryResponse {
   results: Array<{
-    target: string;
-    success: boolean;
+    variable?: string;
+    address: string;
+    previousValue?: unknown;
+    newValue: unknown;
     error?: string;
   }>;
 }
@@ -379,4 +392,9 @@ export const StrobeErrorCodes = {
   FRIDA_ATTACH_FAILED: 'FRIDA_ATTACH_FAILED',
   INVALID_PATTERN: 'INVALID_PATTERN',
   VALIDATION_ERROR: 'VALIDATION_ERROR',
+  WATCH_FAILED: 'WATCH_FAILED',
+  TEST_RUN_NOT_FOUND: 'TEST_RUN_NOT_FOUND',
+  READ_FAILED: 'READ_FAILED',
+  WRITE_FAILED: 'WRITE_FAILED',
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
 } as const;

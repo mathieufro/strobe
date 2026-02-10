@@ -9,6 +9,8 @@ const SETTINGS_PATH = path.join(os.homedir(), '.strobe', 'settings.json');
 const SETTING_MAP: Record<string, string> = {
   'events.maxPerSession': 'events.maxPerSession',
   'test.statusRetryMs': 'test.statusRetryMs',
+  'trace.serializationDepth': 'trace.serializationDepth',
+  'memory.pollIntervalMs': 'memory.pollIntervalMs',
 };
 
 export function syncSettingsToDaemon(): void {

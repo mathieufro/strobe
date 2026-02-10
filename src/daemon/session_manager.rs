@@ -1250,9 +1250,11 @@ impl SessionManager {
             // Frida's Interceptor.attach overwrites up to 16 bytes at the hook address
             // (ARM64: LDR+BR+addr = 16 bytes for far branches). When resuming from
             // the trampoline, the thread JMPs past the overwritten region. One-shot
-            // hooks within that region would never fire. This applies equally to user
-            // breakpoints and step one-shot hooks — both use Interceptor.attach.
-            let min_offset: u64 = 16;
+            // hooks within that region would never fire. Step hooks need min_offset=16
+            // to avoid re-triggering, but user breakpoints need min_offset=0 so they
+            // can resolve to the first source line at function entry.
+            let is_step_hook = bp.is_none() && pause_info.address.is_some();
+            let min_offset: u64 = if is_step_hook { 16 } else { 0 };
 
             let addrs = match action.as_str() {
                 "step-over" => {
@@ -1464,12 +1466,27 @@ impl SessionManager {
     }
 
     pub async fn remove_breakpoint(&self, session_id: &str, breakpoint_id: &str) {
-        // Resume any threads paused on this breakpoint before removing it.
-        // The agent's removeBreakpoint detaches the listener, but the paused thread
-        // is blocked on recv().wait() which requires an inbound message from the daemon.
         let paused = self.get_all_paused_threads(session_id);
         let mut spawner_guard = self.frida_spawner.write().await;
 
+        // IMPORTANT: Detach the listener BEFORE resuming paused threads.
+        // Frida's event loop processes removeBreakpoint even while threads are
+        // blocked on recv('resume-{tid}').wait(). If we resume first, the thread
+        // can loop back and re-hit the still-attached interceptor before the
+        // removal message is processed — causing a spurious re-pause with no
+        // one to continue it.
+        let send_result = if let Some(spawner) = spawner_guard.as_mut() {
+            spawner.remove_breakpoint(session_id, breakpoint_id).await
+        } else {
+            Ok(())
+        };
+
+        if let Err(e) = send_result {
+            tracing::warn!("Failed to send breakpoint removal to agent: {} (cleaning up state anyway)", e);
+        }
+
+        // Now resume any threads that were paused on this breakpoint.
+        // The listener is already detached, so they won't re-trigger.
         for (thread_id, info) in &paused {
             if info.breakpoint_id == breakpoint_id {
                 if let Some(spawner) = spawner_guard.as_mut() {
@@ -1479,17 +1496,6 @@ impl SessionManager {
                 }
                 self.remove_paused_thread(session_id, *thread_id);
             }
-        }
-
-        // Send removal to agent via spawner pipeline (best-effort)
-        let send_result = if let Some(spawner) = spawner_guard.as_mut() {
-            spawner.remove_breakpoint(session_id, breakpoint_id).await
-        } else {
-            Ok(())
-        };
-
-        if let Err(e) = send_result {
-            tracing::warn!("Failed to send breakpoint removal to agent: {} (cleaning up state anyway)", e);
         }
 
         drop(spawner_guard);

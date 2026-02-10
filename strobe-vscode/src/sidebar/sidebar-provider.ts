@@ -60,10 +60,10 @@ export class SidebarProvider
       this.status?.eventCount === status.eventCount &&
       this.status?.hookedFunctions === status.hookedFunctions &&
       this.status?.status === status.status &&
-      this.status?.tracePatterns.length === status.tracePatterns.length &&
-      this.status?.breakpoints.length === status.breakpoints.length &&
-      this.status?.logpoints.length === status.logpoints.length &&
-      this.status?.watches.length === status.watches.length &&
+      JSON.stringify(this.status?.tracePatterns) === JSON.stringify(status.tracePatterns) &&
+      JSON.stringify(this.status?.breakpoints) === JSON.stringify(status.breakpoints) &&
+      JSON.stringify(this.status?.logpoints) === JSON.stringify(status.logpoints) &&
+      JSON.stringify(this.status?.watches) === JSON.stringify(status.watches) &&
       this.status?.pausedThreads.length === status.pausedThreads.length
     ) {
       return;

@@ -22,6 +22,10 @@ export class WatchPanel {
     sessionId: string,
   ): WatchPanel {
     if (WatchPanel.currentPanel) {
+      if (WatchPanel.currentPanel.pollTimer) {
+        clearInterval(WatchPanel.currentPanel.pollTimer);
+        WatchPanel.currentPanel.pollTimer = undefined;
+      }
       WatchPanel.currentPanel.sessionId = sessionId;
       WatchPanel.currentPanel.panel.reveal();
       return WatchPanel.currentPanel;
@@ -77,7 +81,8 @@ export class WatchPanel {
 
   private startPoll(): void {
     this.doPoll();
-    this.pollTimer = setInterval(() => this.doPoll(), 1000);
+    const intervalMs = vscode.workspace.getConfiguration('strobe').get<number>('memory.pollIntervalMs', 500);
+    this.pollTimer = setInterval(() => this.doPoll(), intervalMs);
   }
 
   private async doPoll(): Promise<void> {
@@ -91,7 +96,10 @@ export class WatchPanel {
     }
 
     try {
-      const targets = this.watches.map((w) => ({ variable: w.label }));
+      const targets = this.watches.map((w: ActiveWatch & { variable?: string; type?: string }) => {
+        if (w.address) return { address: w.address, type: w.type };
+        return { variable: w.variable ?? w.label };
+      });
       const result = await this.client.readMemory({
         sessionId: this.sessionId,
         targets,
@@ -108,10 +116,12 @@ export class WatchPanel {
   }
 
   private getHtml(): string {
+    const nonce = getNonce();
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <style>
     body {
       font-family: var(--vscode-font-family);
@@ -143,7 +153,7 @@ export class WatchPanel {
     <thead><tr><th>Variable</th><th>Type</th><th>Value</th><th>Scope</th><th></th></tr></thead>
     <tbody id="body"></tbody>
   </table>
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const bodyEl = document.getElementById('body');
     const tableEl = document.getElementById('table');
@@ -200,6 +210,14 @@ export class WatchPanel {
     WatchPanel.currentPanel = undefined;
     if (this.pollTimer) clearInterval(this.pollTimer);
     for (const d of this.disposables) d.dispose();
-    this.panel.dispose();
   }
+}
+
+function getNonce(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let nonce = '';
+  for (let i = 0; i < 32; i++) {
+    nonce += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return nonce;
 }

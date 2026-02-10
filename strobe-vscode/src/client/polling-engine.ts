@@ -16,6 +16,9 @@ export class PollingEngine extends EventEmitter {
   private cursor: number | undefined;
   private lastStatus: string | undefined;
   private polling = false;
+  private statusInFlight = false;
+  private eventsInFlight = false;
+  private consecutiveErrors = 0;
 
   constructor(
     private client: StrobeClient,
@@ -60,8 +63,11 @@ export class PollingEngine extends EventEmitter {
   }
 
   private async pollStatus(): Promise<void> {
+    if (this.statusInFlight) return;
+    this.statusInFlight = true;
     try {
       const status = await this.client.sessionStatus(this.sessionId);
+      this.consecutiveErrors = 0;
       this.emit('status', status);
 
       // Detect session end
@@ -76,12 +82,20 @@ export class PollingEngine extends EventEmitter {
         this.emit('sessionEnd', this.sessionId);
         this.stop();
       } else {
-        this.emit('error', err instanceof Error ? err : new Error(msg));
+        this.consecutiveErrors++;
+        if (this.consecutiveErrors > 5) {
+          this.emit('error', err instanceof Error ? err : new Error(msg));
+          this.stop();
+        }
       }
+    } finally {
+      this.statusInFlight = false;
     }
   }
 
   private async pollEvents(): Promise<void> {
+    if (this.eventsInFlight) return;
+    this.eventsInFlight = true;
     try {
       const resp = await this.client.query({
         sessionId: this.sessionId,
@@ -90,23 +104,21 @@ export class PollingEngine extends EventEmitter {
         verbose: true,
       });
 
-      if (resp.events.length > 0) {
-        this.emit('events', resp.events);
+      if (resp.lastEventId != null) {
+        this.cursor = resp.lastEventId;
       }
 
-      if (resp.lastEventId !== undefined) {
-        this.cursor = resp.lastEventId;
+      if (resp.events.length > 0) {
+        this.emit('events', resp.events);
       }
 
       if (resp.eventsDropped) {
         this.emit('eventsDropped');
       }
-    } catch (err: unknown) {
-      // Suppress SESSION_NOT_FOUND (handled by status poll)
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('SESSION_NOT_FOUND')) {
-        this.emit('error', err instanceof Error ? err : new Error(msg));
-      }
+    } catch {
+      // Errors handled by pollStatus consecutiveErrors counter
+    } finally {
+      this.eventsInFlight = false;
     }
   }
 }

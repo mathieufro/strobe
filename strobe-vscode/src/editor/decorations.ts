@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { StrobeEvent } from '../client/types';
 import { formatDuration } from '../utils/format';
 
@@ -83,6 +82,10 @@ export class DecorationManager implements vscode.Disposable {
       this.debounceTimer = undefined;
       this.dirty = false;
       this.render();
+      // If new events arrived during render, schedule another
+      if (this.dirty) {
+        this.scheduleRender();
+      }
     }, DEBOUNCE_MS);
   }
 
@@ -95,7 +98,8 @@ export class DecorationManager implements vscode.Disposable {
     const hotDecorations: vscode.DecorationOptions[] = [];
 
     for (const [_key, stat] of this.stats) {
-      if (!stat.file || path.basename(filePath) !== path.basename(stat.file)) continue;
+      if (!stat.file) continue;
+      if (!filePath.endsWith(stat.file) && stat.file !== filePath) continue;
       if (!stat.line) continue;
 
       const line = stat.line - 1;

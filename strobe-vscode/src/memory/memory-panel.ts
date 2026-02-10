@@ -16,6 +16,7 @@ export class MemoryPanel {
     sessionId: string,
   ): MemoryPanel {
     if (MemoryPanel.currentPanel) {
+      MemoryPanel.currentPanel.stopPoll();
       MemoryPanel.currentPanel.sessionId = sessionId;
       MemoryPanel.currentPanel.panel.reveal();
       return MemoryPanel.currentPanel;
@@ -112,7 +113,8 @@ export class MemoryPanel {
       case 'startPoll': {
         this.stopPoll();
         if (!msg.target) return;
-        const intervalMs = msg.pollIntervalMs ?? 500;
+        const configuredInterval = vscode.workspace.getConfiguration('strobe').get<number>('memory.pollIntervalMs', 500);
+        const intervalMs = msg.pollIntervalMs ?? configuredInterval;
         const target = msg.target;
         const type = msg.type;
         this.pollTimer = setInterval(async () => {
@@ -150,11 +152,13 @@ export class MemoryPanel {
   }
 
   private getHtml(): string {
+    const nonce = getNonce();
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <style>
     body {
       font-family: var(--vscode-font-family);
@@ -225,7 +229,7 @@ export class MemoryPanel {
     <thead><tr><th>Target</th><th>Type</th><th>Value</th><th>Address</th><th></th></tr></thead>
     <tbody id="results"></tbody>
   </table>
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const targetEl = document.getElementById('target');
     const typeEl = document.getElementById('typeHint');
@@ -336,6 +340,14 @@ export class MemoryPanel {
     MemoryPanel.currentPanel = undefined;
     this.stopPoll();
     for (const d of this.disposables) d.dispose();
-    this.panel.dispose();
   }
+}
+
+function getNonce(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let nonce = '';
+  for (let i = 0; i < 32; i++) {
+    nonce += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return nonce;
 }

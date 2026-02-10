@@ -69,12 +69,12 @@ fn install_claude_code(config_dir: &Path) -> Result<()> {
 
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&config)?)?;
 
-    // Install TDD skill
-    let skills_dir = config_dir.join("skills").join("strobe-tdd");
+    // Install debugging skill
+    let skills_dir = config_dir.join("skills").join("strobe-debugging");
     std::fs::create_dir_all(&skills_dir)?;
     std::fs::write(
-        skills_dir.join("strobe-tdd.md"),
-        include_str!("../skills/strobe-tdd.md"),
+        skills_dir.join("strobe-debugging.md"),
+        include_str!("../skills/strobe-debugging.md"),
     )?;
 
     Ok(())

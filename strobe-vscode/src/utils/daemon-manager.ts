@@ -1,4 +1,3 @@
-import * as net from 'net';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -28,6 +27,11 @@ export class DaemonManager {
 
   async ensureClient(): Promise<StrobeClient> {
     if (this.client?.isConnected) return this.client;
+    // Disconnect dead client before creating a new one
+    if (this.client) {
+      this.client.disconnect();
+      this.client = null;
+    }
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = this.doEnsureClient();
     try {

@@ -259,8 +259,8 @@
       },
       {
         "command": "strobe.addTracePattern",
-        "key": "ctrl+shift+t",
-        "mac": "cmd+shift+t",
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t",
         "when": "editorTextFocus"
       },
       {
@@ -277,13 +277,13 @@
       },
       {
         "command": "strobe.openMemoryInspector",
-        "key": "ctrl+shift+m",
-        "mac": "cmd+shift+m"
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m"
       },
       {
         "command": "strobe.addWatch",
-        "key": "ctrl+shift+w",
-        "mac": "cmd+shift+w",
+        "key": "ctrl+alt+w",
+        "mac": "cmd+alt+w",
         "when": "editorTextFocus"
       }
     ]

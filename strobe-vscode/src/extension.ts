@@ -408,6 +408,18 @@ async function cmdRunSingleTest(
           await new Promise((r) => setTimeout(r, 1000));
         }
 
+        // Stop the daemon-side session if available
+        if (token.isCancellationRequested && resp.testRunId) {
+          try {
+            const cancelStatus = await client.testStatus(resp.testRunId);
+            if (cancelStatus.sessionId) {
+              await client.stop(cancelStatus.sessionId);
+            }
+          } catch {
+            // Best effort
+          }
+        }
+
         outputChannel.appendLine(`Strobe: Test "${testName}" cancelled`);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -418,6 +430,11 @@ async function cmdRunSingleTest(
 }
 
 function startSession(client: StrobeClient, sessionId: string): void {
+  if (pollingEngine) {
+    pollingEngine.stop();
+    pollingEngine = null;
+  }
+
   activeSessionId = sessionId;
 
   // Start polling
@@ -475,6 +492,14 @@ async function refreshRetainedSessions(): Promise<void> {
 }
 
 export function deactivate(): void {
-  pollingEngine?.stop();
-  daemonManager.dispose();
+  try {
+    pollingEngine?.stop();
+  } catch {
+    // Best-effort cleanup
+  }
+  try {
+    daemonManager.dispose();
+  } catch {
+    // Best-effort cleanup
+  }
 }

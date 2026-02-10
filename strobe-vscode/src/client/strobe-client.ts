@@ -200,14 +200,21 @@ export class StrobeClient extends EventEmitter {
 
     if (response.isError) {
       const text = response.content?.[0]?.text ?? 'Unknown error';
-      const codeMatch = text.match(/^([A-Z_]+):/);
-      throw new StrobeError(text, codeMatch?.[1]);
+      // Server format: "ERROR_CODE": message  (code is JSON-quoted)
+      const codeMatch = text.match(/^"([A-Z_]+)":\s*/);
+      const code = codeMatch?.[1];
+      const message = codeMatch ? text.slice(codeMatch[0].length) : text;
+      throw new StrobeError(message, code);
     }
 
     // Tool responses wrap the actual JSON in a text content block
     const text = response.content?.[0]?.text;
     if (!text) return {};
-    return JSON.parse(text);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new StrobeError(`Invalid JSON response from daemon: ${text.slice(0, 200)}`);
+    }
   }
 
   private sendRequest(

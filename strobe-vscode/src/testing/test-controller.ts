@@ -4,7 +4,6 @@ import { TestStatusResponse } from '../client/types';
 import {
   TestDiscoverer,
   detectDiscoverer,
-  CargoDiscoverer,
 } from './test-discovery';
 
 export class StrobeTestController implements vscode.Disposable {
@@ -12,6 +11,7 @@ export class StrobeTestController implements vscode.Disposable {
   private discoverer: TestDiscoverer | undefined;
   private testItemMap = new Map<string, vscode.TestItem>();
   private disposables: vscode.Disposable[] = [];
+  private activeRun: vscode.TestRun | null = null;
 
   constructor(
     private getClient: () => Promise<StrobeClient>,
@@ -46,9 +46,7 @@ export class StrobeTestController implements vscode.Disposable {
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceFolder) return;
 
-    this.discoverer = await detectDiscoverer(workspaceFolder, [
-      new CargoDiscoverer(),
-    ]);
+    this.discoverer = await detectDiscoverer(workspaceFolder);
     if (!this.discoverer) return;
 
     const tests = await this.discoverer.listTests(workspaceFolder);
@@ -106,11 +104,17 @@ export class StrobeTestController implements vscode.Disposable {
     token: vscode.CancellationToken,
     debug = false,
   ): Promise<void> {
+    if (this.activeRun) {
+      vscode.window.showWarningMessage('Strobe: A test run is already in progress.');
+      return;
+    }
+
     const workspaceFolder =
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceFolder) return;
 
     const run = this.controller.createTestRun(request);
+    this.activeRun = run;
 
     // Determine which tests to run
     let testFilter: string | undefined;
@@ -169,6 +173,7 @@ export class StrobeTestController implements vscode.Disposable {
       }
     } finally {
       run.end();
+      this.activeRun = null;
     }
   }
 
@@ -180,9 +185,24 @@ export class StrobeTestController implements vscode.Disposable {
     token: vscode.CancellationToken,
   ): Promise<void> {
     const startedTests = new Set<string>();
+    let capturedSessionId: string | undefined;
+
+    token.onCancellationRequested(async () => {
+      // Stop the Frida session to kill the test process
+      if (capturedSessionId) {
+        try {
+          await client.stop(capturedSessionId);
+        } catch {
+          // Best effort
+        }
+      }
+    });
 
     while (!token.isCancellationRequested) {
       const status = await client.testStatus(testRunId);
+      if (status.sessionId) {
+        capturedSessionId = status.sessionId;
+      }
 
       if (status.progress) {
         const p = status.progress;
@@ -232,9 +252,7 @@ export class StrobeTestController implements vscode.Disposable {
         const errMsg = status.error ?? 'Test run failed';
         this.outputChannel.appendLine(`Strobe Test: ${errMsg}`);
         for (const item of leafItems) {
-          if (!startedTests.has(item.id)) {
-            run.errored(item, new vscode.TestMessage(errMsg));
-          }
+          run.errored(item, new vscode.TestMessage(errMsg));
         }
         return;
       }

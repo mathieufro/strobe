@@ -68,6 +68,52 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
         });
     }
 
+    if event.event_type == crate::db::EventType::Pause {
+        return serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": "pause",
+            "threadId": event.thread_id,
+            "pid": event.pid,
+            "function": event.function_name,
+            "sourceFile": event.source_file,
+            "line": event.line_number,
+            "breakpointId": event.breakpoint_id,
+            "backtrace": event.backtrace,
+            "arguments": event.arguments,
+        });
+    }
+
+    if event.event_type == crate::db::EventType::Logpoint {
+        return serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": "logpoint",
+            "threadId": event.thread_id,
+            "pid": event.pid,
+            "function": event.function_name,
+            "sourceFile": event.source_file,
+            "line": event.line_number,
+            "breakpointId": event.breakpoint_id,
+            "logpointMessage": event.logpoint_message,
+        });
+    }
+
+    if event.event_type == crate::db::EventType::ConditionError {
+        return serde_json::json!({
+            "id": event.id,
+            "timestamp_ns": event.timestamp_ns,
+            "eventType": "condition_error",
+            "threadId": event.thread_id,
+            "pid": event.pid,
+            "function": event.function_name,
+            "sourceFile": event.source_file,
+            "line": event.line_number,
+            "breakpointId": event.breakpoint_id,
+            "logpointMessage": event.logpoint_message,
+        });
+    }
+
     if verbose {
         serde_json::json!({
             "id": event.id,
@@ -1645,7 +1691,10 @@ Validation Limits (enforced):
 
         let events_dropped = if let Some(after) = req.after_event_id {
             let min_rowid = self.session_manager.db().min_rowid_for_session(&req.session_id)?;
-            Some(min_rowid.map_or(false, |min| after + 1 < min))
+            Some(match min_rowid {
+                Some(min) => after + 1 < min,
+                None => after > 0, // All events evicted → dropped if cursor was set
+            })
         } else {
             None
         };
@@ -1712,7 +1761,6 @@ Validation Limits (enforced):
         match req.action {
             SessionAction::Status => {
                 let session_id = req.session_id.as_deref().unwrap();
-                let _ = self.require_session(session_id)?;
                 let status = self.session_manager.session_status(session_id)?;
                 Ok(serde_json::to_value(status)?)
             }
