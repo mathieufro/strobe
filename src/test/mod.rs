@@ -45,8 +45,9 @@ pub struct TestProgress {
     pub passed: u32,
     pub failed: u32,
     pub skipped: u32,
-    pub current_test: Option<String>,
-    pub current_test_started_at: Option<Instant>,
+    /// All currently running tests and when they started.
+    /// Populated on "test started", removed on "test ok"/"failed"/"timeout".
+    pub running_tests: HashMap<String, Instant>,
     pub started_at: Instant,
     pub phase: TestPhase,
     pub warnings: Vec<StuckWarning>,
@@ -60,8 +61,7 @@ impl TestProgress {
             passed: 0,
             failed: 0,
             skipped: 0,
-            current_test: None,
-            current_test_started_at: None,
+            running_tests: HashMap::new(),
             started_at: Instant::now(),
             phase: TestPhase::Compiling,
             warnings: Vec::new(),
@@ -71,6 +71,18 @@ impl TestProgress {
 
     pub fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// Get the "current test" — the one that's been running longest (for stuck detection).
+    pub fn current_test(&self) -> Option<String> {
+        self.running_tests.iter()
+            .min_by_key(|(_, started)| *started)
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Get when the current (longest-running) test started.
+    pub fn current_test_started_at(&self) -> Option<Instant> {
+        self.running_tests.values().min().copied()
     }
 }
 
@@ -274,20 +286,17 @@ impl TestRunner {
                 break;
             }
 
-            // Hard timeout — kill the process (stuck detector has already written warnings)
+            // Hard timeout — kill the process tree (stuck detector has already written warnings)
             if start.elapsed() > kill_timeout {
-                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                // Reap zombie so is_process_alive returns false
-                unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG); }
+                stacks::kill_process_tree(pid);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 break;
             }
 
             // Safety net timeout
             if start.elapsed() > safety_timeout {
-                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG); }
+                stacks::kill_process_tree(pid);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 break;
             }
 

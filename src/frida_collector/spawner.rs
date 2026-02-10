@@ -439,7 +439,12 @@ impl AgentMessageHandler {
                         line,
                         return_address,
                     };
-                    let _ = tx.try_send(notification);
+                    if let Err(e) = tx.try_send(notification) {
+                        tracing::warn!(
+                            "[{}] Failed to send pause notification for thread {}: {} (thread may remain blocked)",
+                            self.session_id, thread_id, e
+                        );
+                    }
                 }
             }
             "breakpointSet" | "logpointSet" => {
@@ -779,8 +784,24 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     }
 
                     let t = std::time::Instant::now();
-                    let pid = device.spawn(&command, &spawn_opts)
-                        .map_err(|e| crate::Error::FridaAttachFailed(format!("Spawn failed: {}", e)))?;
+                    let pid = {
+                        let mut last_err = String::new();
+                        let mut spawned_pid = None;
+                        for attempt in 0..3u32 {
+                            match device.spawn(&command, &spawn_opts) {
+                                Ok(p) => { spawned_pid = Some(p); break; }
+                                Err(e) => {
+                                    last_err = format!("{}", e);
+                                    if attempt < 2 {
+                                        let delay = 200 * (attempt + 1) as u64;
+                                        tracing::warn!("Spawn attempt {} failed: {}. Retrying in {}ms...", attempt + 1, e, delay);
+                                        thread::sleep(std::time::Duration::from_millis(delay));
+                                    }
+                                }
+                            }
+                        }
+                        spawned_pid.ok_or_else(|| crate::Error::FridaAttachFailed(format!("Spawn failed after 3 attempts: {}", last_err)))?
+                    };
                     tracing::info!("Spawned process {} with PID {}", command, pid);
                     tracing::debug!("PERF: device.spawn() took {:?}", t.elapsed());
 
@@ -800,11 +821,27 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     }
 
                     let t = std::time::Instant::now();
-                    let frida_session = device.attach(pid)
-                        .map_err(|e| {
-                            tracing::error!("Attach to PID {} failed: {:?}", pid, e);
-                            crate::Error::FridaAttachFailed(format!("Attach to PID {} failed: {}", pid, e))
-                        })?;
+                    let frida_session = {
+                        let mut last_err = String::new();
+                        let mut attached = None;
+                        for attempt in 0..3u32 {
+                            match device.attach(pid) {
+                                Ok(s) => { attached = Some(s); break; }
+                                Err(e) => {
+                                    last_err = format!("{}", e);
+                                    if attempt < 2 {
+                                        let delay = 200 * (attempt + 1) as u64;
+                                        tracing::warn!("Attach attempt {} to PID {} failed: {}. Retrying in {}ms...", attempt + 1, pid, e, delay);
+                                        thread::sleep(std::time::Duration::from_millis(delay));
+                                    }
+                                }
+                            }
+                        }
+                        attached.ok_or_else(|| {
+                            tracing::error!("Attach to PID {} failed after 3 attempts: {}", pid, last_err);
+                            crate::Error::FridaAttachFailed(format!("Attach to PID {} failed after 3 attempts: {}", pid, last_err))
+                        })?
+                    };
                     tracing::debug!("PERF: device.attach() took {:?}", t.elapsed());
 
                     let raw_session = unsafe { session_raw_ptr(&frida_session) };
@@ -896,23 +933,39 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                 session_id,
                 response,
             } => {
-                // Kill all PIDs for this session via output_registry + device.kill()
-                if let Ok(mut reg) = output_registry.lock() {
-                    let pids_to_remove: Vec<u32> = reg.iter()
+                // Collect PIDs and release the lock BEFORE killing.
+                // CRITICAL: device.kill() is a sync Frida call that waits for the GLib
+                // main loop to complete the operation. raw_on_output also runs on the
+                // GLib thread and needs the output_registry lock. Holding the lock while
+                // calling device.kill() causes a deadlock:
+                //   coordinator holds lock → device.kill() waits for GLib →
+                //   GLib blocked on lock in raw_on_output → deadlock
+                let pids_to_remove: Vec<u32> = if let Ok(mut reg) = output_registry.lock() {
+                    let pids: Vec<u32> = reg.iter()
                         .filter(|(_, ctx)| ctx.session_id == session_id)
                         .map(|(&pid, _)| pid)
                         .collect();
-                    for pid in &pids_to_remove {
+                    for pid in &pids {
                         reg.remove(pid);
                     }
-                    for pid in pids_to_remove {
-                        let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-                        if is_alive {
-                            tracing::info!("Killing process {} for session {}", pid, session_id);
-                            device.kill(pid)
-                                .unwrap_or_else(|e| tracing::warn!("Failed to kill PID {}: {:?}", pid, e));
-                        }
-                    }
+                    pids
+                    // Lock released here
+                } else {
+                    vec![]
+                };
+
+                // Kill process trees FIRST with SIGKILL, THEN do Frida cleanup.
+                // Order matters: device.kill() is a blocking sync call that can hang
+                // indefinitely on stopped/traced processes. SIGKILL always works.
+                for pid in &pids_to_remove {
+                    tracing::info!("Killing process tree for PID {} (session {})", pid, session_id);
+                    crate::test::stacks::kill_process_tree(*pid);
+                }
+
+                // Now do Frida-level cleanup (fast since processes are already dead)
+                for pid in pids_to_remove {
+                    device.kill(pid)
+                        .unwrap_or_else(|e| tracing::debug!("Frida cleanup PID {}: {:?}", pid, e));
                 }
                 let _ = response.send(Ok(()));
             }
@@ -2015,7 +2068,10 @@ impl FridaSpawner {
     }
 
     // Phase 2: Breakpoint support
-    pub async fn set_breakpoint(
+    /// Send a hook setup message (breakpoint or logpoint) to the agent.
+    /// Both use the same SessionCommand since the message type field
+    /// distinguishes them at the agent level.
+    pub async fn send_hook_message(
         &mut self,
         session_id: &str,
         message: serde_json::Value,
@@ -2032,6 +2088,22 @@ impl FridaSpawner {
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
+
+    pub async fn set_breakpoint(
+        &mut self,
+        session_id: &str,
+        message: serde_json::Value,
+    ) -> Result<()> {
+        self.send_hook_message(session_id, message).await
+    }
+
+    pub async fn set_logpoint(
+        &mut self,
+        session_id: &str,
+        message: serde_json::Value,
+    ) -> Result<()> {
+        self.send_hook_message(session_id, message).await
     }
 
     pub async fn remove_breakpoint(

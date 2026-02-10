@@ -117,6 +117,7 @@ async fn scenario_output_capture(
         assert_eq!(event.pid.unwrap(), pid, "Stdout PID should match");
     }
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -184,6 +185,7 @@ async fn scenario_cpp_tracing(
         .any(|e| e.function_name.contains("slow") && e.duration_ns.unwrap_or(0) >= 40_000_000);
     assert!(has_slow, "Should see slow function with duration >= 40ms");
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -219,21 +221,32 @@ async fn scenario_rust_tracing(
         .expect("Hook install must succeed — ensure Rust fixture has debug symbols (dsymutil)");
     eprintln!("Hooked {} Rust functions", hook_result.installed);
 
-    // Poll for any events (stdout or function traces)
-    let events = poll_events(sm, session_id, Duration::from_secs(5), |events| {
-        events.len() >= 2
-    })
+    // Poll for stdout — the "basic" mode prints "Done" at the end.
+    // We must poll specifically for stdout because function trace events
+    // arrive much faster and would satisfy a generic "events >= 2" check
+    // before stdout is flushed through Frida's output capture pipeline.
+    let stdout_events = poll_events_typed(
+        sm,
+        session_id,
+        Duration::from_secs(10),
+        strobe::db::EventType::Stdout,
+        |events| {
+            let text = collect_stdout(events);
+            text.contains("Done")
+        },
+    )
     .await;
 
-    eprintln!("Events captured: {}", events.len());
+    let stdout = collect_stdout(&stdout_events);
+    eprintln!("Rust stdout: {}", stdout.trim());
 
-    // Verify stdout from basic mode
-    let stdout = collect_stdout(&events);
     assert!(
         stdout.contains("Running basic mode") || stdout.contains("Done"),
-        "Should capture Rust fixture stdout"
+        "Should capture Rust fixture stdout. Got: '{}'",
+        stdout.trim()
     );
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -319,6 +332,7 @@ async fn scenario_crash_null(
     // PID
     assert_eq!(crash.pid, Some(pid), "Crash PID should match");
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -376,6 +390,7 @@ async fn scenario_crash_abort(
         );
     }
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -424,6 +439,7 @@ async fn scenario_fork_workers(
     eprintln!("PIDs in session: {:?}", all_pids);
     assert!(all_pids.contains(&pid), "Session should contain parent PID");
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -470,6 +486,7 @@ async fn scenario_fork_exec(
         "Should capture parent output"
     );
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -547,6 +564,7 @@ async fn scenario_duration_query(
         .any(|e| e.function_name.contains("fast"));
     assert!(!fast_in_slow, "fast function should not appear in >= 40ms filter");
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -608,6 +626,7 @@ async fn scenario_time_range_query(
         }
     }
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -660,6 +679,7 @@ async fn scenario_pattern_add_remove(
         Err(e) => eprintln!("Warning: pattern remove failed: {}", e),
     }
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -763,6 +783,7 @@ async fn scenario_watch_variables(
     )
     .await;
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -838,6 +859,7 @@ async fn scenario_multithreaded(
         .collect();
     eprintln!("Distinct thread names: {:?}", thread_names);
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -942,6 +964,7 @@ async fn scenario_read_oneshot(
     eprintln!("  g_sample_rate = {}", sr_val);
     assert_eq!(sr_val, 44100, "g_sample_rate should be 44100");
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -1038,6 +1061,7 @@ async fn scenario_read_struct(
         val
     );
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
 
@@ -1167,5 +1191,6 @@ async fn scenario_read_poll(
         }
     }
 
+    let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }

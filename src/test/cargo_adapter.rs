@@ -389,39 +389,42 @@ fn update_progress_line(line: &str, progress: &std::sync::Arc<std::sync::Mutex<s
             }
         }
         ("suite", "ok") | ("suite", "failed") => {
-            // Suite finished — mark SuitesFinished so stuck detector knows tests
-            // completed. If another suite starts, ("suite", "started") won't
-            // regress this since it only transitions from Compiling.
-            p.phase = super::TestPhase::SuitesFinished;
-            p.current_test = None;
+            // A single test binary's suite finished. Don't set SuitesFinished here
+            // because cargo test runs multiple binaries sequentially — more suites
+            // may follow. SuitesFinished is set by the orchestrator in mod.rs after
+            // the entire test process exits.
+            p.running_tests.clear();
         }
         ("test", "started") => {
             p.phase = super::TestPhase::Running;
-            p.current_test = v.get("name").and_then(|n| n.as_str()).map(String::from);
-            p.current_test_started_at = Some(std::time::Instant::now());
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                p.running_tests.insert(name.to_string(), std::time::Instant::now());
+            }
         }
         ("test", "ok") => {
             p.passed += 1;
-            // Record wall-clock duration for this test
-            if let Some(started) = p.current_test_started_at {
-                if let Some(name) = p.current_test.clone() {
-                    p.test_durations.insert(name, started.elapsed().as_millis() as u64);
-                }
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if let Some(started) = p.running_tests.remove(name) {
+                p.test_durations.insert(name.to_string(), started.elapsed().as_millis() as u64);
             }
-            p.current_test_started_at = None;
         }
-        ("test", "failed") | ("test", "timeout") => {
+        ("test", "failed") => {
             p.failed += 1;
-            if let Some(started) = p.current_test_started_at {
-                if let Some(name) = p.current_test.clone() {
-                    p.test_durations.insert(name, started.elapsed().as_millis() as u64);
-                }
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if let Some(started) = p.running_tests.remove(name) {
+                p.test_durations.insert(name.to_string(), started.elapsed().as_millis() as u64);
             }
-            p.current_test_started_at = None;
+        }
+        ("test", "timeout") => {
+            // libtest's "timeout" is informational (60s warning) — the test keeps running.
+            // Don't count it as a failure; the authoritative "ok"/"failed" event comes later.
+            // If the test never completes, our safety-net timeout kills the process and
+            // parse_output handles the missing result.
         }
         ("test", "ignored") => {
             p.skipped += 1;
-            p.current_test_started_at = None;
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            p.running_tests.remove(name);
         }
         _ => {}
     }

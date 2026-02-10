@@ -76,19 +76,24 @@ async fn test_stepping_behavioral_suite() {
 
         // Wait for step to complete (should pause at next line via one-shot hook)
         let paused2 = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
-        if !paused2.is_empty() {
-            let step_pause = &paused2[0].1;
-            println!(
-                "  Step-over paused at: bp={} func={:?}",
-                step_pause.breakpoint_id, step_pause.func_name
-            );
-            // The breakpoint_id should be a step-* ID, not the original bp-step
-            assert!(
-                step_pause.breakpoint_id.starts_with("step-"),
-                "Step pause should have step-* breakpoint ID, got: {}",
-                step_pause.breakpoint_id
-            );
-        }
+        assert!(!paused2.is_empty(), "Step-over should produce a new pause");
+        let step_pause = &paused2[0].1;
+        println!(
+            "  Step-over paused at: bp={} func={:?}",
+            step_pause.breakpoint_id, step_pause.func_name
+        );
+        // The breakpoint_id should be a step-* ID, not the original bp-step
+        assert!(
+            step_pause.breakpoint_id.starts_with("step-"),
+            "Step pause should have step-* breakpoint ID, got: {}",
+            step_pause.breakpoint_id
+        );
+        // The step pause is at a different position than the initial pause
+        // (one-shot hook fired at a new address, proving advancement)
+        assert_ne!(
+            step_pause.breakpoint_id, "bp-step",
+            "Step should produce a new breakpoint_id, not reuse the original"
+        );
 
         // Verify Pause events in DB — should have at least 2 (initial + step)
         let pause_events = poll_events_typed(
@@ -99,6 +104,14 @@ async fn test_stepping_behavioral_suite() {
             pause_events.len() >= 2,
             "Should have at least 2 Pause events (initial + step), got {}",
             pause_events.len()
+        );
+        // Verify the two pause events have different breakpoint IDs
+        let bp_ids: Vec<_> = pause_events.iter()
+            .filter_map(|e| e.breakpoint_id.as_deref())
+            .collect();
+        assert!(
+            bp_ids.len() >= 2 && bp_ids[0] != bp_ids[1],
+            "Pause events should have different breakpoint IDs: {:?}", bp_ids
         );
 
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
@@ -194,7 +207,7 @@ async fn test_stepping_behavioral_suite() {
 
         sm.remove_breakpoint(session_id, "bp-inner").await;
 
-        // Step-out — should use return address if available
+        // Step-out — should use return address if available, error if not
         let step_result = sm
             .debug_continue_async(session_id, Some("step-out".to_string()))
             .await;
@@ -208,18 +221,30 @@ async fn test_stepping_behavioral_suite() {
 
             // Wait for pause at caller
             let paused2 = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
-            if !paused2.is_empty() {
-                println!(
-                    "  Step-out paused at caller: {}",
-                    paused2[0].1.breakpoint_id
-                );
-            }
-        } else {
-            // Without return address, step-out may fail — that's a known limitation
-            println!(
-                "  Step-out result without return address: {:?}",
-                step_result
+            assert!(!paused2.is_empty(), "Step-out should pause at caller");
+            let caller_pause = &paused2[0].1;
+            assert!(
+                caller_pause.breakpoint_id.starts_with("step-"),
+                "Step-out pause should have step-* ID, got: {}",
+                caller_pause.breakpoint_id
             );
+            println!(
+                "  Step-out paused at caller: {}",
+                caller_pause.breakpoint_id
+            );
+        } else {
+            // Without return address, step-out should return an error (not silently continue)
+            assert!(
+                step_result.is_err(),
+                "Step-out without return address should return error"
+            );
+            let err_msg = step_result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Cannot step-out"),
+                "Error should mention 'Cannot step-out': {}",
+                err_msg
+            );
+            println!("  Step-out correctly rejected: {}", err_msg);
         }
 
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
@@ -255,8 +280,9 @@ async fn test_stepping_behavioral_suite() {
         assert!(!paused.is_empty(), "Should pause at breakpoint");
         sm.remove_breakpoint(session_id, "bp-seq").await;
 
-        // Perform 3 step-overs
+        // Perform 3 step-overs and verify each produces a unique step-* ID
         let mut step_count = 0;
+        let mut step_ids: Vec<String> = Vec::new();
         for i in 0..3 {
             let step = sm
                 .debug_continue_async(session_id, Some("step-over".to_string()))
@@ -271,15 +297,28 @@ async fn test_stepping_behavioral_suite() {
                 println!("  Step {} didn't produce a pause (may have reached end of function)", i);
                 break;
             }
+            let step_id = paused_step[0].1.breakpoint_id.clone();
+            assert!(
+                step_id.starts_with("step-"),
+                "Step {} should have step-* ID, got: {}", i, step_id
+            );
+            step_ids.push(step_id.clone());
             step_count += 1;
-            println!("  Step {} completed, paused at: {}", i, paused_step[0].1.breakpoint_id);
+            println!("  Step {} completed, paused at: {}", i, step_id);
         }
 
         assert!(
-            step_count >= 1,
-            "Should complete at least 1 step, got {}",
+            step_count >= 2,
+            "Should complete at least 2 sequential steps, got {}",
             step_count
         );
+        // Verify each step produced a distinct ID (different address each time)
+        for i in 1..step_ids.len() {
+            assert_ne!(
+                step_ids[i], step_ids[i - 1],
+                "Sequential steps should produce different IDs: {:?}", step_ids
+            );
+        }
 
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         let _ = sm.stop_frida(session_id).await;

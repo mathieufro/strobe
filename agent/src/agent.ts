@@ -869,10 +869,15 @@ class StrobeAgent {
             const stepId = `step-${threadId}-${Date.now()}`;
             const listeners: InvocationListener[] = [];
             let fired = false;
+            let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
             const cleanupAll = () => {
               if (fired) return;
               fired = true;
+              if (timeoutId !== null) {
+                clearTimeout(timeoutId);
+                timeoutId = null;
+              }
               for (const l of listeners) {
                 l.detach();
               }
@@ -905,7 +910,7 @@ class StrobeAgent {
             }
 
             // Safety timeout: clean up one-shot hooks after 30s if none fired
-            setTimeout(() => {
+            timeoutId = setTimeout(() => {
               if (!fired) {
                 cleanupAll();
                 send({ type: 'log', message: `One-shot step hooks timed out for thread ${threadId}` });
@@ -1041,12 +1046,10 @@ class StrobeAgent {
       return;
     }
 
-    // If thread is paused on this breakpoint, resume it first
-    for (const [threadId, bpId] of this.pausedThreads.entries()) {
-      if (bpId === id) {
-        send({ type: `resume-${threadId}`, payload: {} });
-      }
-    }
+    // NOTE: If threads are paused on this breakpoint, the daemon sends
+    // resume messages BEFORE requesting removal. We don't attempt to
+    // resume from the agent side — send() goes outbound to the daemon,
+    // not to the local recv().wait() handler.
 
     bp.listener.detach();
     this.breakpoints.delete(id);

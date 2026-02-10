@@ -137,6 +137,8 @@ pub const MAX_WATCH_EXPRESSION_DEPTH: usize = 4;
 pub const MAX_BREAKPOINTS_PER_SESSION: usize = 50;
 pub const MAX_LOGPOINTS_PER_SESSION: usize = 100;
 pub const MAX_LINE_NUMBER: u32 = 1_000_000;
+pub const MAX_CONDITION_LENGTH: usize = 1024;
+pub const MAX_LOGPOINT_MESSAGE_LENGTH: usize = 2048;
 
 /// Validate a watch field (expression or variable name) against length and depth limits.
 fn validate_watch_field(value: &str, field_name: &str) -> crate::Result<()> {
@@ -584,6 +586,18 @@ pub struct TestProgressSnapshot {
     /// Historical baseline duration for the current test (average of last 10 passed runs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_test_baseline_ms: Option<u64>,
+    /// All currently running tests (cargo runs tests in parallel within a binary).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub running_tests: Vec<RunningTestSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningTestSnapshot {
+    pub name: String,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_ms: Option<u64>,
 }
 
 // ============ Errors ============
@@ -801,6 +815,15 @@ impl DebugBreakpointRequest {
                         ));
                     }
                 }
+
+                if let Some(ref condition) = target.condition {
+                    if condition.len() > MAX_CONDITION_LENGTH {
+                        return Err(crate::Error::ValidationError(
+                            format!("Condition length ({} bytes) exceeds maximum of {} bytes",
+                                condition.len(), MAX_CONDITION_LENGTH)
+                        ));
+                    }
+                }
             }
         }
 
@@ -930,6 +953,22 @@ impl DebugLogpointRequest {
                     return Err(crate::Error::ValidationError(
                         "Logpoint message must not be empty".to_string()
                     ));
+                }
+
+                if target.message.len() > MAX_LOGPOINT_MESSAGE_LENGTH {
+                    return Err(crate::Error::ValidationError(
+                        format!("Logpoint message length ({} bytes) exceeds maximum of {} bytes",
+                            target.message.len(), MAX_LOGPOINT_MESSAGE_LENGTH)
+                    ));
+                }
+
+                if let Some(ref condition) = target.condition {
+                    if condition.len() > MAX_CONDITION_LENGTH {
+                        return Err(crate::Error::ValidationError(
+                            format!("Condition length ({} bytes) exceeds maximum of {} bytes",
+                                condition.len(), MAX_CONDITION_LENGTH)
+                        ));
+                    }
                 }
 
                 if let Some(line) = target.line {

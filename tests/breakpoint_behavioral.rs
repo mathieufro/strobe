@@ -109,32 +109,75 @@ async fn test_breakpoint_behavioral_suite() {
         println!("  PASSED");
     }
 
-    // === Test 2: Conditional breakpoint ===
-    println!("\n=== Test 2: Conditional breakpoint ===");
+    // === Test 2: Conditional breakpoint — false never pauses, true pauses ===
+    println!("\n=== Test 2: Conditional breakpoint (selective) ===");
     {
-        let session_id = "bp-cond";
+        // Part A: condition="false" should NOT pause — validates evaluator actually filters
+        let session_id = "bp-cond-false";
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
-                &["breakpoint-loop".to_string(), "10".to_string()],
+                &["breakpoint-loop".to_string(), "5".to_string()],
                 None, project_root, None, true,
             )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
-            session_id, Some("bp-cond".to_string()),
+            session_id, Some("bp-false".to_string()),
             Some("audio::process_buffer".to_string()),
-            None, None, Some("true".to_string()), None,
+            None, None, Some("false".to_string()), None,
         ).await;
         assert!(bp.is_ok(), "Failed to set conditional breakpoint: {:?}", bp.err());
 
         sm.resume_process(pid).await.unwrap();
 
-        let paused = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
-        assert!(!paused.is_empty(), "Conditional breakpoint with 'true' should pause");
-        println!("  Condition='true' correctly paused");
+        // Wait briefly — should NOT pause because condition is always false
+        let paused = wait_for_pause(&sm, session_id, 1, Duration::from_secs(3)).await;
+        assert!(paused.is_empty(), "Condition='false' should NOT cause a pause, but {} threads paused", paused.len());
 
+        // Process should complete normally (condition never fires)
+        let stdout_events = poll_events_typed(
+            &sm, session_id, Duration::from_secs(10),
+            strobe::db::EventType::Stdout,
+            |events| {
+                let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
+                text.contains("[BP-LOOP] Done")
+            },
+        ).await;
+        let stdout: String = stdout_events.iter().filter_map(|e| e.text.as_deref()).collect();
+        assert!(stdout.contains("[BP-LOOP] Done"), "Process should complete with condition='false'");
+        println!("  Part A: condition='false' correctly did NOT pause");
+
+        let _ = sm.stop_frida(session_id).await;
+        sm.stop_session(session_id).unwrap();
+
+        // Part B: condition="true" SHOULD pause (control test)
+        let session_id = "bp-cond-true";
+        let pid = sm
+            .spawn_with_frida(
+                session_id, binary.to_str().unwrap(),
+                &["breakpoint-loop".to_string(), "5".to_string()],
+                None, project_root, None, true,
+            )
+            .await.unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+
+        let bp = sm.set_breakpoint_async(
+            session_id, Some("bp-true".to_string()),
+            Some("audio::process_buffer".to_string()),
+            None, None, Some("true".to_string()), None,
+        ).await;
+        assert!(bp.is_ok());
+
+        sm.resume_process(pid).await.unwrap();
+
+        let paused = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
+        assert!(!paused.is_empty(), "Condition='true' should pause");
+        println!("  Part B: condition='true' correctly paused");
+
+        sm.remove_breakpoint(session_id, "bp-true").await;
+        let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).unwrap();
         println!("  PASSED");
@@ -178,8 +221,13 @@ async fn test_breakpoint_behavioral_suite() {
         println!("  PASSED");
     }
 
-    // === Test 4: Multi-thread breakpoint ===
-    println!("\n=== Test 4: Multi-thread breakpoint ===");
+    // === Test 4: Multi-thread breakpoint (recv().wait() per-thread proof) ===
+    // This test proves recv().wait() blocks individual threads independently:
+    // "threads" mode spawns 2 audio workers + 1 midi worker, each calling
+    // process_buffer in a loop. We set a breakpoint and verify that 2+ threads
+    // pause simultaneously with different thread IDs. Then we resume all and
+    // verify execution continues (threads unblock independently).
+    println!("\n=== Test 4: Multi-thread breakpoint (recv().wait() e2e) ===");
     {
         let session_id = "bp-mt";
         let pid = sm
@@ -198,17 +246,31 @@ async fn test_breakpoint_behavioral_suite() {
         ).await;
         assert!(bp.is_ok(), "Failed to set breakpoint: {:?}", bp.err());
 
+        // Wait for 2+ threads to pause — proves recv().wait() blocks per-thread
         let paused = wait_for_pause(&sm, session_id, 2, Duration::from_secs(8)).await;
-        if paused.len() >= 2 {
-            let tids: Vec<u64> = paused.iter().map(|(t, _)| *t).collect();
-            assert_ne!(tids[0], tids[1], "Different thread IDs");
-            println!("  2+ threads paused independently: {:?}", tids);
-        } else if paused.len() == 1 {
-            println!("  1 thread paused (timing-dependent, basic validation OK)");
-        } else {
-            panic!("No threads paused at breakpoint");
+        assert!(
+            paused.len() >= 2,
+            "At least 2 threads should pause independently (proves recv().wait() per-thread), got {}",
+            paused.len()
+        );
+        let tids: Vec<u64> = paused.iter().map(|(t, _)| *t).collect();
+        assert_ne!(tids[0], tids[1], "Paused threads must have different IDs");
+        // All paused on the same breakpoint
+        for (_, info) in &paused {
+            assert_eq!(info.breakpoint_id, "bp-mt", "All threads paused on same breakpoint");
         }
+        println!("  {} threads paused independently: {:?}", paused.len(), tids);
 
+        // Resume all — proves threads unblock independently via per-thread resume messages
+        let resume = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
+        assert!(resume.is_ok(), "Resume failed: {:?}", resume.err());
+
+        // Wait for them to pause again (breakpoint still active, next iteration)
+        let paused2 = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
+        assert!(!paused2.is_empty(), "Should pause again after resume (proves threads unblocked)");
+        println!("  Resumed and paused again — recv().wait() per-thread verified");
+
+        sm.remove_breakpoint(session_id, "bp-mt").await;
         let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).unwrap();

@@ -304,8 +304,8 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
                 if p.phase == super::TestPhase::Compiling {
                     p.phase = super::TestPhase::Running;
                 }
-                p.current_test = Some(after[..end].to_string());
-                p.current_test_started_at = Some(std::time::Instant::now());
+                let test_name = after[..end].to_string();
+                p.running_tests.insert(test_name, std::time::Instant::now());
             }
         }
     }
@@ -316,13 +316,14 @@ pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<su
         } else if trimmed.contains("success=\"false\"") {
             p.failed += 1;
         }
-        // Keep current_test visible (shows last-run test); clear elapsed timer
-        p.current_test_started_at = None;
+        // Catch2 runs tests sequentially — remove the just-completed test.
+        // We don't know the name here, so clear all running (only one at a time).
+        p.running_tests.clear();
     }
     if trimmed.contains("</Catch2TestRun>") {
         let mut p = progress.lock().unwrap();
         p.phase = super::TestPhase::SuitesFinished;
-        p.current_test = None;
+        p.running_tests.clear();
     }
 }
 

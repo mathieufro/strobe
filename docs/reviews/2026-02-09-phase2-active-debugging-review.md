@@ -10,13 +10,34 @@
 
 | Category | Critical | Important | Minor |
 |----------|----------|-----------|-------|
-| Correctness | 2 | 2 | 1 |
-| Security | 0 | 2 | 1 |
-| Integration | 0 | 1 | 1 |
-| Tests | 0 | 3 | 0 |
-| **Total** | **2** | **8** | **3** |
+| Correctness | ~~2~~ 0 | ~~2~~ 0 | ~~1~~ 0 |
+| Security | 0 | ~~2~~ 0 | ~~1~~ 0 |
+| Integration | 0 | ~~1~~ 0 | ~~1~~ 0 |
+| Tests | 0 | ~~3~~ 0 | 0 |
+| **Total** | **0** | **0** | **0** |
 
-**Ready to merge:** No (2 critical issues must be fixed first)
+**Ready to merge:** Yes (all issues fixed)
+
+## All Review Issues Fixed (2026-02-09)
+
+All 11 code issues and 3 test issues from this review have been addressed:
+
+- **Issue 1** (Critical): `callee_entry_addresses()` now returns empty — step-into = step-over until proper callee resolution (DW_TAG_call_site / instruction analysis) is implemented
+- **Issue 2** (Critical): Daemon now resumes paused threads before sending removeBreakpoint to agent; agent's broken `send()` calls removed
+- **Issue 3** (Important): Added `functions_by_addr` sorted index for O(log N) binary search in `function_containing()`; `next_line_in_function()` uses it
+- **Issue 4** (Important): `resolve_address()` now checks `function_containing()` — returns None for inter-function dead space
+- **Issue 5** (Important): Step-out returns `ValidationError` when no return address instead of silently continuing
+- **Issue 6** (Important): Added `MAX_CONDITION_LENGTH=1024` and `MAX_LOGPOINT_MESSAGE_LENGTH=2048` validation
+- **Issue 7** (Important): `add_breakpoint()` / `add_logpoint()` now enforce per-session count limits, return `Result`
+- **Issue 8** (Minor): Added `spawner.set_logpoint()` / `spawner.send_hook_message()` — logpoint setup no longer calls `set_breakpoint()`
+- **Issue 9** (Minor): One-shot timeout timer is now tracked and cancelled via `clearTimeout` when cleanup fires
+- **Issue 10** (Minor): `resolve_line()` / `find_nearest_lines()` now handle both `/` and `\` path separators in DWARF data
+- **Issue 11** (Important): Pause notification `try_send` failure now logs warning with session/thread context
+- **Test T2**: Stepping tests now assert step-over produces distinct `step-*` breakpoint IDs and verify DB pause events differ
+- **Test T3**: Conditional breakpoint test now verifies `condition="false"` does NOT pause (control test with `"true"` still pauses)
+- **Test T4**: Multi-thread test strengthened: asserts 2+ threads pause independently, resume/re-pause cycle proves `recv().wait()` per-thread
+
+---
 
 ## Previously-Identified Issues Now Fixed
 

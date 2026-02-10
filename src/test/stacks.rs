@@ -10,6 +10,64 @@ pub fn is_process_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Collect all descendant PIDs of a process via recursive `pgrep -P`.
+fn collect_descendants(pid: u32, result: &mut Vec<i32>) {
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output();
+    if let Ok(o) = output {
+        if o.status.success() {
+            for line in String::from_utf8_lossy(&o.stdout).split_whitespace() {
+                if let Ok(child_pid) = line.parse::<i32>() {
+                    // Recurse into grandchildren first (depth-first)
+                    collect_descendants(child_pid as u32, result);
+                    result.push(child_pid);
+                }
+            }
+        }
+    }
+}
+
+/// Kill a process and its entire descendant tree.
+/// Finds all children recursively via `pgrep -P`, kills bottom-up (leaves first),
+/// then kills the root. Also reaps zombies.
+pub fn kill_process_tree(pid: u32) {
+    let mut descendants = Vec::new();
+    collect_descendants(pid, &mut descendants);
+
+    if !descendants.is_empty() {
+        tracing::info!(
+            "Killing process tree: root PID {} + {} descendants {:?}",
+            pid, descendants.len(), descendants
+        );
+    }
+
+    // Kill descendants bottom-up (deepest children first)
+    for &child_pid in &descendants {
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+        }
+    }
+
+    // Kill the root process
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+
+    // Brief wait for signals to be delivered
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Reap zombies (only works if we're the parent)
+    for &child_pid in &descendants {
+        unsafe {
+            libc::waitpid(child_pid, std::ptr::null_mut(), libc::WNOHANG);
+        }
+    }
+    unsafe {
+        libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+    }
+}
+
 /// Capture thread stacks using OS-level tools. Works for native code (Rust, C, C++).
 pub fn capture_native_stacks(pid: u32) -> Vec<ThreadStack> {
     #[cfg(target_os = "macos")]

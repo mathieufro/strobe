@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Auto-build and return the C++ CLI target binary path.
-/// Builds on first call, caches via OnceLock.
+/// Builds on first call, caches via OnceLock. Skips rebuild if sources unchanged.
 pub fn cpp_target() -> PathBuf {
     static CACHED: OnceLock<PathBuf> = OnceLock::new();
     CACHED
@@ -14,9 +14,17 @@ pub fn cpp_target() -> PathBuf {
             let fixture_dir =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
             let binary = fixture_dir.join("build/strobe_test_target");
+            let cmake = fixture_dir.join("CMakeLists.txt");
 
-            if !binary.exists() || needs_rebuild(&fixture_dir.join("src"), &binary) {
+            if !binary.exists()
+                || needs_rebuild(
+                    &[&fixture_dir.join("src"), &cmake],
+                    &binary,
+                )
+            {
                 build_cpp_fixtures(&fixture_dir);
+            } else {
+                eprintln!("C++ fixtures up-to-date, skipping build");
             }
 
             assert!(
@@ -37,9 +45,17 @@ pub fn cpp_test_suite() -> PathBuf {
             let fixture_dir =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
             let binary = fixture_dir.join("build/strobe_test_suite");
+            let cmake = fixture_dir.join("CMakeLists.txt");
 
-            if !binary.exists() || needs_rebuild(&fixture_dir.join("src"), &binary) {
+            if !binary.exists()
+                || needs_rebuild(
+                    &[&fixture_dir.join("src"), &fixture_dir.join("tests"), &cmake],
+                    &binary,
+                )
+            {
                 build_cpp_fixtures(&fixture_dir);
+            } else {
+                eprintln!("C++ test suite up-to-date, skipping build");
             }
 
             assert!(
@@ -60,9 +76,17 @@ pub fn rust_target() -> PathBuf {
             let fixture_dir =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust");
             let binary = fixture_dir.join("target/debug/strobe_test_fixture");
+            let cargo_toml = fixture_dir.join("Cargo.toml");
 
-            if !binary.exists() || needs_rebuild(&fixture_dir.join("src"), &binary) {
+            if !binary.exists()
+                || needs_rebuild(
+                    &[&fixture_dir.join("src"), &cargo_toml],
+                    &binary,
+                )
+            {
                 build_rust_fixture(&fixture_dir);
+            } else {
+                eprintln!("Rust fixture up-to-date, skipping build");
             }
 
             assert!(
@@ -135,36 +159,38 @@ pub fn collect_stdout(events: &[strobe::db::Event]) -> String {
         .collect()
 }
 
-/// Check if sources are newer than binary (for rebuild detection).
-fn needs_rebuild(src_dir: &Path, binary: &Path) -> bool {
+/// Check if any source files are newer than binary (for rebuild detection).
+/// Checks multiple directories/files to catch all relevant changes.
+fn needs_rebuild(source_paths: &[&Path], binary: &Path) -> bool {
     let binary_mtime = match std::fs::metadata(binary) {
         Ok(m) => m.modified().unwrap(),
         Err(_) => return true,
     };
 
-    fn newest_in_dir(dir: &Path) -> Option<std::time::SystemTime> {
+    fn newest_in_path(path: &Path) -> Option<std::time::SystemTime> {
+        if path.is_file() {
+            return path.metadata().ok().and_then(|m| m.modified().ok());
+        }
         let mut newest = None;
-        if let Ok(entries) = std::fs::read_dir(dir) {
+        if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(t) = newest_in_dir(&path) {
-                        newest = Some(newest.map_or(t, |n: std::time::SystemTime| n.max(t)));
-                    }
-                } else if let Ok(m) = path.metadata() {
-                    if let Ok(t) = m.modified() {
-                        newest = Some(newest.map_or(t, |n: std::time::SystemTime| n.max(t)));
-                    }
+                let p = entry.path();
+                if let Some(t) = newest_in_path(&p) {
+                    newest = Some(newest.map_or(t, |n: std::time::SystemTime| n.max(t)));
                 }
             }
         }
         newest
     }
 
-    match newest_in_dir(src_dir) {
-        Some(src_time) => src_time > binary_mtime,
-        None => true,
+    for path in source_paths {
+        if let Some(src_time) = newest_in_path(path) {
+            if src_time > binary_mtime {
+                return true;
+            }
+        }
     }
+    false
 }
 
 /// Build C++ fixtures via cmake + dsymutil on macOS.
@@ -185,16 +211,22 @@ fn build_cpp_fixtures(fixture_dir: &Path) {
         .unwrap();
     assert!(status.success(), "cmake build failed");
 
-    // macOS: generate .dSYM bundles so DWARF parsing works
+    // macOS: generate .dSYM bundles so DWARF parsing works.
+    // Skip dsymutil if the .dSYM is already newer than the binary.
     if cfg!(target_os = "macos") {
         for bin in ["strobe_test_target", "strobe_test_suite"] {
             let binary = fixture_dir.join("build").join(bin);
-            let status = Command::new("dsymutil").arg(&binary).status();
-            assert!(
-                status.map(|s| s.success()).unwrap_or(false),
-                "dsymutil failed for {}",
-                bin
-            );
+            if needs_dsymutil(&binary) {
+                eprintln!("  Running dsymutil for {}...", bin);
+                let status = Command::new("dsymutil").arg(&binary).status();
+                assert!(
+                    status.map(|s| s.success()).unwrap_or(false),
+                    "dsymutil failed for {}",
+                    bin
+                );
+            } else {
+                eprintln!("  dSYM for {} up-to-date, skipping dsymutil", bin);
+            }
         }
     }
 }
@@ -212,6 +244,32 @@ fn build_rust_fixture(fixture_dir: &Path) {
 
     if cfg!(target_os = "macos") {
         let binary = fixture_dir.join("target/debug/strobe_test_fixture");
-        let _ = Command::new("dsymutil").arg(&binary).status();
+        if needs_dsymutil(&binary) {
+            eprintln!("  Running dsymutil for Rust fixture...");
+            let _ = Command::new("dsymutil").arg(&binary).status();
+        } else {
+            eprintln!("  dSYM for Rust fixture up-to-date, skipping dsymutil");
+        }
     }
+}
+
+/// Check if dsymutil needs to run (binary is newer than .dSYM).
+fn needs_dsymutil(binary: &Path) -> bool {
+    let dsym = binary.with_extension("dSYM");
+    if !dsym.exists() {
+        return true;
+    }
+    // Compare binary mtime against the DWARF file inside the dSYM bundle
+    let dwarf_file = dsym
+        .join("Contents/Resources/DWARF")
+        .join(binary.file_name().unwrap());
+    let bin_mtime = binary
+        .metadata()
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let dsym_mtime = dwarf_file
+        .metadata()
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    bin_mtime > dsym_mtime
 }

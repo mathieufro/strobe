@@ -71,6 +71,90 @@ fn is_process_alive(pid: u32) -> bool {
     matches!(err.raw_os_error(), Some(libc::EPERM))
 }
 
+/// Kill orphaned processes from previous Strobe runs.
+/// Only kills processes whose PPID == 1 (re-parented to launchd/init),
+/// which proves their parent died — they're definitively orphaned.
+/// Processes with a live parent are left alone (could be another agent).
+///
+/// Checks multiple sources of orphans:
+/// 1. Exact binary name match (the command we're about to spawn)
+/// 2. Processes whose command line contains the project's target/debug path
+///    (catches test binaries spawned by `cargo test` that we don't know by name)
+/// 3. Known test fixtures (strobe_test_target)
+fn reap_orphaned_processes(command: &str, project_root: &str) {
+    let binary_name = std::path::Path::new(command)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let mut killed = std::collections::HashSet::new();
+
+    // Strategy 1: Exact binary name match
+    if !binary_name.is_empty() {
+        kill_orphans_by_name(binary_name, &mut killed);
+    }
+
+    // Strategy 2: Known test fixtures
+    if binary_name != "strobe_test_target" {
+        kill_orphans_by_name("strobe_test_target", &mut killed);
+    }
+
+    // Strategy 3: Orphans whose command line contains target/debug/deps
+    // (test binaries spawned by cargo test — their full path includes the project root)
+    if !project_root.is_empty() {
+        let target_deps = format!("{}/target/debug/deps", project_root);
+        kill_orphans_by_cmdline(&target_deps, &mut killed);
+    }
+}
+
+/// Find and kill orphaned processes (PPID=1) matching an exact binary name.
+fn kill_orphans_by_name(name: &str, killed: &mut std::collections::HashSet<i32>) {
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", "1", "-x", name])
+        .output();
+
+    let pids: Vec<i32> = match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .filter_map(|s| s.parse::<i32>().ok())
+                .collect()
+        }
+        _ => return,
+    };
+
+    for pid in pids {
+        if killed.insert(pid) {
+            tracing::warn!("Reaping orphaned process {} (name: {})", pid, name);
+            crate::test::stacks::kill_process_tree(pid as u32);
+        }
+    }
+}
+
+/// Find and kill orphaned processes (PPID=1) whose command line matches a substring.
+fn kill_orphans_by_cmdline(pattern: &str, killed: &mut std::collections::HashSet<i32>) {
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", "1", "-f", pattern])
+        .output();
+
+    let pids: Vec<i32> = match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .filter_map(|s| s.parse::<i32>().ok())
+                .collect()
+        }
+        _ => return,
+    };
+
+    for pid in pids {
+        if killed.insert(pid) {
+            tracing::warn!("Reaping orphaned process {} (cmdline match: {})", pid, pattern);
+            crate::test::stacks::kill_process_tree(pid as u32);
+        }
+    }
+}
+
 pub struct SessionManager {
     db: Database,
     /// Active trace patterns per session
@@ -357,6 +441,10 @@ impl SessionManager {
         env: Option<&std::collections::HashMap<String, String>>,
         defer_resume: bool,
     ) -> Result<u32> {
+        // Kill orphaned instances from previous runs (PPID == 1 means parent died).
+        // Checks: exact binary name, known test fixtures, and target/debug/deps binaries.
+        reap_orphaned_processes(command, project_root);
+
         // Extract image base cheaply (<10ms) — only reads __TEXT segment address
         let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
 
@@ -1095,7 +1183,7 @@ impl SessionManager {
             hits: 0,
         };
 
-        self.add_breakpoint(session_id, bp);
+        self.add_breakpoint(session_id, bp)?;
 
         Ok(crate::mcp::BreakpointInfo {
             id: breakpoint_id,
@@ -1165,6 +1253,10 @@ impl SessionManager {
                     addresses
                 }
                 "step-into" => {
+                    // NOTE: Step-into currently behaves like step-over because
+                    // callee resolution (DW_TAG_call_site / instruction analysis)
+                    // is not yet implemented. We set one-shot hooks on the next
+                    // line and return address — same as step-over.
                     let mut addresses: Vec<(u64, bool)> = Vec::new();
 
                     // Next line in same function (DWARF-static → needs slide)
@@ -1177,40 +1269,26 @@ impl SessionManager {
                     if let Some(ret_addr) = pause_info.return_address {
                         if !addresses.iter().any(|(a, _)| *a == ret_addr) {
                             addresses.push((ret_addr, true));
-                            tracing::debug!("step-into: return address fallback at 0x{:x}", ret_addr);
-                        }
-                    }
-
-                    // Callee entry points (DWARF-static → needs slide)
-                    let callee_addresses = dwarf.callee_entry_addresses(current_address);
-                    let callee_count = callee_addresses.len();
-
-                    for callee_addr in callee_addresses.into_iter().take(20) {
-                        if !addresses.iter().any(|(a, _)| *a == callee_addr) {
-                            addresses.push((callee_addr, false));
+                            tracing::debug!("step-into: return address at 0x{:x}", ret_addr);
                         }
                     }
 
                     tracing::debug!(
-                        "step-into: {} one-shot addresses ({} callees, capped at 20 from {})",
-                        addresses.len(),
-                        addresses.len().saturating_sub(2),
-                        callee_count
+                        "step-into: {} one-shot addresses (callee resolution not yet implemented)",
+                        addresses.len()
                     );
                     addresses
                 }
                 "step-out" => {
-                    let mut addresses: Vec<(u64, bool)> = Vec::new();
-
                     // Return address is already runtime → no slide
                     if let Some(ret_addr) = pause_info.return_address {
-                        addresses.push((ret_addr, true));
                         tracing::debug!("step-out: hooking return address 0x{:x}", ret_addr);
+                        vec![(ret_addr, true)]
                     } else {
-                        tracing::warn!("step-out: no return address available, resuming normally");
+                        return Err(crate::Error::ValidationError(
+                            "Cannot step-out: no return address captured (may be in top-level or optimized function)".to_string()
+                        ));
                     }
-
-                    addresses
                 }
                 _ => {
                     return Err(crate::Error::ValidationError(
@@ -1312,7 +1390,7 @@ impl SessionManager {
             "imageBase": format!("0x{:x}", dwarf.image_base),
         });
 
-        spawner.set_breakpoint(session_id, msg).await?;
+        spawner.set_logpoint(session_id, msg).await?;
 
         // Store logpoint in session state
         let lp = Logpoint {
@@ -1330,7 +1408,7 @@ impl SessionManager {
             condition,
         };
 
-        self.add_logpoint(session_id, lp);
+        self.add_logpoint(session_id, lp)?;
 
         Ok(crate::mcp::LogpointInfo {
             id: logpoint_id,
@@ -1344,27 +1422,50 @@ impl SessionManager {
 
     // ========== Phase 2: Breakpoint management (sync helpers) ==========
 
-    pub fn add_breakpoint(&self, session_id: &str, breakpoint: Breakpoint) {
+    pub fn add_breakpoint(&self, session_id: &str, breakpoint: Breakpoint) -> Result<()> {
         let mut guard = write_lock(&self.breakpoints);
-        guard.entry(session_id.to_string())
-            .or_insert_with(HashMap::new)
-            .insert(breakpoint.id.clone(), breakpoint);
+        let session_bps = guard.entry(session_id.to_string())
+            .or_insert_with(HashMap::new);
+        if session_bps.len() >= crate::mcp::MAX_BREAKPOINTS_PER_SESSION {
+            return Err(crate::Error::ValidationError(
+                format!("Session has {} breakpoints (max {})",
+                    session_bps.len(), crate::mcp::MAX_BREAKPOINTS_PER_SESSION)
+            ));
+        }
+        session_bps.insert(breakpoint.id.clone(), breakpoint);
+        Ok(())
     }
 
     pub async fn remove_breakpoint(&self, session_id: &str, breakpoint_id: &str) {
-        // Send removal to agent via spawner pipeline (best-effort)
-        let send_result = async {
-            let mut spawner_guard = self.frida_spawner.write().await;
-            if let Some(spawner) = spawner_guard.as_mut() {
-                spawner.remove_breakpoint(session_id, breakpoint_id).await
-            } else {
-                Ok(())
+        // Resume any threads paused on this breakpoint before removing it.
+        // The agent's removeBreakpoint detaches the listener, but the paused thread
+        // is blocked on recv().wait() which requires an inbound message from the daemon.
+        let paused = self.get_all_paused_threads(session_id);
+        let mut spawner_guard = self.frida_spawner.write().await;
+
+        for (thread_id, info) in &paused {
+            if info.breakpoint_id == breakpoint_id {
+                if let Some(spawner) = spawner_guard.as_mut() {
+                    if let Err(e) = spawner.resume_thread(session_id, *thread_id).await {
+                        tracing::warn!("Failed to resume thread {} paused on breakpoint {}: {}", thread_id, breakpoint_id, e);
+                    }
+                }
+                self.remove_paused_thread(session_id, *thread_id);
             }
-        }.await;
+        }
+
+        // Send removal to agent via spawner pipeline (best-effort)
+        let send_result = if let Some(spawner) = spawner_guard.as_mut() {
+            spawner.remove_breakpoint(session_id, breakpoint_id).await
+        } else {
+            Ok(())
+        };
 
         if let Err(e) = send_result {
             tracing::warn!("Failed to send breakpoint removal to agent: {} (cleaning up state anyway)", e);
         }
+
+        drop(spawner_guard);
 
         let mut guard = write_lock(&self.breakpoints);
         if let Some(session_bps) = guard.get_mut(session_id) {
@@ -1387,11 +1488,18 @@ impl SessionManager {
     }
 
     // Logpoint management
-    pub fn add_logpoint(&self, session_id: &str, logpoint: Logpoint) {
+    pub fn add_logpoint(&self, session_id: &str, logpoint: Logpoint) -> Result<()> {
         let mut guard = write_lock(&self.logpoints);
-        guard.entry(session_id.to_string())
-            .or_insert_with(HashMap::new)
-            .insert(logpoint.id.clone(), logpoint);
+        let session_lps = guard.entry(session_id.to_string())
+            .or_insert_with(HashMap::new);
+        if session_lps.len() >= crate::mcp::MAX_LOGPOINTS_PER_SESSION {
+            return Err(crate::Error::ValidationError(
+                format!("Session has {} logpoints (max {})",
+                    session_lps.len(), crate::mcp::MAX_LOGPOINTS_PER_SESSION)
+            ));
+        }
+        session_lps.insert(logpoint.id.clone(), logpoint);
+        Ok(())
     }
 
     pub async fn remove_logpoint(&self, session_id: &str, logpoint_id: &str) {
@@ -1527,7 +1635,7 @@ mod tests {
         };
 
         // Add breakpoint
-        sm.add_breakpoint(session_id, bp.clone());
+        sm.add_breakpoint(session_id, bp.clone()).unwrap();
 
         // Retrieve breakpoint
         let breakpoints = sm.get_breakpoints(session_id);
@@ -1597,7 +1705,7 @@ mod tests {
         };
 
         // Add logpoint
-        sm.add_logpoint(session_id, lp);
+        sm.add_logpoint(session_id, lp).unwrap();
 
         // Retrieve
         let logpoints = sm.get_logpoints(session_id);

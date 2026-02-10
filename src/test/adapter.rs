@@ -161,13 +161,9 @@ pub trait TestAdapter: Send + Sync {
         super::stacks::capture_native_stacks(pid)
     }
 
-    /// Default hard timeout for a given test level.
-    fn default_timeout(&self, level: Option<TestLevel>) -> u64 {
-        match level {
-            Some(TestLevel::Unit) => 30_000,
-            None => 120_000, // Running all tests across multiple binaries
-            Some(TestLevel::Integration) => 120_000,
-            Some(TestLevel::E2e) => 300_000,
-        }
+    /// Safety-net timeout — per-test tracking via stuck detector is the primary mechanism.
+    /// This only fires if something goes catastrophically wrong.
+    fn default_timeout(&self, _level: Option<TestLevel>) -> u64 {
+        600_000 // 10 minutes
     }
 }

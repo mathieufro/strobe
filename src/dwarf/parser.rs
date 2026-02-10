@@ -88,6 +88,8 @@ pub(crate) struct StructMember {
 pub struct DwarfParser {
     pub functions: Vec<FunctionInfo>,
     pub(crate) functions_by_name: HashMap<String, Vec<usize>>,
+    /// Sorted by low_pc for binary search in address-to-function lookups.
+    pub(crate) functions_by_addr: Vec<(u64, u64)>, // (low_pc, high_pc)
     pub variables: Vec<VariableInfo>,
     pub(crate) variables_by_name: HashMap<String, Vec<usize>>,
     /// Cache of lazily-resolved struct member layouts for pointer variables.
@@ -295,9 +297,18 @@ impl DwarfParser {
             }
         }
 
+        // Build sorted address index for O(log N) address-to-function lookups
+        let mut functions_by_addr: Vec<(u64, u64)> = functions
+            .iter()
+            .filter(|f| f.low_pc > 0 && f.high_pc > f.low_pc)
+            .map(|f| (f.low_pc, f.high_pc))
+            .collect();
+        functions_by_addr.sort_unstable_by_key(|&(low, _)| low);
+
         Ok(Self {
             functions,
             functions_by_name,
+            functions_by_addr,
             variables,
             variables_by_name,
             struct_members: Mutex::new(HashMap::new()),
@@ -1127,11 +1138,14 @@ impl DwarfParser {
 
         // Find entries matching file.
         // Use path-component-aware matching: require separator before the match
-        // to avoid "main.c" matching "not_main.c".
+        // to avoid "main.c" matching "not_main.c". Also handle OS separator
+        // differences in DWARF paths.
+        let sep_file = format!("/{}", file);
+        let sep_file_win = format!("\\{}", file);
         let mut matches: Vec<_> = entries
             .iter()
             .filter(|e| {
-                e.is_statement && (e.file == file || e.file.ends_with(&format!("/{}", file)))
+                e.is_statement && (e.file == file || e.file.ends_with(&sep_file) || e.file.ends_with(&sep_file_win))
             })
             .collect();
 
@@ -1157,9 +1171,11 @@ impl DwarfParser {
         };
 
         // Get all unique statement lines for this file
+        let sep_file = format!("/{}", file);
+        let sep_file_win = format!("\\{}", file);
         let mut lines: Vec<u32> = entries
             .iter()
-            .filter(|e| e.is_statement && (e.file == file || e.file.ends_with(&format!("/{}", file))))
+            .filter(|e| e.is_statement && (e.file == file || e.file.ends_with(&sep_file) || e.file.ends_with(&sep_file_win)))
             .map(|e| e.line)
             .collect();
 
@@ -1186,9 +1202,26 @@ impl DwarfParser {
         result.join(", ")
     }
 
+    /// O(log N) lookup: find the function containing `address` via binary search
+    /// on the sorted functions_by_addr index. Returns (low_pc, high_pc) or None.
+    fn function_containing(&self, address: u64) -> Option<(u64, u64)> {
+        let idx = match self.functions_by_addr.binary_search_by_key(&address, |&(low, _)| low) {
+            Ok(idx) => idx,           // Exact match on low_pc
+            Err(0) => return None,    // Before all functions
+            Err(idx) => idx - 1,      // Check preceding function
+        };
+        let (low, high) = self.functions_by_addr[idx];
+        if address >= low && address < high {
+            Some((low, high))
+        } else {
+            None
+        }
+    }
+
     /// Reverse lookup: address → (file, line, column).
     /// For addresses between line entries, returns the closest preceding entry
-    /// (the line that "contains" that address).
+    /// (the line that "contains" that address). Only returns a result if the
+    /// address falls within a known function boundary.
     pub fn resolve_address(&self, address: u64) -> Option<(String, u32, u32)> {
         self.ensure_line_table();
         let table = self.line_table.lock().unwrap();
@@ -1199,6 +1232,13 @@ impl DwarfParser {
             Err(0) => return None,    // Before all entries
             Err(idx) => idx - 1,      // Closest preceding entry
         };
+
+        // Verify the address is within a known function to avoid returning
+        // misleading locations for addresses in inter-function dead space.
+        if self.function_containing(address).is_none() {
+            return None;
+        }
+
         let entry = &entries[idx];
         Some((entry.file.clone(), entry.line, entry.column))
     }
@@ -1218,10 +1258,8 @@ impl DwarfParser {
         };
         let current = &entries[idx];
 
-        // Find the function containing this address to enforce boundary
-        let func_high_pc = self.functions.iter()
-            .find(|f| address >= f.low_pc && address < f.high_pc)
-            .map(|f| f.high_pc);
+        // Find the function containing this address to enforce boundary (O(log N))
+        let func_high_pc = self.function_containing(address).map(|(_, high)| high);
 
         // Find next is_statement line with different line number, same file,
         // staying within the function boundary
@@ -1232,27 +1270,13 @@ impl DwarfParser {
             .map(|e| (e.address, e.file.clone(), e.line))
     }
 
-    /// Get entry addresses of all functions callable from the current line.
-    /// Uses a heuristic: returns entry addresses of all known functions that
-    /// are NOT the function containing `address` itself. The caller should
-    /// intersect this with currently-traced functions if available.
-    pub fn callee_entry_addresses(&self, address: u64) -> Vec<u64> {
-        // Find the function containing `address`
-        let current_func = self.functions.iter().find(|f| address >= f.low_pc && address < f.high_pc);
-
-        self.functions
-            .iter()
-            .filter(|f| {
-                // Exclude the current function
-                if let Some(cf) = current_func {
-                    f.low_pc != cf.low_pc
-                } else {
-                    true
-                }
-            })
-            .filter(|f| f.low_pc > 0)
-            .map(|f| f.low_pc)
-            .collect()
+    /// Get entry addresses of functions callable from the current line.
+    /// Currently returns empty — proper callee resolution requires DWARF call site
+    /// info (DW_TAG_call_site) or instruction-level analysis, which is not yet
+    /// implemented. Step-into therefore behaves like step-over (next line + return
+    /// address as one-shot targets).
+    pub fn callee_entry_addresses(&self, _address: u64) -> Vec<u64> {
+        Vec::new()
     }
     /// Parse line table on first access (lazy initialization)
     fn ensure_line_table(&self) {

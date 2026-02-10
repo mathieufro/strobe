@@ -1591,6 +1591,31 @@ Validation Limits (enforced):
 
         let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
 
+        // Lifecycle guardrail: kill any still-running test sessions before starting a new one.
+        // This prevents resource leaks from stuck/abandoned tests and ensures a clean slate.
+        {
+            let runs = self.test_runs.read().await;
+            let stale_session_ids: Vec<String> = runs.values()
+                .filter(|run| matches!(&run.state, crate::test::TestRunState::Running { .. }))
+                .filter_map(|run| run.session_id.clone())
+                .collect();
+            drop(runs);
+
+            for sid in &stale_session_ids {
+                tracing::warn!("Killing stale test session {} before new test run", sid);
+                let _ = self.session_manager.stop_frida(sid).await;
+                let _ = self.session_manager.stop_session(sid);
+            }
+
+            // Remove killed runs from the map
+            if !stale_session_ids.is_empty() {
+                let mut runs = self.test_runs.write().await;
+                runs.retain(|_, run| {
+                    !matches!(&run.state, crate::test::TestRunState::Running { .. })
+                });
+            }
+        }
+
         // Detect framework name for the start response
         let runner = crate::test::TestRunner::new();
         let project_root_path = std::path::Path::new(&req.project_root);
@@ -1676,6 +1701,20 @@ Validation Limits (enforced):
                         &run_result.raw_stderr,
                     ).ok();
 
+                    // Detect compilation failure: 0 tests ran and stderr contains error
+                    let is_compile_failure = run_result.result.all_tests.is_empty()
+                        && (run_result.raw_stderr.contains("error[E")
+                            || run_result.raw_stderr.contains("could not compile")
+                            || run_result.raw_stderr.contains("uild failed"));
+
+                    let hint = if is_compile_failure {
+                        Some("COMPILATION FAILED — 0 tests ran. Check 'details' file for compiler errors in rawStderr.".to_string())
+                    } else if run_result.result.all_tests.is_empty() && run_result.result.failures.is_empty() {
+                        Some("No tests found. Check framework detection, test filter, or project path.".to_string())
+                    } else {
+                        None
+                    };
+
                     let response = crate::mcp::DebugTestResponse {
                         framework: run_result.framework,
                         summary: Some(run_result.result.summary),
@@ -1683,9 +1722,9 @@ Validation Limits (enforced):
                         stuck: run_result.result.stuck,
                         session_id: run_result.session_id,
                         details: details_path,
-                        no_tests: None,
+                        no_tests: if is_compile_failure { Some(true) } else { None },
                         project: None,
-                        hint: None,
+                        hint,
                     };
 
                     match serde_json::to_value(response) {
@@ -1769,18 +1808,29 @@ Validation Limits (enforced):
                     }
                 }).collect();
 
-                // Look up baseline for current test
-                let baseline_ms = if let Some(ref test_name) = p.current_test {
-                    self.session_manager.db()
-                        .get_test_baseline(test_name, &test_run.project_root)
-                        .unwrap_or(None)
-                } else {
-                    None
-                };
+                // Build running_tests snapshot with baselines
+                let running_tests_snapshot: Vec<crate::mcp::RunningTestSnapshot> = p.running_tests.iter()
+                    .map(|(name, started)| {
+                        let baseline = self.session_manager.db()
+                            .get_test_baseline(name, &test_run.project_root)
+                            .unwrap_or(None);
+                        crate::mcp::RunningTestSnapshot {
+                            name: name.clone(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            baseline_ms: baseline,
+                        }
+                    })
+                    .collect();
 
-                // How long the current test has been running
-                let current_test_elapsed_ms = p.current_test_started_at
+                // current_test = longest-running test (backward compat + stuck detector)
+                let current_test = p.current_test();
+                let current_test_elapsed_ms = p.current_test_started_at()
                     .map(|t| t.elapsed().as_millis() as u64);
+                let baseline_ms = current_test.as_ref().and_then(|name| {
+                    self.session_manager.db()
+                        .get_test_baseline(name, &test_run.project_root)
+                        .unwrap_or(None)
+                });
 
                 crate::mcp::DebugTestStatusResponse {
                     test_run_id: req.test_run_id,
@@ -1790,11 +1840,12 @@ Validation Limits (enforced):
                         passed: p.passed,
                         failed: p.failed,
                         skipped: p.skipped,
-                        current_test: p.current_test.clone(),
+                        current_test,
                         phase: Some(phase_str.to_string()),
                         warnings,
                         current_test_elapsed_ms,
                         current_test_baseline_ms: baseline_ms,
+                        running_tests: running_tests_snapshot,
                     }),
                     result: None,
                     error: None,
@@ -1803,12 +1854,14 @@ Validation Limits (enforced):
             }
             crate::test::TestRunState::Completed { response, .. } => {
                 test_run.fetched = true;
+                // Surface hint at the top level so the agent sees it immediately
+                let hint = response.get("hint").and_then(|h| h.as_str()).map(|s| s.to_string());
                 crate::mcp::DebugTestStatusResponse {
                     test_run_id: req.test_run_id,
                     status: "completed".to_string(),
                     progress: None,
                     result: Some(response.clone()),
-                    error: None,
+                    error: hint,
                     session_id: test_run.session_id.clone(),
                 }
             }

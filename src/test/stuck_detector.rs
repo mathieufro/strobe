@@ -69,12 +69,12 @@ impl StuckDetector {
     }
 
     fn current_test(&self) -> Option<String> {
-        self.progress.lock().unwrap().current_test.clone()
+        self.progress.lock().unwrap().current_test()
     }
 
     fn write_warning(&self, diagnosis: &str, idle_ms: u64) {
         let mut p = self.progress.lock().unwrap();
-        let test_name = p.current_test.clone();
+        let test_name = p.current_test();
         // Clear any previous warning for this test (replace, don't accumulate)
         p.warnings.retain(|w| w.test_name != test_name);
         p.warnings.push(super::StuckWarning {
