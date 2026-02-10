@@ -255,6 +255,45 @@ export interface ReadMemoryResponse {
   results: ReadResult[];
 }
 
+// ---- debug_memory (write) ----
+
+export interface MemoryWriteRequest {
+  sessionId: string;
+  action: 'write';
+  targets: Array<{
+    variable?: string;
+    address?: string;
+    type?: string;
+    value: number | boolean;
+  }>;
+}
+
+export interface WriteMemoryResponse {
+  results: Array<{
+    target: string;
+    success: boolean;
+    error?: string;
+  }>;
+}
+
+// ---- debug_session (list) ----
+
+export interface SessionSummary {
+  sessionId: string;
+  binaryPath: string;
+  pid: number;
+  startedAt: number;
+  endedAt?: number;
+  status: string;
+  retainedAt?: number;
+  sizeBytes?: number;
+}
+
+export interface ListSessionsResponse {
+  sessions: SessionSummary[];
+  totalSize: number;
+}
+
 // ---- debug_test ----
 
 export interface TestRunRequest {

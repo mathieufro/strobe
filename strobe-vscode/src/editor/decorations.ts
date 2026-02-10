@@ -13,9 +13,12 @@ interface FunctionStats {
   line?: number;
 }
 
+const HOT_THRESHOLD = 100;
+
 export class DecorationManager implements vscode.Disposable {
   private stats = new Map<string, FunctionStats>();
   private decorationType: vscode.TextEditorDecorationType;
+  private hotDecorationType: vscode.TextEditorDecorationType;
   private dirty = false;
   private debounceTimer: ReturnType<typeof setTimeout> | undefined;
   private disposables: vscode.Disposable[] = [];
@@ -27,6 +30,16 @@ export class DecorationManager implements vscode.Disposable {
         margin: '0 0 0 2em',
         fontStyle: 'italic',
       },
+    });
+
+    this.hotDecorationType = vscode.window.createTextEditorDecorationType({
+      after: {
+        color: new vscode.ThemeColor('editorWarning.foreground'),
+        margin: '0 0 0 2em',
+        fontStyle: 'italic',
+      },
+      backgroundColor: new vscode.ThemeColor('diffEditor.insertedTextBackground'),
+      isWholeLine: true,
     });
 
     this.disposables.push(
@@ -78,7 +91,8 @@ export class DecorationManager implements vscode.Disposable {
     if (!editor) return;
 
     const filePath = editor.document.uri.fsPath;
-    const decorations: vscode.DecorationOptions[] = [];
+    const normalDecorations: vscode.DecorationOptions[] = [];
+    const hotDecorations: vscode.DecorationOptions[] = [];
 
     for (const [_key, stat] of this.stats) {
       if (!stat.file || path.basename(filePath) !== path.basename(stat.file)) continue;
@@ -100,15 +114,22 @@ export class DecorationManager implements vscode.Disposable {
         parts.push(`last -> ${rv}`);
       }
 
-      decorations.push({
+      const decoration: vscode.DecorationOptions = {
         range: new vscode.Range(line, 0, line, 0),
         renderOptions: {
           after: { contentText: `  // ${parts.join(' | ')}` },
         },
-      });
+      };
+
+      if (stat.callCount >= HOT_THRESHOLD) {
+        hotDecorations.push(decoration);
+      } else {
+        normalDecorations.push(decoration);
+      }
     }
 
-    editor.setDecorations(this.decorationType, decorations);
+    editor.setDecorations(this.decorationType, normalDecorations);
+    editor.setDecorations(this.hotDecorationType, hotDecorations);
   }
 
   clear(): void {
@@ -120,12 +141,14 @@ export class DecorationManager implements vscode.Disposable {
     }
     for (const editor of vscode.window.visibleTextEditors) {
       editor.setDecorations(this.decorationType, []);
+      editor.setDecorations(this.hotDecorationType, []);
     }
   }
 
   dispose(): void {
     this.clear();
     this.decorationType.dispose();
+    this.hotDecorationType.dispose();
     for (const d of this.disposables) d.dispose();
   }
 }

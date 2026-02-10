@@ -2,12 +2,13 @@ import * as vscode from 'vscode';
 import { DaemonManager } from './utils/daemon-manager';
 import { StrobeOutputChannel } from './output/output-channel';
 import { StrobeStatusBar } from './utils/status-bar';
-import { SidebarProvider } from './sidebar/sidebar-provider';
+import { SidebarProvider, RetainedSessionsProvider } from './sidebar/sidebar-provider';
 import { PollingEngine } from './client/polling-engine';
 import {
   registerContextMenuCommands,
   setBreakpointAtCursor,
   addLogpointAtCursor,
+  addWatchAtCursor,
 } from './editor/context-menu';
 import { StrobeClient } from './client/strobe-client';
 import { SessionStatusResponse, StrobeEvent } from './client/types';
@@ -15,6 +16,9 @@ import { StrobeTestController } from './testing/test-controller';
 import { TestCodeLensProvider } from './testing/test-codelens';
 import { StrobeDebugAdapter } from './dap/debug-adapter';
 import { DecorationManager } from './editor/decorations';
+import { MemoryPanel } from './memory/memory-panel';
+import { WatchPanel } from './memory/watch-panel';
+import { syncSettingsToDaemon } from './utils/settings-sync';
 
 let daemonManager: DaemonManager;
 let outputChannel: StrobeOutputChannel;
@@ -23,6 +27,7 @@ let sidebarProvider: SidebarProvider;
 let pollingEngine: PollingEngine | null = null;
 let activeSessionId: string | undefined;
 let decorationManager: DecorationManager;
+let retainedProvider: RetainedSessionsProvider;
 
 export function activate(context: vscode.ExtensionContext): void {
   daemonManager = new DaemonManager(context.extensionPath);
@@ -30,15 +35,21 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar = new StrobeStatusBar();
   sidebarProvider = new SidebarProvider();
   decorationManager = new DecorationManager();
+  retainedProvider = new RetainedSessionsProvider();
 
   // Register sidebar
   const treeView = vscode.window.createTreeView('strobe.session', {
     treeDataProvider: sidebarProvider,
   });
 
+  const retainedTreeView = vscode.window.createTreeView('strobe.retainedSessions', {
+    treeDataProvider: retainedProvider,
+  });
+
   // Register commands
   context.subscriptions.push(
     treeView,
+    retainedTreeView,
     outputChannel,
     statusBar,
 
@@ -48,7 +59,75 @@ export function activate(context: vscode.ExtensionContext): void {
       'strobe.addTracePattern',
       cmdAddTracePattern,
     ),
+
+    // M4: Memory inspector + watch viewer
+    vscode.commands.registerCommand('strobe.openMemoryInspector', async () => {
+      if (!activeSessionId) {
+        vscode.window.showWarningMessage('Strobe: No active session. Launch a program first.');
+        return;
+      }
+      const client = daemonManager.getClient();
+      if (!client) return;
+      MemoryPanel.createOrShow(client, activeSessionId);
+    }),
+    vscode.commands.registerCommand('strobe.openWatchViewer', async () => {
+      if (!activeSessionId) {
+        vscode.window.showWarningMessage('Strobe: No active session.');
+        return;
+      }
+      const client = daemonManager.getClient();
+      if (!client) return;
+      WatchPanel.createOrShow(client, activeSessionId);
+    }),
+    vscode.commands.registerCommand('strobe.addWatch', async () => {
+      const client = await daemonManager.ensureClient();
+      await addWatchAtCursor(client, activeSessionId);
+    }),
+
+    // M4: Retained sessions
+    vscode.commands.registerCommand('strobe.refreshRetainedSessions', refreshRetainedSessions),
+    vscode.commands.registerCommand('strobe.openRetainedSession', async (node: { sessionId?: string }) => {
+      if (!node?.sessionId) return;
+      try {
+        const client = await daemonManager.ensureClient();
+        const events = await client.query({ sessionId: node.sessionId, limit: 200, verbose: true });
+        outputChannel.appendLine(`\n--- Retained Session: ${node.sessionId} ---`);
+        outputChannel.appendEvents(events.events);
+        outputChannel.show();
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        vscode.window.showErrorMessage(`Failed to open session: ${msg}`);
+      }
+    }),
+    vscode.commands.registerCommand('strobe.deleteRetainedSession', async (node: { sessionId?: string }) => {
+      if (!node?.sessionId) return;
+      const confirm = await vscode.window.showWarningMessage(
+        `Delete retained session ${node.sessionId}?`,
+        { modal: true },
+        'Delete',
+      );
+      if (confirm !== 'Delete') return;
+      try {
+        const client = await daemonManager.ensureClient();
+        await client.deleteSession(node.sessionId);
+        await refreshRetainedSessions();
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        vscode.window.showErrorMessage(`Failed to delete: ${msg}`);
+      }
+    }),
+
+    // M4: Settings sync
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('strobe')) {
+        syncSettingsToDaemon();
+      }
+    }),
   );
+
+  // Initial settings sync and retained sessions refresh
+  syncSettingsToDaemon();
+  refreshRetainedSessions();
 
   // Register context menu commands
   registerContextMenuCommands(context, {
@@ -93,7 +172,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // CodeLens for test functions
   const codeLensProvider = new TestCodeLensProvider();
   const codeLensRegistration = vscode.languages.registerCodeLensProvider(
-    [{ language: 'rust' }, { language: 'cpp' }, { language: 'c' }],
+    [{ language: 'rust' }, { language: 'cpp' }, { language: 'c' }, { language: 'go' }],
     codeLensProvider,
   );
 
@@ -144,9 +223,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (session.type === 'strobe') {
         try {
           const client = await daemonManager.ensureClient();
-          const sessions = await client.listSessions() as Array<{ sessionId: string }>;
-          if (sessions.length > 0) {
-            const latest = sessions[sessions.length - 1];
+          const resp = await client.listSessions();
+          if (resp.sessions.length > 0) {
+            const latest = resp.sessions[resp.sessions.length - 1];
             if (latest.sessionId) {
               activeSessionId = latest.sessionId;
               statusBar.setConnected();
@@ -204,12 +283,23 @@ async function cmdStop(): Promise<void> {
     return;
   }
   try {
+    const retain = await vscode.window.showQuickPick(
+      [
+        { label: 'Stop', description: 'Discard session data', value: false },
+        { label: 'Stop & Retain', description: 'Keep for post-mortem analysis', value: true },
+      ],
+      { placeHolder: 'Stop session' },
+    );
+    if (!retain) return; // cancelled
     const client = daemonManager.getClient();
     if (client) {
-      await client.stop(activeSessionId);
+      await client.stop(activeSessionId, retain.value);
     }
     endSession();
-    vscode.window.showInformationMessage('Strobe: Session stopped.');
+    vscode.window.showInformationMessage(
+      `Strobe: Session stopped${retain.value ? ' (retained)' : ''}.`,
+    );
+    if (retain.value) refreshRetainedSessions();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(`Strobe: ${msg}`);
@@ -336,6 +426,10 @@ function startSession(client: StrobeClient, sessionId: string): void {
   pollingEngine.on('status', (status: SessionStatusResponse) => {
     statusBar.setSession(status, sessionId);
     sidebarProvider.update(sessionId, status);
+    // Update watch panel if open
+    if (WatchPanel.instance) {
+      WatchPanel.instance.updateWatches(status.watches);
+    }
   });
 
   pollingEngine.on('events', (events: StrobeEvent[]) => {
@@ -368,6 +462,16 @@ function endSession(): void {
   statusBar.setConnected();
   sidebarProvider.clear();
   decorationManager.clear();
+}
+
+async function refreshRetainedSessions(): Promise<void> {
+  try {
+    const client = await daemonManager.ensureClient();
+    const resp = await client.listSessions();
+    retainedProvider.update(resp.sessions, resp.totalSize);
+  } catch {
+    // Not connected yet — leave empty
+  }
 }
 
 export function deactivate(): void {

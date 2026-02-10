@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { SessionStatusResponse } from '../client/types';
+import * as path from 'path';
+import { SessionStatusResponse, SessionSummary } from '../client/types';
 
 type TreeNode = SessionNode | CategoryNode | LeafNode;
 
@@ -139,5 +140,59 @@ export class SidebarProvider
     }
 
     return [];
+  }
+}
+
+// ---- Retained Sessions ----
+
+class RetainedSessionNode extends vscode.TreeItem {
+  sessionId?: string;
+  constructor(label: string, description?: string) {
+    super(label, vscode.TreeItemCollapsibleState.None);
+    if (description) this.description = description;
+  }
+}
+
+export class RetainedSessionsProvider
+  implements vscode.TreeDataProvider<RetainedSessionNode>
+{
+  private _onDidChangeTreeData = new vscode.EventEmitter<void>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  private sessions: SessionSummary[] = [];
+
+  update(sessions: SessionSummary[], _totalSize: number): void {
+    this.sessions = sessions;
+    this._onDidChangeTreeData.fire();
+  }
+
+  getTreeItem(element: RetainedSessionNode): vscode.TreeItem {
+    return element;
+  }
+
+  getChildren(): RetainedSessionNode[] {
+    if (this.sessions.length === 0) {
+      const empty = new RetainedSessionNode(
+        'No retained sessions',
+        'Stop with retain to keep',
+      );
+      empty.iconPath = new vscode.ThemeIcon('info');
+      return [empty];
+    }
+
+    return this.sessions.map((s) => {
+      const sizeStr = s.sizeBytes
+        ? `${(s.sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+        : '';
+      const node = new RetainedSessionNode(
+        path.basename(s.binaryPath),
+        `PID ${s.pid} | ${s.status} | ${sizeStr}`,
+      );
+      node.iconPath = new vscode.ThemeIcon('archive');
+      node.contextValue = 'retainedSession';
+      node.sessionId = s.sessionId;
+      node.tooltip = `Session: ${s.sessionId}\nBinary: ${s.binaryPath}\nRetained: ${s.retainedAt ? new Date(s.retainedAt * 1000).toLocaleString() : ''}`;
+      return node;
+    });
   }
 }

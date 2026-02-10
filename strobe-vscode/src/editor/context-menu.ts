@@ -117,3 +117,65 @@ export async function addLogpointAtCursor(
     vscode.window.showErrorMessage(`Failed to add logpoint: ${msg}`);
   }
 }
+
+export async function addWatchAtCursor(
+  client: StrobeClient,
+  sessionId: string | undefined,
+): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return;
+
+  if (!sessionId) {
+    vscode.window.showWarningMessage('No active Strobe session. Launch a program first.');
+    return;
+  }
+
+  const variable = await vscode.window.showInputBox({
+    prompt: 'Variable name to watch (e.g., gTempo, gClock->counter)',
+    placeHolder: 'gTempo',
+  });
+  if (!variable) return;
+
+  // Detect enclosing function for scoping
+  const fn = await identifyFunctionAtCursor(
+    editor.document,
+    editor.selection.active,
+  );
+
+  let scopePatterns: string[] | undefined;
+  if (fn) {
+    const profile = detectProfile(editor.document.languageId);
+    const separator = profile?.patternSeparator ?? '::';
+    const pattern = formatPattern(fn, separator);
+
+    const choice = await vscode.window.showQuickPick(
+      [
+        { label: `Scoped to ${pattern}`, description: 'Only read during this function', value: [pattern] as string[] | undefined },
+        { label: 'Global', description: 'Read on all traced functions', value: undefined as string[] | undefined },
+      ],
+      { placeHolder: 'Watch scope' },
+    );
+    if (!choice) return;
+    scopePatterns = choice.value;
+  }
+
+  try {
+    await client.trace({
+      sessionId,
+      watches: {
+        add: [{
+          variable,
+          label: variable,
+          on: scopePatterns,
+        }],
+      },
+    });
+    const scopeMsg = scopePatterns ? ` (scoped to ${scopePatterns.join(', ')})` : '';
+    vscode.window.showInformationMessage(
+      `Watching ${variable}${scopeMsg}`,
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`Failed to add watch: ${msg}`);
+  }
+}

@@ -21,6 +21,9 @@ import {
   TestStartResponse,
   TestStatusResponse,
   ReadMemoryResponse,
+  MemoryWriteRequest,
+  WriteMemoryResponse,
+  ListSessionsResponse,
 } from './types';
 
 const SOCKET_PATH = path.join(os.homedir(), '.strobe', 'strobe.sock');
@@ -118,8 +121,8 @@ export class StrobeClient extends EventEmitter {
     });
   }
 
-  async listSessions(): Promise<unknown> {
-    return this.callTool('debug_session', { action: 'list' });
+  async listSessions(): Promise<ListSessionsResponse> {
+    return this.callTool('debug_session', { action: 'list' }) as Promise<ListSessionsResponse>;
   }
 
   async deleteSession(sessionId: string): Promise<unknown> {
@@ -154,6 +157,10 @@ export class StrobeClient extends EventEmitter {
       sessionId,
       action,
     }) as Promise<ContinueResponse>;
+  }
+
+  async writeMemory(req: MemoryWriteRequest): Promise<WriteMemoryResponse> {
+    return this.callTool('debug_memory', req) as Promise<WriteMemoryResponse>;
   }
 
   async readMemory(req: {

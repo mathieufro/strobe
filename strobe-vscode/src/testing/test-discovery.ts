@@ -74,13 +74,59 @@ export class CargoDiscoverer implements TestDiscoverer {
   }
 }
 
+export class GoTestDiscoverer implements TestDiscoverer {
+  readonly framework = 'go';
+
+  async detect(workspaceFolder: string): Promise<number> {
+    const goModPath = path.join(workspaceFolder, 'go.mod');
+    try {
+      await fs.promises.access(goModPath);
+      return 85;
+    } catch {
+      return 0;
+    }
+  }
+
+  async listTests(workspaceFolder: string): Promise<DiscoveredTest[]> {
+    return new Promise((resolve) => {
+      const proc = cp.spawn('go', ['test', '-list', '.*', './...'], {
+        cwd: workspaceFolder,
+        env: process.env,
+      });
+
+      let stdout = '';
+      proc.stdout.on('data', (d: Buffer) => { stdout += d; });
+      proc.stderr.on('data', () => { /* discard */ });
+
+      proc.on('close', (code) => {
+        if (code !== 0) {
+          resolve([]);
+          return;
+        }
+        const tests: DiscoveredTest[] = [];
+        for (const line of stdout.split('\n')) {
+          const trimmed = line.trim();
+          // go test -list outputs test names, one per line
+          // Skip "ok" lines, "?" lines, and empty lines
+          if (trimmed && !trimmed.startsWith('ok ') && !trimmed.startsWith('?')) {
+            tests.push({ name: trimmed });
+          }
+        }
+        resolve(tests);
+      });
+
+      proc.on('error', () => resolve([]));
+    });
+  }
+}
+
 /**
  * Auto-detect the best discoverer for a workspace.
  * Returns the highest-confidence discoverer, or undefined if none match.
  */
 export async function detectDiscoverer(
   workspaceFolder: string,
-  discoverers: TestDiscoverer[] = [new CargoDiscoverer()],
+  discoverers: TestDiscoverer[] = [new CargoDiscoverer(), new GoTestDiscoverer()],
 ): Promise<TestDiscoverer | undefined> {
   let best: TestDiscoverer | undefined;
   let bestScore = 0;
