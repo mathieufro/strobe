@@ -198,7 +198,21 @@ impl DwarfParser {
             headers.push(header);
         }
 
-        // Parse each compilation unit in parallel
+        // Parse each compilation unit in parallel.
+        // Collect: functions, variables, lazy struct info, declaration names (for
+        // cross-CU reference resolution), and unresolved functions (have code but
+        // name is in a different CU via DW_AT_specification).
+        //
+        // declarations: (absolute_debug_info_offset -> demangled_name)
+        // unresolved:   partial FunctionInfo with spec_offset pointing to declaration
+        struct UnresolvedFunc {
+            low_pc: u64,
+            high_pc: u64,
+            source_file: Option<String>,
+            line_number: Option<u32>,
+            spec_offset: usize,
+        }
+
         let results: Vec<_> = headers
             .into_par_iter()
             .filter_map(|header| {
@@ -210,6 +224,8 @@ impl DwarfParser {
                 let mut functions = Vec::new();
                 let mut variables = Vec::new();
                 let mut lazy_infos: Vec<(String, (usize, usize))> = Vec::new();
+                let mut declarations: Vec<(usize, String)> = Vec::new();
+                let mut unresolved: Vec<UnresolvedFunc> = Vec::new();
 
                 let mut entries = unit.entries();
                 let mut in_subprogram = false;
@@ -227,8 +243,53 @@ impl DwarfParser {
                         gimli::DW_TAG_subprogram => {
                             in_subprogram = true;
                             subprogram_depth = current_depth;
-                            if let Ok(Some(func)) = Self::parse_function(&dwarf, &unit, entry) {
-                                functions.push(func);
+
+                            // Collect declaration names for cross-CU resolution.
+                            // These are subprograms with a name but DW_AT_declaration=true
+                            // (no code body), typically from class method declarations.
+                            let is_declaration = entry.attr_value(gimli::DW_AT_declaration)
+                                .ok().flatten()
+                                .map(|v| matches!(v, gimli::AttributeValue::Flag(true)))
+                                .unwrap_or(false);
+                            if is_declaration {
+                                let linkage = Self::resolve_string_attr(&dwarf, &unit, entry, gimli::DW_AT_linkage_name);
+                                if let Some(name) = linkage {
+                                    // Compute absolute .debug_info offset for this entry
+                                    let entry_offset = entry.offset();
+                                    let abs_offset = cu_offset + entry_offset.0;
+                                    let demangled = crate::symbols::demangle_symbol(&name);
+                                    declarations.push((abs_offset, demangled));
+                                }
+                            }
+
+                            match Self::parse_function(&dwarf, &unit, entry) {
+                                Ok(Some(func)) => functions.push(func),
+                                Ok(None) => {
+                                    // Function had no name AND no same-CU reference — check
+                                    // for cross-CU DW_AT_specification that we can resolve later
+                                    if let Some(spec_off) = Self::cross_cu_spec_offset(&unit, entry) {
+                                        // Only collect if it has a code address (low_pc)
+                                        if let Some(low_pc) = entry.attr_value(gimli::DW_AT_low_pc).ok().flatten()
+                                            .and_then(|v| dwarf.attr_address(&unit, v).ok().flatten())
+                                        {
+                                            let high_pc = match entry.attr_value(gimli::DW_AT_high_pc).ok().flatten() {
+                                                Some(gimli::AttributeValue::Udata(offset)) => low_pc + offset,
+                                                Some(attr_val) => dwarf.attr_address(&unit, attr_val).ok().flatten().unwrap_or(low_pc + 1),
+                                                _ => low_pc + 1,
+                                            };
+                                            let source_file = Self::parse_source_file(&dwarf, &unit, entry);
+                                            let line_number = match entry.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
+                                                Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
+                                                _ => None,
+                                            };
+                                            unresolved.push(UnresolvedFunc {
+                                                low_pc, high_pc, source_file, line_number,
+                                                spec_offset: spec_off,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(_) => {}
                             }
                         }
                         gimli::DW_TAG_variable if !in_subprogram => {
@@ -258,7 +319,7 @@ impl DwarfParser {
                     }
                 }
 
-                Some((functions, variables, lazy_infos))
+                Some((functions, variables, lazy_infos, declarations, unresolved))
             })
             .collect();
 
@@ -266,10 +327,38 @@ impl DwarfParser {
         let mut functions = Vec::new();
         let mut variables = Vec::new();
         let mut lazy_struct_info = HashMap::new();
-        for (funcs, vars, infos) in results {
+        let mut declaration_map: HashMap<usize, String> = HashMap::new();
+        let mut all_unresolved: Vec<UnresolvedFunc> = Vec::new();
+        for (funcs, vars, infos, decls, unres) in results {
             functions.extend(funcs);
             variables.extend(vars);
             lazy_struct_info.extend(infos);
+            declaration_map.extend(decls);
+            all_unresolved.extend(unres);
+        }
+
+        // Resolve cross-CU function references: match unresolved functions
+        // (code with no name) to declarations (name with no code)
+        if !all_unresolved.is_empty() {
+            let resolved_count = all_unresolved.len();
+            let mut actually_resolved = 0;
+            for unres in all_unresolved {
+                if let Some(name) = declaration_map.get(&unres.spec_offset) {
+                    let name_raw = None; // declarations already have demangled names
+                    functions.push(FunctionInfo {
+                        name: name.clone(),
+                        name_raw,
+                        low_pc: unres.low_pc,
+                        high_pc: unres.high_pc,
+                        source_file: unres.source_file,
+                        line_number: unres.line_number,
+                    });
+                    actually_resolved += 1;
+                }
+            }
+            if actually_resolved > 0 {
+                tracing::debug!("Resolved {}/{} cross-CU function references", actually_resolved, resolved_count);
+            }
         }
 
         // Build indexes
@@ -342,6 +431,32 @@ impl DwarfParser {
         match ref_offset {
             Some(gimli::AttributeValue::UnitRef(offset)) => {
                 unit.entry(offset).ok()
+            }
+            // Cross-CU reference: try converting DebugInfoRef to same-CU UnitRef
+            Some(gimli::AttributeValue::DebugInfoRef(offset)) => {
+                offset.to_unit_offset(&unit.header)
+                    .and_then(|unit_offset| unit.entry(unit_offset).ok())
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the absolute .debug_info offset for a DW_AT_specification/DW_AT_abstract_origin
+    /// that couldn't be resolved within the same CU (cross-CU DebugInfoRef).
+    fn cross_cu_spec_offset<R: gimli::Reader<Offset = usize>>(
+        unit: &gimli::Unit<R>,
+        entry: &gimli::DebuggingInformationEntry<R>,
+    ) -> Option<usize> {
+        let ref_offset = entry.attr_value(gimli::DW_AT_specification).ok().flatten()
+            .or_else(|| entry.attr_value(gimli::DW_AT_abstract_origin).ok().flatten());
+        match ref_offset {
+            Some(gimli::AttributeValue::DebugInfoRef(offset)) => {
+                // Only return if it's truly cross-CU (couldn't be converted to UnitRef)
+                if offset.to_unit_offset(&unit.header).is_none() {
+                    Some(offset.0)
+                } else {
+                    None
+                }
             }
             _ => None,
         }

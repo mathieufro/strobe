@@ -182,6 +182,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_session_pid(&self, id: &str, pid: u32) -> Result<()> {
+        let conn = self.connection();
+        conn.execute(
+            "UPDATE sessions SET pid = ? WHERE id = ?",
+            params![pid, id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.connection();
         conn.execute("DELETE FROM events WHERE session_id = ?", params![id])?;

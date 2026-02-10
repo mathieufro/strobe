@@ -262,6 +262,10 @@ impl SessionManager {
         self.db.get_session(id)
     }
 
+    pub fn update_session_pid(&self, id: &str, pid: u32) -> Result<()> {
+        self.db.update_session_pid(id, pid)
+    }
+
     pub fn get_running_sessions(&self) -> Result<Vec<Session>> {
         self.db.get_running_sessions()
     }

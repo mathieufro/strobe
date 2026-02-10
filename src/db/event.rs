@@ -453,6 +453,70 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Count events matching the same filters as query_events (without limit/offset).
+    pub fn count_filtered_events<F>(&self, session_id: &str, build_query: F) -> Result<u64>
+    where
+        F: FnOnce(EventQuery) -> EventQuery,
+    {
+        let query = build_query(EventQuery::default());
+        let conn = self.connection();
+
+        let mut sql = String::from("SELECT COUNT(*) FROM events WHERE session_id = ?");
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(session_id.to_string())];
+
+        if let Some(ref et) = query.event_type {
+            sql.push_str(" AND event_type = ?");
+            params_vec.push(Box::new(et.as_str().to_string()));
+        }
+        if let Some(ref f) = query.function_equals {
+            sql.push_str(" AND event_type IN ('function_enter', 'function_exit') AND function_name = ?");
+            params_vec.push(Box::new(f.clone()));
+        }
+        if let Some(ref f) = query.function_contains {
+            sql.push_str(" AND event_type IN ('function_enter', 'function_exit') AND function_name LIKE ? ESCAPE '\\'");
+            params_vec.push(Box::new(format!("%{}%", escape_like_pattern(f))));
+        }
+        if let Some(ref f) = query.source_file_contains {
+            sql.push_str(" AND source_file LIKE ? ESCAPE '\\'");
+            params_vec.push(Box::new(format!("%{}%", escape_like_pattern(f))));
+        }
+        if let Some(is_null) = query.return_value_is_null {
+            if is_null {
+                sql.push_str(" AND return_value IS NULL");
+            } else {
+                sql.push_str(" AND return_value IS NOT NULL");
+            }
+        }
+        if let Some(tid) = query.thread_id_equals {
+            sql.push_str(" AND thread_id = ?");
+            params_vec.push(Box::new(tid));
+        }
+        if let Some(ref name) = query.thread_name_contains {
+            sql.push_str(" AND thread_name LIKE ? ESCAPE '\\'");
+            params_vec.push(Box::new(format!("%{}%", escape_like_pattern(name))));
+        }
+        if let Some(pid) = query.pid_equals {
+            sql.push_str(" AND pid = ?");
+            params_vec.push(Box::new(pid as i64));
+        }
+        if let Some(from) = query.timestamp_from_ns {
+            sql.push_str(" AND timestamp_ns >= ?");
+            params_vec.push(Box::new(from));
+        }
+        if let Some(to) = query.timestamp_to_ns {
+            sql.push_str(" AND timestamp_ns <= ?");
+            params_vec.push(Box::new(to));
+        }
+        if let Some(min_dur) = query.min_duration_ns {
+            sql.push_str(" AND duration_ns IS NOT NULL AND duration_ns >= ?");
+            params_vec.push(Box::new(min_dur));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn.query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
     /// Delete oldest events for a session, keeping only the most recent N.
     /// Returns the number of events deleted.
     pub fn cleanup_old_events(&self, session_id: &str, keep_count: usize) -> Result<u64> {

@@ -976,10 +976,20 @@ Validation Limits (enforced):
 
         let session_id = self.session_manager.generate_session_id(binary_name);
 
+        // Create session in DB BEFORE spawning — the Frida event writer task starts
+        // immediately on spawn and would hit a FOREIGN KEY error if the session row
+        // doesn't exist yet.
+        self.session_manager.create_session(
+            &session_id,
+            &req.command,
+            &req.project_root,
+            0, // PID not known yet, updated after spawn
+        )?;
+
         // Launch always starts fast (no DWARF blocking, no initial hooks).
         // DWARF parsing happens in the background.
         let args_vec = req.args.unwrap_or_default();
-        let pid = self.session_manager.spawn_with_frida(
+        let pid = match self.session_manager.spawn_with_frida(
             &session_id,
             &req.command,
             &args_vec,
@@ -987,14 +997,20 @@ Validation Limits (enforced):
             &req.project_root,
             req.env.as_ref(),
             false, // debug_launch: resume immediately
-        ).await?;
-
-        self.session_manager.create_session(
-            &session_id,
-            &req.command,
-            &req.project_root,
-            pid,
-        )?;
+        ).await {
+            Ok(pid) => {
+                // Update PID now that we know it
+                self.session_manager.update_session_pid(&session_id, pid)?;
+                pid
+            }
+            Err(e) => {
+                // Clean up the pre-created session on spawn failure
+                let _ = self.session_manager.db().update_session_status(
+                    &session_id, crate::db::SessionStatus::Stopped
+                );
+                return Err(e);
+            }
+        };
 
         // Register session ownership for disconnect cleanup
         {
@@ -1473,8 +1489,51 @@ Validation Limits (enforced):
             q.limit(limit).offset(offset)
         })?;
 
-        let total_count = self.session_manager.db().count_session_events(&req.session_id)?;
-        let has_more = (offset + events.len() as u32) < total_count as u32;
+        // Count with same filters (except limit/offset) for accurate totalCount
+        let total_count = self.session_manager.db().count_filtered_events(&req.session_id, |mut q| {
+            if let Some(ref et) = req.event_type {
+                q = q.event_type(match et {
+                    EventTypeFilter::FunctionEnter => crate::db::EventType::FunctionEnter,
+                    EventTypeFilter::FunctionExit => crate::db::EventType::FunctionExit,
+                    EventTypeFilter::Stdout => crate::db::EventType::Stdout,
+                    EventTypeFilter::Stderr => crate::db::EventType::Stderr,
+                    EventTypeFilter::Crash => crate::db::EventType::Crash,
+                    EventTypeFilter::VariableSnapshot => crate::db::EventType::VariableSnapshot,
+                });
+            }
+            if let Some(ref f) = req.function {
+                if let Some(ref eq) = f.equals {
+                    q = q.function_equals(eq);
+                }
+                if let Some(ref contains) = f.contains {
+                    q = q.function_contains(contains);
+                }
+            }
+            if let Some(ref sf) = req.source_file {
+                if let Some(ref contains) = sf.contains {
+                    q = q.source_file_contains(contains);
+                }
+            }
+            if let Some(ref tn) = req.thread_name {
+                if let Some(ref contains) = tn.contains {
+                    q = q.thread_name_contains(contains);
+                }
+            }
+            if let Some(from) = timestamp_from_ns {
+                q.timestamp_from_ns = Some(from);
+            }
+            if let Some(to) = timestamp_to_ns {
+                q.timestamp_to_ns = Some(to);
+            }
+            if let Some(dur) = req.min_duration_ns {
+                q.min_duration_ns = Some(dur);
+            }
+            if let Some(pid) = req.pid {
+                q.pid_equals = Some(pid);
+            }
+            q
+        })?;
+        let has_more = (offset as u64 + events.len() as u64) < total_count;
 
         // Convert to appropriate format
         let verbose = req.verbose.unwrap_or(false);

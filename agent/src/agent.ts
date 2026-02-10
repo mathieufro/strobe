@@ -588,11 +588,8 @@ class StrobeAgent {
   }
 
   private readTypedValue(addr: NativePointer, size: number, typeKind: string): any {
-    const range = Process.findRangeByAddress(addr);
-    if (!range || !range.protection.includes('r')) {
-      throw new Error(`Address ${addr} not readable`);
-    }
-
+    // Note: Process.findRangeByAddress() can hang on large macOS binaries with
+    // unmapped addresses — skip the pre-check and rely on try/catch in the caller.
     switch (typeKind) {
       case 'float':
         return size === 4 ? addr.readFloat() : addr.readDouble();
@@ -651,10 +648,8 @@ class StrobeAgent {
   }
 
   private writeTypedValue(addr: NativePointer, size: number, typeKind: string, value: number): void {
-    const range = Process.findRangeByAddress(addr);
-    if (!range || !range.protection.includes('w')) {
-      throw new Error(`Address ${addr} not writable (protection: ${range?.protection || 'unmapped'})`);
-    }
+    // Note: Process.findRangeByAddress() can hang on large macOS binaries —
+    // skip pre-check and rely on try/catch in the caller for error handling.
 
     switch (typeKind) {
       case 'float':
