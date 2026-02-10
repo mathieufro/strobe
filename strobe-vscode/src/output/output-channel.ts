@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { StrobeEvent } from '../client/types';
+import { formatDuration } from '../utils/format';
 
 export class StrobeOutputChannel {
   private channel: vscode.OutputChannel;
@@ -41,7 +42,7 @@ export class StrobeOutputChannel {
       case 'function_exit': {
         const dur =
           event.duration_ns != null
-            ? ` [${this.formatDuration(event.duration_ns)}]`
+            ? ` [${formatDuration(event.duration_ns)}]`
             : '';
         const ret =
           event.returnValue !== undefined
@@ -83,13 +84,6 @@ export class StrobeOutputChannel {
     const s = Math.floor((totalMs % 60_000) / 1000);
     const ms = Math.floor(totalMs % 1000);
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
-  }
-
-  private formatDuration(ns: number): string {
-    if (ns < 1000) return `${ns}ns`;
-    if (ns < 1_000_000) return `${(ns / 1000).toFixed(1)}\u00B5s`;
-    if (ns < 1_000_000_000) return `${(ns / 1_000_000).toFixed(1)}ms`;
-    return `${(ns / 1_000_000_000).toFixed(2)}s`;
   }
 
   private formatArgs(args: unknown): string {

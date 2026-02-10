@@ -60,6 +60,22 @@ export interface PausedThreadInfo {
   function?: string;
   file?: string;
   line?: number;
+  backtrace?: BacktraceFrame[];
+  arguments?: CapturedArg[];
+}
+
+export interface BacktraceFrame {
+  address: string;
+  moduleName?: string;
+  functionName?: string;
+  file?: string;
+  line?: number;
+}
+
+export interface CapturedArg {
+  index: number;
+  value: string;
+  type?: string;
 }
 
 export interface BreakpointInfo {
@@ -223,6 +239,22 @@ export interface MemoryReadRequest {
   poll?: { intervalMs: number; durationMs: number };
 }
 
+export interface ReadResult {
+  target: string;
+  address?: string;
+  type?: string;
+  value?: unknown;
+  size?: number;
+  fields?: unknown;
+  error?: string;
+  file?: string;
+  preview?: string;
+}
+
+export interface ReadMemoryResponse {
+  results: ReadResult[];
+}
+
 // ---- debug_test ----
 
 export interface TestRunRequest {
@@ -253,11 +285,18 @@ export interface TestStatusResponse {
     skipped: number;
     currentTest?: string;
     currentTestElapsedMs?: number;
+    currentTestBaselineMs?: number;
     phase?: string;
     warnings?: Array<{
       testName?: string;
       idleMs: number;
       diagnosis: string;
+      suggestedTraces?: string[];
+    }>;
+    runningTests?: Array<{
+      name: string;
+      elapsedMs: number;
+      baselineMs?: number;
     }>;
   };
   result?: {
@@ -266,6 +305,7 @@ export interface TestStatusResponse {
       passed: number;
       failed: number;
       skipped: number;
+      stuck?: number;
       durationMs: number;
     };
     failures: Array<{
@@ -273,9 +313,18 @@ export interface TestStatusResponse {
       file?: string;
       line?: number;
       message: string;
+      rerun?: string;
       suggestedTraces: string[];
     }>;
-    stuck: unknown[];
+    stuck: Array<{
+      name: string;
+      elapsedMs: number;
+      diagnosis: string;
+      threads?: Array<{ name: string; stack: string[] }>;
+      suggestedTraces?: string[];
+    }>;
+    noTests?: boolean;
+    hint?: string;
   };
   error?: string;
 }

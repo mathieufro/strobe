@@ -31,6 +31,26 @@
       {
         "command": "strobe.traceFunction",
         "title": "Strobe: Trace This Function"
+      },
+      {
+        "command": "strobe.refreshTests",
+        "title": "Strobe: Refresh Test List"
+      },
+      {
+        "command": "strobe.runSingleTest",
+        "title": "Strobe: Run Test"
+      },
+      {
+        "command": "strobe.debugSingleTest",
+        "title": "Strobe: Debug Test with Strobe"
+      },
+      {
+        "command": "strobe.setBreakpoint",
+        "title": "Strobe: Set Breakpoint"
+      },
+      {
+        "command": "strobe.addLogpoint",
+        "title": "Strobe: Add Logpoint..."
       }
     ],
     "menus": {
@@ -44,6 +64,14 @@
         {
           "command": "strobe.traceFunction",
           "group": "1_trace"
+        },
+        {
+          "command": "strobe.setBreakpoint",
+          "group": "2_debug"
+        },
+        {
+          "command": "strobe.addLogpoint",
+          "group": "2_debug"
         }
       ]
     },
@@ -69,13 +97,73 @@
           "name": "Session"
         }
       ]
-    }
+    },
+    "debuggers": [
+      {
+        "type": "strobe",
+        "label": "Strobe",
+        "languages": ["rust", "c", "cpp", "swift", "go"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the executable to debug",
+                "default": "${workspaceFolder}/target/debug/${workspaceFolderBasename}"
+              },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Command-line arguments",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory",
+                "default": "${workspaceFolder}"
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Additional environment variables",
+                "default": {}
+              },
+              "tracePatterns": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Trace patterns to apply at launch (e.g., [\"myapp::*\"])",
+                "default": []
+              },
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "Strobe: Launch",
+            "description": "Launch and debug with Strobe",
+            "body": {
+              "type": "strobe",
+              "request": "launch",
+              "name": "Debug with Strobe",
+              "program": "^\"\\${workspaceFolder}/target/debug/\\${workspaceFolderBasename}\"",
+              "args": [],
+              "cwd": "^\"\\${workspaceFolder}\""
+            }
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
     "build": "webpack --mode production",
     "watch": "webpack --mode development --watch",
     "package": "vsce package"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "^1.68.0",
+    "@vscode/debugprotocol": "^1.68.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.33",

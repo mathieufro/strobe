@@ -292,6 +292,8 @@ pub struct PauseNotification {
     pub return_address: Option<u64>,
     /// Runtime address where the thread paused (for one-shot step BPs)
     pub address: Option<u64>,
+    pub backtrace: Vec<crate::mcp::BacktraceFrame>,
+    pub arguments: Vec<crate::mcp::CapturedArg>,
 }
 
 /// Channel for pause notifications from agent to daemon
@@ -406,6 +408,35 @@ impl AgentMessageHandler {
                     .and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
+                let backtrace: Vec<crate::mcp::BacktraceFrame> = payload
+                    .get("backtrace")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().filter_map(|frame| {
+                            Some(crate::mcp::BacktraceFrame {
+                                address: frame.get("address")?.as_str()?.to_string(),
+                                module_name: frame.get("moduleName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                function_name: frame.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                file: frame.get("fileName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                line: frame.get("lineNumber").and_then(|v| v.as_u64()).map(|n| n as u32),
+                            })
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+
+                let arguments: Vec<crate::mcp::CapturedArg> = payload
+                    .get("arguments")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().filter_map(|arg| {
+                            Some(crate::mcp::CapturedArg {
+                                index: arg.get("index")?.as_u64()? as u32,
+                                value: arg.get("value")?.as_str()?.to_string(),
+                            })
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+
                 tracing::info!(
                     "[{}] Thread {} paused at breakpoint {} (addr=0x{:x?}, ret=0x{:x?})",
                     self.session_id, thread_id, breakpoint_id_str,
@@ -445,6 +476,8 @@ impl AgentMessageHandler {
                         line,
                         return_address,
                         address,
+                        backtrace,
+                        arguments,
                     };
                     if let Err(e) = tx.try_send(notification) {
                         tracing::warn!(
@@ -2565,6 +2598,81 @@ mod tests {
         // Event should still be created
         let event = event_rx.recv().await.unwrap();
         assert_eq!(event.event_type, EventType::Pause);
+    }
+
+    #[tokio::test]
+    async fn test_handler_paused_with_backtrace_and_arguments() {
+        let (pause_tx, mut pause_rx) = mpsc::channel(10);
+        let (event_tx, mut event_rx) = mpsc::channel(1000);
+        let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
+        let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
+        let write_response: WriteResponseSignal = Arc::new(Mutex::new(None));
+        let handler = AgentMessageHandler {
+            event_tx,
+            session_id: "bt-test".to_string(),
+            hooks_ready,
+            read_response,
+            write_response,
+            crash_reported: Arc::new(AtomicBool::new(false)),
+            pause_notify_tx: Some(pause_tx),
+        };
+
+        let payload = json!({
+            "type": "paused",
+            "threadId": 99,
+            "breakpointId": "bp-42",
+            "funcName": "audio::process",
+            "file": "src/audio.rs",
+            "line": 120,
+            "returnAddress": "0xdeadbeef",
+            "backtrace": [
+                {
+                    "address": "0x1000",
+                    "moduleName": "libfoo.dylib",
+                    "name": "foo::bar",
+                    "fileName": "src/foo.rs",
+                    "lineNumber": 42
+                },
+                {
+                    "address": "0x2000",
+                    "moduleName": "libsystem.dylib"
+                }
+            ],
+            "arguments": [
+                { "index": 0, "value": "0x7fff1234" },
+                { "index": 1, "value": "42" }
+            ]
+        });
+
+        handler.handle_payload("paused", &payload);
+
+        // Verify event
+        let event = event_rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::Pause);
+        assert_eq!(event.breakpoint_id, Some("bp-42".to_string()));
+
+        // Verify notification with backtrace and arguments
+        let notification = pause_rx.recv().await.unwrap();
+        assert_eq!(notification.session_id, "bt-test");
+        assert_eq!(notification.thread_id, 99);
+        assert_eq!(notification.func_name, Some("audio::process".to_string()));
+
+        // Backtrace
+        assert_eq!(notification.backtrace.len(), 2);
+        assert_eq!(notification.backtrace[0].address, "0x1000");
+        assert_eq!(notification.backtrace[0].function_name, Some("foo::bar".to_string()));
+        assert_eq!(notification.backtrace[0].file, Some("src/foo.rs".to_string()));
+        assert_eq!(notification.backtrace[0].line, Some(42));
+        assert_eq!(notification.backtrace[1].address, "0x2000");
+        assert_eq!(notification.backtrace[1].module_name, Some("libsystem.dylib".to_string()));
+        assert_eq!(notification.backtrace[1].function_name, None);
+
+        // Arguments
+        assert_eq!(notification.arguments.len(), 2);
+        assert_eq!(notification.arguments[0].index, 0);
+        assert_eq!(notification.arguments[0].value, "0x7fff1234");
+        assert_eq!(notification.arguments[1].index, 1);
+        assert_eq!(notification.arguments[1].value, "42");
     }
 
     // --- @usercode pattern resolution ---

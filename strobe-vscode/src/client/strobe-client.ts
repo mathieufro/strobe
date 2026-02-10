@@ -20,6 +20,7 @@ import {
   TestRunRequest,
   TestStartResponse,
   TestStatusResponse,
+  ReadMemoryResponse,
 } from './types';
 
 const SOCKET_PATH = path.join(os.homedir(), '.strobe', 'strobe.sock');
@@ -164,8 +165,8 @@ export class StrobeClient extends EventEmitter {
       type?: string;
     }>;
     depth?: number;
-  }): Promise<unknown> {
-    return this.callTool('debug_memory', { ...req, action: 'read' });
+  }): Promise<ReadMemoryResponse> {
+    return this.callTool('debug_memory', { ...req, action: 'read' }) as Promise<ReadMemoryResponse>;
   }
 
   async runTest(req: TestRunRequest): Promise<TestStartResponse> {
