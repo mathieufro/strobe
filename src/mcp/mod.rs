@@ -47,6 +47,7 @@ mod tests {
             limit: Some(100),
             offset: None,
             verbose: Some(true),
+            after_event_id: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

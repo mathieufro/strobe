@@ -11,6 +11,8 @@ struct SuspicionState {
     since: Option<Instant>,
     zero_delta_count: u32,
     constant_high_count: u32,
+    /// Low-CPU stall: consecutive samples where CPU is non-zero but < 10%.
+    low_cpu_count: u32,
 }
 
 impl SuspicionState {
@@ -19,6 +21,7 @@ impl SuspicionState {
             since: None,
             zero_delta_count: 0,
             constant_high_count: 0,
+            low_cpu_count: 0,
         }
     }
 
@@ -26,8 +29,14 @@ impl SuspicionState {
         self.since = None;
         self.zero_delta_count = 0;
         self.constant_high_count = 0;
+        self.low_cpu_count = 0;
     }
 }
+
+/// Per-test stall threshold: warn if a single test has been running for this long
+/// with low CPU activity (< 10%). Catches "stuck on Frida RPC / I/O retry" cases
+/// that show non-zero but minimal CPU usage.
+const PER_TEST_STALL_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Multi-signal stuck detector — continuous advisory monitor.
 /// Runs in parallel with test subprocess, monitors:
@@ -70,6 +79,10 @@ impl StuckDetector {
 
     fn current_test(&self) -> Option<String> {
         self.progress.lock().unwrap().current_test()
+    }
+
+    fn current_test_started_at(&self) -> Option<Instant> {
+        self.progress.lock().unwrap().current_test_started_at()
     }
 
     fn write_warning(&self, diagnosis: &str, idle_ms: u64) {
@@ -170,12 +183,23 @@ impl StuckDetector {
                 if delta == 0 {
                     suspicion.zero_delta_count += 1;
                     suspicion.constant_high_count = 0;
+                    suspicion.low_cpu_count = 0;
                     if suspicion.since.is_none() {
                         suspicion.since = Some(Instant::now());
                     }
                 } else if delta > sample_interval_ns * 80 / 100 {
                     suspicion.constant_high_count += 1;
                     suspicion.zero_delta_count = 0;
+                    suspicion.low_cpu_count = 0;
+                    if suspicion.since.is_none() {
+                        suspicion.since = Some(Instant::now());
+                    }
+                } else if delta < sample_interval_ns / 10 {
+                    // Low CPU (< 10%) — not zero, but suspiciously low.
+                    // Track as potential stall (stuck on I/O, Frida RPC retry, etc.)
+                    suspicion.low_cpu_count += 1;
+                    suspicion.zero_delta_count = 0;
+                    suspicion.constant_high_count = 0;
                     if suspicion.since.is_none() {
                         suspicion.since = Some(Instant::now());
                     }
@@ -192,6 +216,8 @@ impl StuckDetector {
                             "deadlock"
                         } else if suspicion.constant_high_count >= 3 {
                             "infinite_loop"
+                        } else if suspicion.low_cpu_count >= 3 {
+                            "stall"
                         } else {
                             "unknown"
                         };
@@ -203,6 +229,29 @@ impl StuckDetector {
                             // Reset suspicious counters but keep the warning
                         }
                         suspicion.reset();
+                    }
+                }
+
+                // Per-test stall detection: independent of CPU signals.
+                // If a single test has been running for a long time, warn even if
+                // CPU-based suspicion keeps resetting (e.g., bursty I/O patterns).
+                {
+                    let test_started = self.current_test_started_at();
+                    if let Some(started) = test_started {
+                        let test_elapsed = started.elapsed();
+                        if test_elapsed > PER_TEST_STALL_THRESHOLD && delta < sample_interval_ns / 10 {
+                            let test_name = self.current_test().unwrap_or_default();
+                            let elapsed_s = test_elapsed.as_secs();
+                            let cpu_pct = (delta as f64 / sample_interval_ns as f64) * 100.0;
+                            self.write_warning(
+                                &format!(
+                                    "Test stall: '{}' running for {}s with {:.1}% CPU — \
+                                     possible Frida hang, I/O timeout, or deadlock with non-zero spin",
+                                    test_name, elapsed_s, cpu_pct
+                                ),
+                                test_elapsed.as_millis() as u64,
+                            );
+                        }
                     }
                 }
             }
@@ -245,6 +294,7 @@ impl StuckDetector {
             let diagnosis = match diagnosis_type {
                 "deadlock" => "Deadlock: 0% CPU, stacks unchanged across samples",
                 "infinite_loop" => "Infinite loop: 100% CPU, stacks unchanged across samples",
+                "stall" => "Stall: low CPU (<10%), stacks unchanged — possible Frida hang or I/O timeout",
                 _ => "Process appears stuck: stacks unchanged across samples",
             };
             Some(diagnosis.to_string())
@@ -517,5 +567,38 @@ mod tests {
             .with_pause_check(Arc::new(|| true));
         assert!(detector.has_paused_threads.is_some());
         assert!(detector.has_paused_threads.as_ref().unwrap()());
+    }
+
+    #[test]
+    fn test_suspicion_state_low_cpu_tracking() {
+        let mut s = SuspicionState::new();
+        // Low CPU should increment low_cpu_count
+        s.low_cpu_count += 1;
+        assert_eq!(s.low_cpu_count, 1);
+        s.low_cpu_count += 1;
+        s.low_cpu_count += 1;
+        assert_eq!(s.low_cpu_count, 3);
+        // Reset clears everything
+        s.reset();
+        assert_eq!(s.low_cpu_count, 0);
+        assert_eq!(s.zero_delta_count, 0);
+        assert_eq!(s.constant_high_count, 0);
+        assert!(s.since.is_none());
+    }
+
+    #[test]
+    fn test_per_test_stall_threshold_value() {
+        // Stall threshold should be 30 seconds — long enough for normal tests,
+        // short enough to catch real hangs quickly.
+        assert_eq!(PER_TEST_STALL_THRESHOLD, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_stacks_match_empty() {
+        assert!(!stacks_match(&[], &[]));
+        assert!(!stacks_match(&[super::super::adapter::ThreadStack {
+            name: "thread-1".to_string(),
+            stack: vec!["frame1".to_string()],
+        }], &[]));
     }
 }

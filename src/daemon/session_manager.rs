@@ -1498,6 +1498,105 @@ impl SessionManager {
         }
     }
 
+    /// Build a full status snapshot for a session.
+    pub fn session_status(&self, session_id: &str) -> Result<crate::mcp::SessionStatusResponse> {
+        let session = self.get_session(session_id)?
+            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+
+        let event_count = self.db.count_session_events(session_id)?;
+        let hooked_functions = self.get_hook_count(session_id);
+        let trace_patterns = self.get_patterns(session_id);
+
+        // Convert breakpoints
+        let breakpoints: Vec<crate::mcp::BreakpointInfo> = self.get_breakpoints(session_id)
+            .into_iter()
+            .map(|bp| crate::mcp::BreakpointInfo {
+                id: bp.id,
+                function: match &bp.target {
+                    BreakpointTarget::Function(f) => Some(f.clone()),
+                    _ => None,
+                },
+                file: match &bp.target {
+                    BreakpointTarget::Line { file, .. } => Some(file.clone()),
+                    _ => None,
+                },
+                line: match &bp.target {
+                    BreakpointTarget::Line { line, .. } => Some(*line),
+                    _ => None,
+                },
+                address: format!("0x{:x}", bp.address),
+            })
+            .collect();
+
+        // Convert logpoints
+        let logpoints: Vec<crate::mcp::LogpointInfo> = self.get_logpoints(session_id)
+            .into_iter()
+            .map(|lp| crate::mcp::LogpointInfo {
+                id: lp.id,
+                message: lp.message,
+                function: match &lp.target {
+                    BreakpointTarget::Function(f) => Some(f.clone()),
+                    _ => None,
+                },
+                file: match &lp.target {
+                    BreakpointTarget::Line { file, .. } => Some(file.clone()),
+                    _ => None,
+                },
+                line: match &lp.target {
+                    BreakpointTarget::Line { line, .. } => Some(*line),
+                    _ => None,
+                },
+                address: format!("0x{:x}", lp.address),
+            })
+            .collect();
+
+        // Convert watches
+        let watches: Vec<crate::mcp::ActiveWatch> = self.get_watches(session_id)
+            .into_iter()
+            .map(|w| crate::mcp::ActiveWatch {
+                label: w.label,
+                address: if w.is_expr { "expr".to_string() } else { format!("0x{:x}", w.address) },
+                size: w.size,
+                type_name: w.type_name,
+                on: w.on_patterns,
+            })
+            .collect();
+
+        // Convert paused threads
+        let paused_map = self.get_all_paused_threads(session_id);
+        let paused_threads: Vec<crate::mcp::PausedThreadInfo> = paused_map
+            .into_iter()
+            .map(|(tid, info)| crate::mcp::PausedThreadInfo {
+                thread_id: tid,
+                breakpoint_id: info.breakpoint_id,
+                function: info.func_name,
+                file: info.file,
+                line: info.line,
+            })
+            .collect();
+
+        // Determine status
+        let status = if !paused_threads.is_empty() {
+            "paused".to_string()
+        } else if is_process_alive(session.pid) {
+            "running".to_string()
+        } else {
+            "exited".to_string()
+        };
+
+        Ok(crate::mcp::SessionStatusResponse {
+            status,
+            pid: session.pid,
+            event_count,
+            hooked_functions,
+            trace_patterns,
+            breakpoints,
+            logpoints,
+            watches,
+            paused_threads,
+        })
+    }
+
     pub fn get_breakpoints(&self, session_id: &str) -> Vec<Breakpoint> {
         let guard = read_lock(&self.breakpoints);
         guard.get(session_id)

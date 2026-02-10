@@ -50,6 +50,9 @@ impl EventType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    /// SQLite implicit rowid (populated by queries, not inserted)
+    #[serde(skip)]
+    pub rowid: Option<i64>,
     pub id: String,
     pub session_id: String,
     pub timestamp_ns: i64,
@@ -80,6 +83,7 @@ pub struct Event {
 impl Default for Event {
     fn default() -> Self {
         Self {
+            rowid: None,
             id: String::new(),
             session_id: String::new(),
             timestamp_ns: 0,
@@ -158,6 +162,8 @@ pub struct EventQuery {
     pub min_duration_ns: Option<i64>,
     pub limit: u32,
     pub offset: u32,
+    /// Cursor: return only events with rowid > after_rowid
+    pub after_rowid: Option<i64>,
 }
 
 impl Default for EventQuery {
@@ -176,6 +182,7 @@ impl Default for EventQuery {
             min_duration_ns: None,
             limit: 50,
             offset: 0,
+            after_rowid: None,
         }
     }
 }
@@ -298,35 +305,36 @@ fn read_json_text(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<Option<se
     }
 }
 
-/// Parse an Event from a row with the standard 25-column SELECT order.
+/// Parse an Event from a row with the standard 26-column SELECT order (rowid + 25 data columns).
 fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
-    let event_type_str: String = row.get(6)?;
+    let event_type_str: String = row.get(7)?;
     Ok(Event {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        timestamp_ns: row.get(2)?,
-        thread_id: row.get(3)?,
-        thread_name: row.get(4)?,
-        parent_event_id: row.get(5)?,
+        rowid: row.get(0)?,
+        id: row.get(1)?,
+        session_id: row.get(2)?,
+        timestamp_ns: row.get(3)?,
+        thread_id: row.get(4)?,
+        thread_name: row.get(5)?,
+        parent_event_id: row.get(6)?,
         event_type: EventType::from_str(&event_type_str).unwrap_or(EventType::FunctionEnter),
-        function_name: row.get(7)?,
-        function_name_raw: row.get(8)?,
-        source_file: row.get(9)?,
-        line_number: row.get(10)?,
-        arguments: read_json_flexible(row, 11)?,
-        return_value: read_json_flexible(row, 12)?,
-        duration_ns: row.get(13)?,
-        text: row.get(14)?,
-        sampled: row.get(15)?,
-        watch_values: read_json_text(row, 16)?,
-        pid: row.get::<_, Option<i64>>(17)?.map(|p| p as u32),
-        signal: row.get(18)?,
-        fault_address: row.get(19)?,
-        registers: read_json_text(row, 20)?,
-        backtrace: read_json_text(row, 21)?,
-        locals: read_json_text(row, 22)?,
-        breakpoint_id: row.get(23)?,
-        logpoint_message: row.get(24)?,
+        function_name: row.get(8)?,
+        function_name_raw: row.get(9)?,
+        source_file: row.get(10)?,
+        line_number: row.get(11)?,
+        arguments: read_json_flexible(row, 12)?,
+        return_value: read_json_flexible(row, 13)?,
+        duration_ns: row.get(14)?,
+        text: row.get(15)?,
+        sampled: row.get(16)?,
+        watch_values: read_json_text(row, 17)?,
+        pid: row.get::<_, Option<i64>>(18)?.map(|p| p as u32),
+        signal: row.get(19)?,
+        fault_address: row.get(20)?,
+        registers: read_json_text(row, 21)?,
+        backtrace: read_json_text(row, 22)?,
+        locals: read_json_text(row, 23)?,
+        breakpoint_id: row.get(24)?,
+        logpoint_message: row.get(25)?,
     })
 }
 
@@ -355,7 +363,7 @@ impl Database {
         let conn = self.connection();
 
         let mut sql = String::from(
-            "SELECT id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
+            "SELECT rowid, id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
              arguments, return_value, duration_ns, text, sampled, watch_values, pid,
              signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message
@@ -418,6 +426,11 @@ impl Database {
         if let Some(min_dur) = query.min_duration_ns {
             sql.push_str(" AND duration_ns IS NOT NULL AND duration_ns >= ?");
             params_vec.push(Box::new(min_dur));
+        }
+
+        if let Some(after) = query.after_rowid {
+            sql.push_str(" AND rowid > ?");
+            params_vec.push(Box::new(after));
         }
 
         sql.push_str(" ORDER BY timestamp_ns DESC");
@@ -510,6 +523,11 @@ impl Database {
         if let Some(min_dur) = query.min_duration_ns {
             sql.push_str(" AND duration_ns IS NOT NULL AND duration_ns >= ?");
             params_vec.push(Box::new(min_dur));
+        }
+
+        if let Some(after) = query.after_rowid {
+            sql.push_str(" AND rowid > ?");
+            params_vec.push(Box::new(after));
         }
 
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
@@ -609,6 +627,17 @@ impl Database {
 
         tx.commit()?;
         Ok(stats)
+    }
+
+    /// Get the minimum rowid for events in a session. Used for FIFO drop detection.
+    pub fn min_rowid_for_session(&self, session_id: &str) -> Result<Option<i64>> {
+        let conn = self.connection();
+        let result: Option<i64> = conn.query_row(
+            "SELECT MIN(rowid) FROM events WHERE session_id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(result)
     }
 
     pub fn update_event_locals(&self, event_id: &str, locals: &serde_json::Value) -> Result<()> {

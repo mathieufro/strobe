@@ -444,9 +444,10 @@ Read globals during function execution (requires DWARF symbols).
 
 ## Queries
 
-- eventType: `stderr`/`stdout` (always captured), `function_enter`/`function_exit` (when tracing)
+- eventType: `stderr`/`stdout` (always captured), `function_enter`/`function_exit` (when tracing), `pause`/`logpoint`/`condition_error`
 - Filters: `function: { contains: \"parse\" }`, `sourceFile: { contains: \"auth\" }`, `verbose: true`
 - Default 50 events. Paginate with `offset`. Check `hasMore`.
+- Cursor-based polling: pass `afterEventId` (from previous response's `lastEventId`) to get only new events. Response includes `eventsDropped: true` if FIFO eviction occurred.
 
 ## Mistakes to Avoid
 
@@ -460,20 +461,19 @@ Read globals during function execution (requires DWARF symbols).
 ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
 Tests always run inside Frida, so you can add traces at any time without restarting.
 
-`debug_test` returns immediately with a `testRunId`. Poll `debug_test_status(testRunId)`
-for progress. The server blocks up to 15s waiting for completion, so it's safe to call
-immediately after each response.
+`debug_test` returns immediately with a `testRunId`. Poll with `debug_test({ action: \"status\", testRunId })`.
+The server blocks up to 15s waiting for completion, so it's safe to call immediately after each response.
 
 ### Status Response Fields
 - `progress.currentTest` — name of the currently executing test
 - `progress.currentTestElapsedMs` — how long the current test has been running
 - `progress.currentTestBaselineMs` — historical average duration for this test (if known)
 - `progress.warnings` — stuck detection warnings (see below)
-- `sessionId` — Frida session ID for `debug_trace` and `debug_stop`
+- `sessionId` — Frida session ID for `debug_trace` and `debug_session`
 
 ### Stuck Test Detection
 The test runner monitors for stuck tests (deadlocks, infinite loops). When detected,
-`debug_test_status` includes warnings:
+status response includes warnings:
 ```json
 { \"warnings\": [{ \"testName\": \"test_auth\", \"idleMs\": 12000,
   \"diagnosis\": \"0% CPU, stacks unchanged 6s\" }] }
@@ -482,20 +482,28 @@ The test runner monitors for stuck tests (deadlocks, infinite loops). When detec
 When you see a warning:
 1. Use `debug_trace({ sessionId, add: [\"relevant::patterns\"] })` to investigate
 2. Use `debug_query({ sessionId })` to see what's happening
-3. Use `debug_stop({ sessionId })` to kill the test when you understand the issue
+3. Use `debug_session({ action: \"stop\", sessionId })` to kill the test when you understand the issue
 
 ### Quick Reference
 - Rust: provide `projectRoot` | C++: provide `command` (test binary path)
 - Add `tracePatterns` to trace from the start (optional — can add later via `debug_trace`)
 
-## Live Memory Reads
+## Live Memory Access
 
-Read variables from a running process without setting up traces:
-- `debug_read({ sessionId, targets: [{ variable: \"gTempo\" }] })` — read a global
-- `debug_read({ sessionId, targets: [{ variable: \"gClock->counter\" }] })` — follow pointer chain
-- `debug_read({ sessionId, targets: [...], depth: 2 })` — expand struct fields
-- `debug_read({ sessionId, targets: [...], poll: { intervalMs: 100, durationMs: 2000 } })` — sample over time
-- Poll results: `debug_query({ eventType: \"variable_snapshot\" })`"#
+Read/write variables in a running process without setting up traces:
+- `debug_memory({ sessionId, targets: [{ variable: \"gTempo\" }] })` — read a global (action defaults to \"read\")
+- `debug_memory({ sessionId, targets: [{ variable: \"gClock->counter\" }] })` — follow pointer chain
+- `debug_memory({ sessionId, targets: [...], depth: 2 })` — expand struct fields
+- `debug_memory({ sessionId, targets: [...], poll: { intervalMs: 100, durationMs: 2000 } })` — sample over time
+- `debug_memory({ action: \"write\", sessionId, targets: [{ variable: \"gTempo\", value: 120.0 }] })` — write a value
+- Poll results: `debug_query({ eventType: \"variable_snapshot\" })`
+
+## Session Management
+
+- `debug_session({ action: \"status\", sessionId })` — full snapshot: pid, status, hook count, patterns, breakpoints, logpoints, watches, paused threads
+- `debug_session({ action: \"stop\", sessionId })` — stop session (add `retain: true` to keep events for post-mortem)
+- `debug_session({ action: \"list\" })` — list retained sessions
+- `debug_session({ action: \"delete\", sessionId })` — delete a retained session"#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
@@ -587,7 +595,7 @@ Validation Limits (enforced):
                     "type": "object",
                     "properties": {
                         "sessionId": { "type": "string" },
-                        "eventType": { "type": "string", "enum": ["function_enter", "function_exit", "stdout", "stderr", "crash"] },
+                        "eventType": { "type": "string", "enum": ["function_enter", "function_exit", "stdout", "stderr", "crash", "variable_snapshot", "pause", "logpoint", "condition_error"] },
                         "function": {
                             "type": "object",
                             "properties": {
@@ -632,49 +640,35 @@ Validation Limits (enforced):
                         },
                         "limit": { "type": "integer", "default": 50, "maximum": 500 },
                         "offset": { "type": "integer" },
-                        "verbose": { "type": "boolean", "default": false }
+                        "verbose": { "type": "boolean", "default": false },
+                        "afterEventId": { "type": "integer", "description": "Cursor: return only events with rowid > afterEventId (for incremental polling)" }
                     },
                     "required": ["sessionId"]
                 }),
             },
             McpTool {
-                name: "debug_stop".to_string(),
-                description: "Stop a debug session and clean up resources".to_string(),
+                name: "debug_session".to_string(),
+                description: "Manage debug sessions: get status, stop, list retained, or delete. Use action to select operation.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "sessionId": { "type": "string" },
-                        "retain": { "type": "boolean", "description": "Retain session data for post-mortem debugging (default: false)" }
+                        "action": { "type": "string", "enum": ["status", "stop", "list", "delete"], "description": "Action to perform" },
+                        "sessionId": { "type": "string", "description": "Session ID (required for status/stop/delete)" },
+                        "retain": { "type": "boolean", "description": "Retain session data for post-mortem debugging (default: false, only for action: 'stop')" }
                     },
-                    "required": ["sessionId"]
+                    "required": ["action"]
                 }),
             },
-            McpTool {
-                name: "debug_list_sessions".to_string(),
-                description: "List all retained debug sessions".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                }),
-            },
-            McpTool {
-                name: "debug_delete_session".to_string(),
-                description: "Delete a retained session and its data".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" }
-                    },
-                    "required": ["sessionId"]
-                }),
-            },
+            // ---- Primary tools (8) ----
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously. Returns a testRunId immediately — poll debug_test_status for progress and results. Auto-detects test framework (Cargo/Catch2). Use this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Default action is 'run' which returns a testRunId immediately. Use action: 'status' with testRunId to poll for progress and results. Auto-detects test framework (Cargo/Catch2). Use this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "projectRoot": { "type": "string", "description": "Project root for adapter detection" },
+                        "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' polls for results" },
+                        "testRunId": { "type": "string", "description": "Test run ID (required for action: 'status')" },
+                        "projectRoot": { "type": "string", "description": "Project root for adapter detection (required for action: 'run')" },
                         "framework": { "type": "string", "description": "Override auto-detection: \"cargo\", \"catch2\"" },
                         "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
                         "test": { "type": "string", "description": "Run a single test by name (substring match — e.g. 'stuck_detector' runs all tests containing that string)" },
@@ -689,13 +683,120 @@ Validation Limits (enforced):
                             }
                         },
                         "env": { "type": "object", "description": "Additional environment variables" }
+                    }
+                }),
+            },
+            McpTool {
+                name: "debug_breakpoint".to_string(),
+                description: "Set or remove breakpoints and logpoints. Pauses execution when hit (breakpoint) or logs a message without pausing (logpoint, when 'message' is present). Use debug_continue to resume after breakpoint pause. Supports function names, file:line, conditions, and hit counts.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "add": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "function": { "type": "string", "description": "Function name or pattern" },
+                                    "file": { "type": "string", "description": "Source file path" },
+                                    "line": { "type": "integer", "description": "Line number (required with file)" },
+                                    "condition": { "type": "string", "description": "JS condition: e.g. 'args[0] > 100'" },
+                                    "hitCount": { "type": "integer", "description": "Break after N hits (breakpoints only)" },
+                                    "message": { "type": "string", "description": "Log message template — if present, creates a logpoint instead of breakpoint. Use {args[0]} etc for arguments." }
+                                }
+                            }
+                        },
+                        "remove": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Breakpoint or logpoint IDs to remove"
+                        }
                     },
-                    "required": ["projectRoot"]
+                    "required": ["sessionId"]
+                }),
+            },
+            McpTool {
+                name: "debug_continue".to_string(),
+                description: "Resume execution after a breakpoint pause. Supports stepping: continue (resume all), step-over (next line), step-into (into calls), step-out (to caller).".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "action": { "type": "string", "enum": ["continue", "step-over", "step-into", "step-out"], "description": "Default: continue" }
+                    },
+                    "required": ["sessionId"]
+                }),
+            },
+            McpTool {
+                name: "debug_memory".to_string(),
+                description: "Read or write memory in a running process. Supports DWARF-resolved variables, pointer chains, struct expansion, raw addresses, and polling mode for timeline integration.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "action": { "type": "string", "enum": ["read", "write"], "description": "Default: read" },
+                        "targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "variable": { "type": "string", "description": "Variable name or pointer chain (e.g. 'gClock->counter')" },
+                                    "address": { "type": "string", "description": "Hex address for raw memory reads" },
+                                    "size": { "type": "integer", "description": "Size in bytes (required for raw address)" },
+                                    "type": { "type": "string", "description": "Type: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer/bytes" },
+                                    "value": { "description": "Value to write (required for action: 'write')" }
+                                }
+                            },
+                            "description": "1-16 read/write targets"
+                        },
+                        "depth": { "type": "integer", "description": "Struct traversal depth (default 1, max 5)", "minimum": 1, "maximum": 5 },
+                        "poll": {
+                            "type": "object",
+                            "properties": {
+                                "intervalMs": { "type": "integer", "description": "Poll interval in ms (50-5000)", "minimum": 50, "maximum": 5000 },
+                                "durationMs": { "type": "integer", "description": "Poll duration in ms (100-30000)", "minimum": 100, "maximum": 30000 }
+                            }
+                        }
+                    },
+                    "required": ["sessionId", "targets"]
+                }),
+            },
+            // ---- Deprecated tools (7) — kept for backward compatibility ----
+            McpTool {
+                name: "debug_stop".to_string(),
+                description: "(Deprecated: use debug_session with action: 'stop') Stop a debug session and clean up resources".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" },
+                        "retain": { "type": "boolean", "description": "Retain session data for post-mortem debugging (default: false)" }
+                    },
+                    "required": ["sessionId"]
+                }),
+            },
+            McpTool {
+                name: "debug_list_sessions".to_string(),
+                description: "(Deprecated: use debug_session with action: 'list') List all retained debug sessions".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                }),
+            },
+            McpTool {
+                name: "debug_delete_session".to_string(),
+                description: "(Deprecated: use debug_session with action: 'delete') Delete a retained session and its data".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string" }
+                    },
+                    "required": ["sessionId"]
                 }),
             },
             McpTool {
                 name: "debug_test_status".to_string(),
-                description: "Query the status of a running test. Returns progress (elapsed_ms, passed/failed/skipped, phase, current test name and its elapsed time) while running, or full results when complete. Server blocks up to 15s waiting for completion — safe to call immediately after previous response.".to_string(),
+                description: "(Deprecated: use debug_test with action: 'status') Query the status of a running test.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -706,7 +807,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_read".to_string(),
-                description: "Read memory from a running process. Supports DWARF-resolved variables, pointer chains, struct expansion, raw addresses, and polling mode for timeline integration.".to_string(),
+                description: "(Deprecated: use debug_memory with action: 'read') Read memory from a running process.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -738,7 +839,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_write".to_string(),
-                description: "Write to global variables or raw memory addresses while the process is running (or paused at a breakpoint). Supports named DWARF variables and raw hex addresses.".to_string(),
+                description: "(Deprecated: use debug_memory with action: 'write') Write to global variables or raw memory addresses.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -761,49 +862,8 @@ Validation Limits (enforced):
                 }),
             },
             McpTool {
-                name: "debug_breakpoint".to_string(),
-                description: "Set or remove breakpoints. Pauses execution when hit. Use debug_continue to resume. Supports function names, file:line, conditions, and hit counts.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" },
-                        "add": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "function": { "type": "string", "description": "Function name or pattern" },
-                                    "file": { "type": "string", "description": "Source file path" },
-                                    "line": { "type": "integer", "description": "Line number (required with file)" },
-                                    "condition": { "type": "string", "description": "JS condition: e.g. 'args[0] > 100'" },
-                                    "hitCount": { "type": "integer", "description": "Break after N hits" }
-                                }
-                            }
-                        },
-                        "remove": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Breakpoint IDs to remove"
-                        }
-                    },
-                    "required": ["sessionId"]
-                }),
-            },
-            McpTool {
-                name: "debug_continue".to_string(),
-                description: "Resume execution after a breakpoint pause. Supports stepping: continue (resume all), step-over (next line), step-into (into calls), step-out (to caller).".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" },
-                        "action": { "type": "string", "enum": ["continue", "step-over", "step-into", "step-out"], "description": "Default: continue" }
-                    },
-                    "required": ["sessionId"]
-                }),
-            },
-            McpTool {
                 name: "debug_logpoint".to_string(),
-                description: "Set or remove logpoints. Like breakpoints but non-blocking — logs a message template on each hit without pausing. Use {args[0]}, {args[1]} for arguments, {threadId} for thread ID.".to_string(),
+                description: "(Deprecated: use debug_breakpoint with 'message' field) Set or remove logpoints. Like breakpoints but non-blocking — logs a message template on each hit without pausing.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -844,13 +904,33 @@ Validation Limits (enforced):
             "debug_launch" => self.tool_debug_launch(&call.arguments, connection_id).await,
             "debug_trace" => self.tool_debug_trace(&call.arguments, connection_id).await,
             "debug_query" => self.tool_debug_query(&call.arguments).await,
-            "debug_stop" => self.tool_debug_stop(&call.arguments).await,
-            "debug_list_sessions" => self.tool_debug_list_sessions().await,
-            "debug_delete_session" => self.tool_debug_delete_session(&call.arguments).await,
+            "debug_session" => self.tool_debug_session(&call.arguments).await,
+            "debug_stop" => {
+                tracing::warn!("debug_stop is deprecated, use debug_session with action: 'stop'");
+                self.tool_debug_stop(&call.arguments).await
+            },
+            "debug_list_sessions" => {
+                tracing::warn!("debug_list_sessions is deprecated, use debug_session with action: 'list'");
+                self.tool_debug_list_sessions().await
+            },
+            "debug_delete_session" => {
+                tracing::warn!("debug_delete_session is deprecated, use debug_session with action: 'delete'");
+                self.tool_debug_delete_session(&call.arguments).await
+            },
             "debug_test" => self.tool_debug_test(&call.arguments, connection_id).await,
-            "debug_test_status" => self.tool_debug_test_status(&call.arguments).await,
-            "debug_read" => self.tool_debug_read(&call.arguments).await,
-            "debug_write" => self.tool_debug_write(&call.arguments).await,
+            "debug_test_status" => {
+                tracing::warn!("debug_test_status is deprecated, use debug_test with action: 'status'");
+                self.tool_debug_test_status(&call.arguments).await
+            },
+            "debug_memory" => self.tool_debug_memory(&call.arguments).await,
+            "debug_read" => {
+                tracing::warn!("debug_read is deprecated, use debug_memory with action: 'read'");
+                self.tool_debug_read(&call.arguments).await
+            },
+            "debug_write" => {
+                tracing::warn!("debug_write is deprecated, use debug_memory with action: 'write'");
+                self.tool_debug_write(&call.arguments).await
+            },
             "debug_breakpoint" => self.tool_debug_breakpoint(&call.arguments).await,
             "debug_continue" => self.tool_debug_continue(&call.arguments).await,
             "debug_logpoint" => self.tool_debug_logpoint(&call.arguments).await,
@@ -1459,6 +1539,9 @@ Validation Limits (enforced):
                     EventTypeFilter::Stderr => crate::db::EventType::Stderr,
                     EventTypeFilter::Crash => crate::db::EventType::Crash,
                     EventTypeFilter::VariableSnapshot => crate::db::EventType::VariableSnapshot,
+                    EventTypeFilter::Pause => crate::db::EventType::Pause,
+                    EventTypeFilter::Logpoint => crate::db::EventType::Logpoint,
+                    EventTypeFilter::ConditionError => crate::db::EventType::ConditionError,
                 });
             }
             if let Some(ref f) = req.function {
@@ -1490,6 +1573,9 @@ Validation Limits (enforced):
             }
             if let Some(pid) = req.pid {
                 q.pid_equals = Some(pid);
+            }
+            if let Some(after) = req.after_event_id {
+                q.after_rowid = Some(after);
             }
             q.limit(limit).offset(offset)
         })?;
@@ -1504,6 +1590,9 @@ Validation Limits (enforced):
                     EventTypeFilter::Stderr => crate::db::EventType::Stderr,
                     EventTypeFilter::Crash => crate::db::EventType::Crash,
                     EventTypeFilter::VariableSnapshot => crate::db::EventType::VariableSnapshot,
+                    EventTypeFilter::Pause => crate::db::EventType::Pause,
+                    EventTypeFilter::Logpoint => crate::db::EventType::Logpoint,
+                    EventTypeFilter::ConditionError => crate::db::EventType::ConditionError,
                 });
             }
             if let Some(ref f) = req.function {
@@ -1536,6 +1625,9 @@ Validation Limits (enforced):
             if let Some(pid) = req.pid {
                 q.pid_equals = Some(pid);
             }
+            if let Some(after) = req.after_event_id {
+                q.after_rowid = Some(after);
+            }
             q
         })?;
         let has_more = (offset as u64 + events.len() as u64) < total_count;
@@ -1546,15 +1638,63 @@ Validation Limits (enforced):
             .map(|e| format_event(e, verbose))
             .collect();
 
+        // Compute cursor fields
+        let last_event_id = events.iter()
+            .filter_map(|e| e.rowid)
+            .max();
+
+        let events_dropped = if let Some(after) = req.after_event_id {
+            let min_rowid = self.session_manager.db().min_rowid_for_session(&req.session_id)?;
+            Some(min_rowid.map_or(false, |min| after < min))
+        } else {
+            None
+        };
+
         let pids = self.session_manager.get_all_pids(&req.session_id);
         let response = DebugQueryResponse {
             events: event_values,
             total_count,
             has_more,
             pids: if pids.len() > 1 { Some(pids) } else { None },
+            last_event_id,
+            events_dropped,
         };
 
         Ok(serde_json::to_value(response)?)
+    }
+
+    async fn tool_debug_memory(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugMemoryRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        match req.action {
+            crate::mcp::MemoryAction::Read => {
+                let read_req = crate::mcp::DebugReadRequest {
+                    session_id: req.session_id,
+                    targets: req.targets.into_iter().map(|t| crate::mcp::ReadTarget {
+                        variable: t.variable,
+                        address: t.address,
+                        size: t.size,
+                        type_hint: t.type_hint,
+                    }).collect(),
+                    depth: req.depth,
+                    poll: req.poll,
+                };
+                self.session_manager.execute_debug_read(&serde_json::to_value(read_req)?).await
+            }
+            crate::mcp::MemoryAction::Write => {
+                let write_req = crate::mcp::DebugWriteRequest {
+                    session_id: req.session_id,
+                    targets: req.targets.into_iter().map(|t| crate::mcp::WriteTarget {
+                        variable: t.variable,
+                        address: t.address,
+                        value: t.value.unwrap_or(serde_json::Value::Null),
+                        type_hint: t.type_hint,
+                    }).collect(),
+                };
+                self.session_manager.execute_debug_write(&serde_json::to_value(write_req)?).await
+            }
+        }
     }
 
     async fn tool_debug_read(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -1563,6 +1703,29 @@ Validation Limits (enforced):
 
     async fn tool_debug_write(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         self.session_manager.execute_debug_write(args).await
+    }
+
+    async fn tool_debug_session(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: DebugSessionRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        match req.action {
+            SessionAction::Status => {
+                let session_id = req.session_id.as_deref().unwrap();
+                let _ = self.require_session(session_id)?;
+                let status = self.session_manager.session_status(session_id)?;
+                Ok(serde_json::to_value(status)?)
+            }
+            SessionAction::Stop => {
+                self.tool_debug_stop(args).await
+            }
+            SessionAction::List => {
+                self.tool_debug_list_sessions().await
+            }
+            SessionAction::Delete => {
+                self.tool_debug_delete_session(args).await
+            }
+        }
     }
 
     async fn tool_debug_stop(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
@@ -1650,6 +1813,22 @@ Validation Limits (enforced):
     }
 
     async fn tool_debug_test(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
+
+        match req.action.as_ref().unwrap_or(&crate::mcp::TestAction::Run) {
+            crate::mcp::TestAction::Run => self.tool_debug_test_run(args, connection_id).await,
+            crate::mcp::TestAction::Status => {
+                let test_run_id = req.test_run_id.as_deref()
+                    .ok_or_else(|| crate::Error::ValidationError(
+                        "testRunId is required for action: 'status'".to_string()
+                    ))?;
+                let status_req = serde_json::json!({ "testRunId": test_run_id });
+                self.tool_debug_test_status(&status_req).await
+            }
+        }
+    }
+
+    async fn tool_debug_test_run(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
         // Cleanup stale runs
         self.cleanup_stale_test_runs().await;
 
@@ -1969,33 +2148,55 @@ Validation Limits (enforced):
         req.validate()?;
 
         let mut all_breakpoints = Vec::new();
+        let mut all_logpoints = Vec::new();
 
-        // Handle additions
+        // Handle additions — split by presence of `message` field
         if let Some(targets) = req.add {
             for target in targets {
-                let breakpoint = self.session_manager
-                    .set_breakpoint_async(
-                        &req.session_id,
-                        None, // auto-generate ID
-                        target.function,
-                        target.file,
-                        target.line,
-                        target.condition,
-                        target.hit_count,
-                    )
-                    .await?;
-                all_breakpoints.push(breakpoint);
+                if let Some(message) = target.message {
+                    // Logpoint path: has message
+                    let logpoint = self.session_manager
+                        .set_logpoint_async(
+                            &req.session_id,
+                            None,
+                            target.function,
+                            target.file,
+                            target.line,
+                            message,
+                            target.condition,
+                        )
+                        .await?;
+                    all_logpoints.push(logpoint);
+                } else {
+                    // Breakpoint path: no message
+                    let breakpoint = self.session_manager
+                        .set_breakpoint_async(
+                            &req.session_id,
+                            None,
+                            target.function,
+                            target.file,
+                            target.line,
+                            target.condition,
+                            target.hit_count,
+                        )
+                        .await?;
+                    all_breakpoints.push(breakpoint);
+                }
             }
         }
 
-        // Handle removals
+        // Handle removals — try both breakpoints and logpoints (IDs are namespaced bp-*/lp-*)
         if let Some(ids) = req.remove {
-            for id in ids {
-                self.session_manager.remove_breakpoint(&req.session_id, &id).await;
+            for id in &ids {
+                if id.starts_with("lp-") {
+                    self.session_manager.remove_logpoint(&req.session_id, id).await;
+                } else {
+                    self.session_manager.remove_breakpoint(&req.session_id, id).await;
+                }
             }
         }
 
-        // Return current breakpoints
+        // Return current breakpoints if none were just added
         if all_breakpoints.is_empty() {
             all_breakpoints = self.session_manager
                 .get_breakpoints(&req.session_id)
@@ -2019,52 +2220,7 @@ Validation Limits (enforced):
                 .collect();
         }
 
-        Ok(serde_json::to_value(crate::mcp::DebugBreakpointResponse {
-            breakpoints: all_breakpoints,
-        })?)
-    }
-
-    async fn tool_debug_continue(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let req: crate::mcp::DebugContinueRequest = serde_json::from_value(args.clone())?;
-        req.validate()?;
-
-        let response = self.session_manager.debug_continue_async(&req.session_id, req.action).await?;
-
-        Ok(serde_json::to_value(response)?)
-    }
-
-    async fn tool_debug_logpoint(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let req: crate::mcp::DebugLogpointRequest = serde_json::from_value(args.clone())?;
-        req.validate()?;
-
-        let mut all_logpoints = Vec::new();
-
-        // Handle additions
-        if let Some(targets) = req.add {
-            for target in targets {
-                let logpoint = self.session_manager
-                    .set_logpoint_async(
-                        &req.session_id,
-                        None,
-                        target.function,
-                        target.file,
-                        target.line,
-                        target.message,
-                        target.condition,
-                    )
-                    .await?;
-                all_logpoints.push(logpoint);
-            }
-        }
-
-        // Handle removals
-        if let Some(ids) = req.remove {
-            for id in ids {
-                self.session_manager.remove_logpoint(&req.session_id, &id).await;
-            }
-        }
-
-        // Return current logpoints
+        // Return current logpoints if none were just added
         if all_logpoints.is_empty() {
             all_logpoints = self.session_manager
                 .get_logpoints(&req.session_id)
@@ -2089,9 +2245,43 @@ Validation Limits (enforced):
                 .collect();
         }
 
-        Ok(serde_json::to_value(crate::mcp::DebugLogpointResponse {
+        Ok(serde_json::to_value(crate::mcp::DebugBreakpointResponse {
+            breakpoints: all_breakpoints,
             logpoints: all_logpoints,
         })?)
+    }
+
+    async fn tool_debug_continue(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugContinueRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        let response = self.session_manager.debug_continue_async(&req.session_id, req.action).await?;
+
+        Ok(serde_json::to_value(response)?)
+    }
+
+    async fn tool_debug_logpoint(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        tracing::warn!("debug_logpoint is deprecated, use debug_breakpoint with 'message' field");
+        let req: crate::mcp::DebugLogpointRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        // Convert LogpointRequest → BreakpointRequest and delegate
+        let bp_targets: Vec<crate::mcp::BreakpointTarget> = req.add.unwrap_or_default().into_iter().map(|lp| {
+            crate::mcp::BreakpointTarget {
+                function: lp.function,
+                file: lp.file,
+                line: lp.line,
+                condition: lp.condition,
+                hit_count: None,
+                message: Some(lp.message),
+            }
+        }).collect();
+        let bp_req = serde_json::to_value(crate::mcp::DebugBreakpointRequest {
+            session_id: req.session_id,
+            add: if bp_targets.is_empty() { None } else { Some(bp_targets) },
+            remove: req.remove,
+        })?;
+        self.tool_debug_breakpoint(&bp_req).await
     }
 }
 

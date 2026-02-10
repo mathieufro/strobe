@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+fn default_empty_string() -> String { String::new() }
+
 // ============ debug_launch ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +205,9 @@ pub enum EventTypeFilter {
     Stderr,
     Crash,
     VariableSnapshot,
+    Pause,
+    Logpoint,
+    ConditionError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +274,9 @@ pub struct DebugQueryRequest {
     pub offset: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbose: Option<bool>,
+    /// Cursor: return only events with rowid > after_event_id (for incremental polling)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_event_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +288,12 @@ pub struct DebugQueryResponse {
     /// All process IDs in this session (parent + children), only present when multiple
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pids: Option<Vec<u32>>,
+    /// Highest event rowid in this response (use as next cursor)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<i64>,
+    /// True if FIFO eviction happened since the cursor position
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_dropped: Option<bool>,
 }
 
 // ============ debug_stop ============
@@ -478,9 +492,23 @@ pub struct DebugReadPollResponse {
 
 // ============ debug_test ============
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestAction {
+    Run,
+    Status,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugTestRequest {
+    /// Action: "run" (default) starts a test, "status" polls for results
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<TestAction>,
+    /// Required for action: "status" — the test run ID to poll
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_run_id: Option<String>,
+    #[serde(default = "default_empty_string")]
     pub project_root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework: Option<String>,
@@ -768,6 +796,10 @@ pub struct BreakpointTarget {
     pub condition: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hit_count: Option<u32>,
+    /// If present, this entry is a logpoint (non-blocking log on hit).
+    /// Use {args[0]}, {args[1]} for arguments, {threadId} for thread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl DebugBreakpointRequest {
@@ -824,6 +856,26 @@ impl DebugBreakpointRequest {
                         ));
                     }
                 }
+
+                // Logpoint-specific validation (message present)
+                if let Some(ref message) = target.message {
+                    if message.is_empty() {
+                        return Err(crate::Error::ValidationError(
+                            "Logpoint message must not be empty".to_string()
+                        ));
+                    }
+                    if message.len() > MAX_LOGPOINT_MESSAGE_LENGTH {
+                        return Err(crate::Error::ValidationError(
+                            format!("Logpoint message length ({} bytes) exceeds maximum of {} bytes",
+                                message.len(), MAX_LOGPOINT_MESSAGE_LENGTH)
+                        ));
+                    }
+                    if target.hit_count.is_some() {
+                        return Err(crate::Error::ValidationError(
+                            "hit_count is not valid for logpoints (entries with 'message')".to_string()
+                        ));
+                    }
+                }
             }
         }
 
@@ -835,6 +887,8 @@ impl DebugBreakpointRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DebugBreakpointResponse {
     pub breakpoints: Vec<BreakpointInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub logpoints: Vec<LogpointInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1005,6 +1059,160 @@ pub struct LogpointInfo {
     pub address: String,
 }
 
+// ============ debug_memory (consolidated read + write) ============
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAction {
+    Read,
+    Write,
+}
+
+impl Default for MemoryAction {
+    fn default() -> Self { Self::Read }
+}
+
+/// Unified target for debug_memory — works for both read and write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTarget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_hint: Option<String>,
+    /// Value to write (required for action: "write", ignored for "read")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugMemoryRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub action: MemoryAction,
+    pub targets: Vec<MemoryTarget>,
+    /// Max struct traversal depth for reads (1-5)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    /// Poll config for reads
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollConfig>,
+}
+
+impl DebugMemoryRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.session_id.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "sessionId must not be empty".to_string()
+            ));
+        }
+        if self.targets.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "targets must not be empty".to_string()
+            ));
+        }
+        match self.action {
+            MemoryAction::Read => {
+                // Delegate validation to DebugReadRequest
+                let read_req = DebugReadRequest {
+                    session_id: self.session_id.clone(),
+                    targets: self.targets.iter().map(|t| ReadTarget {
+                        variable: t.variable.clone(),
+                        address: t.address.clone(),
+                        size: t.size,
+                        type_hint: t.type_hint.clone(),
+                    }).collect(),
+                    depth: self.depth,
+                    poll: self.poll.clone(),
+                };
+                read_req.validate()
+            }
+            MemoryAction::Write => {
+                // Delegate validation to DebugWriteRequest
+                let write_req = DebugWriteRequest {
+                    session_id: self.session_id.clone(),
+                    targets: self.targets.iter().map(|t| WriteTarget {
+                        variable: t.variable.clone(),
+                        address: t.address.clone(),
+                        value: t.value.clone().unwrap_or(serde_json::Value::Null),
+                        type_hint: t.type_hint.clone(),
+                    }).collect(),
+                };
+                write_req.validate()
+            }
+        }
+    }
+}
+
+// ============ debug_session (consolidated stop + list + delete + status) ============
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAction {
+    Status,
+    Stop,
+    List,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugSessionRequest {
+    pub action: SessionAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retain: Option<bool>,
+}
+
+impl DebugSessionRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        match self.action {
+            SessionAction::Status | SessionAction::Stop | SessionAction::Delete => {
+                if self.session_id.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(crate::Error::ValidationError(
+                        format!("sessionId is required for action: {:?}", self.action)
+                    ));
+                }
+            }
+            SessionAction::List => {} // no sessionId needed
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PausedThreadInfo {
+    pub thread_id: u64,
+    pub breakpoint_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatusResponse {
+    pub status: String,             // "running" | "paused" | "exited"
+    pub pid: u32,
+    pub event_count: u64,
+    pub hooked_functions: u32,
+    pub trace_patterns: Vec<String>,
+    pub breakpoints: Vec<BreakpointInfo>,
+    pub logpoints: Vec<LogpointInfo>,
+    pub watches: Vec<ActiveWatch>,
+    pub paused_threads: Vec<PausedThreadInfo>,
+}
+
 #[cfg(test)]
 mod write_tests {
     use super::*;
@@ -1104,6 +1312,7 @@ mod breakpoint_tests {
                 line: None,
                 condition: None,
                 hit_count: None,
+                message: None,
             }]),
             remove: None,
         };
@@ -1118,6 +1327,7 @@ mod breakpoint_tests {
                 line: Some(42),
                 condition: None,
                 hit_count: None,
+                message: None,
             }]),
             remove: None,
         };
@@ -1132,6 +1342,7 @@ mod breakpoint_tests {
                 line: None,
                 condition: None,
                 hit_count: None,
+                message: None,
             }]),
             remove: None,
         };
@@ -1146,6 +1357,7 @@ mod breakpoint_tests {
                 line: None,
                 condition: None,
                 hit_count: None,
+                message: None,
             }]),
             remove: None,
         };
@@ -1537,5 +1749,270 @@ mod read_tests {
             };
             assert!(req.validate().is_ok(), "type '{}' should be valid", type_hint);
         }
+    }
+}
+
+#[cfg(test)]
+mod event_type_filter_tests {
+    use super::*;
+
+    #[test]
+    fn test_event_type_filter_pause() {
+        let json = serde_json::json!("pause");
+        let filter: EventTypeFilter = serde_json::from_value(json).unwrap();
+        assert!(matches!(filter, EventTypeFilter::Pause));
+    }
+
+    #[test]
+    fn test_event_type_filter_logpoint() {
+        let json = serde_json::json!("logpoint");
+        let filter: EventTypeFilter = serde_json::from_value(json).unwrap();
+        assert!(matches!(filter, EventTypeFilter::Logpoint));
+    }
+
+    #[test]
+    fn test_event_type_filter_condition_error() {
+        let json = serde_json::json!("condition_error");
+        let filter: EventTypeFilter = serde_json::from_value(json).unwrap();
+        assert!(matches!(filter, EventTypeFilter::ConditionError));
+    }
+}
+
+#[cfg(test)]
+mod query_pagination_tests {
+    use super::*;
+
+    #[test]
+    fn test_query_request_with_after_event_id() {
+        let json = serde_json::json!({
+            "sessionId": "s1",
+            "afterEventId": 42
+        });
+        let req: DebugQueryRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.after_event_id, Some(42));
+    }
+
+    #[test]
+    fn test_query_response_has_cursor_fields() {
+        let resp = DebugQueryResponse {
+            events: vec![],
+            total_count: 0,
+            has_more: false,
+            pids: None,
+            last_event_id: Some(99),
+            events_dropped: Some(false),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["lastEventId"], 99);
+        assert_eq!(json["eventsDropped"], false);
+    }
+}
+
+#[cfg(test)]
+mod unified_breakpoint_tests {
+    use super::*;
+
+    #[test]
+    fn test_breakpoint_target_with_message_is_logpoint() {
+        let json = serde_json::json!({
+            "function": "foo",
+            "message": "hit: {args[0]}"
+        });
+        let target: BreakpointTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(target.message.as_deref(), Some("hit: {args[0]}"));
+    }
+
+    #[test]
+    fn test_breakpoint_target_without_message_is_breakpoint() {
+        let json = serde_json::json!({
+            "function": "foo",
+            "condition": "args[0] > 100"
+        });
+        let target: BreakpointTarget = serde_json::from_value(json).unwrap();
+        assert!(target.message.is_none());
+    }
+
+    #[test]
+    fn test_breakpoint_response_includes_logpoints() {
+        let resp = DebugBreakpointResponse {
+            breakpoints: vec![BreakpointInfo {
+                id: "bp-1".to_string(),
+                function: Some("foo".to_string()),
+                file: None,
+                line: None,
+                address: "0x1000".to_string(),
+            }],
+            logpoints: vec![LogpointInfo {
+                id: "lp-1".to_string(),
+                message: "hit".to_string(),
+                function: Some("bar".to_string()),
+                file: None,
+                line: None,
+                address: "0x2000".to_string(),
+            }],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["breakpoints"].as_array().unwrap().len(), 1);
+        assert_eq!(json["logpoints"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod memory_consolidation_tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_read_request() {
+        let json = serde_json::json!({
+            "sessionId": "s1",
+            "action": "read",
+            "targets": [{ "variable": "gTempo" }]
+        });
+        let req: DebugMemoryRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, MemoryAction::Read);
+        assert_eq!(req.targets.len(), 1);
+    }
+
+    #[test]
+    fn test_memory_write_request() {
+        let json = serde_json::json!({
+            "sessionId": "s1",
+            "action": "write",
+            "targets": [{ "variable": "g_counter", "value": 42 }]
+        });
+        let req: DebugMemoryRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, MemoryAction::Write);
+    }
+
+    #[test]
+    fn test_memory_action_default_read() {
+        let json = serde_json::json!({
+            "sessionId": "s1",
+            "targets": [{ "variable": "gTempo" }]
+        });
+        let req: DebugMemoryRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, MemoryAction::Read);
+    }
+}
+
+#[cfg(test)]
+mod test_consolidation_tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_test_with_action_run() {
+        let json = serde_json::json!({
+            "action": "run",
+            "projectRoot": "/tmp/proj"
+        });
+        let req: DebugTestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, Some(TestAction::Run));
+    }
+
+    #[test]
+    fn test_debug_test_with_action_status() {
+        let json = serde_json::json!({
+            "action": "status",
+            "testRunId": "tr-123"
+        });
+        let req: DebugTestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, Some(TestAction::Status));
+        assert_eq!(req.test_run_id.as_deref(), Some("tr-123"));
+    }
+
+    #[test]
+    fn test_debug_test_default_action_is_run() {
+        let json = serde_json::json!({
+            "projectRoot": "/tmp/proj"
+        });
+        let req: DebugTestRequest = serde_json::from_value(json).unwrap();
+        assert!(req.action.is_none()); // None treated as "run"
+    }
+}
+
+#[cfg(test)]
+mod session_consolidation_tests {
+    use super::*;
+
+    #[test]
+    fn test_session_action_serde() {
+        let json = serde_json::json!({ "action": "status", "sessionId": "s1" });
+        let req: DebugSessionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, SessionAction::Status);
+        assert_eq!(req.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn test_session_action_list_no_session_id() {
+        let json = serde_json::json!({ "action": "list" });
+        let req: DebugSessionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, SessionAction::List);
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_session_status_requires_session_id() {
+        let json = serde_json::json!({ "action": "status" });
+        let req: DebugSessionRequest = serde_json::from_value(json).unwrap();
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_session_stop_requires_session_id() {
+        let json = serde_json::json!({ "action": "stop" });
+        let req: DebugSessionRequest = serde_json::from_value(json).unwrap();
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_session_delete_requires_session_id() {
+        let json = serde_json::json!({ "action": "delete" });
+        let req: DebugSessionRequest = serde_json::from_value(json).unwrap();
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_session_stop_with_retain() {
+        let json = serde_json::json!({ "action": "stop", "sessionId": "s1", "retain": true });
+        let req: DebugSessionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.action, SessionAction::Stop);
+        assert_eq!(req.retain, Some(true));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_session_status_response_serde() {
+        let resp = SessionStatusResponse {
+            status: "running".to_string(),
+            pid: 1234,
+            event_count: 100,
+            hooked_functions: 5,
+            trace_patterns: vec!["foo::*".to_string()],
+            breakpoints: vec![],
+            logpoints: vec![],
+            watches: vec![],
+            paused_threads: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["pid"], 1234);
+        assert_eq!(json["eventCount"], 100);
+    }
+
+    #[test]
+    fn test_paused_thread_info_serde() {
+        let info = PausedThreadInfo {
+            thread_id: 42,
+            breakpoint_id: "bp-1".to_string(),
+            function: Some("main".to_string()),
+            file: None,
+            line: None,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["threadId"], 42);
+        assert_eq!(json["breakpointId"], "bp-1");
+        assert_eq!(json["function"], "main");
+        // file/line should be omitted (skip_serializing_if)
+        assert!(json.get("file").is_none());
     }
 }
