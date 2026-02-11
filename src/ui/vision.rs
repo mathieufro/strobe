@@ -146,7 +146,15 @@ impl VisionSidecar {
     fn start(&mut self) -> Result<()> {
         let sidecar_dir = self.find_sidecar_dir()?;
 
-        let child = Command::new("python3")
+        // Prefer venv Python (required: system Python may be 3.14+ which breaks transformers)
+        let venv_python = sidecar_dir.join("venv/bin/python");
+        let python = if venv_python.exists() {
+            venv_python.to_string_lossy().to_string()
+        } else {
+            "python3".to_string()
+        };
+
+        let child = Command::new(&python)
             .args(["-m", "strobe_vision.server"])
             .current_dir(&sidecar_dir)
             .stdin(Stdio::piped())

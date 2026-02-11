@@ -9,6 +9,13 @@ tests/**/target/
 tests/**/build/
 tests/**/*.dSYM/.worktrees/
 
+# Vision sidecar (Python)
+vision-sidecar/venv/
+vision-sidecar/__pycache__/
+vision-sidecar/**/__pycache__/
+vision-sidecar/*.egg-info/
+*.pyc
+
 # VS Code extension
 strobe-vscode/node_modules/
 strobe-vscode/dist/
