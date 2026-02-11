@@ -14,6 +14,7 @@ vision-sidecar/venv/
 vision-sidecar/__pycache__/
 vision-sidecar/**/__pycache__/
 vision-sidecar/*.egg-info/
+vision-sidecar/*.pt
 *.pyc
 
 # VS Code extension
