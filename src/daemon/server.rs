@@ -2231,6 +2231,28 @@ Validation Limits (enforced):
                         ));
                     }
 
+                    // SEC-8: Rate limit vision calls to prevent GPU/CPU exhaustion
+                    // Allow 1 call per second per session
+                    {
+                        use std::sync::{Mutex, OnceLock};
+                        static LAST_VISION_CALL: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>>
+                            = OnceLock::new();
+
+                        let now = std::time::Instant::now();
+                        let rate_limiter = LAST_VISION_CALL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+                        let mut last_calls = rate_limiter.lock().unwrap();
+                        if let Some(last_time) = last_calls.get(&req.session_id) {
+                            let elapsed = now.duration_since(*last_time);
+                            if elapsed < std::time::Duration::from_secs(1) {
+                                return Err(crate::Error::UiQueryFailed(
+                                    format!("Vision rate limit exceeded. Please wait {:.1}s before next call.",
+                                        1.0 - elapsed.as_secs_f64())
+                                ));
+                            }
+                        }
+                        last_calls.insert(req.session_id.clone(), now);
+                    } // Lock guard dropped here, before any await points
+
                     // Capture screenshot for vision
                     let screenshot_b64 = {
                         let pid = session.pid;

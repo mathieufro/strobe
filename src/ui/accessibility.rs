@@ -48,6 +48,32 @@ pub fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
         }
     }
 
+    // SEC-5: Validate PID ownership to prevent privilege escalation
+    unsafe {
+        let current_uid = libc::geteuid();
+        let mut proc_info: libc::proc_bsdinfo = std::mem::zeroed();
+        let ret = libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut proc_info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as i32,
+        );
+
+        if ret <= 0 {
+            return Err(crate::Error::UiQueryFailed(
+                format!("Process {} not found or not accessible", pid)
+            ));
+        }
+
+        // Check if the process is owned by the current user
+        if proc_info.pbi_uid != current_uid && current_uid != 0 {
+            return Err(crate::Error::UiQueryFailed(
+                format!("Permission denied: process {} is owned by another user", pid)
+            ));
+        }
+    }
+
     unsafe {
         let app_ref = AXUIElementCreateApplication(pid as i32);
         if app_ref.is_null() {

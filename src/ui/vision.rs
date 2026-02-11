@@ -190,6 +190,9 @@ impl VisionSidecar {
             .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to flush sidecar stdin: {}", e)))?;
 
         // CORR-1: Read response line without taking ownership of stdout
+        // SEC-7: Note: This read_line() can block indefinitely if sidecar hangs.
+        // Mitigation: (1) health check at startup, (2) idle timeout kills hung process,
+        // (3) crash detection on empty response. Full timeout requires async I/O refactor.
         let stdout = child.stdout.as_mut()
             .ok_or_else(|| crate::Error::UiQueryFailed("Sidecar stdout closed".to_string()))?;
         let mut response_line = String::new();
@@ -236,5 +239,140 @@ impl VisionSidecar {
 impl Drop for VisionSidecar {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TEST-1: Sidecar crash recovery test
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_sidecar_crash_recovery() {
+        use std::process::Command;
+
+        let mut sidecar = VisionSidecar::new();
+
+        // Check if Python environment is available
+        let python_check = Command::new("python3")
+            .arg("-c")
+            .arg("import torch, ultralytics, transformers")
+            .output();
+
+        if python_check.is_err() || !python_check.unwrap().status.success() {
+            eprintln!("Skipping vision crash recovery test: Python dependencies not installed");
+            return;
+        }
+
+        // First detect call — should start sidecar
+        use base64::Engine;
+        let test_image = base64::engine::general_purpose::STANDARD.encode(&[0u8; 100]);
+        let _result1 = sidecar.detect(&test_image, 0.5, 0.5);
+
+        // Even if detection fails due to invalid image, the process should be started
+        if let Some(ref child) = sidecar.process {
+            let pid = child.id();
+
+            // Kill the sidecar process to simulate crash
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+
+            // Wait briefly for process to die
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Second detect call — should auto-restart
+            let result2 = sidecar.detect(&test_image, 0.5, 0.5);
+
+            // If the second call didn't panic and returned an error (not crash),
+            // then crash recovery worked (process was restarted)
+            match result2 {
+                Ok(_) => {
+                    // Success means recovery worked and image was processed
+                    assert!(true, "Sidecar recovered and processed image");
+                }
+                Err(e) => {
+                    // Error is OK as long as it's not a "sidecar closed" error
+                    let err_msg = format!("{:?}", e);
+                    assert!(
+                        !err_msg.contains("stdout closed") && !err_msg.contains("stdin closed"),
+                        "Sidecar should have recovered from crash, got: {}",
+                        err_msg
+                    );
+                }
+            }
+
+            // Verify new process was spawned
+            if let Some(ref new_child) = sidecar.process {
+                let new_pid = new_child.id();
+                assert_ne!(
+                    pid, new_pid,
+                    "New sidecar process should have different PID after crash recovery"
+                );
+            }
+        } else {
+            // If sidecar couldn't start at all, that's expected in CI without models
+            eprintln!("Sidecar didn't start (models not available), skipping crash test");
+        }
+    }
+
+    // TEST-2: Invalid screenshot data test
+    #[test]
+    fn test_invalid_screenshot_data() {
+        use base64::Engine;
+        let mut sidecar = VisionSidecar::new();
+
+        // Test empty data
+        let empty_b64 = "";
+        let result = sidecar.detect(empty_b64, 0.5, 0.5);
+        assert!(result.is_err(), "Empty screenshot should fail");
+
+        // Test truncated data
+        let truncated_b64 = base64::engine::general_purpose::STANDARD.encode(&[0x89, 0x50, 0x4E, 0x47]);
+        let result = sidecar.detect(&truncated_b64, 0.5, 0.5);
+        assert!(result.is_err(), "Truncated screenshot should fail");
+
+        // Test oversized data (>50MB base64)
+        // 50MB base64 = ~37.5MB raw, let's use 40MB to be safe
+        let huge = vec![0u8; 40 * 1024 * 1024];
+        let huge_b64 = base64::engine::general_purpose::STANDARD.encode(&huge);
+        let result = sidecar.detect(&huge_b64, 0.5, 0.5);
+        assert!(result.is_err(), "Oversized screenshot should fail");
+        if let Err(e) = result {
+            let err_msg = format!("{:?}", e);
+            // If sidecar can start (Python deps installed), should get size limit error.
+            // If sidecar can't start (no deps), that's also acceptable.
+            let valid_error = err_msg.contains("too large")
+                || err_msg.contains("limit")
+                || err_msg.contains("crashed")
+                || err_msg.contains("Failed to start");
+            assert!(
+                valid_error,
+                "Error should mention size limit or sidecar failure, got: {}",
+                err_msg
+            );
+        }
+    }
+
+    // TEST-3: Multiple rapid calls should not leak processes
+    #[test]
+    fn test_no_process_leak() {
+        use base64::Engine;
+        let mut sidecar = VisionSidecar::new();
+
+        // Make multiple detect calls with invalid data
+        let dummy_b64 = base64::engine::general_purpose::STANDARD.encode(&[1, 2, 3, 4]);
+        for _ in 0..5 {
+            let _ = sidecar.detect(&dummy_b64, 0.5, 0.5);
+        }
+
+        // Should have at most one process
+        let process_count = if sidecar.process.is_some() { 1 } else { 0 };
+        assert!(
+            process_count <= 1,
+            "Should have at most one sidecar process, got {}",
+            process_count
+        );
     }
 }

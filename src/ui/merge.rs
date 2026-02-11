@@ -240,4 +240,232 @@ mod tests {
         assert_eq!(tree[0].children.len(), 1);
         assert!(matches!(tree[0].children[0].source, NodeSource::Vision { .. }));
     }
+
+    // TEST-3: Edge case tests for merge algorithm
+
+    #[test]
+    fn test_merge_zero_area_bounds() {
+        // Test IoU with zero-area rectangles
+        let zero_w = Rect { x: 10.0, y: 10.0, w: 0.0, h: 50.0 };
+        let zero_h = Rect { x: 10.0, y: 10.0, w: 50.0, h: 0.0 };
+        let normal = Rect { x: 10.0, y: 10.0, w: 50.0, h: 50.0 };
+
+        assert_eq!(iou(&zero_w, &normal), 0.0, "Zero width should have 0 IoU");
+        assert_eq!(iou(&zero_h, &normal), 0.0, "Zero height should have 0 IoU");
+        assert_eq!(iou(&zero_w, &zero_h), 0.0, "Two zero-area should have 0 IoU");
+
+        // Merge should not crash with zero-area vision elements
+        let mut tree = vec![UiNode {
+            id: "btn_1".to_string(),
+            role: "button".to_string(),
+            title: Some("Test".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: Some(normal),
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![],
+        }];
+
+        let vision = vec![VisionElement {
+            label: "button".to_string(),
+            description: "Zero width".to_string(),
+            confidence: 0.9,
+            bounds: VisionBounds { x: 10, y: 10, w: 0, h: 50 },
+        }];
+
+        let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
+        // Should not merge (IoU = 0), should add as new node
+        assert_eq!(merged, 0);
+        assert_eq!(added, 1);
+    }
+
+    #[test]
+    fn test_merge_negative_coordinates() {
+        // Some window systems use negative coords for off-screen windows
+        let neg = Rect { x: -100.0, y: -50.0, w: 200.0, h: 100.0 };
+        let pos = Rect { x: 50.0, y: 25.0, w: 100.0, h: 50.0 };
+
+        // Should have partial overlap
+        let score = iou(&neg, &pos);
+        assert!(score > 0.0 && score < 1.0, "Should have partial overlap: {}", score);
+    }
+
+    #[test]
+    fn test_merge_exact_overlap() {
+        // Two nodes with exactly the same bounds (IoU = 1.0)
+        let mut tree = vec![UiNode {
+            id: "btn_1".to_string(),
+            role: "button".to_string(),
+            title: Some("AX Button".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: Some(Rect { x: 100.0, y: 100.0, w: 80.0, h: 40.0 }),
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![],
+        }];
+
+        let vision = vec![VisionElement {
+            label: "button".to_string(),
+            description: "Vision Button".to_string(),
+            confidence: 0.95,
+            bounds: VisionBounds { x: 100, y: 100, w: 80, h: 40 }, // Exact match
+        }];
+
+        let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
+        assert_eq!(merged, 1, "Exact overlap should merge");
+        assert_eq!(added, 0);
+        assert!(matches!(tree[0].source, NodeSource::Merged { confidence } if (confidence - 0.95).abs() < 0.01));
+    }
+
+    #[test]
+    fn test_merge_deeply_nested_tree() {
+        // Create a deeply nested tree: window > panel > container > button
+        let mut tree = vec![UiNode {
+            id: "window".to_string(),
+            role: "window".to_string(),
+            title: Some("App".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: Some(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }),
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![UiNode {
+                id: "panel".to_string(),
+                role: "panel".to_string(),
+                title: None,
+                value: None,
+                enabled: true,
+                focused: false,
+                bounds: Some(Rect { x: 10.0, y: 10.0, w: 780.0, h: 580.0 }),
+                actions: vec![],
+                source: NodeSource::Ax,
+                children: vec![UiNode {
+                    id: "container".to_string(),
+                    role: "group".to_string(),
+                    title: None,
+                    value: None,
+                    enabled: true,
+                    focused: false,
+                    bounds: Some(Rect { x: 100.0, y: 100.0, w: 200.0, h: 100.0 }),
+                    actions: vec![],
+                    source: NodeSource::Ax,
+                    children: vec![UiNode {
+                        id: "button".to_string(),
+                        role: "button".to_string(),
+                        title: Some("Click Me".to_string()),
+                        value: None,
+                        enabled: true,
+                        focused: false,
+                        bounds: Some(Rect { x: 120.0, y: 130.0, w: 80.0, h: 30.0 }),
+                        actions: vec![],
+                        source: NodeSource::Ax,
+                        children: vec![],
+                    }],
+                }],
+            }],
+        }];
+
+        // Vision element matching the deep button
+        let vision = vec![VisionElement {
+            label: "button".to_string(),
+            description: "Click Me".to_string(),
+            confidence: 0.9,
+            bounds: VisionBounds { x: 121, y: 131, w: 78, h: 28 }, // High IoU with nested button
+        }];
+
+        let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
+        assert_eq!(merged, 1, "Should find and merge deeply nested button");
+        assert_eq!(added, 0);
+
+        // Navigate to the deep button and verify merge
+        let button = &tree[0].children[0].children[0].children[0];
+        assert!(matches!(button.source, NodeSource::Merged { .. }));
+    }
+
+    #[test]
+    fn test_merge_out_of_bounds_vision() {
+        // Vision element completely outside any AX node bounds
+        let mut tree = vec![UiNode {
+            id: "window".to_string(),
+            role: "window".to_string(),
+            title: Some("App".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: Some(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }),
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![],
+        }];
+
+        let vision = vec![VisionElement {
+            label: "button".to_string(),
+            description: "Off Screen".to_string(),
+            confidence: 0.8,
+            bounds: VisionBounds { x: 1000, y: 1000, w: 100, h: 50 }, // Way outside
+        }];
+
+        let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
+        assert_eq!(merged, 0, "Out of bounds should not merge");
+        assert_eq!(added, 1, "Should add as root-level vision node");
+
+        // Should be added at root level (not inside window)
+        assert_eq!(tree.len(), 2, "Should have window + vision node at root");
+        assert!(matches!(tree[1].source, NodeSource::Vision { .. }));
+    }
+
+    #[test]
+    fn test_merge_tie_breaking() {
+        // Two AX buttons with identical IoU to vision element
+        let mut tree = vec![
+            UiNode {
+                id: "btn_1".to_string(),
+                role: "button".to_string(),
+                title: Some("Button 1".to_string()),
+                value: None,
+                enabled: true,
+                focused: false,
+                bounds: Some(Rect { x: 10.0, y: 10.0, w: 80.0, h: 30.0 }),
+                actions: vec![],
+                source: NodeSource::Ax,
+                children: vec![],
+            },
+            UiNode {
+                id: "btn_2".to_string(),
+                role: "button".to_string(),
+                title: Some("Button 2".to_string()),
+                value: None,
+                enabled: true,
+                focused: false,
+                bounds: Some(Rect { x: 10.0, y: 10.0, w: 80.0, h: 30.0 }), // Same bounds
+                actions: vec![],
+                source: NodeSource::Ax,
+                children: vec![],
+            },
+        ];
+
+        let vision = vec![VisionElement {
+            label: "button".to_string(),
+            description: "Ambiguous".to_string(),
+            confidence: 0.9,
+            bounds: VisionBounds { x: 10, y: 10, w: 80, h: 30 },
+        }];
+
+        let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
+
+        // Should merge with one of them (first found wins)
+        assert_eq!(merged, 1, "Should merge with one button");
+        assert_eq!(added, 0);
+
+        // Exactly one should be merged
+        let merged_count = tree.iter()
+            .filter(|n| matches!(n.source, NodeSource::Merged { .. }))
+            .count();
+        assert_eq!(merged_count, 1, "Exactly one button should be merged");
+    }
 }
