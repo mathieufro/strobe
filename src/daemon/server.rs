@@ -331,12 +331,9 @@ impl Daemon {
             let _ = self.session_manager.stop_frida(id).await;
         }
 
-        // Phase 2: Let DB writer tasks flush remaining buffered events
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Phase 3: Delete sessions from DB (safe now that writers have flushed)
+        // Phase 2: Delete sessions from DB (writers are now awaited in stop_session)
         for id in &session_ids {
-            let _ = self.session_manager.stop_session(id);
+            let _ = self.session_manager.stop_session(id).await;
         }
 
         self.cleanup();
@@ -887,7 +884,7 @@ Validation Limits (enforced):
                 if session.status == crate::db::SessionStatus::Running {
                     tracing::info!("Cleaning up session {} after client disconnect", session_id);
                     let _ = self.session_manager.stop_frida(&session_id).await;
-                    let _ = self.session_manager.stop_session(&session_id);
+                    let _ = self.session_manager.stop_session(&session_id).await;
                 }
             }
         }
@@ -943,7 +940,7 @@ Validation Limits (enforced):
             if existing.status == crate::db::SessionStatus::Running {
                 tracing::info!("Auto-stopping existing session {} before new launch", existing.id);
                 let _ = self.session_manager.stop_frida(&existing.id).await;
-                let _ = self.session_manager.stop_session(&existing.id);
+                let _ = self.session_manager.stop_session(&existing.id).await;
 
                 // Remove from all connection tracking
                 self.untrack_session(&existing.id).await;
@@ -1642,9 +1639,9 @@ Validation Limits (enforced):
         }
 
         let events_collected = if retain {
-            self.session_manager.stop_session_retain(&req.session_id)?
+            self.session_manager.stop_session_retain(&req.session_id).await?
         } else {
-            self.session_manager.stop_session(&req.session_id)?
+            self.session_manager.stop_session(&req.session_id).await?
         };
 
         // Remove from connection tracking so disconnect cleanup doesn't try to stop it again

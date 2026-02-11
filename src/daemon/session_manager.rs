@@ -173,6 +173,8 @@ pub struct SessionManager {
     child_pids: Arc<RwLock<HashMap<String, Vec<u32>>>>,
     /// Cancellation tokens for database writer tasks per session
     writer_cancel_tokens: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    /// JoinHandles for database writer tasks per session (for awaiting completion)
+    writer_handles: Arc<tokio::sync::RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Breakpoints per session
     breakpoints: Arc<RwLock<HashMap<String, HashMap<String, Breakpoint>>>>,
     /// Logpoints per session
@@ -198,6 +200,7 @@ impl SessionManager {
             frida_spawner: Arc::new(tokio::sync::RwLock::new(None)),
             child_pids: Arc::new(RwLock::new(HashMap::new())),
             writer_cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+            writer_handles: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             breakpoints: Arc::new(RwLock::new(HashMap::new())),
             logpoints: Arc::new(RwLock::new(HashMap::new())),
             paused_threads: Arc::new(RwLock::new(HashMap::new())),
@@ -270,14 +273,20 @@ impl SessionManager {
         self.db.get_running_sessions()
     }
 
-    pub fn stop_session(&self, id: &str) -> Result<u64> {
+    pub async fn stop_session(&self, id: &str) -> Result<u64> {
         let count = self.db.count_session_events(id)?;
 
-        // Signal database writer task to flush and exit
+        // Phase 1: Signal database writer task to flush and exit
         if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
             let _ = cancel_tx.send(true);
         }
 
+        // Phase 2: Wait for writer task to complete (ensures all events flushed)
+        if let Some(handle) = self.writer_handles.write().await.remove(id) {
+            let _ = handle.await; // Wait for writer to finish flushing
+        }
+
+        // Phase 3: Now safe to delete session (all events flushed, no FK violations)
         self.db.delete_session(id)?;
 
         // Clean up in-memory state
@@ -295,15 +304,20 @@ impl SessionManager {
 
     /// Stop a session but retain its DB rows for later inspection.
     /// Cleans up in-memory state and flushes the writer, but does NOT delete from DB.
-    pub fn stop_session_retain(&self, id: &str) -> Result<u64> {
+    pub async fn stop_session_retain(&self, id: &str) -> Result<u64> {
         let count = self.db.count_session_events(id)?;
 
-        // Signal database writer task to flush and exit
+        // Phase 1: Signal database writer task to flush and exit
         if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
             let _ = cancel_tx.send(true);
         }
 
-        // Mark session as stopped (but keep it in the DB)
+        // Phase 2: Wait for writer task to complete (ensures all events flushed)
+        if let Some(handle) = self.writer_handles.write().await.remove(id) {
+            let _ = handle.await; // Wait for writer to finish flushing
+        }
+
+        // Phase 3: Mark session as stopped (but keep it in the DB)
         self.db.mark_session_stopped(id)?;
 
         // Clean up in-memory state
@@ -464,7 +478,7 @@ impl SessionManager {
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         write_lock(&self.writer_cancel_tokens).insert(session_id.to_string(), cancel_tx);
 
-        tokio::spawn(async move {
+        let writer_handle = tokio::spawn(async move {
             let mut batch = Vec::with_capacity(100);
             let mut cached_limit = crate::config::StrobeSettings::default().events_max_per_session;
             let mut batches_since_refresh = 0u32;
@@ -512,6 +526,9 @@ impl SessionManager {
                 }
             }
         });
+
+        // Store writer handle so we can await completion during stop
+        self.writer_handles.write().await.insert(session_id.to_string(), writer_handle);
 
         // Create pause notification channel for breakpoint support
         let (pause_tx, mut pause_rx) = mpsc::channel::<crate::frida_collector::PauseNotification>(100);
