@@ -193,7 +193,26 @@ type RuntimeType = 'native' | 'cpython' | 'v8' | 'jsc';
  * Returns 'native' if no interpreter runtime is detected.
  */
 function detectRuntime(): RuntimeType {
-  // For now, always return 'native' — Python/JS detection will be added in Plan 2/3
+  // Check for Python (CPython) symbols
+  if (Module.findExportByName(null, '_PyEval_EvalFrameDefault') ||
+      Module.findExportByName(null, 'Py_Initialize') ||
+      Module.findExportByName(null, 'PyRun_SimpleString')) {
+    return 'cpython';
+  }
+
+  // Check for V8 (Node.js, Chrome, etc.) symbols
+  if (Module.findExportByName(null, '_ZN2v88internal7Isolate7currentEv') ||
+      Module.findExportByName(null, '_ZN2v85Locker4LockEv')) {
+    return 'v8';
+  }
+
+  // Check for JavaScriptCore (Safari, iOS, etc.) symbols
+  if (Module.findExportByName(null, 'JSGlobalContextCreate') ||
+      Module.findExportByName(null, 'JSEvaluateScript')) {
+    return 'jsc';
+  }
+
+  // Default to native (C/C++/Rust/etc.)
   return 'native';
 }
 
@@ -222,6 +241,8 @@ class StrobeAgent {
   public tracer: Tracer;                  // Public Tracer interface
   private rateTracker: RateTracker | null = null;
   private funcIdToName: Map<number, string> = new Map();
+  private funcIdToAddress: Map<number, string> = new Map();  // Track funcId → address for removal
+  private addressToFuncId: Map<string, number> = new Map();  // Track address → funcId for removal
 
   // Phase 2: Breakpoint management
   private breakpoints: Map<string, BreakpointState> = new Map(); // id → state
@@ -259,6 +280,7 @@ class StrobeAgent {
     // Create language-appropriate tracer based on runtime detection
     const runtime = detectRuntime();
     this.tracer = createTracer(runtime, this);
+    send({ type: 'runtime_detected', runtime });
 
     this.sessionStartNs = Date.now() * 1000000;
 
@@ -351,6 +373,8 @@ class StrobeAgent {
             }, mode);
             if (funcId !== null) {
               this.funcIdToName.set(funcId, func.name);
+              this.funcIdToAddress.set(funcId, func.address);
+              this.addressToFuncId.set(func.address, funcId);
               installed++;
             } else {
               failed++;
@@ -368,6 +392,7 @@ class StrobeAgent {
             }, mode);
             if (funcId !== null) {
               this.funcIdToName.set(funcId, target.name);
+              // File:line targets don't have addresses - funcIdToAddress only for native
               installed++;
             } else {
               failed++;
@@ -380,8 +405,11 @@ class StrobeAgent {
         // Remove address-based hooks
         if (message.functions) {
           for (const func of message.functions) {
-            // Call native method directly - address-based removal
-            this.removeNativeHook(func.address);
+            // Look up funcId from address, then remove via tracer interface
+            const funcId = this.addressToFuncId.get(func.address);
+            if (funcId !== undefined) {
+              this.tracer.removeHook(funcId);
+            }
           }
         }
         // Remove file:line hooks (not yet implemented)
@@ -1243,17 +1271,27 @@ class StrobeAgent {
 
   /**
    * Wrapper for NativeTracer to remove hooks via CModuleTracer.
+   * Takes funcId, looks up address, and removes the hook.
    */
-  public removeNativeHook(address: string): void {
-    this.cmoduleTracer.removeHook(address);
+  public removeNativeHook(funcId: number): void {
+    const address = this.funcIdToAddress.get(funcId);
+    if (address) {
+      this.cmoduleTracer?.removeHook(address);
+      this.funcIdToAddress.delete(funcId);
+      this.addressToFuncId.delete(address);
+      this.funcIdToName.delete(funcId);
+    }
   }
 
   /**
    * Wrapper for NativeTracer to remove all hooks via CModuleTracer.
    */
   public removeAllNativeHooks(): void {
-    // CModuleTracer doesn't have removeAll, so we'll need to track this differently
-    // For now, this is a no-op placeholder
+    // Iterate over all funcIds and remove them
+    const funcIds = Array.from(this.funcIdToAddress.keys());
+    for (const funcId of funcIds) {
+      this.removeNativeHook(funcId);
+    }
   }
 
   /**

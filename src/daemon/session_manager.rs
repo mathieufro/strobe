@@ -211,6 +211,10 @@ pub struct SessionManager {
     logpoints: Arc<RwLock<HashMap<String, HashMap<String, Logpoint>>>>,
     /// Paused threads per session
     paused_threads: Arc<RwLock<HashMap<String, HashMap<u64, PauseInfo>>>>,
+    /// Language per session (native, python, javascript)
+    languages: Arc<RwLock<HashMap<String, Language>>>,
+    /// Symbol resolvers per session (DwarfResolver, PythonResolver, etc.)
+    resolvers: Arc<RwLock<HashMap<String, Arc<dyn SymbolResolver>>>>,
 }
 
 impl SessionManager {
@@ -234,6 +238,8 @@ impl SessionManager {
             breakpoints: Arc::new(RwLock::new(HashMap::new())),
             logpoints: Arc::new(RwLock::new(HashMap::new())),
             paused_threads: Arc::new(RwLock::new(HashMap::new())),
+            languages: Arc::new(RwLock::new(HashMap::new())),
+            resolvers: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -493,11 +499,36 @@ impl SessionManager {
         // Checks: exact binary name, known test fixtures, and target/debug/deps binaries.
         reap_orphaned_processes(command, project_root);
 
+        // Detect language from command and project signals
+        let language = detect_language(command, Path::new(project_root));
+        write_lock(&self.languages).insert(session_id.to_string(), language);
+        tracing::info!("Detected language for session {}: {:?}", session_id, language);
+
         // Extract image base cheaply (<10ms) — only reads __TEXT segment address
         let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
 
         // Start background DWARF parse (or get cached handle)
         let dwarf_handle = self.get_or_start_dwarf_parse(command);
+
+        // For native binaries, instantiate DwarfResolver once parse completes
+        if language == Language::Native {
+            let mut dwarf_clone = dwarf_handle.clone();
+            let resolvers = Arc::clone(&self.resolvers);
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                // Wait for DWARF parse to complete
+                match dwarf_clone.get().await {
+                    Ok(_) => {
+                        let resolver = Arc::new(DwarfResolver::new(dwarf_clone, image_base));
+                        write_lock(&resolvers).insert(sid.clone(), resolver as Arc<dyn SymbolResolver>);
+                        tracing::debug!("DwarfResolver instantiated for session {}", sid);
+                    }
+                    Err(e) => {
+                        tracing::warn!("DWARF parse failed for session {}: {}", sid, e);
+                    }
+                }
+            });
+        }
 
         // Create event channel
         let (tx, mut rx) = mpsc::channel::<Event>(10000);
@@ -1941,5 +1972,79 @@ mod tests {
         assert!(all_paused.contains_key(&99));
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_detect_language_python_command() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(detect_language("python script.py", temp.path()), Language::Python);
+        assert_eq!(detect_language("/usr/bin/python3", temp.path()), Language::Python);
+        assert_eq!(detect_language("script.py", temp.path()), Language::Python);
+        assert_eq!(detect_language("python3.11", temp.path()), Language::Python);
+    }
+
+    #[test]
+    fn test_detect_language_javascript_command() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(detect_language("node index.js", temp.path()), Language::JavaScript);
+        assert_eq!(detect_language("bun test.ts", temp.path()), Language::JavaScript);
+        assert_eq!(detect_language("npx tsx script.ts", temp.path()), Language::JavaScript);
+        assert_eq!(detect_language("test.js", temp.path()), Language::JavaScript);
+        assert_eq!(detect_language("test.ts", temp.path()), Language::JavaScript);
+    }
+
+    #[test]
+    fn test_detect_language_project_files() {
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+
+        // Python project
+        fs::write(temp.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(detect_language("./binary", temp.path()), Language::Python);
+        fs::remove_file(temp.path().join("pyproject.toml")).unwrap();
+
+        fs::write(temp.path().join("requirements.txt"), "").unwrap();
+        assert_eq!(detect_language("./binary", temp.path()), Language::Python);
+        fs::remove_file(temp.path().join("requirements.txt")).unwrap();
+
+        fs::write(temp.path().join("setup.py"), "").unwrap();
+        assert_eq!(detect_language("./binary", temp.path()), Language::Python);
+        fs::remove_file(temp.path().join("setup.py")).unwrap();
+
+        // JavaScript project
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
+        fs::remove_file(temp.path().join("package.json")).unwrap();
+
+        fs::write(temp.path().join("bun.lockb"), "").unwrap();
+        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
+        fs::remove_file(temp.path().join("bun.lockb")).unwrap();
+
+        fs::write(temp.path().join("deno.json"), "{}").unwrap();
+        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
+    }
+
+    #[test]
+    fn test_detect_language_native_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(detect_language("./my_binary", temp.path()), Language::Native);
+        assert_eq!(detect_language("/usr/bin/ls", temp.path()), Language::Native);
+        assert_eq!(detect_language("cargo test", temp.path()), Language::Native);
+    }
+
+    #[test]
+    fn test_detect_language_command_priority() {
+        use std::fs;
+
+        // Command detection should override project files
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        // Python command overrides JS project markers
+        assert_eq!(detect_language("python test.py", temp.path()), Language::Python);
+
+        // But a generic binary name falls back to project detection
+        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
     }
 }

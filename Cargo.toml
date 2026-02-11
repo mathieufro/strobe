@@ -49,6 +49,10 @@ regex = "1"
 # UI vision sidecar (base64 encoding for screenshots sent to Python sidecar)
 base64 = "0.22"
 
+# Python support
+rustpython-parser = "0.4"
+walkdir = "2.5"
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"

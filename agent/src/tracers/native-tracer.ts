@@ -3,8 +3,6 @@ import { Tracer, ResolvedTarget, HookMode, BreakpointMessage, StepHooksMessage,
          LogpointMessage, ReadMemoryMessage, WriteMemoryMessage } from './tracer.js';
 
 export class NativeTracer implements Tracer {
-  private imageBase: NativePointer = ptr(0);
-  private slide: NativePointer = ptr(0);
   private agent: any; // Reference to StrobeAgent for delegation
 
   constructor(agent: any) {
@@ -77,16 +75,14 @@ export class NativeTracer implements Tracer {
   }
 
   setImageBase(imageBase: string): void {
-    this.imageBase = ptr(imageBase);
-    const moduleBase = Process.mainModule?.base ?? ptr(0);
-    this.slide = moduleBase.sub(this.imageBase);
-    // Also set on the CModuleTracer
+    // Delegate entirely to CModuleTracer to avoid duplicate slide calculation
     if (this.agent.cmoduleTracer) {
       this.agent.cmoduleTracer.setImageBase(imageBase);
     }
   }
 
   getSlide(): NativePointer {
-    return this.slide;
+    // Get slide from CModuleTracer (single source of truth)
+    return this.agent.cmoduleTracer?.getSlide() ?? ptr(0);
   }
 }
