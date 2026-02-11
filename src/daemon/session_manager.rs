@@ -529,22 +529,27 @@ impl SessionManager {
                 }
             });
         } else if language == Language::Python {
-            // For Python, instantiate PythonResolver by parsing project .py files
+            // For Python, instantiate PythonResolver by parsing project .py files.
+            // Await completion so resolver is ready before patterns are added.
             let resolvers = Arc::clone(&self.resolvers);
             let sid = session_id.to_string();
             let project_root_path = Path::new(project_root).to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                match PythonResolver::parse(&project_root_path) {
-                    Ok(resolver) => {
-                        let resolver = Arc::new(resolver);
-                        write_lock(&resolvers).insert(sid.clone(), resolver as Arc<dyn SymbolResolver>);
-                        tracing::debug!("PythonResolver instantiated for session {}", sid);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Python resolver parse failed for session {}: {}", sid, e);
-                    }
+            match tokio::task::spawn_blocking(move || {
+                PythonResolver::parse(&project_root_path)
+            }).await {
+                Ok(Ok(resolver)) => {
+                    let count = resolver.function_count();
+                    let resolver = Arc::new(resolver);
+                    write_lock(&resolvers).insert(sid.clone(), resolver as Arc<dyn SymbolResolver>);
+                    tracing::info!("PythonResolver instantiated for session {} ({} functions)", sid, count);
                 }
-            });
+                Ok(Err(e)) => {
+                    tracing::warn!("Python resolver parse failed for session {}: {}", sid, e);
+                }
+                Err(e) => {
+                    tracing::warn!("Python resolver task panicked for session {}: {}", sid, e);
+                }
+            }
         }
 
         // Create event channel

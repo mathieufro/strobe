@@ -19,6 +19,25 @@ fn is_python_excluded(name: &str) -> bool {
     )
 }
 
+/// Build a lookup table of byte-offset → 1-indexed line number.
+/// Pre-scans once so all offset lookups are O(log n) via binary search.
+fn build_line_starts(source: &str) -> Vec<u32> {
+    let mut starts = vec![0u32]; // line 1 starts at offset 0
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push((i + 1) as u32);
+        }
+    }
+    starts
+}
+
+fn offset_to_line(line_starts: &[u32], offset: u32) -> u32 {
+    match line_starts.binary_search(&offset) {
+        Ok(idx) => (idx + 1) as u32,
+        Err(idx) => idx as u32, // idx is the next line, so current line = idx
+    }
+}
+
 /// Extract function/class method definitions from a Python source string.
 pub fn extract_functions_from_source(
     source: &str,
@@ -27,8 +46,9 @@ pub fn extract_functions_from_source(
     let ast = parse(source, Mode::Module, "<input>")
         .map_err(|e| crate::Error::Internal(format!("Python parse error in {:?}: {}", file_path, e)))?;
 
+    let line_starts = build_line_starts(source);
     let mut functions = HashMap::new();
-    extract_from_module(&ast, file_path, &[], &mut functions);
+    extract_from_module(&ast, file_path, &[], &line_starts, &mut functions);
     Ok(functions)
 }
 
@@ -38,15 +58,16 @@ fn extract_from_module(
     module: &ast::Mod,
     file_path: &Path,
     prefix: &[String],
+    line_starts: &[u32],
     functions: &mut HashMap<String, (PathBuf, u32)>,
 ) {
     match module {
         ast::Mod::Module(m) => {
             for stmt in &m.body {
-                extract_from_stmt(stmt, file_path, prefix, functions);
+                extract_from_stmt(stmt, file_path, prefix, line_starts, functions);
             }
         }
-        _ => {} // Interactive, Expression, FunctionType not relevant for source files
+        _ => {}
     }
 }
 
@@ -54,6 +75,7 @@ fn extract_from_stmt(
     stmt: &ast::Stmt,
     file_path: &Path,
     prefix: &[String],
+    line_starts: &[u32],
     functions: &mut HashMap<String, (PathBuf, u32)>,
 ) {
     match stmt {
@@ -63,16 +85,13 @@ fn extract_from_stmt(
             } else {
                 format!("{}.{}", prefix.join("."), f.name)
             };
-            // TODO: rustpython-parser 0.4 doesn't expose line numbers from TextRange
-            // For now, use offset as line approximation (will be fixed in integration)
-            let line = 1; // Placeholder - will be enhanced with proper line tracking
+            let line = offset_to_line(line_starts, f.range.start().to_u32());
             functions.insert(qualified_name.clone(), (file_path.to_path_buf(), line));
 
-            // Extract nested functions
             let mut new_prefix = prefix.to_vec();
             new_prefix.push(qualified_name);
             for nested_stmt in &f.body {
-                extract_from_stmt(nested_stmt, file_path, &new_prefix, functions);
+                extract_from_stmt(nested_stmt, file_path, &new_prefix, line_starts, functions);
             }
         }
         ast::Stmt::AsyncFunctionDef(f) => {
@@ -81,27 +100,23 @@ fn extract_from_stmt(
             } else {
                 format!("{}.{}", prefix.join("."), f.name)
             };
-            // TODO: rustpython-parser 0.4 doesn't expose line numbers from TextRange
-            // For now, use offset as line approximation (will be fixed in integration)
-            let line = 1; // Placeholder - will be enhanced with proper line tracking
+            let line = offset_to_line(line_starts, f.range.start().to_u32());
             functions.insert(qualified_name.clone(), (file_path.to_path_buf(), line));
 
-            // Extract nested functions
             let mut new_prefix = prefix.to_vec();
             new_prefix.push(qualified_name);
             for nested_stmt in &f.body {
-                extract_from_stmt(nested_stmt, file_path, &new_prefix, functions);
+                extract_from_stmt(nested_stmt, file_path, &new_prefix, line_starts, functions);
             }
         }
         ast::Stmt::ClassDef(c) => {
-            // Add class name to prefix and recurse into methods
             let mut class_prefix = prefix.to_vec();
             class_prefix.push(c.name.to_string());
             for method_stmt in &c.body {
-                extract_from_stmt(method_stmt, file_path, &class_prefix, functions);
+                extract_from_stmt(method_stmt, file_path, &class_prefix, line_starts, functions);
             }
         }
-        _ => {} // Other statements don't define functions
+        _ => {}
     }
 }
 
@@ -142,6 +157,10 @@ impl PythonResolver {
         }
 
         Ok(Self { functions: all_functions })
+    }
+
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
     }
 
     /// Create from pre-built function list (for testing).

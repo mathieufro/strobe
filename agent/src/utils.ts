@@ -19,3 +19,16 @@ export function signExtend(value: number, byteSize: number): number {
   if (byteSize === 4) return value | 0;
   return value;
 }
+
+/**
+ * Find an export across all loaded modules.
+ * Replaces Module.findExportByName(null, name) which was removed as a
+ * static method in Frida 17.x.
+ */
+export function findGlobalExport(exportName: string): NativePointer | null {
+  for (const m of Process.enumerateModules()) {
+    const addr = m.findExportByName(exportName);
+    if (addr !== null) return addr;
+  }
+  return null;
+}

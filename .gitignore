@@ -15,7 +15,11 @@ vision-sidecar/__pycache__/
 vision-sidecar/**/__pycache__/
 vision-sidecar/*.egg-info/
 vision-sidecar/*.pt
+
+# Python
+__pycache__/
 *.pyc
+*.pyo
 
 # VS Code extension
 strobe-vscode/node_modules/

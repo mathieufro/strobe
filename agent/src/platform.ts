@@ -3,6 +3,8 @@
  * Selected at startup via Process.platform.
  */
 
+import { findGlobalExport } from './utils.js';
+
 export interface PlatformAdapter {
   /** C source preamble implementing `static uint64_t strobe_timestamp(void)` */
   getCModuleTimingPreamble(): string;
@@ -97,7 +99,7 @@ static unsigned long long strobe_timestamp(void) {
       // Older glibc or musl — try global search
     }
     if (!clockGettime) {
-      clockGettime = Module.findExportByName(null, 'clock_gettime');
+      clockGettime = findGlobalExport('clock_gettime');
     }
     if (!clockGettime) {
       throw new Error('Cannot resolve clock_gettime — required for Linux tracing');
@@ -115,7 +117,7 @@ static unsigned long long strobe_timestamp(void) {
     } catch {
       // Fallback: global search
     }
-    return Module.findExportByName(null, 'write');
+    return findGlobalExport('write');
   }
 }
 

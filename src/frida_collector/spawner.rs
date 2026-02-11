@@ -1263,17 +1263,37 @@ fn handle_add_patterns(
 ) -> Result<u32> {
     tracing::info!("AddPatterns: {} functions ({:?} mode) for session {}", functions.len(), mode, session_id);
 
-    let func_list: Vec<serde_json::Value> = functions.iter().map(|f| {
-        serde_json::json!({
-            "address": format!("0x{:x}", f.address),
-            "name": f.name,
-            "nameRaw": f.name_raw,
-            "sourceFile": f.source_file,
-            "lineNumber": f.line_number,
-        })
-    }).collect();
+    // Split targets: native (address > 0) vs interpreted (address == 0)
+    let mut native_funcs: Vec<serde_json::Value> = Vec::new();
+    let mut interpreted_targets: Vec<serde_json::Value> = Vec::new();
 
-    tracing::debug!("Sending hooks message with {} functions ({:?} mode)", func_list.len(), mode);
+    for f in functions {
+        if f.address == 0 {
+            // Interpreted language target (Python, JS, etc.)
+            interpreted_targets.push(serde_json::json!({
+                "file": f.source_file,
+                "line": f.line_number,
+                "name": f.name,
+            }));
+        } else {
+            // Native binary target
+            native_funcs.push(serde_json::json!({
+                "address": format!("0x{:x}", f.address),
+                "name": f.name,
+                "nameRaw": f.name_raw,
+                "sourceFile": f.source_file,
+                "lineNumber": f.line_number,
+            }));
+        }
+    }
+
+    tracing::info!("Split targets: {} native + {} interpreted targets ({:?} mode)",
+                    native_funcs.len(), interpreted_targets.len(), mode);
+
+    // Debug: log first interpreted target if any
+    if !interpreted_targets.is_empty() {
+        tracing::info!("First interpreted target: {}", serde_json::to_string(&interpreted_targets[0]).unwrap());
+    }
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
     {
@@ -1289,13 +1309,26 @@ fn handle_add_patterns(
     let mut hooks_msg = serde_json::json!({
         "type": "hooks",
         "action": "add",
-        "functions": func_list,
-        "imageBase": format!("0x{:x}", image_base),
         "mode": mode_str,
     });
+
+    // Add native functions if any
+    if !native_funcs.is_empty() {
+        hooks_msg["functions"] = serde_json::json!(native_funcs);
+        hooks_msg["imageBase"] = serde_json::json!(format!("0x{:x}", image_base));
+    }
+
+    // Add interpreted targets if any
+    if !interpreted_targets.is_empty() {
+        hooks_msg["targets"] = serde_json::json!(interpreted_targets);
+    }
+
     if let Some(depth) = serialization_depth {
         hooks_msg["serializationDepth"] = serde_json::json!(depth);
     }
+
+    // Debug: log the full message being sent
+    tracing::info!("Sending hooks message: {}", serde_json::to_string_pretty(&hooks_msg).unwrap());
 
     unsafe {
         post_message_raw(script_ptr, &serde_json::to_string(&hooks_msg).unwrap())

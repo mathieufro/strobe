@@ -1,6 +1,7 @@
 import { CModuleTracer, HookMode, type FunctionTarget } from './cmodule-tracer.js';
 import { createPlatformAdapter, type PlatformAdapter } from './platform.js';
 import { RateTracker } from './rate-tracker.js';
+import { findGlobalExport } from './utils.js';
 import { Tracer, type ResolvedTarget as TracerResolvedTarget } from './tracers/tracer.js';
 import { NativeTracer } from './tracers/native-tracer.js';
 import { PythonTracer } from './tracers/python-tracer.js';
@@ -195,21 +196,21 @@ type RuntimeType = 'native' | 'cpython' | 'v8' | 'jsc';
  */
 function detectRuntime(): RuntimeType {
   // Check for Python (CPython) symbols
-  if (Module.findExportByName(null, '_PyEval_EvalFrameDefault') ||
-      Module.findExportByName(null, 'Py_Initialize') ||
-      Module.findExportByName(null, 'PyRun_SimpleString')) {
+  if (findGlobalExport('_PyEval_EvalFrameDefault') ||
+      findGlobalExport('Py_Initialize') ||
+      findGlobalExport('PyRun_SimpleString')) {
     return 'cpython';
   }
 
   // Check for V8 (Node.js, Chrome, etc.) symbols
-  if (Module.findExportByName(null, '_ZN2v88internal7Isolate7currentEv') ||
-      Module.findExportByName(null, '_ZN2v85Locker4LockEv')) {
+  if (findGlobalExport('_ZN2v88internal7Isolate7currentEv') ||
+      findGlobalExport('_ZN2v85Locker4LockEv')) {
     return 'v8';
   }
 
   // Check for JavaScriptCore (Safari, iOS, etc.) symbols
-  if (Module.findExportByName(null, 'JSGlobalContextCreate') ||
-      Module.findExportByName(null, 'JSEvaluateScript')) {
+  if (findGlobalExport('JSGlobalContextCreate') ||
+      findGlobalExport('JSEvaluateScript')) {
     return 'jsc';
   }
 
@@ -346,6 +347,11 @@ class StrobeAgent {
 
   handleMessage(message: HookInstruction): void {
     try {
+      // Debug: log what we received
+      send({ type: 'log', message: `handleMessage received: action=${message.action}, ` +
+        `functions=${message.functions ? message.functions.length : 'none'}, ` +
+        `targets=${message.targets ? message.targets.length : 'none'}` });
+
       // Set imageBase for ASLR slide computation (only needs to happen once)
       if (message.imageBase) {
         send({ type: 'log', message: `Setting imageBase=${message.imageBase}` });

@@ -3,6 +3,7 @@
 
 import { Tracer, ResolvedTarget, HookMode, BreakpointMessage, StepHooksMessage,
          LogpointMessage, ReadMemoryMessage, WriteMemoryMessage } from './tracer.js';
+import { findGlobalExport } from '../utils.js';
 
 interface PythonHook {
   funcId: number;
@@ -60,20 +61,20 @@ export class PythonTracer implements Tracer {
 
   initialize(sessionId: string): void {
     // Find CPython symbols
-    this.PyEval_EvalFrameDefault = Module.findExportByName(null, '_PyEval_EvalFrameDefault');
-    this.PyFrame_GetCode = Module.findExportByName(null, 'PyFrame_GetCode');
-    this.PyCode_GetCode = Module.findExportByName(null, 'PyCode_GetCode');
-    this.PyUnicode_AsUTF8 = Module.findExportByName(null, 'PyUnicode_AsUTF8');
-    this.PyRun_SimpleString = Module.findExportByName(null, 'PyRun_SimpleString');
-    this.PyGILState_Ensure = Module.findExportByName(null, 'PyGILState_Ensure');
-    this.PyGILState_Release = Module.findExportByName(null, 'PyGILState_Release');
+    this.PyEval_EvalFrameDefault = findGlobalExport('_PyEval_EvalFrameDefault');
+    this.PyFrame_GetCode = findGlobalExport('PyFrame_GetCode');
+    this.PyCode_GetCode = findGlobalExport('PyCode_GetCode');
+    this.PyUnicode_AsUTF8 = findGlobalExport('PyUnicode_AsUTF8');
+    this.PyRun_SimpleString = findGlobalExport('PyRun_SimpleString');
+    this.PyGILState_Ensure = findGlobalExport('PyGILState_Ensure');
+    this.PyGILState_Release = findGlobalExport('PyGILState_Release');
 
     if (!this.PyEval_EvalFrameDefault) {
       throw new Error('CPython symbols not found - is this a Python process?');
     }
 
-    // Hook frame evaluation to intercept function calls
-    this.installFrameEvalHook();
+    // Frame eval hook is installed lazily on first installHook/installBreakpoint
+    // to avoid monopolizing the JS thread when no hooks are active.
   }
 
   dispose(): void {
@@ -92,8 +93,14 @@ export class PythonTracer implements Tracer {
     const self = this;
     this.frameEvalHook = Interceptor.attach(this.PyEval_EvalFrameDefault, {
       onEnter(args: any) {
+        // Fast path: nothing to check
+        if (self.hooks.size === 0 && self.breakpoints.size === 0 &&
+            self.logpoints.size === 0 && !self.stepState.active) {
+          return;
+        }
+
         // args[0] = PyThreadState*
-        // args[1] = PyFrameObject*
+        // args[1] = _PyInterpreterFrame* (CPython 3.11+)
         // args[2] = int throwflag
         const frame = args[1];
 
@@ -325,6 +332,12 @@ export class PythonTracer implements Tracer {
     };
 
     this.hooks.set(funcId, hook);
+
+    // Lazily install frame eval hook on first hook
+    if (!this.frameEvalHook) {
+      this.installFrameEvalHook();
+    }
+
     return funcId;
   }
 
