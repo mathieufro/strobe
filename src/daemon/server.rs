@@ -2252,16 +2252,18 @@ Validation Limits (enforced):
                         )?
                     };
 
-                    vision_count = vision_elements.len();
-
-                    // Merge vision into tree (modifies tree in-place)
-                    crate::ui::merge::merge_vision_into_tree(
+                    // COMP-1: Merge vision into tree and capture accurate stats
+                    let (actual_merged, actual_added) = crate::ui::merge::merge_vision_into_tree(
                         &mut final_nodes,
                         &vision_elements,
                         settings.vision_iou_merge_threshold as f64,
                     );
 
-                    merged_count = crate::ui::tree::count_nodes(&final_nodes);
+                    // Stats semantics:
+                    // - vision_nodes: total vision elements added (pure vision nodes)
+                    // - merged_nodes: AX nodes enhanced with vision data
+                    vision_count = actual_added;
+                    merged_count = actual_merged;
                 }
 
                 tree_output = Some(if verbose {

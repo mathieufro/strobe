@@ -34,10 +34,10 @@ class OmniParser:
         from transformers import AutoModelForCausalLM, AutoProcessor
         caption_path = f"{mdir}/icon_caption"
         self.caption_processor = AutoProcessor.from_pretrained(
-            caption_path, trust_remote_code=True
+            caption_path
         )
         self.caption_model = AutoModelForCausalLM.from_pretrained(
-            caption_path, trust_remote_code=True
+            caption_path
         )
         if self.device != "cpu":
             self.caption_model = self.caption_model.to(self.device)
@@ -51,9 +51,19 @@ class OmniParser:
         """Detect UI elements in a base64-encoded PNG image."""
         self.load()
 
+        # SEC-3: Validate base64 size to prevent memory exhaustion
+        MAX_IMAGE_SIZE = 50 * 1024 * 1024  # 50MB base64 limit
+        if len(image_b64) > MAX_IMAGE_SIZE:
+            raise ValueError(f"Image too large: {len(image_b64)} bytes exceeds 50MB limit")
+
         # Decode image
         img_bytes = base64.b64decode(image_b64)
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        # SEC-3: Validate image dimensions (4K limit)
+        MAX_PIXELS = 3840 * 2160
+        if image.width * image.height > MAX_PIXELS:
+            raise ValueError(f"Image too large: {image.width}x{image.height} exceeds 4K limit")
 
         # Run YOLO detection
         results = self.yolo_model(

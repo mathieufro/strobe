@@ -119,13 +119,14 @@ fn find_best_match(
     }
 }
 
+// CORR-3: Use safe indexing to prevent panics on invalid paths
 fn get_node_mut<'a>(nodes: &'a mut [UiNode], path: &[usize]) -> Option<&'a mut UiNode> {
     if path.is_empty() {
         return None;
     }
-    let mut current = &mut nodes[path[0]];
+    let mut current = nodes.get_mut(path[0])?;
     for &idx in &path[1..] {
-        current = &mut current.children[idx];
+        current = current.children.get_mut(idx)?;
     }
     Some(current)
 }

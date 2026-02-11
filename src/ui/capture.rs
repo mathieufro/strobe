@@ -123,6 +123,16 @@ unsafe fn find_main_window(pid: u32) -> Result<CGWindowID> {
 fn cg_image_to_png(image: &CGImage) -> Result<Vec<u8>> {
     let width = image.width();
     let height = image.height();
+
+    // SEC-3: Validate image size to prevent memory exhaustion
+    const MAX_PIXELS: usize = 3840 * 2160; // 4K resolution limit
+    if width.checked_mul(height).map_or(true, |pixels| pixels > MAX_PIXELS) {
+        return Err(crate::Error::UiQueryFailed(
+            format!("Screenshot too large: {}x{} exceeds 4K limit ({}x{})",
+                width, height, 3840, 2160)
+        ));
+    }
+
     let bytes_per_row = image.bytes_per_row();
     let data = image.data();
     let bytes = data.bytes();
@@ -137,7 +147,12 @@ fn cg_image_to_png(image: &CGImage) -> Result<Vec<u8>> {
         .map_err(|e| crate::Error::UiQueryFailed(format!("PNG encode error: {}", e)))?;
 
     // CGImage is BGRA, PNG expects RGBA — swap channels
-    let mut rgba = Vec::with_capacity(width * height * 4);
+    // SEC-4: Use checked multiplication to prevent integer overflow
+    let pixel_count = width.checked_mul(height)
+        .ok_or_else(|| crate::Error::UiQueryFailed("Image dimensions overflow".to_string()))?;
+    let byte_count = pixel_count.checked_mul(4)
+        .ok_or_else(|| crate::Error::UiQueryFailed("Image size overflow".to_string()))?;
+    let mut rgba = Vec::with_capacity(byte_count);
     for y in 0..height {
         let row_start = y * bytes_per_row;
         for x in 0..width {

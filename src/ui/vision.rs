@@ -5,7 +5,7 @@
 
 use crate::Result;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -94,12 +94,29 @@ impl VisionSidecar {
         if let Some(ref mut child) = self.process {
             // Close stdin to signal EOF
             drop(child.stdin.take());
-            // Wait briefly, then kill
-            match child.wait() {
-                Ok(_) => tracing::info!("Vision sidecar exited gracefully"),
-                Err(_) => {
-                    let _ = child.kill();
-                    tracing::warn!("Vision sidecar killed after timeout");
+            // CORR-2: Wait with timeout to prevent indefinite blocking
+            let timeout = Duration::from_secs(3);
+            let start = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        tracing::info!("Vision sidecar exited gracefully with {:?}", status);
+                        break;
+                    }
+                    Ok(None) => {
+                        if start.elapsed() > timeout {
+                            tracing::warn!("Vision sidecar did not exit after 3s, killing");
+                            let _ = child.kill();
+                            let _ = child.wait(); // Reap zombie
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to check sidecar status: {}, killing", e);
+                        let _ = child.kill();
+                        break;
+                    }
                 }
             }
         }
@@ -172,16 +189,24 @@ impl VisionSidecar {
         stdin.flush()
             .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to flush sidecar stdin: {}", e)))?;
 
-        // Read response line
+        // CORR-1: Read response line without taking ownership of stdout
         let stdout = child.stdout.as_mut()
             .ok_or_else(|| crate::Error::UiQueryFailed("Sidecar stdout closed".to_string()))?;
-        let mut reader = BufReader::new(stdout);
         let mut response_line = String::new();
-        reader.read_line(&mut response_line)
+        BufReader::new(stdout.by_ref()).read_line(&mut response_line)
             .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to read sidecar response: {}", e)))?;
 
+        // CORR-5: Check for empty response (process crash)
+        if response_line.trim().is_empty() {
+            return Err(crate::Error::UiQueryFailed(
+                "Sidecar returned empty response (process may have crashed)".to_string()
+            ));
+        }
+
         serde_json::from_str(&response_line)
-            .map_err(|e| crate::Error::UiQueryFailed(format!("Invalid sidecar response: {}", e)))
+            .map_err(|e| crate::Error::UiQueryFailed(
+                format!("Invalid sidecar JSON: {}. Response: {}", e, response_line.trim())
+            ))
     }
 
     fn find_sidecar_dir(&self) -> Result<std::path::PathBuf> {
