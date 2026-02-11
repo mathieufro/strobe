@@ -118,8 +118,15 @@ mod macos_tests {
         sm.stop_session(session_id).unwrap();
     }
 
+    /// Test that subsequent AX tree queries complete in reasonable time.
+    ///
+    /// Threshold: 600ms for a warm (non-first) query. This accounts for:
+    /// - PID validation via proc_pidinfo
+    /// - Full AX tree traversal with recursion
+    /// - System load variance on CI
+    /// The first query is slower due to permission checks and AX cache warming.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_ax_latency_under_50ms() {
+    async fn test_ax_query_latency_reasonable() {
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
@@ -143,9 +150,6 @@ mod macos_tests {
         let _nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
         let elapsed = start.elapsed();
 
-        // Second query should be fast (<600ms is reasonable for subsequent queries)
-        // Note: Includes PID validation via proc_pidinfo, AX tree traversal, and recursion
-        // Latency can vary depending on system load and complexity of UI tree
         assert!(elapsed.as_millis() < 600, "Subsequent AX query should be <600ms, took {}ms", elapsed.as_millis());
 
         let _ = sm.stop_frida(session_id).await;
@@ -376,5 +380,79 @@ mod macos_tests {
         assert_eq!(rect.y, 20.0);
         assert_eq!(rect.w, 100.0);
         assert_eq!(rect.h, 50.0);
+    }
+
+    // ---- Error path and edge case tests ----
+
+    #[test]
+    fn test_ax_query_kernel_pid() {
+        // PID 0 is the kernel — should fail gracefully
+        let result = strobe::ui::accessibility::query_ax_tree(0);
+        match result {
+            Ok(nodes) => assert!(nodes.is_empty(), "Kernel PID should return empty tree"),
+            Err(_) => {} // Error is also acceptable
+        }
+    }
+
+    #[test]
+    fn test_merge_empty_vision() {
+        use strobe::ui::tree::{UiNode, Rect, NodeSource};
+        use strobe::ui::merge::merge_vision_into_tree;
+
+        let mut tree = vec![UiNode {
+            id: "w".to_string(),
+            role: "window".to_string(),
+            title: Some("App".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: Some(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }),
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![],
+        }];
+
+        // Empty vision elements should not modify tree
+        let (merged, added) = merge_vision_into_tree(&mut tree, &[], 0.5);
+        assert_eq!(merged, 0);
+        assert_eq!(added, 0);
+        assert_eq!(tree.len(), 1, "Tree should be unchanged");
+    }
+
+    #[test]
+    fn test_merge_empty_tree() {
+        use strobe::ui::vision::{VisionElement, VisionBounds};
+        use strobe::ui::merge::merge_vision_into_tree;
+
+        let mut tree = vec![];
+        let vision = vec![VisionElement {
+            label: "button".to_string(),
+            description: "Orphan".to_string(),
+            confidence: 0.9,
+            bounds: VisionBounds { x: 10, y: 10, w: 50, h: 30 },
+        }];
+
+        // Vision elements with empty tree should be added at root
+        let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
+        assert_eq!(merged, 0);
+        assert_eq!(added, 1);
+        assert_eq!(tree.len(), 1, "Vision node should be added at root");
+    }
+
+    #[test]
+    fn test_ui_error_code_mapping() {
+        use strobe::mcp::McpError;
+
+        // UiQueryFailed should map to UiQueryFailed error code
+        let err = strobe::Error::UiQueryFailed("test error".to_string());
+        let mcp_err: McpError = err.into();
+        let code_str = serde_json::to_string(&mcp_err.code).unwrap();
+        assert!(code_str.contains("UI_QUERY_FAILED"), "UiQueryFailed should map to UI_QUERY_FAILED, got: {}", code_str);
+
+        // UiNotAvailable should map to its own error code (not UiQueryFailed)
+        let err = strobe::Error::UiNotAvailable("not available".to_string());
+        let mcp_err: McpError = err.into();
+        let code_str = serde_json::to_string(&mcp_err.code).unwrap();
+        assert!(code_str.contains("UI_NOT_AVAILABLE"), "UiNotAvailable should map to UI_NOT_AVAILABLE, got: {}", code_str);
     }
 }

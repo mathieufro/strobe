@@ -101,12 +101,26 @@ def download_florence2_processor():
 
     The OmniParser fine-tuned model only ships weights, not the processor.
     The processor comes from the base microsoft/Florence-2-base model.
+
+    SECURITY NOTE: trust_remote_code=True executes arbitrary Python from the
+    HuggingFace model repo. We pin to a specific revision to reduce supply chain
+    risk. Update FLORENCE2_REVISION only after auditing the new repo contents.
     """
     from transformers import AutoProcessor
 
+    # Pin to known-good revision to mitigate trust_remote_code supply chain risk.
+    # Florence-2-base requires trust_remote_code for its custom processor.
+    FLORENCE2_REVISION = "refs/pr/6"
+
     print("  Caching Florence-2-base processor (tokenizer)...")
+    print("  WARNING: trust_remote_code=True is required for Florence-2 processor.")
+    print(f"  Pinned to revision: {FLORENCE2_REVISION}")
     try:
-        AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
+        AutoProcessor.from_pretrained(
+            "microsoft/Florence-2-base",
+            trust_remote_code=True,
+            revision=FLORENCE2_REVISION,
+        )
         print("  Florence-2-base processor cached.")
     except Exception as e:
         print(f"  WARNING: Failed to cache processor: {e}", file=sys.stderr)

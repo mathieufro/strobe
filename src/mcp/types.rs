@@ -668,6 +668,7 @@ pub enum ErrorCode {
     ReadFailed,
     WriteFailed,
     UiQueryFailed,
+    UiNotAvailable,
     InternalError,
 }
 
@@ -693,7 +694,7 @@ impl From<crate::Error> for McpError {
             crate::Error::ReadFailed(_) => ErrorCode::ReadFailed,
             crate::Error::WriteFailed(_) => ErrorCode::WriteFailed,
             crate::Error::UiQueryFailed(_) => ErrorCode::UiQueryFailed,
-            crate::Error::UiNotAvailable(_) => ErrorCode::UiQueryFailed,
+            crate::Error::UiNotAvailable(_) => ErrorCode::UiNotAvailable,
             _ => ErrorCode::InternalError,
         };
 

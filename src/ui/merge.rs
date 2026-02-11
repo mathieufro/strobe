@@ -19,7 +19,7 @@ pub fn iou(a: &Rect, b: &Rect) -> f64 {
     let area_b = b.w * b.h;
     let union = area_a + area_b - intersection;
 
-    if union <= 0.0 { 0.0 } else { intersection / union }
+    if union <= f64::EPSILON { 0.0 } else { intersection / union }
 }
 
 /// Convert VisionBounds to Rect.

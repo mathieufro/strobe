@@ -48,7 +48,12 @@ pub fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
         }
     }
 
-    // SEC-5: Validate PID ownership to prevent privilege escalation
+    // SEC-5: Validate PID ownership to prevent privilege escalation.
+    // NOTE: TOCTOU race exists between this check and AXUIElementCreateApplication below.
+    // An attacker could replace the process between validation and use. This is a known
+    // limitation — full mitigation would require kernel-level PID validation which macOS
+    // AX APIs don't support. The window is very small (microseconds) and exploitation
+    // requires local access, so the risk is accepted.
     unsafe {
         let current_uid = libc::geteuid();
         let mut proc_info: libc::proc_bsdinfo = std::mem::zeroed();
@@ -87,9 +92,10 @@ pub fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
         let all_children = get_ax_children(app_ref);
 
         // Build nodes and filter out menu bars (include windows and other UI elements)
+        let mut node_count: usize = 0;
         let mut window_index = 0;
         for child_ref in all_children.iter() {
-            if let Some(node) = build_node(*child_ref, window_index) {
+            if let Some(node) = build_node(*child_ref, window_index, 0, &mut node_count) {
                 // Skip menu bars but include windows and other UI elements
                 if !node.role.contains("MenuBar") {
                     children.push(node);
@@ -109,8 +115,23 @@ pub fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
     }
 }
 
+/// Maximum depth for AX tree traversal to prevent stack overflow on pathological trees.
+const MAX_AX_DEPTH: usize = 50;
+/// Maximum total nodes to collect to prevent excessive memory usage.
+const MAX_AX_NODES: usize = 10_000;
+
 /// Recursively build a UiNode from an AXUIElementRef.
-unsafe fn build_node(element: AXUIElementRef, sibling_index: usize) -> Option<UiNode> {
+unsafe fn build_node(
+    element: AXUIElementRef,
+    sibling_index: usize,
+    depth: usize,
+    node_count: &mut usize,
+) -> Option<UiNode> {
+    if depth >= MAX_AX_DEPTH || *node_count >= MAX_AX_NODES {
+        return None;
+    }
+    *node_count += 1;
+
     let role = get_ax_string(element, attr_to_cfstring(kAXRoleAttribute))?;
     let title = get_ax_string(element, attr_to_cfstring(kAXTitleAttribute))
         .or_else(|| get_ax_string(element, attr_to_cfstring(kAXDescriptionAttribute)));
@@ -126,7 +147,7 @@ unsafe fn build_node(element: AXUIElementRef, sibling_index: usize) -> Option<Ui
     let child_refs = get_ax_children(element);
     let mut children = Vec::new();
     for (i, child_ref) in child_refs.iter().enumerate() {
-        if let Some(child_node) = build_node(*child_ref, i) {
+        if let Some(child_node) = build_node(*child_ref, i, depth + 1, node_count) {
             children.push(child_node);
         }
     }
@@ -204,7 +225,11 @@ unsafe fn get_ax_bool(element: AXUIElementRef, attribute: CFStringRef) -> Option
     if err != 0 || value.is_null() {
         return None;
     }
-    // Try to read as CFBoolean
+    // CORR-1: Verify it's actually a CFBoolean before casting
+    if CFGetTypeID(value) != CFBoolean::type_id() {
+        CFRelease(value);
+        return None;
+    }
     let cf_bool = CFBoolean::wrap_under_get_rule(value as _);
     let result = cf_bool.into();
     Some(result)

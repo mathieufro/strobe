@@ -203,11 +203,30 @@ impl VisionSidecar {
             .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to flush sidecar stdin: {}", e)))?;
 
         // CORR-1: Read response line without taking ownership of stdout
-        // SEC-7: Note: This read_line() can block indefinitely if sidecar hangs.
-        // Mitigation: (1) health check at startup, (2) idle timeout kills hung process,
-        // (3) crash detection on empty response. Full timeout requires async I/O refactor.
+        // SEC-7: Use poll(2) with 30s timeout to prevent indefinite blocking
         let stdout = child.stdout.as_mut()
             .ok_or_else(|| crate::Error::UiQueryFailed("Sidecar stdout closed".to_string()))?;
+
+        {
+            use std::os::unix::io::AsRawFd;
+            let raw_fd = stdout.as_raw_fd();
+            let mut pollfd = libc::pollfd {
+                fd: raw_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let poll_result = unsafe { libc::poll(&mut pollfd, 1, 30_000) };
+            if poll_result == 0 {
+                return Err(crate::Error::UiQueryFailed(
+                    "Sidecar response timed out after 30s".to_string()
+                ));
+            } else if poll_result < 0 {
+                return Err(crate::Error::UiQueryFailed(
+                    format!("Poll error waiting for sidecar: {}", std::io::Error::last_os_error())
+                ));
+            }
+        }
+
         let mut response_line = String::new();
         BufReader::new(stdout.by_ref()).read_line(&mut response_line)
             .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to read sidecar response: {}", e)))?;

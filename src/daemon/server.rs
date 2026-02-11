@@ -2241,6 +2241,8 @@ Validation Limits (enforced):
                         let now = std::time::Instant::now();
                         let rate_limiter = LAST_VISION_CALL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
                         let mut last_calls = rate_limiter.lock().unwrap();
+                        // Prune entries older than 60s to prevent unbounded growth
+                        last_calls.retain(|_, last| now.duration_since(*last) < std::time::Duration::from_secs(60));
                         if let Some(last_time) = last_calls.get(&req.session_id) {
                             let elapsed = now.duration_since(*last_time);
                             if elapsed < std::time::Duration::from_secs(1) {
@@ -2667,5 +2669,114 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(result.is_ok(), "Notify should wake the waiting task");
         assert!(result.unwrap().unwrap(), "Task should return true");
+    }
+
+    // ---- E2E MCP tool handler tests for debug_ui ----
+
+    fn make_debug_ui_call(session_id: &str, mode: &str, id: i64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "debug_ui",
+                "arguments": {
+                    "sessionId": session_id,
+                    "mode": mode
+                }
+            }
+        }).to_string()
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_debug_ui_nonexistent_session() {
+        let (daemon, _dir) = test_daemon();
+        let mut initialized = false;
+        let conn_id = "test-ui-1";
+
+        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+
+        let msg = make_debug_ui_call("nonexistent-session", "tree", 10);
+        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+
+        // Tool errors are wrapped as successful JSON-RPC with isError in content
+        let result = resp.result.expect("Should have result");
+        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        assert!(is_error, "Should return error for nonexistent session");
+
+        let content = result.get("content").unwrap().as_array().unwrap();
+        let text = content[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("SESSION_NOT_FOUND"), "Error should mention SESSION_NOT_FOUND, got: {}", text);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_debug_ui_stopped_process() {
+        let (daemon, _dir) = test_daemon();
+        let mut initialized = false;
+        let conn_id = "test-ui-2";
+
+        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+
+        // Create a session and mark it as stopped (process exited)
+        let session_id = daemon.session_manager.generate_session_id("testapp");
+        daemon.session_manager.create_session(
+            &session_id, "/bin/testapp", "/home/user", 99999,
+        ).unwrap();
+        daemon.session_manager.db().update_session_status(
+            &session_id, crate::db::SessionStatus::Stopped,
+        ).unwrap();
+
+        let msg = make_debug_ui_call(&session_id, "tree", 10);
+        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+
+        let result = resp.result.expect("Should have result");
+        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        assert!(is_error, "Should return error for stopped process");
+
+        let content = result.get("content").unwrap().as_array().unwrap();
+        let text = content[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("not running") || text.contains("exited"),
+            "Error should mention process not running, got: {}", text);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn test_debug_ui_vision_disabled_error() {
+        let (daemon, _dir) = test_daemon();
+        let mut initialized = false;
+        let conn_id = "test-ui-3";
+
+        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+
+        // Create a running session (process won't actually exist, but we'll hit
+        // the vision check before the AX query since vision is checked first)
+        let session_id = daemon.session_manager.generate_session_id("testapp");
+        daemon.session_manager.create_session(
+            &session_id, "/bin/testapp", "/home/user", 99999,
+        ).unwrap();
+
+        // Request vision on a running session — should fail because vision is disabled by default
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "debug_ui",
+                "arguments": {
+                    "sessionId": session_id,
+                    "mode": "tree",
+                    "vision": true
+                }
+            }
+        }).to_string();
+        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+
+        let result = resp.result.expect("Should have result");
+        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        // This may fail with either "vision not enabled" or an AX error (since PID 99999 doesn't exist).
+        // Both are acceptable - the key is it doesn't panic.
+        assert!(is_error, "Should return error (vision disabled or invalid PID)");
     }
 }
