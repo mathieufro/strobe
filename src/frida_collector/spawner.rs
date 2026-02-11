@@ -311,6 +311,9 @@ struct AgentMessageHandler {
     write_response: WriteResponseSignal,
     crash_reported: Arc<AtomicBool>,
     pause_notify_tx: Option<PauseNotifyTx>,
+    /// Wall-clock epoch nanos at process start, subtracted from event timestamps
+    /// to produce process-relative timestamps consistent with trace events.
+    start_ns: i64,
 }
 
 impl AgentMessageHandler {
@@ -443,11 +446,12 @@ impl AgentMessageHandler {
                     address.unwrap_or(0), return_address.unwrap_or(0)
                 );
 
-                // Create a Pause event for the database
+                // Create a Pause event for the database (process-relative timestamp)
                 let timestamp_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos() as i64;
+                    .as_nanos() as i64
+                    - self.start_ns;
 
                 let event = Event {
                     id: format!("{}-pause-{}-{}", self.session_id, thread_id, timestamp_ns),
@@ -503,11 +507,12 @@ impl AgentMessageHandler {
                 let error = payload.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
                 tracing::warn!("[{}] Condition error on breakpoint {}: {}", self.session_id, bp_id, error);
 
-                // Store as event for queryability
+                // Store as event for queryability (process-relative timestamp)
                 let timestamp_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos() as i64;
+                    .as_nanos() as i64
+                    - self.start_ns;
                 let event = Event {
                     id: format!("{}-cond-err-{}", self.session_id, timestamp_ns),
                     session_id: self.session_id.clone(),
@@ -917,6 +922,10 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         write_response: write_response.clone(),
                         crash_reported: crash_reported.clone(),
                         pause_notify_tx,
+                        start_ns: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as i64,
                     };
 
                     unsafe { register_handler_raw(script_ptr, handler) };
@@ -1572,6 +1581,10 @@ fn handle_child_spawn(
                         write_response: write_response.clone(),
                         crash_reported: Arc::new(AtomicBool::new(false)),
                         pause_notify_tx: None,
+                        start_ns: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as i64,
                     };
                     unsafe {
                         register_handler_raw(script_ptr, handler);
@@ -2460,6 +2473,7 @@ mod tests {
             write_response,
             crash_reported: Arc::new(AtomicBool::new(false)),
             pause_notify_tx: None,
+            start_ns: 1_000_000_000, // 1s offset for test determinism
         };
         (handler, event_rx, hooks_ready)
     }
@@ -2550,6 +2564,7 @@ mod tests {
             write_response,
             crash_reported: Arc::new(AtomicBool::new(false)),
             pause_notify_tx: Some(pause_tx),
+            start_ns: 1_000_000_000,
         };
 
         // Simulate a "paused" message from agent
@@ -2615,6 +2630,7 @@ mod tests {
             write_response,
             crash_reported: Arc::new(AtomicBool::new(false)),
             pause_notify_tx: Some(pause_tx),
+            start_ns: 1_000_000_000,
         };
 
         let payload = json!({

@@ -1,5 +1,6 @@
 use gimli::{self, RunTimeEndian, EndianSlice, SectionId};
-use object::{Object, ObjectSection, ObjectSegment};
+use object::{Object, ObjectSection, ObjectSegment, FileKind};
+use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -9,6 +10,61 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 use crate::symbols::demangle_symbol;
 use super::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation};
+
+/// Extract the native architecture slice from a fat (universal) Mach-O binary.
+/// Returns `(offset, size)` for the slice matching the current architecture,
+/// or `None` if the data is not a fat binary.
+fn extract_native_arch_range(data: &[u8]) -> Option<(u64, u64)> {
+    let kind = FileKind::parse(data).ok()?;
+    match kind {
+        FileKind::MachOFat32 => {
+            let fat = MachOFatFile32::parse(data).ok()?;
+            let target_arch = target_mach_cputype();
+            for arch in fat.arches() {
+                if arch.cputype() == target_arch {
+                    return Some((arch.offset().into(), arch.size().into()));
+                }
+            }
+            // Fallback: return first arch if no exact match
+            fat.arches().first().map(|a| (a.offset().into(), a.size().into()))
+        }
+        FileKind::MachOFat64 => {
+            let fat = MachOFatFile64::parse(data).ok()?;
+            let target_arch = target_mach_cputype();
+            for arch in fat.arches() {
+                if arch.cputype() == target_arch {
+                    return Some((arch.offset(), arch.size()));
+                }
+            }
+            fat.arches().first().map(|a| (a.offset(), a.size()))
+        }
+        _ => None,
+    }
+}
+
+/// Return the Mach-O CPU type constant for the current architecture.
+fn target_mach_cputype() -> u32 {
+    if cfg!(target_arch = "aarch64") {
+        0x0100000C // CPU_TYPE_ARM64
+    } else if cfg!(target_arch = "x86_64") {
+        0x01000007 // CPU_TYPE_X86_64
+    } else {
+        0 // Unknown — will fall through to first-arch fallback
+    }
+}
+
+/// Parse an object file from mmap data, handling fat (universal) binaries
+/// by extracting the native architecture slice first.
+fn parse_object_file(data: &[u8]) -> std::result::Result<object::File<'_>, object::read::Error> {
+    if let Some((offset, size)) = extract_native_arch_range(data) {
+        let end = offset.saturating_add(size) as usize;
+        let offset = offset as usize;
+        if end <= data.len() {
+            return object::File::parse(&data[offset..end]);
+        }
+    }
+    object::File::parse(data)
+}
 
 /// Parsed DWARF sections with their associated endianness.
 /// Owns all section data (copied from mmap) so there are no lifetime constraints.
@@ -25,7 +81,7 @@ fn load_dwarf_sections(path: &Path) -> Result<LoadedDwarf> {
         .map_err(|e| Error::Frida(format!("Failed to open binary: {}", e)))?;
     let mmap = unsafe { Mmap::map(&file) }
         .map_err(|e| Error::Frida(format!("Failed to mmap binary: {}", e)))?;
-    let object = object::File::parse(&*mmap)
+    let object = parse_object_file(&mmap)
         .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
 
     let has_debug_info = object.section_by_name(".debug_info").is_some()
@@ -146,7 +202,7 @@ impl DwarfParser {
     pub fn extract_image_base(binary_path: &Path) -> Result<u64> {
         let file = File::open(binary_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let object = object::File::parse(&*mmap)
+        let object = parse_object_file(&mmap)
             .map_err(|e| Error::Frida(format!("Failed to parse binary: {}", e)))?;
 
         // Mach-O: use the __TEXT segment address directly

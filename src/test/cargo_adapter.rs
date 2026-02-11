@@ -104,6 +104,12 @@ impl TestAdapter for CargoTestAdapter {
         let mut duration_ms = 0u64;
         let mut failures = Vec::new();
         let mut all_tests = Vec::new();
+        // Track tests that received libtest's informational "timeout" event (60s warning).
+        // These are NOT failures — the test keeps running and will emit "ok" or "failed" later.
+        // We only report them as failures if no final result arrives (process was killed).
+        let mut timed_out_tests: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Track tests that received a final result ("ok" or "failed").
+        let mut resolved_tests: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for line in stdout.lines() {
             let line = line.trim();
@@ -124,6 +130,7 @@ impl TestAdapter for CargoTestAdapter {
                     passed += 1;
                     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                     let exec_time = v.get("exec_time").and_then(|t| t.as_f64()).unwrap_or(0.0);
+                    resolved_tests.insert(name.clone());
                     all_tests.push(TestDetail {
                         name,
                         status: TestStatus::Pass,
@@ -133,18 +140,14 @@ impl TestAdapter for CargoTestAdapter {
                         message: None,
                     });
                 }
-                ("test", "failed") | ("test", "timeout") => {
+                ("test", "failed") => {
                     failed += 1;
                     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                     let exec_time = v.get("exec_time").and_then(|t| t.as_f64()).unwrap_or(0.0);
                     let test_stdout = v.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
+                    let (file, line_num, message) = parse_panic_location(test_stdout);
 
-                    let (file, line_num, message) = if event == "timeout" {
-                        (None, None, format!("Test '{}' timed out", name))
-                    } else {
-                        parse_panic_location(test_stdout)
-                    };
-
+                    resolved_tests.insert(name.clone());
                     failures.push(TestFailure {
                         name: name.clone(),
                         file: file.clone(),
@@ -162,6 +165,14 @@ impl TestAdapter for CargoTestAdapter {
                         stderr: None,
                         message: Some(message),
                     });
+                }
+                ("test", "timeout") => {
+                    // libtest's "timeout" is informational (emitted at 60s) — the test
+                    // keeps running. Don't count as failure yet; the authoritative
+                    // "ok"/"failed" event will come later. Only report as failure if
+                    // the process is killed before the final result arrives.
+                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    timed_out_tests.insert(name);
                 }
                 ("test", "ignored") => {
                     skipped += 1;
@@ -183,6 +194,31 @@ impl TestAdapter for CargoTestAdapter {
                     duration_ms += (exec_time * 1000.0) as u64;
                 }
                 _ => {}
+            }
+        }
+
+        // Report timed-out tests that never received a final result as failures.
+        // This happens when the process was killed (by Strobe's hard timeout or a crash)
+        // before the test could complete.
+        for name in &timed_out_tests {
+            if !resolved_tests.contains(name) {
+                failed += 1;
+                failures.push(TestFailure {
+                    name: name.clone(),
+                    file: None,
+                    line: None,
+                    message: format!("Test '{}' timed out (killed before completion)", name),
+                    rerun: Some(name.clone()),
+                    suggested_traces: vec![format!("@file:{}", name.replace("::", "/"))],
+                });
+                all_tests.push(TestDetail {
+                    name: name.clone(),
+                    status: TestStatus::Fail,
+                    duration_ms: 0,
+                    stdout: None,
+                    stderr: None,
+                    message: Some(format!("Test '{}' timed out (killed before completion)", name)),
+                });
             }
         }
 
@@ -595,5 +631,38 @@ mod tests {
         assert_eq!(result.summary.failed, 1);
         assert_eq!(result.failures.len(), 1);
         assert!(result.failures[0].message.contains("SIGSEGV"));
+    }
+
+    #[test]
+    fn test_libtest_timeout_not_counted_as_failure_when_test_completes() {
+        let adapter = CargoTestAdapter;
+        // libtest emits "timeout" at 60s as a warning, then the test finishes with "ok".
+        // The timeout event should NOT be counted as a failure.
+        let stdout = r#"{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "tests::slow_test" }
+{ "type": "test", "event": "timeout", "name": "tests::slow_test" }
+{ "type": "test", "event": "ok", "name": "tests::slow_test", "exec_time": 75.123 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 75.123 }
+"#;
+        let result = adapter.parse_output(stdout, "", 0);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.failed, 0, "Timeout warning followed by ok should not be a failure");
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_libtest_timeout_counted_as_failure_when_process_killed() {
+        let adapter = CargoTestAdapter;
+        // libtest emits "timeout" but the process is killed before the test completes.
+        // No final "ok"/"failed" event — should be counted as a failure.
+        let stdout = r#"{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "tests::stuck_test" }
+{ "type": "test", "event": "timeout", "name": "tests::stuck_test" }
+"#;
+        let result = adapter.parse_output(stdout, "", 101);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].message.contains("timed out"));
+        assert!(result.failures[0].message.contains("killed before completion"));
     }
 }
