@@ -667,6 +667,7 @@ pub enum ErrorCode {
     ValidationError,
     ReadFailed,
     WriteFailed,
+    UiQueryFailed,
     InternalError,
 }
 
@@ -691,6 +692,8 @@ impl From<crate::Error> for McpError {
             crate::Error::TestRunNotFound(_) => ErrorCode::TestRunNotFound,
             crate::Error::ReadFailed(_) => ErrorCode::ReadFailed,
             crate::Error::WriteFailed(_) => ErrorCode::WriteFailed,
+            crate::Error::UiQueryFailed(_) => ErrorCode::UiQueryFailed,
+            crate::Error::UiNotAvailable(_) => ErrorCode::UiQueryFailed,
             _ => ErrorCode::InternalError,
         };
 
@@ -1270,6 +1273,63 @@ pub struct SessionStatusResponse {
     pub paused_threads: Vec<PausedThreadInfo>,
 }
 
+// ============ debug_ui ============
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiMode {
+    Tree,
+    Screenshot,
+    Both,
+}
+
+impl Default for UiMode {
+    fn default() -> Self { Self::Tree }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugUiRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub mode: UiMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbose: Option<bool>,
+}
+
+impl DebugUiRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.session_id.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "sessionId must not be empty".to_string()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiStats {
+    pub ax_nodes: usize,
+    pub vision_nodes: usize,
+    pub merged_nodes: usize,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugUiResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<UiStats>,
+}
+
 #[cfg(test)]
 mod write_tests {
     use super::*;
@@ -1351,6 +1411,38 @@ mod write_tests {
             }],
         };
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_ui_request_serde() {
+        let req: DebugUiRequest = serde_json::from_str(r#"{"sessionId": "s1", "mode": "tree"}"#).unwrap();
+        assert_eq!(req.session_id, "s1");
+        assert_eq!(req.mode, UiMode::Tree);
+        assert!(req.vision.is_none());
+    }
+
+    #[test]
+    fn test_debug_ui_request_validation() {
+        let req = DebugUiRequest {
+            session_id: "".to_string(),
+            mode: UiMode::Tree,
+            vision: None,
+            verbose: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_ui_response_serde() {
+        let resp = DebugUiResponse {
+            tree: Some("[window \"Test\" id=w1]".to_string()),
+            screenshot: None,
+            stats: Some(UiStats { ax_nodes: 5, vision_nodes: 0, merged_nodes: 0, latency_ms: 12 }),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("tree").is_some());
+        assert!(json.get("screenshot").is_none()); // skip_serializing_if
+        assert_eq!(json["stats"]["axNodes"], 5);
     }
 }
 

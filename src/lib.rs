@@ -8,5 +8,6 @@ pub mod install;
 pub mod mcp;
 pub mod symbols;
 pub mod test;
+pub mod ui;
 
 pub use error::{Error, Result};

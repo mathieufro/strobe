@@ -35,6 +35,12 @@ pub enum Error {
     #[error("WRITE_FAILED: {0}")]
     WriteFailed(String),
 
+    #[error("UI_QUERY_FAILED: {0}")]
+    UiQueryFailed(String),
+
+    #[error("UI_NOT_AVAILABLE: {0}")]
+    UiNotAvailable(String),
+
     #[error("TEST_RUN_NOT_FOUND: No test run found with ID '{0}'.")]
     TestRunNotFound(String),
 

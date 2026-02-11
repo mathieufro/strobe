@@ -813,6 +813,20 @@ Validation Limits (enforced):
                     }
                 }),
             },
+            McpTool {
+                name: "debug_ui".to_string(),
+                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and optionally AI-detected custom widgets. Use mode to select output.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "sessionId": { "type": "string", "description": "Session ID (from debug_launch)" },
+                        "mode": { "type": "string", "enum": ["tree", "screenshot", "both"], "description": "Output mode: tree (UI element hierarchy), screenshot (PNG image), or both" },
+                        "vision": { "type": "boolean", "description": "Enable AI vision pass for custom widgets (default: false). Requires vision sidecar." },
+                        "verbose": { "type": "boolean", "description": "Return JSON instead of compact text (default: false)" }
+                    },
+                    "required": ["sessionId", "mode"]
+                }),
+            },
         ];
 
         let response = McpToolsListResponse { tools };
@@ -831,6 +845,7 @@ Validation Limits (enforced):
             "debug_memory" => self.tool_debug_memory(&call.arguments).await,
             "debug_breakpoint" => self.tool_debug_breakpoint(&call.arguments).await,
             "debug_continue" => self.tool_debug_continue(&call.arguments).await,
+            "debug_ui" => self.tool_debug_ui(&call.arguments).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -2145,6 +2160,98 @@ Validation Limits (enforced):
         req.validate()?;
 
         let response = self.session_manager.debug_continue_async(&req.session_id, req.action).await?;
+
+        Ok(serde_json::to_value(response)?)
+    }
+
+    async fn tool_debug_ui(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        let req: crate::mcp::DebugUiRequest = serde_json::from_value(args.clone())?;
+        req.validate()?;
+
+        let session = self.require_session(&req.session_id)?;
+        if session.status != crate::db::SessionStatus::Running {
+            return Err(crate::Error::UiQueryFailed(
+                format!("Process not running (PID {} exited). Cannot query UI.", session.pid)
+            ));
+        }
+
+        let start = std::time::Instant::now();
+        let vision_requested = req.vision.unwrap_or(false);
+        let verbose = req.verbose.unwrap_or(false);
+
+        let mut tree_output = None;
+        let mut screenshot_output = None;
+        let mut ax_count = 0;
+        let vision_count = 0;
+        let merged_count = 0;
+
+        let needs_tree = matches!(req.mode, crate::mcp::UiMode::Tree | crate::mcp::UiMode::Both);
+        let needs_screenshot = matches!(req.mode, crate::mcp::UiMode::Screenshot | crate::mcp::UiMode::Both);
+
+        // Query AX tree
+        if needs_tree {
+            #[cfg(target_os = "macos")]
+            {
+                let pid = session.pid;
+                let nodes = tokio::task::spawn_blocking(move || {
+                    crate::ui::accessibility::query_ax_tree(pid)
+                }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
+
+                ax_count = crate::ui::tree::count_nodes(&nodes);
+
+                // TODO (M2): If vision_requested, run vision sidecar and merge
+                if vision_requested {
+                    tracing::warn!("Vision pipeline not yet implemented, returning AX-only tree");
+                }
+
+                tree_output = Some(if verbose {
+                    crate::ui::tree::format_json(&nodes)?
+                } else {
+                    crate::ui::tree::format_compact(&nodes)
+                });
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(crate::Error::UiNotAvailable(
+                    "UI observation is only supported on macOS".to_string()
+                ));
+            }
+        }
+
+        // Capture screenshot
+        if needs_screenshot {
+            #[cfg(target_os = "macos")]
+            {
+                let pid = session.pid;
+                let png_bytes = tokio::task::spawn_blocking(move || {
+                    crate::ui::capture::capture_window_screenshot(pid)
+                }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
+
+                use base64::Engine;
+                screenshot_output = Some(base64::engine::general_purpose::STANDARD.encode(&png_bytes));
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(crate::Error::UiNotAvailable(
+                    "Screenshot capture is only supported on macOS".to_string()
+                ));
+            }
+        }
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        let response = crate::mcp::DebugUiResponse {
+            tree: tree_output,
+            screenshot: screenshot_output,
+            stats: Some(crate::mcp::UiStats {
+                ax_nodes: ax_count,
+                vision_nodes: vision_count,
+                merged_nodes: merged_count,
+                latency_ms,
+            }),
+        };
 
         Ok(serde_json::to_value(response)?)
     }
