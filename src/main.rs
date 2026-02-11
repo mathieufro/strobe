@@ -17,8 +17,11 @@ async fn main() -> Result<()> {
         Some("install") => {
             strobe::install::install()
         }
+        Some("setup-vision") => {
+            strobe::setup_vision::setup_vision()
+        }
         _ => {
-            eprintln!("Usage: strobe <daemon|mcp|install>");
+            eprintln!("Usage: strobe <daemon|mcp|install|setup-vision>");
             std::process::exit(1);
         }
     }

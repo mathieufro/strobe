@@ -46,11 +46,21 @@ rayon = "1"
 quick-xml = "0.37"
 regex = "1"
 
+# UI vision sidecar (base64 encoding for screenshots sent to Python sidecar)
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# UI screenshot encoding (capture.rs is macOS-only)
+png = "0.17"
+accessibility-sys = "0.2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+core-graphics = "0.24"
 
 [[bin]]
 name = "strobe"

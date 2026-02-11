@@ -2,6 +2,22 @@
 
 Each phase builds on the previous. Each has a clear validation criteria: "What can I do now that I couldn't before?"
 
+## Implementation Status
+
+| Phase | Name | Status |
+|-------|------|--------|
+| 1a | Tracing Foundation | **Shipped** |
+| 1b | Advanced Runtime Control | **Shipped** |
+| 1c | Crash & Multi-Process | **Shipped** |
+| 1d | Test Instrumentation | **Shipped** |
+| 1e | Live Memory Access | **Shipped** |
+| 2 | Active Debugging (breakpoints, stepping) | **Shipped** |
+| 3 | VS Code Extension | **Shipped** |
+| 4 | UI Observation (AX tree + AI vision) | **Shipped** |
+| 5 | UI Interaction | Planned |
+| 6 | I/O Channels | Planned |
+| 7 | Autonomous Test Scenarios | Planned |
+
 ---
 
 ## Phase 1a: Tracing Foundation

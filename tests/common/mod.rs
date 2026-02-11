@@ -104,6 +104,33 @@ pub fn rust_fixture_project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust")
 }
 
+/// Build and return the SwiftUI UI test app path.
+pub fn ui_test_app() -> PathBuf {
+    static CACHED: OnceLock<PathBuf> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let fixture_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui-test-app");
+            let binary = fixture_dir.join("build/UITestApp");
+
+            if !binary.exists() || needs_rebuild(&[&fixture_dir.join("UITestApp.swift")], &binary) {
+                eprintln!("Building SwiftUI UI test app...");
+                let status = Command::new("bash")
+                    .arg(fixture_dir.join("build.sh"))
+                    .current_dir(&fixture_dir)
+                    .status()
+                    .expect("Failed to run build.sh");
+                assert!(status.success(), "UI test app build failed");
+            } else {
+                eprintln!("UI test app up-to-date, skipping build");
+            }
+
+            assert!(binary.exists(), "UI test app not found after build: {:?}", binary);
+            binary
+        })
+        .clone()
+}
+
 /// Create a SessionManager with a temp database.
 pub fn create_session_manager() -> (strobe::daemon::SessionManager, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
