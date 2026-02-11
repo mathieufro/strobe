@@ -56,6 +56,12 @@ impl DwarfHandle {
             .clone()
             .map_err(|e| crate::Error::Frida(e))
     }
+
+    /// Try to synchronously borrow the parsed result.
+    /// Returns None if parse is still pending, Some(Ok(...)) if successful, Some(Err(...)) if failed.
+    pub fn try_borrow_parser(&self) -> Option<Result<Arc<DwarfParser>, String>> {
+        self.rx.borrow().as_ref().map(|r| r.clone())
+    }
 }
 
 #[cfg(test)]
