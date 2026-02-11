@@ -568,6 +568,27 @@ Read/write variables in a running process without setting up traces:
 - `debug_memory({ action: \"write\", sessionId, targets: [{ variable: \"gTempo\", value: 120.0 }] })` — write a value
 - Poll results: `debug_query({ eventType: \"variable_snapshot\" })`
 
+## UI Observation (macOS only)
+
+Inspect the UI of a running process — accessibility tree and screenshots.
+
+- `debug_ui({ sessionId, mode: \"tree\" })` — accessibility tree as compact text
+- `debug_ui({ sessionId, mode: \"screenshot\" })` — base64-encoded PNG of the window
+- `debug_ui({ sessionId, mode: \"both\" })` — tree + screenshot in one call
+- `debug_ui({ sessionId, mode: \"tree\", verbose: true })` — JSON format instead of compact text
+
+### Output Format (compact text, default)
+```
+[window \"App\" bounds=0,0,800,600]
+  [button \"Play\" bounds=10,5,80,30 enabled focused]
+  [slider \"Volume\" bounds=100,50,200,30 value≈0.75]
+```
+
+### Tips
+- Start with `mode: \"tree\"` — fast, works for standard widgets and most frameworks (JUCE, Qt, Cocoa)
+- Use `mode: \"both\"` when you need to see the actual rendered UI alongside the tree
+- Use `verbose: true` when you need structured JSON for programmatic analysis
+
 ## Session Management
 
 - `debug_session({ action: \"status\", sessionId })` — full snapshot: pid, status, hook count, patterns, breakpoints, logpoints, watches, paused threads
@@ -834,13 +855,12 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_ui".to_string(),
-                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and optionally AI-detected custom widgets. Use mode to select output.".to_string(),
+                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and/or a screenshot. Use mode to select output.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "sessionId": { "type": "string", "description": "Session ID (from debug_launch)" },
                         "mode": { "type": "string", "enum": ["tree", "screenshot", "both"], "description": "Output mode: tree (UI element hierarchy), screenshot (PNG image), or both" },
-                        "vision": { "type": "boolean", "description": "Enable AI vision pass for custom widgets (default: false). Requires vision sidecar." },
                         "verbose": { "type": "boolean", "description": "Return JSON instead of compact text (default: false)" }
                     },
                     "required": ["sessionId", "mode"]

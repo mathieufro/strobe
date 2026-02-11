@@ -109,6 +109,35 @@ fn run(cmd: &str, args: &[&str]) -> crate::Result<()> {
     Ok(())
 }
 
+/// Ensure flash_attn stub exists in the venv (Florence-2 imports it but it's CUDA-only).
+fn ensure_flash_attn_stub(venv_python: &Path) -> crate::Result<()> {
+    let output = Command::new(venv_python)
+        .args(["-c", "import flash_attn"])
+        .output()
+        .map_err(|e| crate::Error::Internal(format!("Failed to check flash_attn: {}", e)))?;
+
+    if !output.status.success() {
+        // Run setup_models.py's stub creation via Python
+        let site_pkg_output = Command::new(venv_python)
+            .args(["-c", "import site; print(site.getsitepackages()[0])"])
+            .output()
+            .map_err(|e| crate::Error::Internal(format!("Failed to get site-packages: {}", e)))?;
+
+        let site_packages = String::from_utf8_lossy(&site_pkg_output.stdout).trim().to_string();
+        let stub_dir = Path::new(&site_packages).join("flash_attn");
+        std::fs::create_dir_all(&stub_dir)
+            .map_err(|e| crate::Error::Internal(format!("Failed to create flash_attn stub dir: {}", e)))?;
+        std::fs::write(
+            stub_dir.join("__init__.py"),
+            "\"\"\"Stub for flash_attn on non-CUDA platforms.\"\"\"\n",
+        )
+        .map_err(|e| crate::Error::Internal(format!("Failed to write flash_attn stub: {}", e)))?;
+        println!("  Created flash_attn stub (macOS/CPU).");
+    }
+
+    Ok(())
+}
+
 /// Main entry point for `strobe setup-vision`.
 pub fn setup_vision() -> crate::Result<()> {
     let home = strobe_home();
@@ -125,6 +154,9 @@ pub fn setup_vision() -> crate::Result<()> {
     let venv_ok = venv_python.exists();
 
     if status.yolo_ok && status.florence2_ok && venv_ok {
+        // Even when models are installed, ensure flash_attn stub exists (macOS/CPU)
+        ensure_flash_attn_stub(&venv_python)?;
+
         println!("Already installed:");
         println!("  YOLO icon detection:   {:.1} MB", status.yolo_size_mb);
         println!("  Florence-2 captioning: {:.0} MB", status.florence2_size_mb);
