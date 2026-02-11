@@ -186,6 +186,7 @@ class StrobeAgent {
   private breakpointsByAddress: Map<string, string> = new Map(); // address → id
   private pausedThreads: Map<number, string> = new Map(); // threadId → breakpointId
   private logpoints: Map<string, LogpointState> = new Map(); // id → state
+  private steppingThreads: Set<number> = new Set(); // threads with active step hooks
 
   // Output event buffering (low-frequency, stays in JS)
   private outputBuffer: OutputEvent[] = [];
@@ -828,6 +829,12 @@ class StrobeAgent {
         const bp = self.breakpoints.get(msg.id);
         if (!bp) return;
 
+        // Suppress user breakpoints for threads that are actively stepping.
+        // Without this, a step-over from a breakpoint in a loop would re-trigger
+        // the original breakpoint on the next iteration before the step hook fires.
+        const tid = Process.getCurrentThreadId();
+        if (self.steppingThreads.has(tid)) return;
+
         // Evaluate condition if present
         if (bp.condition && !self.evaluateCondition(bp.condition, args, bp.id)) {
           return;
@@ -1056,6 +1063,9 @@ class StrobeAgent {
     const stepSlide = this.tracer.getSlide();
     const self = this;
 
+    // Mark this thread as stepping — suppresses user breakpoints until step completes.
+    this.steppingThreads.add(threadId);
+
     const stepId = `step-${threadId}-${Date.now()}`;
     const listeners: InvocationListener[] = [];
     let fired = false;
@@ -1064,6 +1074,7 @@ class StrobeAgent {
     const cleanupAll = () => {
       if (fired) return;
       fired = true;
+      self.steppingThreads.delete(threadId);
       if (timeoutId !== null) {
         clearTimeout(timeoutId);
         timeoutId = null;

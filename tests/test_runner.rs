@@ -248,7 +248,7 @@ fn test_adapter_detection() {
 
     // Cargo adapter should detect Rust fixture
     let rust_project = rust_fixture_project();
-    let adapter = runner.detect_adapter(&rust_project, None, None);
+    let adapter = runner.detect_adapter(&rust_project, None, None).unwrap();
     eprintln!("Detected adapter for Rust project: {}", adapter.name());
     assert_eq!(adapter.name(), "cargo", "Should detect Cargo for Rust fixture");
 
@@ -262,13 +262,27 @@ fn test_adapter_detection() {
         cpp_suite.parent().unwrap(),
         None,
         Some(cpp_suite.to_str().unwrap()),
-    );
+    ).unwrap();
     eprintln!("Detected adapter for C++ suite: {}", adapter.name());
     assert_eq!(adapter.name(), "catch2", "Should detect Catch2 for C++ test suite");
 
     let catch2_confidence = adapter.detect(cpp_suite.parent().unwrap(), Some(cpp_suite.to_str().unwrap()));
     eprintln!("Catch2 confidence: {}", catch2_confidence);
     assert!(catch2_confidence >= 80, "Catch2 should detect C++ test suite");
+
+    // No framework should error with guidance
+    let result = runner.detect_adapter(std::path::Path::new("/nonexistent"), None, None);
+    assert!(result.is_err(), "Should error when no framework detected");
+    let err = result.err().unwrap().to_string();
+    eprintln!("No-framework error: {}", err);
+    assert!(err.contains("No test framework detected"));
+
+    // Invalid framework name should error
+    let result = runner.detect_adapter(&rust_project, Some("pytest"), None);
+    assert!(result.is_err(), "Should error on unknown framework");
+    let err = result.err().unwrap().to_string();
+    eprintln!("Invalid-framework error: {}", err);
+    assert!(err.contains("Unknown framework 'pytest'"));
 }
 
 async fn test_details_file_writing(sm: &strobe::daemon::SessionManager) {

@@ -1,7 +1,6 @@
 pub mod adapter;
 pub mod cargo_adapter;
 pub mod catch2_adapter;
-pub mod generic_adapter;
 pub mod stacks;
 pub mod stuck_detector;
 pub mod output;
@@ -15,7 +14,6 @@ use std::time::Instant;
 use adapter::*;
 use cargo_adapter::CargoTestAdapter;
 use catch2_adapter::Catch2Adapter;
-use generic_adapter::GenericAdapter;
 use stuck_detector::StuckDetector;
 
 /// Phase of a test run lifecycle.
@@ -126,41 +124,53 @@ impl TestRunner {
             adapters: vec![
                 Box::new(CargoTestAdapter),
                 Box::new(Catch2Adapter),
-                Box::new(GenericAdapter),
             ],
         }
     }
 
     /// Detect the best adapter for this project.
+    /// Returns an error if no framework is detected or an invalid framework name is given.
     pub fn detect_adapter(
         &self,
         project_root: &Path,
         framework: Option<&str>,
         command: Option<&str>,
-    ) -> &dyn TestAdapter {
+    ) -> crate::Result<&dyn TestAdapter> {
         // Explicit framework override
         if let Some(name) = framework {
             for adapter in &self.adapters {
                 if adapter.name() == name {
-                    return adapter.as_ref();
+                    return Ok(adapter.as_ref());
                 }
             }
+            return Err(crate::Error::ValidationError(
+                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2'", name)
+            ));
         }
 
         // Auto-detect: highest confidence wins
         let mut best: Option<(&dyn TestAdapter, u8)> = None;
         for adapter in &self.adapters {
             let confidence = adapter.detect(project_root, command);
-            if let Some((_, best_conf)) = best {
-                if confidence > best_conf {
+            if confidence > 0 {
+                if let Some((_, best_conf)) = best {
+                    if confidence > best_conf {
+                        best = Some((adapter.as_ref(), confidence));
+                    }
+                } else {
                     best = Some((adapter.as_ref(), confidence));
                 }
-            } else {
-                best = Some((adapter.as_ref(), confidence));
             }
         }
 
-        best.map(|(a, _)| a).unwrap_or(self.adapters.last().unwrap().as_ref())
+        match best {
+            Some((adapter, _)) => Ok(adapter),
+            None => Err(crate::Error::ValidationError(
+                "No test framework detected. Supported frameworks:\n\
+                 - Cargo (Rust): provide projectRoot pointing to a directory with Cargo.toml\n\
+                 - Catch2 (C++): provide command with path to a test binary".to_string()
+            )),
+        }
     }
 
     /// Run tests inside Frida with DB-based progress polling.
@@ -181,7 +191,7 @@ impl TestRunner {
         session_id: &str,
         progress: Arc<Mutex<TestProgress>>,
     ) -> crate::Result<TestRunResult> {
-        let adapter = self.detect_adapter(project_root, framework, command);
+        let adapter = self.detect_adapter(project_root, framework, command)?;
         let framework_name = adapter.name().to_string();
 
         // Build command
@@ -500,15 +510,29 @@ mod tests {
     fn test_adapter_detection_cargo() {
         let runner = TestRunner::new();
         // strobe project root has Cargo.toml → should detect cargo
-        let adapter = runner.detect_adapter(Path::new("."), None, None);
+        let adapter = runner.detect_adapter(Path::new("."), None, None).unwrap();
         assert_eq!(adapter.name(), "cargo");
     }
 
     #[test]
-    fn test_adapter_detection_explicit_override() {
+    fn test_adapter_detection_no_match() {
         let runner = TestRunner::new();
-        let adapter = runner.detect_adapter(Path::new("/nonexistent"), Some("generic"), None);
-        assert_eq!(adapter.name(), "generic");
+        let result = runner.detect_adapter(Path::new("/nonexistent"), None, None);
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("No test framework detected"), "got: {}", err);
+        assert!(err.contains("Cargo"));
+        assert!(err.contains("Catch2"));
+    }
+
+    #[test]
+    fn test_adapter_detection_invalid_framework() {
+        let runner = TestRunner::new();
+        let result = runner.detect_adapter(Path::new("."), Some("generic"), None);
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("Unknown framework 'generic'"), "got: {}", err);
+        assert!(err.contains("'cargo', 'catch2'"));
     }
 
     #[test]

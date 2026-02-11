@@ -126,7 +126,7 @@ pub trait TestAdapter: Send + Sync {
     /// Scan projectRoot for signals. Returns 0-100 confidence. Highest wins.
     fn detect(&self, project_root: &Path, command: Option<&str>) -> u8;
 
-    /// Human-readable name: "cargo", "catch2", "generic"
+    /// Human-readable name: "cargo", "catch2"
     fn name(&self) -> &str;
 
     /// Build command for running tests at a given level. None = all.

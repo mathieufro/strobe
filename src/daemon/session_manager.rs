@@ -1250,11 +1250,10 @@ impl SessionManager {
             // Frida's Interceptor.attach overwrites up to 16 bytes at the hook address
             // (ARM64: LDR+BR+addr = 16 bytes for far branches). When resuming from
             // the trampoline, the thread JMPs past the overwritten region. One-shot
-            // hooks within that region would never fire. Step hooks need min_offset=16
-            // to avoid re-triggering, but user breakpoints need min_offset=0 so they
-            // can resolve to the first source line at function entry.
-            let is_step_hook = bp.is_none() && pause_info.address.is_some();
-            let min_offset: u64 = if is_step_hook { 16 } else { 0 };
+            // hooks within that region would never fire. This applies whether we're
+            // stepping from a user breakpoint or a previous step hook — both use
+            // Interceptor.attach trampolines that skip the first 16 bytes on resume.
+            let min_offset: u64 = 16;
 
             let addrs = match action.as_str() {
                 "step-over" => {

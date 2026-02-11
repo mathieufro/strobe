@@ -131,7 +131,7 @@ int main(int argc, char* argv[]) {
         printf("[THREADS] Done\n");
     } else if (strcmp(mode, "globals") == 0) {
         printf("[GLOBALS] Starting global variable updates\n");
-        for (int i = 0; i < 200; i++) {
+        for (int i = 0; i < 50; i++) {
             g_counter = i;
             g_tempo = 120.0 + (i % 10);
             g_point_ptr->x = i;

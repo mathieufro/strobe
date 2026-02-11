@@ -767,10 +767,15 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
         }
     }
 
+    // Track raw Frida session pointers per PID for proper cleanup.
+    // Sessions are created via device.attach() and mem::forget'd to extract raw ptrs.
+    // We must explicitly detach + unref them during StopSession.
+    let mut session_ptrs: HashMap<u32, *mut frida_sys::_FridaSession> = HashMap::new();
+
     loop {
         // Check for spawn notifications (non-blocking)
         while let Ok(child_pid) = spawn_rx.try_recv() {
-            handle_child_spawn(&mut device, child_pid, &output_registry);
+            handle_child_spawn(&mut device, child_pid, &output_registry, &mut session_ptrs);
         }
 
         // Wait for commands with timeout so we periodically check for spawns
@@ -899,6 +904,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
 
                     let raw_session = unsafe { session_raw_ptr(&frida_session) };
                     std::mem::forget(frida_session);
+                    session_ptrs.insert(pid, raw_session);
 
                     let t = std::time::Instant::now();
                     let script_ptr = unsafe {
@@ -1011,18 +1017,31 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     vec![]
                 };
 
-                // Kill process trees FIRST with SIGKILL, THEN do Frida cleanup.
-                // Order matters: device.kill() is a blocking sync call that can hang
-                // indefinitely on stopped/traced processes. SIGKILL always works.
+                // Kill process trees FIRST with SIGKILL, THEN clean up Frida state.
+                // Order matters: detaching while a process is paused at a breakpoint
+                // can hang because Frida tries to restore the original code in the
+                // stopped process. SIGKILL always works.
                 for pid in &pids_to_remove {
                     tracing::info!("Killing process tree for PID {} (session {})", pid, session_id);
                     crate::test::stacks::kill_process_tree(*pid);
                 }
 
-                // Now do Frida-level cleanup (fast since processes are already dead)
-                for pid in pids_to_remove {
-                    device.kill(pid)
+                // Frida-level kill to update device's internal bookkeeping
+                for pid in &pids_to_remove {
+                    device.kill(*pid)
                         .unwrap_or_else(|e| tracing::debug!("Frida cleanup PID {}: {:?}", pid, e));
+                }
+
+                // Release Frida session objects. The process is already dead, so we
+                // just need to unref the GObject to prevent resource leaks. This is
+                // equivalent to what frida::Session's Drop impl does (frida_unref).
+                // Without this, forgotten sessions accumulate and exhaust Frida state.
+                for pid in pids_to_remove {
+                    if let Some(session_ptr) = session_ptrs.remove(&pid) {
+                        unsafe {
+                            frida_sys::frida_unref(session_ptr as *mut c_void);
+                        }
+                    }
                 }
                 let _ = response.send(Ok(()));
             }
@@ -1521,6 +1540,7 @@ fn handle_child_spawn(
     device: &mut frida::Device,
     child_pid: u32,
     output_registry: &OutputRegistry,
+    session_ptrs: &mut HashMap<u32, *mut frida_sys::_FridaSession>,
 ) {
     // Find which session this child belongs to by checking the output registry
     let parent_info = {
@@ -1566,6 +1586,7 @@ fn handle_child_spawn(
         Ok(frida_session) => {
             let raw_session = unsafe { session_raw_ptr(&frida_session) };
             std::mem::forget(frida_session);
+            session_ptrs.insert(child_pid, raw_session);
 
             // Create and load agent script in child
             match unsafe { create_script_raw(raw_session, AGENT_CODE) } {

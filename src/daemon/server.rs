@@ -530,8 +530,13 @@ When you see a warning:
 2. Use `debug_query({ sessionId })` to see what's happening
 3. Use `debug_session({ action: \"stop\", sessionId })` to kill the test when you understand the issue
 
+### Framework Selection
+- **Rust projects**: just provide `projectRoot` — Cargo.toml is auto-detected
+- **C++/Catch2**: provide `command` (path to test binary)
+- Do NOT pass `framework` unless auto-detection fails — it's usually unnecessary
+- Only two frameworks are supported: `cargo` and `catch2`
+
 ### Quick Reference
-- Rust: provide `projectRoot` | C++: provide `command` (test binary path)
 - Add `tracePatterns` to trace from the start (optional — can add later via `debug_trace`)
 
 ## Live Memory Access
@@ -784,17 +789,17 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Default action is 'run' which returns a testRunId immediately. Use action: 'status' with testRunId to poll for progress and results. Auto-detects test framework (Cargo/Catch2). Use this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' polls for results" },
                         "testRunId": { "type": "string", "description": "Test run ID (required for action: 'status')" },
                         "projectRoot": { "type": "string", "description": "Project root for adapter detection (required for action: 'run')" },
-                        "framework": { "type": "string", "description": "Override auto-detection: \"cargo\", \"catch2\"" },
+                        "framework": { "type": "string", "enum": ["cargo", "catch2"], "description": "Override auto-detection. Usually not needed — framework is detected from projectRoot (Cargo) or command (Catch2)." },
                         "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
                         "test": { "type": "string", "description": "Run a single test by name (substring match — e.g. 'stuck_detector' runs all tests containing that string)" },
-                        "command": { "type": "string", "description": "Test binary path (required for compiled test frameworks like Catch2)" },
+                        "command": { "type": "string", "description": "Path to test binary. Required for C++/Catch2 projects." },
                         "tracePatterns": { "type": "array", "items": { "type": "string" }, "description": "Trace patterns to apply immediately (tests always run inside Frida)" },
                         "watches": {
                             "type": "object",
@@ -806,135 +811,6 @@ Validation Limits (enforced):
                         },
                         "env": { "type": "object", "description": "Additional environment variables" }
                     }
-                }),
-            },
-            // ---- Deprecated tools (7) — kept for backward compatibility ----
-            McpTool {
-                name: "debug_stop".to_string(),
-                description: "(Deprecated: use debug_session with action: 'stop') Stop a debug session and clean up resources".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" },
-                        "retain": { "type": "boolean", "description": "Retain session data for post-mortem debugging (default: false)" }
-                    },
-                    "required": ["sessionId"]
-                }),
-            },
-            McpTool {
-                name: "debug_list_sessions".to_string(),
-                description: "(Deprecated: use debug_session with action: 'list') List all retained debug sessions".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                }),
-            },
-            McpTool {
-                name: "debug_delete_session".to_string(),
-                description: "(Deprecated: use debug_session with action: 'delete') Delete a retained session and its data".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" }
-                    },
-                    "required": ["sessionId"]
-                }),
-            },
-            McpTool {
-                name: "debug_test_status".to_string(),
-                description: "(Deprecated: use debug_test with action: 'status') Query the status of a running test.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "testRunId": { "type": "string", "description": "Test run ID returned by debug_test" }
-                    },
-                    "required": ["testRunId"]
-                }),
-            },
-            McpTool {
-                name: "debug_read".to_string(),
-                description: "(Deprecated: use debug_memory with action: 'read') Read memory from a running process.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" },
-                        "targets": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "variable": { "type": "string", "description": "Variable name or pointer chain (e.g. 'gClock->counter')" },
-                                    "address": { "type": "string", "description": "Hex address for raw memory reads" },
-                                    "size": { "type": "integer", "description": "Size in bytes (required for raw address)" },
-                                    "type": { "type": "string", "description": "Type: i8/u8/i16/u16/i32/u32/i64/u64/f32/f64/pointer/bytes" }
-                                }
-                            },
-                            "description": "1-16 read targets"
-                        },
-                        "depth": { "type": "integer", "description": "Struct traversal depth (default 1, max 5)", "minimum": 1, "maximum": 5 },
-                        "poll": {
-                            "type": "object",
-                            "properties": {
-                                "intervalMs": { "type": "integer", "description": "Poll interval in ms (50-5000)", "minimum": 50, "maximum": 5000 },
-                                "durationMs": { "type": "integer", "description": "Poll duration in ms (100-30000)", "minimum": 100, "maximum": 30000 }
-                            }
-                        }
-                    },
-                    "required": ["sessionId", "targets"]
-                }),
-            },
-            McpTool {
-                name: "debug_write".to_string(),
-                description: "(Deprecated: use debug_memory with action: 'write') Write to global variables or raw memory addresses.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" },
-                        "targets": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "variable": { "type": "string", "description": "DWARF variable name (e.g. 'g_counter', 'g_tempo')" },
-                                    "address": { "type": "string", "description": "Raw hex address (e.g. '0x7ff800')" },
-                                    "value": { "description": "Value to write (number or boolean)" },
-                                    "type": { "type": "string", "enum": ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "pointer"], "description": "Type hint (required for raw address)" }
-                                },
-                                "required": ["value"]
-                            }
-                        }
-                    },
-                    "required": ["sessionId", "targets"]
-                }),
-            },
-            McpTool {
-                name: "debug_logpoint".to_string(),
-                description: "(Deprecated: use debug_breakpoint with 'message' field) Set or remove logpoints. Like breakpoints but non-blocking — logs a message template on each hit without pausing.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "sessionId": { "type": "string" },
-                        "add": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "message": { "type": "string", "description": "Log message template. Use {args[0]} etc for arguments." },
-                                    "function": { "type": "string", "description": "Function name or pattern" },
-                                    "file": { "type": "string", "description": "Source file path" },
-                                    "line": { "type": "integer", "description": "Line number (required with file)" },
-                                    "condition": { "type": "string", "description": "JS condition" }
-                                },
-                                "required": ["message"]
-                            }
-                        },
-                        "remove": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Logpoint IDs to remove"
-                        }
-                    },
-                    "required": ["sessionId"]
                 }),
             },
         ];
@@ -951,35 +827,10 @@ Validation Limits (enforced):
             "debug_trace" => self.tool_debug_trace(&call.arguments, connection_id).await,
             "debug_query" => self.tool_debug_query(&call.arguments).await,
             "debug_session" => self.tool_debug_session(&call.arguments).await,
-            "debug_stop" => {
-                tracing::warn!("debug_stop is deprecated, use debug_session with action: 'stop'");
-                self.tool_debug_stop(&call.arguments).await
-            },
-            "debug_list_sessions" => {
-                tracing::warn!("debug_list_sessions is deprecated, use debug_session with action: 'list'");
-                self.tool_debug_list_sessions().await
-            },
-            "debug_delete_session" => {
-                tracing::warn!("debug_delete_session is deprecated, use debug_session with action: 'delete'");
-                self.tool_debug_delete_session(&call.arguments).await
-            },
             "debug_test" => self.tool_debug_test(&call.arguments, connection_id).await,
-            "debug_test_status" => {
-                tracing::warn!("debug_test_status is deprecated, use debug_test with action: 'status'");
-                self.tool_debug_test_status(&call.arguments).await
-            },
             "debug_memory" => self.tool_debug_memory(&call.arguments).await,
-            "debug_read" => {
-                tracing::warn!("debug_read is deprecated, use debug_memory with action: 'read'");
-                self.tool_debug_read(&call.arguments).await
-            },
-            "debug_write" => {
-                tracing::warn!("debug_write is deprecated, use debug_memory with action: 'write'");
-                self.tool_debug_write(&call.arguments).await
-            },
             "debug_breakpoint" => self.tool_debug_breakpoint(&call.arguments).await,
             "debug_continue" => self.tool_debug_continue(&call.arguments).await,
-            "debug_logpoint" => self.tool_debug_logpoint(&call.arguments).await,
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -1746,14 +1597,6 @@ Validation Limits (enforced):
         }
     }
 
-    async fn tool_debug_read(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        self.session_manager.execute_debug_read(args).await
-    }
-
-    async fn tool_debug_write(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        self.session_manager.execute_debug_write(args).await
-    }
-
     async fn tool_debug_session(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let req: DebugSessionRequest = serde_json::from_value(args.clone())?;
         req.validate()?;
@@ -1912,7 +1755,7 @@ Validation Limits (enforced):
             project_root_path,
             req.framework.as_deref(),
             req.command.as_deref(),
-        ).name().to_string();
+        )?.name().to_string();
 
         // Create shared progress tracker
         let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test::TestProgress::new()));
@@ -2306,29 +2149,6 @@ Validation Limits (enforced):
         Ok(serde_json::to_value(response)?)
     }
 
-    async fn tool_debug_logpoint(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        tracing::warn!("debug_logpoint is deprecated, use debug_breakpoint with 'message' field");
-        let req: crate::mcp::DebugLogpointRequest = serde_json::from_value(args.clone())?;
-        req.validate()?;
-
-        // Convert LogpointRequest → BreakpointRequest and delegate
-        let bp_targets: Vec<crate::mcp::BreakpointTarget> = req.add.unwrap_or_default().into_iter().map(|lp| {
-            crate::mcp::BreakpointTarget {
-                function: lp.function,
-                file: lp.file,
-                line: lp.line,
-                condition: lp.condition,
-                hit_count: None,
-                message: Some(lp.message),
-            }
-        }).collect();
-        let bp_req = serde_json::to_value(crate::mcp::DebugBreakpointRequest {
-            session_id: req.session_id,
-            add: if bp_targets.is_empty() { None } else { Some(bp_targets) },
-            remove: req.remove,
-        })?;
-        self.tool_debug_breakpoint(&bp_req).await
-    }
 }
 
 #[cfg(test)]
