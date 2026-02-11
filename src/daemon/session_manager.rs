@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use crate::db::{Database, Session, SessionStatus, Event};
 use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::{FridaSpawner, HookResult};
+use crate::symbols::{Language, SymbolResolver, DwarfResolver};
 use crate::Result;
 
 /// Map TypeKind to the string the agent expects.
@@ -43,6 +44,35 @@ fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 /// Acquire a write lock, recovering from poisoned state.
 fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Detect language from command and project root signals.
+pub fn detect_language(command: &str, project_root: &Path) -> Language {
+    let cmd_lower = command.to_lowercase();
+
+    // Check command name
+    if cmd_lower.contains("python") || command.ends_with(".py") {
+        return Language::Python;
+    }
+    if cmd_lower.contains("node") || cmd_lower.contains("bun")
+       || command.ends_with(".js") || command.ends_with(".ts")
+       || cmd_lower.contains("npx") || cmd_lower.contains("tsx") {
+        return Language::JavaScript;
+    }
+
+    // Check project root signals
+    if project_root.join("pyproject.toml").exists()
+       || project_root.join("requirements.txt").exists()
+       || project_root.join("setup.py").exists() {
+        return Language::Python;
+    }
+    if project_root.join("package.json").exists()
+       || project_root.join("bun.lockb").exists()
+       || project_root.join("deno.json").exists() {
+        return Language::JavaScript;
+    }
+
+    Language::Native
 }
 
 #[derive(Clone)]
