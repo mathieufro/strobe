@@ -1550,45 +1550,63 @@ impl DwarfParser {
 /// Glob-style pattern matcher for function names
 pub struct PatternMatcher<'a> {
     pattern: &'a str,
+    separator: &'static str,
 }
 
 impl<'a> PatternMatcher<'a> {
     pub fn new(pattern: &'a str) -> Self {
-        Self { pattern }
+        Self { pattern, separator: "::" }
+    }
+
+    pub fn new_with_separator(pattern: &'a str, sep: char) -> Self {
+        let separator: &'static str = match sep {
+            '.' => ".",
+            ':' => "::",
+            _ => "::",
+        };
+        Self { pattern, separator }
     }
 
     pub fn matches(&self, name: &str) -> bool {
-        // Strip C++ parameter signature before matching.
+        // Strip C++ parameter signature before matching (only for :: separator).
         // e.g. "timing::fast()" → "timing::fast"
         // e.g. "audio::process_buffer(audio::AudioBuffer*)" → "audio::process_buffer"
         // This ensures patterns like "timing::fast" and "audio::*" work with demangled C++ names.
-        let name = match name.find('(') {
-            Some(idx) => &name[..idx],
-            None => name,
+        let name = if self.separator == "::" {
+            match name.find('(') {
+                Some(idx) => &name[..idx],
+                None => name,
+            }
+        } else {
+            name
         };
-        Self::glob_match(self.pattern, name)
+        self.glob_match(self.pattern, name)
     }
 
-    fn glob_match(pattern: &str, text: &str) -> bool {
-        // Handle **:: (matches zero or more segments including separators)
-        if pattern.starts_with("**::") {
-            let rest = &pattern[4..]; // skip "**::"
+    fn glob_match(&self, pattern: &str, text: &str) -> bool {
+        // Build the double-separator pattern (e.g., "**::" or "**.")
+        let double_sep = format!("**{}", self.separator);
 
-            // Try matching zero segments (skip the :: too)
-            if Self::glob_match(rest, text) {
+        // Handle **:: or **. (matches zero or more segments including separators)
+        if pattern.starts_with(&double_sep) {
+            let skip_len = double_sep.len();
+            let rest = &pattern[skip_len..];
+
+            // Try matching zero segments (skip the separator too)
+            if self.glob_match(rest, text) {
                 return true;
             }
 
             // Try matching at every position in text
             for i in 0..=text.len() {
-                if Self::glob_match(&pattern[2..], &text[i..]) { // keep the "::" in pattern
+                if self.glob_match(&pattern[2..], &text[i..]) { // keep the separator in pattern
                     return true;
                 }
             }
             return false;
         }
 
-        // Handle ** (matches anything including ::)
+        // Handle ** (matches anything including separator)
         if pattern.starts_with("**") {
             let rest = &pattern[2..];
             if rest.is_empty() {
@@ -1596,28 +1614,28 @@ impl<'a> PatternMatcher<'a> {
             }
             // Try matching rest of pattern at every position in text
             for i in 0..=text.len() {
-                if Self::glob_match(rest, &text[i..]) {
+                if self.glob_match(rest, &text[i..]) {
                     return true;
                 }
             }
             return false;
         }
 
-        // Handle * (matches anything except ::)
+        // Handle * (matches anything except separator)
         if pattern.starts_with('*') {
             let rest = &pattern[1..];
             if rest.is_empty() {
-                // * at end matches if no :: in remaining text
-                return !text.contains("::");
+                // * at end matches if no separator in remaining text
+                return !text.contains(self.separator);
             }
-            // Find positions in text that don't cross :: boundary
+            // Find positions in text that don't cross separator boundary
             for i in 0..=text.len() {
-                // Check if we crossed a ::
+                // Check if we crossed a separator
                 let consumed = &text[..i];
-                if consumed.contains("::") {
+                if consumed.contains(self.separator) {
                     break;
                 }
-                if Self::glob_match(rest, &text[i..]) {
+                if self.glob_match(rest, &text[i..]) {
                     return true;
                 }
             }
@@ -1636,7 +1654,7 @@ impl<'a> PatternMatcher<'a> {
         let t_char = text.chars().next().unwrap();
 
         if p_char == t_char {
-            Self::glob_match(&pattern[p_char.len_utf8()..], &text[t_char.len_utf8()..])
+            self.glob_match(&pattern[p_char.len_utf8()..], &text[t_char.len_utf8()..])
         } else {
             false
         }

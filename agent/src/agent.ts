@@ -3,6 +3,7 @@ import { createPlatformAdapter, type PlatformAdapter } from './platform.js';
 import { RateTracker } from './rate-tracker.js';
 import { Tracer, type ResolvedTarget as TracerResolvedTarget } from './tracers/tracer.js';
 import { NativeTracer } from './tracers/native-tracer.js';
+import { PythonTracer } from './tracers/python-tracer.js';
 
 interface HookInstruction {
   action: 'add' | 'remove';
@@ -224,6 +225,7 @@ function createTracer(runtime: RuntimeType, agent: any): Tracer {
     case 'native':
       return new NativeTracer(agent);
     case 'cpython':
+      return new PythonTracer(agent);
     case 'v8':
     case 'jsc':
       throw new Error(`Runtime '${runtime}' tracer not yet implemented`);

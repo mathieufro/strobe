@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crate::db::{Database, Session, SessionStatus, Event};
 use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::{FridaSpawner, HookResult};
-use crate::symbols::{Language, SymbolResolver, DwarfResolver};
+use crate::symbols::{Language, SymbolResolver, DwarfResolver, PythonResolver};
 use crate::Result;
 
 /// Map TypeKind to the string the agent expects.
@@ -525,6 +525,23 @@ impl SessionManager {
                     }
                     Err(e) => {
                         tracing::warn!("DWARF parse failed for session {}: {}", sid, e);
+                    }
+                }
+            });
+        } else if language == Language::Python {
+            // For Python, instantiate PythonResolver by parsing project .py files
+            let resolvers = Arc::clone(&self.resolvers);
+            let sid = session_id.to_string();
+            let project_root_path = Path::new(project_root).to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                match PythonResolver::parse(&project_root_path) {
+                    Ok(resolver) => {
+                        let resolver = Arc::new(resolver);
+                        write_lock(&resolvers).insert(sid.clone(), resolver as Arc<dyn SymbolResolver>);
+                        tracing::debug!("PythonResolver instantiated for session {}", sid);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Python resolver parse failed for session {}: {}", sid, e);
                     }
                 }
             });

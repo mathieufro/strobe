@@ -1,6 +1,8 @@
 pub mod adapter;
 pub mod cargo_adapter;
 pub mod catch2_adapter;
+pub mod pytest_adapter;
+pub mod unittest_adapter;
 pub mod stacks;
 pub mod stuck_detector;
 pub mod output;
@@ -14,6 +16,8 @@ use std::time::Instant;
 use adapter::*;
 use cargo_adapter::CargoTestAdapter;
 use catch2_adapter::Catch2Adapter;
+use pytest_adapter::PytestAdapter;
+use unittest_adapter::UnittestAdapter;
 use stuck_detector::StuckDetector;
 
 /// Phase of a test run lifecycle.
@@ -124,6 +128,8 @@ impl TestRunner {
             adapters: vec![
                 Box::new(CargoTestAdapter),
                 Box::new(Catch2Adapter),
+                Box::new(PytestAdapter),
+                Box::new(UnittestAdapter),
             ],
         }
     }

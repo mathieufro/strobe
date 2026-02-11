@@ -1,10 +1,12 @@
 mod demangle;
 pub mod resolver;
 pub mod dwarf_resolver;
+pub mod python_resolver;
 
 pub use demangle::demangle_symbol;
 pub use resolver::{Language, ResolvedTarget, VariableResolution, SymbolResolver};
 pub use dwarf_resolver::DwarfResolver;
+pub use python_resolver::PythonResolver;
 
 #[cfg(test)]
 mod tests {
