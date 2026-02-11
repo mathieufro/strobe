@@ -1,6 +1,8 @@
 import { CModuleTracer, HookMode, type FunctionTarget } from './cmodule-tracer.js';
 import { createPlatformAdapter, type PlatformAdapter } from './platform.js';
 import { RateTracker } from './rate-tracker.js';
+import { Tracer } from './tracers/tracer.js';
+import { NativeTracer } from './tracers/native-tracer.js';
 
 interface HookInstruction {
   action: 'add' | 'remove';
@@ -172,12 +174,47 @@ interface InstallStepHooksMessage {
   returnAddress?: string | null; // Carried forward from original BP for step-out support
 }
 
+// Type aliases for Tracer interface compatibility
+type ResolvedTarget = FunctionTarget;
+type BreakpointMessage = SetBreakpointMessage;
+type LogpointMessage = SetLogpointMessage;
+type StepHooksMessage = InstallStepHooksMessage;
+
+// Runtime detection types
+type RuntimeType = 'native' | 'cpython' | 'v8' | 'jsc';
+
+/**
+ * Detect the target process runtime by probing for known symbols.
+ * Returns 'native' if no interpreter runtime is detected.
+ */
+function detectRuntime(): RuntimeType {
+  // For now, always return 'native' — Python/JS detection will be added in Plan 2/3
+  return 'native';
+}
+
+/**
+ * Factory function to create the appropriate tracer for the detected runtime.
+ */
+function createTracer(runtime: RuntimeType, agent: any): Tracer {
+  switch (runtime) {
+    case 'native':
+      return new NativeTracer(agent);
+    case 'cpython':
+    case 'v8':
+    case 'jsc':
+      throw new Error(`Runtime '${runtime}' tracer not yet implemented`);
+    default:
+      return new NativeTracer(agent);
+  }
+}
+
 class StrobeAgent {
   private sessionId: string = '';
   private sessionStartNs: number = 0;
   private eventSeq: number = 0;
   private platform: PlatformAdapter;
-  private tracer: CModuleTracer;
+  private cmoduleTracer: CModuleTracer;  // Internal CModule-based tracer
+  public tracer: Tracer;                  // Public Tracer interface
   private rateTracker: RateTracker | null = null;
   private funcIdToName: Map<number, string> = new Map();
 
@@ -210,9 +247,14 @@ class StrobeAgent {
 
   constructor() {
     this.platform = createPlatformAdapter();
-    this.tracer = new CModuleTracer((events) => {
+    this.cmoduleTracer = new CModuleTracer((events) => {
       send({ type: 'events', events });
     }, this.platform);
+
+    // Create language-appropriate tracer based on runtime detection
+    const runtime = detectRuntime();
+    this.tracer = createTracer(runtime, this);
+
     this.sessionStartNs = Date.now() * 1000000;
 
     // Periodic flush for output events
@@ -234,7 +276,12 @@ class StrobeAgent {
   initialize(sessionId: string): void {
     this.sessionId = sessionId;
     this.sessionStartNs = Date.now() * 1000000;
-    this.tracer.setSessionId(sessionId);
+
+    // Initialize Tracer interface
+    this.tracer.initialize(sessionId);
+
+    // Initialize CModule-specific functionality
+    this.cmoduleTracer.setSessionId(sessionId);
 
     // Initialize rate tracker for hot function detection
     this.rateTracker = new RateTracker(
@@ -255,7 +302,7 @@ class StrobeAgent {
 
     // Wire rate tracker into the CModule tracer drain loop
     const tracker = this.rateTracker;
-    this.tracer.setRateCheck((funcId: number) => tracker.recordCall(funcId));
+    this.cmoduleTracer.setRateCheck((funcId: number) => tracker.recordCall(funcId));
 
     // Periodically send sampling stats
     this.samplingStatsTimer = setInterval(() => {
@@ -277,9 +324,9 @@ class StrobeAgent {
         send({ type: 'log', message: `ASLR slide computed` });
       }
 
-      // Set serialization depth if provided
+      // Set serialization depth if provided (CModule-specific)
       if (message.serializationDepth) {
-        this.tracer.setSerializationDepth(message.serializationDepth);
+        this.cmoduleTracer.setSerializationDepth(message.serializationDepth);
       }
 
       const mode: HookMode = message.mode || 'full';
@@ -299,7 +346,8 @@ class StrobeAgent {
         send({ type: 'log', message: `Hooks: ${installed} installed, ${failed} failed` });
       } else if (message.action === 'remove') {
         for (const func of message.functions) {
-          this.tracer.removeHook(func.address);
+          // Call native method directly - address-based removal
+          this.removeNativeHook(func.address);
         }
       }
 
@@ -319,9 +367,9 @@ class StrobeAgent {
 
   handleWatches(message: WatchInstruction): void {
     try {
-      this.tracer.updateWatches(message.watches);
+      this.cmoduleTracer.updateWatches(message.watches);
       if (message.exprWatches) {
-        this.tracer.updateExprWatches(message.exprWatches);
+        this.cmoduleTracer.updateExprWatches(message.exprWatches);
       }
       const totalCount = message.watches.length + (message.exprWatches ? message.exprWatches.length : 0);
       send({ type: 'watches_updated', activeCount: totalCount });
@@ -383,12 +431,14 @@ class StrobeAgent {
       const pathBuf = Memory.allocUtf8String(crashPath);
       const dataBuf = Memory.allocUtf8String(data);
 
+      // Get system library exports - try main module first
+      const libcModule = Process.enumerateModules().find(m => m.name.includes('libc')) || Process.mainModule;
       const openFn = new NativeFunction(
-        Module.getExportByName(null, 'open'), 'int', ['pointer', 'int', 'int']);
+        libcModule.getExportByName('open'), 'int', ['pointer', 'int', 'int']);
       const writeFn = new NativeFunction(
-        Module.getExportByName(null, 'write'), 'long', ['int', 'pointer', 'long']);
+        libcModule.getExportByName('write'), 'long', ['int', 'pointer', 'long']);
       const closeFn = new NativeFunction(
-        Module.getExportByName(null, 'close'), 'int', ['int']);
+        libcModule.getExportByName('close'), 'int', ['int']);
 
       // O_WRONLY | O_CREAT | O_TRUNC
       const flags = Process.platform === 'linux' ? 0x241 : 0x601;
@@ -524,7 +574,7 @@ class StrobeAgent {
     this.flushOutput();
   }
 
-  handleReadMemory(message: ReadMemoryMessage): void {
+  handleNativeReadMemory(message: ReadMemoryMessage): void {
     // Ensure ASLR slide is set (may not be if no hooks installed yet)
     if (message.imageBase) {
       this.tracer.setImageBase(message.imageBase);
@@ -624,7 +674,7 @@ class StrobeAgent {
     }
   }
 
-  handleWriteMemory(message: WriteMemoryMessage): void {
+  handleNativeWriteMemory(message: WriteMemoryMessage): void {
     if (message.imageBase) {
       this.tracer.setImageBase(message.imageBase);
     }
@@ -815,7 +865,7 @@ class StrobeAgent {
 
   // ========== Phase 2: Breakpoint methods ==========
 
-  setBreakpoint(msg: SetBreakpointMessage): void {
+  setNativeBreakpoint(msg: SetBreakpointMessage): void {
     // Apply ASLR slide: address from daemon is DWARF-static
     if (msg.imageBase) {
       this.tracer.setImageBase(msg.imageBase);
@@ -928,7 +978,7 @@ class StrobeAgent {
     });
   }
 
-  setLogpoint(msg: SetLogpointMessage): void {
+  setNativeLogpoint(msg: SetLogpointMessage): void {
     // Apply ASLR slide: address from daemon is DWARF-static
     if (msg.imageBase) {
       this.tracer.setImageBase(msg.imageBase);
@@ -1011,7 +1061,7 @@ class StrobeAgent {
     });
   }
 
-  removeLogpoint(id: string): void {
+  removeNativeLogpoint(id: string): void {
     const lp = this.logpoints.get(id);
     if (!lp) return;
 
@@ -1021,7 +1071,7 @@ class StrobeAgent {
     send({ type: 'logpointRemoved', id });
   }
 
-  removeBreakpoint(id: string): void {
+  removeNativeBreakpoint(id: string): void {
     const bp = this.breakpoints.get(id);
     if (!bp) {
       send({ type: 'error', message: `Breakpoint ${id} not found` });
@@ -1049,7 +1099,7 @@ class StrobeAgent {
    * a simple recv('resume-{tid}').wait(). The daemon will send another
    * 'installStepHooks' message before 'resume-{tid}' if further stepping is needed.
    */
-  installStepHooks(msg: InstallStepHooksMessage): void {
+  installNativeStepHooks(msg: InstallStepHooksMessage): void {
     if (!msg.oneShot || msg.oneShot.length === 0) return;
 
     const threadId = msg.threadId;
@@ -1142,6 +1192,38 @@ class StrobeAgent {
     }, 30000);
   }
 
+  // ========== Public wrapper methods for NativeTracer delegation ==========
+
+  /**
+   * Wrapper for NativeTracer to install hooks via CModuleTracer.
+   * Returns funcId on success, null on failure.
+   */
+  public installNativeHook(target: ResolvedTarget, mode: HookMode): number | null {
+    return this.cmoduleTracer.installHook(target, mode);
+  }
+
+  /**
+   * Wrapper for NativeTracer to remove hooks via CModuleTracer.
+   */
+  public removeNativeHook(address: string): void {
+    this.cmoduleTracer.removeHook(address);
+  }
+
+  /**
+   * Wrapper for NativeTracer to remove all hooks via CModuleTracer.
+   */
+  public removeAllNativeHooks(): void {
+    // CModuleTracer doesn't have removeAll, so we'll need to track this differently
+    // For now, this is a no-op placeholder
+  }
+
+  /**
+   * Wrapper for NativeTracer to get active hook count.
+   */
+  public getActiveHookCount(): number {
+    return this.cmoduleTracer.activeHookCount();
+  }
+
   private evaluateCondition(condition: string, args: InvocationArguments, breakpointId?: string): boolean {
     try {
       // Convert args to array for Function context
@@ -1210,46 +1292,52 @@ recv('watches', onWatchesMessage);
 
 function onReadMemoryMessage(message: ReadMemoryMessage): void {
   recv('read_memory', onReadMemoryMessage);
-  agent.handleReadMemory(message);
+  // Delegate to tracer if it implements handleReadMemory (optional method)
+  if (agent.tracer.handleReadMemory) {
+    agent.tracer.handleReadMemory(message);
+  }
 }
 recv('read_memory', onReadMemoryMessage);
 
 // Phase 2a: Write memory message handler
 function onWriteMemoryMessage(message: WriteMemoryMessage): void {
   recv('write_memory', onWriteMemoryMessage);
-  agent.handleWriteMemory(message);
+  // Delegate to tracer if it implements handleWriteMemory (optional method)
+  if (agent.tracer.handleWriteMemory) {
+    agent.tracer.handleWriteMemory(message);
+  }
 }
 recv('write_memory', onWriteMemoryMessage);
 
 // Phase 2: Breakpoint message handlers
 function onSetBreakpointMessage(message: SetBreakpointMessage): void {
   recv('setBreakpoint', onSetBreakpointMessage);
-  agent.setBreakpoint(message);
+  agent.tracer.installBreakpoint(message);
 }
 recv('setBreakpoint', onSetBreakpointMessage);
 
 function onRemoveBreakpointMessage(message: RemoveBreakpointMessage): void {
   recv('removeBreakpoint', onRemoveBreakpointMessage);
-  agent.removeBreakpoint(message.id);
+  agent.tracer.removeBreakpoint(message.id);
 }
 recv('removeBreakpoint', onRemoveBreakpointMessage);
 
 function onSetLogpointMessage(message: SetLogpointMessage): void {
   recv('setLogpoint', onSetLogpointMessage);
-  agent.setLogpoint(message);
+  agent.tracer.installLogpoint(message);
 }
 recv('setLogpoint', onSetLogpointMessage);
 
 function onRemoveLogpointMessage(message: RemoveBreakpointMessage): void {
   recv('removeLogpoint', onRemoveLogpointMessage);
-  agent.removeLogpoint(message.id);
+  agent.tracer.removeLogpoint(message.id);
 }
 recv('removeLogpoint', onRemoveLogpointMessage);
 
 // Phase 2: Step hook installation (sent as separate message before resume)
 function onInstallStepHooksMessage(message: InstallStepHooksMessage): void {
   recv('installStepHooks', onInstallStepHooksMessage);
-  agent.installStepHooks(message);
+  agent.tracer.installStepHooks(message);
 }
 recv('installStepHooks', onInstallStepHooksMessage);
 
