@@ -1966,27 +1966,64 @@ impl FridaSpawner {
             .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?
     }
 
-    pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String], serialization_depth: Option<u32>) -> Result<HookResult> {
+    pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String], serialization_depth: Option<u32>, resolver: Option<&dyn crate::symbols::SymbolResolver>) -> Result<HookResult> {
         let session = self.sessions.get_mut(session_id)
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
         session.hook_manager.add_patterns(patterns);
 
-        // Await DWARF parse completion (may block if still parsing in background)
-        let dwarf = session.dwarf_handle.clone().get().await?;
-
         // Group functions by mode
         let mut full_funcs: Vec<FunctionTarget> = Vec::new();
         let mut light_funcs: Vec<FunctionTarget> = Vec::new();
 
-        for pattern in patterns {
-            let matches: Vec<&FunctionInfo> = resolve_pattern(&dwarf, pattern, &session.project_root);
-            let mode = HookManager::classify_with_count(pattern, matches.len());
-            tracing::info!("Pattern '{}' -> {:?} mode ({} functions)", pattern, mode, matches.len());
+        // Use SymbolResolver if available, otherwise fall back to DWARF
+        if let Some(resolver) = resolver {
+            // For interpreted languages (Python, JS, etc.)
+            use std::path::Path;
+            for pattern in patterns {
+                let targets = resolver.resolve_pattern(pattern, Path::new(&session.project_root))?;
+                let mode = HookManager::classify_with_count(pattern, targets.len());
+                tracing::info!("Pattern '{}' -> {:?} mode ({} targets, resolver)", pattern, mode, targets.len());
 
-            let target = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
-            for func in matches {
-                target.push(FunctionTarget::from(func));
+                let target_list = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
+                for target in targets {
+                    // For interpreted languages, send file:line targets instead of address targets
+                    match target {
+                        crate::symbols::ResolvedTarget::SourceLocation { file, line, name } => {
+                            // Create a FunctionTarget with file and line
+                            target_list.push(FunctionTarget {
+                                address: 0, // No address for interpreted
+                                name: name.clone(),
+                                name_raw: Some(name.clone()),
+                                source_file: Some(file),
+                                line_number: Some(line),
+                            });
+                        }
+                        crate::symbols::ResolvedTarget::Address { address, name, name_raw, file, line } => {
+                            // Native function from resolver (DwarfResolver)
+                            target_list.push(FunctionTarget {
+                                address,
+                                name: name.clone(),
+                                name_raw: name_raw.clone(),
+                                source_file: file.clone(),
+                                line_number: line,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // For native binaries (C++/Rust) - use DWARF
+            let dwarf = session.dwarf_handle.clone().get().await?;
+            for pattern in patterns {
+                let matches: Vec<&FunctionInfo> = resolve_pattern(&dwarf, pattern, &session.project_root);
+                let mode = HookManager::classify_with_count(pattern, matches.len());
+                tracing::info!("Pattern '{}' -> {:?} mode ({} functions, DWARF)", pattern, mode, matches.len());
+
+                let target = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
+                for func in matches {
+                    target.push(FunctionTarget::from(func));
+                }
             }
         }
 

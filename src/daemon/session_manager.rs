@@ -679,6 +679,12 @@ impl SessionManager {
         remove: Option<&[String]>,
         serialization_depth: Option<u32>,
     ) -> Result<HookResult> {
+        // Get resolver for this session (if available)
+        let resolver = {
+            let resolvers = read_lock(&self.resolvers);
+            resolvers.get(session_id).cloned()
+        };
+
         let mut guard = self.frida_spawner.write().await;
         let spawner = match guard.as_mut() {
             Some(s) => s,
@@ -686,7 +692,7 @@ impl SessionManager {
         };
 
         if let Some(patterns) = add {
-            return spawner.add_patterns(session_id, patterns, serialization_depth).await;
+            return spawner.add_patterns(session_id, patterns, serialization_depth, resolver.as_ref().map(|v| &**v)).await;
         }
 
         if let Some(patterns) = remove {
