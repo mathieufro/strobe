@@ -1,12 +1,17 @@
 import { CModuleTracer, HookMode, type FunctionTarget } from './cmodule-tracer.js';
 import { createPlatformAdapter, type PlatformAdapter } from './platform.js';
 import { RateTracker } from './rate-tracker.js';
-import { Tracer } from './tracers/tracer.js';
+import { Tracer, type ResolvedTarget as TracerResolvedTarget } from './tracers/tracer.js';
 import { NativeTracer } from './tracers/native-tracer.js';
 
 interface HookInstruction {
   action: 'add' | 'remove';
-  functions: FunctionTarget[];
+  functions?: FunctionTarget[];  // Address-based targets (native)
+  targets?: Array<{              // file:line-based targets (interpreted)
+    file: string;
+    line: number;
+    name: string;
+  }>;
   imageBase?: string;
   mode?: HookMode;
   serializationDepth?: number;
@@ -334,20 +339,54 @@ class StrobeAgent {
       let failed = 0;
 
       if (message.action === 'add') {
-        for (const func of message.functions) {
-          const funcId = this.tracer.installHook(func, mode);
-          if (funcId !== null) {
-            this.funcIdToName.set(funcId, func.name);
-            installed++;
-          } else {
-            failed++;
+        // Handle address-based targets (native)
+        if (message.functions) {
+          for (const func of message.functions) {
+            const funcId = this.tracer.installHook({
+              address: func.address,
+              name: func.name,
+              nameRaw: func.nameRaw,
+              sourceFile: func.sourceFile,
+              lineNumber: func.lineNumber,
+            }, mode);
+            if (funcId !== null) {
+              this.funcIdToName.set(funcId, func.name);
+              installed++;
+            } else {
+              failed++;
+            }
           }
         }
+
+        // Handle file:line targets (interpreted)
+        if (message.targets) {
+          for (const target of message.targets) {
+            const funcId = this.tracer.installHook({
+              file: target.file,
+              line: target.line,
+              name: target.name,
+            }, mode);
+            if (funcId !== null) {
+              this.funcIdToName.set(funcId, target.name);
+              installed++;
+            } else {
+              failed++;
+            }
+          }
+        }
+
         send({ type: 'log', message: `Hooks: ${installed} installed, ${failed} failed` });
       } else if (message.action === 'remove') {
-        for (const func of message.functions) {
-          // Call native method directly - address-based removal
-          this.removeNativeHook(func.address);
+        // Remove address-based hooks
+        if (message.functions) {
+          for (const func of message.functions) {
+            // Call native method directly - address-based removal
+            this.removeNativeHook(func.address);
+          }
+        }
+        // Remove file:line hooks (not yet implemented)
+        if (message.targets) {
+          // TODO: Implement removal by file:line for interpreted tracers
         }
       }
 
@@ -1279,7 +1318,8 @@ function onHooksMessage(message: HookInstruction): void {
   // Re-register BEFORE processing — recv() is one-shot in Frida.
   // Without this, only the first hooks message is ever received.
   recv('hooks', onHooksMessage);
-  send({ type: 'log', message: `Received hooks: action=${message.action} count=${message.functions.length} imageBase=${message.imageBase}` });
+  const count = (message.functions?.length || 0) + (message.targets?.length || 0);
+  send({ type: 'log', message: `Received hooks: action=${message.action} count=${count} imageBase=${message.imageBase}` });
   agent.handleMessage(message);
 }
 recv('hooks', onHooksMessage);
@@ -1340,6 +1380,33 @@ function onInstallStepHooksMessage(message: InstallStepHooksMessage): void {
   agent.tracer.installStepHooks(message);
 }
 recv('installStepHooks', onInstallStepHooksMessage);
+
+// Eval variable message handler for interpreted languages
+function onEvalVariableMessage(message: { expr: string; label?: string }): void {
+  recv('eval_variable', onEvalVariableMessage);
+  try {
+    const value = agent.tracer.readVariable(message.expr);
+    send({ type: 'eval_response', label: message.label || message.expr, value });
+  } catch (e: any) {
+    send({ type: 'eval_response', label: message.label || message.expr, error: e.message });
+  }
+}
+recv('eval_variable', onEvalVariableMessage);
+
+// Runtime resolve message handler for agent-side resolution fallback
+function onResolveMessage(message: { patterns: string[] }): void {
+  recv('resolve', onResolveMessage);
+  if (agent.tracer.resolvePattern) {
+    const targets: TracerResolvedTarget[] = [];
+    for (const pattern of message.patterns) {
+      targets.push(...agent.tracer.resolvePattern(pattern));
+    }
+    send({ type: 'resolved', targets });
+  } else {
+    send({ type: 'resolved', targets: [] });
+  }
+}
+recv('resolve', onResolveMessage);
 
 // Frida calls rpc.exports.dispose() before script unload — ensures all
 // buffered trace events (CModule ring buffer) and output events are flushed.
