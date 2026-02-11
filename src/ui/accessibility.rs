@@ -82,20 +82,27 @@ pub fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
             ));
         }
 
-        // Get windows
+        // Get all children of application (windows, menu bars, etc.)
         let mut children = Vec::new();
-        let windows = get_ax_children(app_ref);
-        for (i, window_ref) in windows.iter().enumerate() {
-            if let Some(node) = build_node(*window_ref, i) {
-                children.push(node);
+        let all_children = get_ax_children(app_ref);
+
+        // Build nodes and filter out menu bars (include windows and other UI elements)
+        let mut window_index = 0;
+        for child_ref in all_children.iter() {
+            if let Some(node) = build_node(*child_ref, window_index) {
+                // Skip menu bars but include windows and other UI elements
+                if !node.role.contains("MenuBar") {
+                    children.push(node);
+                    window_index += 1;
+                }
             }
         }
 
         CFRelease(app_ref as *const c_void);
 
-        // Also release window refs
-        for w in &windows {
-            CFRelease(*w as *const c_void);
+        // Release child refs
+        for child in &all_children {
+            CFRelease(*child as *const c_void);
         }
 
         Ok(children)
