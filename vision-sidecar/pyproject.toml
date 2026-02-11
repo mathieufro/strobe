@@ -1,0 +1,13 @@
+[project]
+name = "strobe-vision"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "ultralytics>=8.0",
+    "transformers>=4.36",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+strobe-vision = "strobe_vision.server:main"

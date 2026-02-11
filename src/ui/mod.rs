@@ -5,3 +5,5 @@ pub mod accessibility;
 
 #[cfg(target_os = "macos")]
 pub mod capture;
+
+pub mod vision;
