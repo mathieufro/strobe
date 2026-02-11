@@ -9,10 +9,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(60); // Model loading can be slow
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionElement {
     pub label: String,
@@ -85,9 +81,10 @@ impl VisionSidecar {
     }
 
     /// Check if sidecar should be shut down due to idle timeout.
-    pub fn check_idle_timeout(&mut self) {
-        if self.process.is_some() && self.last_used.elapsed() > IDLE_TIMEOUT {
-            tracing::info!("Vision sidecar idle for {}s, shutting down", IDLE_TIMEOUT.as_secs());
+    pub fn check_idle_timeout(&mut self, timeout_seconds: u64) {
+        let timeout = Duration::from_secs(timeout_seconds);
+        if self.process.is_some() && self.last_used.elapsed() > timeout {
+            tracing::info!("Vision sidecar idle for {}s, shutting down", timeout_seconds);
             self.shutdown();
         }
     }

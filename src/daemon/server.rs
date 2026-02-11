@@ -28,6 +28,9 @@ pub struct Daemon {
     test_runs: Arc<tokio::sync::RwLock<HashMap<String, crate::test::TestRun>>>,
     /// Signaled by idle_timeout_loop to tell the accept loop to exit
     shutdown_signal: Arc<tokio::sync::Notify>,
+    /// Vision sidecar for UI element detection
+    #[cfg(target_os = "macos")]
+    vision_sidecar: Arc<std::sync::Mutex<crate::ui::vision::VisionSidecar>>,
 }
 
 fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
@@ -238,6 +241,8 @@ impl Daemon {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(target_os = "macos")]
+            vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
         });
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -306,6 +311,15 @@ impl Daemon {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
 
+            // Check vision sidecar idle timeout
+            #[cfg(target_os = "macos")]
+            {
+                let settings = crate::config::resolve(None);
+                if let Ok(mut sidecar) = self.vision_sidecar.lock() {
+                    sidecar.check_idle_timeout(settings.vision_sidecar_idle_timeout_seconds);
+                }
+            }
+
             let last = *self.last_activity.read().await;
             if last.elapsed() > IDLE_TIMEOUT {
                 tracing::info!("Idle timeout reached, shutting down");
@@ -337,6 +351,14 @@ impl Daemon {
         // Phase 3: Delete sessions from DB (safe now that writers have flushed)
         for id in &session_ids {
             let _ = self.session_manager.stop_session(id);
+        }
+
+        // Phase 4: Shutdown vision sidecar if running
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(mut sidecar) = self.vision_sidecar.lock() {
+                sidecar.shutdown();
+            }
         }
 
         self.cleanup();
@@ -2182,8 +2204,8 @@ Validation Limits (enforced):
         let mut tree_output = None;
         let mut screenshot_output = None;
         let mut ax_count = 0;
-        let vision_count = 0;
-        let merged_count = 0;
+        let mut vision_count = 0;
+        let mut merged_count = 0;
 
         let needs_tree = matches!(req.mode, crate::mcp::UiMode::Tree | crate::mcp::UiMode::Both);
         let needs_screenshot = matches!(req.mode, crate::mcp::UiMode::Screenshot | crate::mcp::UiMode::Both);
@@ -2199,15 +2221,53 @@ Validation Limits (enforced):
 
                 ax_count = crate::ui::tree::count_nodes(&nodes);
 
-                // TODO (M2): If vision_requested, run vision sidecar and merge
+                // Run vision pipeline if requested and enabled
+                let mut final_nodes = nodes;
                 if vision_requested {
-                    tracing::warn!("Vision pipeline not yet implemented, returning AX-only tree");
+                    let settings = crate::config::resolve(None);
+                    if !settings.vision_enabled {
+                        return Err(crate::Error::UiQueryFailed(
+                            "Vision pipeline requested but not enabled. Set vision.enabled=true in ~/.strobe/settings.json".to_string()
+                        ));
+                    }
+
+                    // Capture screenshot for vision
+                    let screenshot_b64 = {
+                        let pid = session.pid;
+                        let png_bytes = tokio::task::spawn_blocking(move || {
+                            crate::ui::capture::capture_window_screenshot(pid)
+                        }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
+
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.encode(&png_bytes)
+                    };
+
+                    // Run vision detection
+                    let vision_elements = {
+                        let mut sidecar = self.vision_sidecar.lock().unwrap();
+                        sidecar.detect(
+                            &screenshot_b64,
+                            settings.vision_confidence_threshold,
+                            settings.vision_iou_merge_threshold,
+                        )?
+                    };
+
+                    vision_count = vision_elements.len();
+
+                    // Merge vision into tree (modifies tree in-place)
+                    crate::ui::merge::merge_vision_into_tree(
+                        &mut final_nodes,
+                        &vision_elements,
+                        settings.vision_iou_merge_threshold as f64,
+                    );
+
+                    merged_count = crate::ui::tree::count_nodes(&final_nodes);
                 }
 
                 tree_output = Some(if verbose {
-                    crate::ui::tree::format_json(&nodes)?
+                    crate::ui::tree::format_json(&final_nodes)?
                 } else {
-                    crate::ui::tree::format_compact(&nodes)
+                    crate::ui::tree::format_compact(&final_nodes)
                 });
             }
 
@@ -2278,6 +2338,8 @@ mod tests {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(target_os = "macos")]
+            vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
         };
 
         (daemon, dir)
@@ -2552,6 +2614,8 @@ mod tests {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(target_os = "macos")]
+            vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
         };
 
         daemon.graceful_shutdown().await;
