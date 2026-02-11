@@ -146,10 +146,15 @@ impl VisionSidecar {
     fn start(&mut self) -> Result<()> {
         let sidecar_dir = self.find_sidecar_dir()?;
 
-        // Prefer venv Python (required: system Python may be 3.14+ which breaks transformers)
-        let venv_python = sidecar_dir.join("venv/bin/python");
-        let python = if venv_python.exists() {
-            venv_python.to_string_lossy().to_string()
+        // Python resolution: standard install venv > sidecar-local venv > system python
+        let strobe_venv = dirs::home_dir()
+            .map(|h| h.join(".strobe/vision-env/bin/python"));
+        let local_venv = sidecar_dir.join("venv/bin/python");
+
+        let python = if strobe_venv.as_ref().map_or(false, |p| p.exists()) {
+            strobe_venv.unwrap().to_string_lossy().to_string()
+        } else if local_venv.exists() {
+            local_venv.to_string_lossy().to_string()
         } else {
             "python3".to_string()
         };
@@ -162,7 +167,7 @@ impl VisionSidecar {
             .stderr(Stdio::inherit()) // Pass through to daemon stderr
             .spawn()
             .map_err(|e| crate::Error::UiQueryFailed(
-                format!("Failed to start vision sidecar: {}. Ensure Python 3.10+ is installed with torch, ultralytics, transformers.", e)
+                format!("Failed to start vision sidecar: {}. Run `strobe setup-vision` to install.", e)
             ))?;
 
         self.process = Some(child);
@@ -221,25 +226,32 @@ impl VisionSidecar {
     }
 
     fn find_sidecar_dir(&self) -> Result<std::path::PathBuf> {
-        // Check relative to binary
-        let exe = std::env::current_exe()
-            .map_err(|e| crate::Error::Internal(format!("Cannot find exe path: {}", e)))?;
-        let exe_dir = exe.parent().unwrap();
-
-        // Development: relative to cargo manifest
+        // 1. Development: relative to cargo manifest
         let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vision-sidecar");
         if dev_path.is_dir() {
             return Ok(dev_path);
         }
 
-        // Installed: next to binary
-        let installed_path = exe_dir.join("vision-sidecar");
-        if installed_path.is_dir() {
-            return Ok(installed_path);
+        // 2. Installed: next to binary
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let installed_path = exe_dir.join("vision-sidecar");
+                if installed_path.is_dir() {
+                    return Ok(installed_path);
+                }
+            }
+        }
+
+        // 3. Standard install location (~/.strobe/vision-sidecar)
+        if let Some(home) = dirs::home_dir() {
+            let strobe_path = home.join(".strobe/vision-sidecar");
+            if strobe_path.is_dir() {
+                return Ok(strobe_path);
+            }
         }
 
         Err(crate::Error::UiQueryFailed(
-            format!("Vision sidecar not found. Checked: {:?}, {:?}", dev_path, installed_path)
+            "Vision sidecar not found. Run `strobe setup-vision` to install.".to_string()
         ))
     }
 }

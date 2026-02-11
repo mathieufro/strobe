@@ -32,6 +32,9 @@ pub fn install() -> Result<()> {
         Some(AgentSystem::ClaudeCode { config_dir }) => {
             install_claude_code(&config_dir)?;
             println!("Strobe installed for Claude Code.");
+            println!();
+            println!("Optional: Enable AI vision for UI observation:");
+            println!("  strobe setup-vision");
         }
         None => {
             println!("No supported coding agent detected.");
@@ -39,6 +42,9 @@ pub fn install() -> Result<()> {
             println!("\nManual setup: add strobe to your MCP config with:");
             println!("  command: \"strobe\"");
             println!("  args: [\"mcp\"]");
+            println!();
+            println!("Optional: Enable AI vision for UI observation:");
+            println!("  strobe setup-vision");
         }
     }
 
