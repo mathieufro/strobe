@@ -131,6 +131,16 @@ pub fn ui_test_app() -> PathBuf {
         .clone()
 }
 
+/// Return the Python fixture script path.
+pub fn python_target() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python/fixture.py")
+}
+
+/// Return the Python fixture project root.
+pub fn python_fixture_project() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python")
+}
+
 /// Create a SessionManager with a temp database.
 pub fn create_session_manager() -> (strobe::daemon::SessionManager, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
