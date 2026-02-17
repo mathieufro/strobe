@@ -4,7 +4,7 @@ set -euo pipefail
 # Strobe installer — builds from source and configures MCP.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Primitive78/strobe/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/mathieufro/strobe/main/install.sh | bash
 #
 # Prerequisites: Rust toolchain (rustup), Node.js 18+, Git
 #
@@ -15,7 +15,7 @@ set -euo pipefail
 #   4. Configures MCP for Claude Code
 #   5. Optionally sets up AI vision (~3.5 GB)
 
-REPO_URL="https://github.com/Primitive78/strobe.git"
+REPO_URL="https://github.com/mathieufro/strobe.git"
 INSTALL_DIR="${STROBE_HOME:-$HOME/.strobe}"
 BIN_DIR="$INSTALL_DIR/bin"
 SRC_DIR="$INSTALL_DIR/src"

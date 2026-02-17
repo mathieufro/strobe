@@ -3,7 +3,7 @@
 LLM-native debugging infrastructure. Launch programs, trace functions at runtime, observe execution — no recompilation needed.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/Primitive78/strobe/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mathieufro/strobe/main/install.sh | bash
 ```
 
 ## What It Does
@@ -101,7 +101,7 @@ debug_memory({ sessionId, targets: [{ variable: "gCounter" }] })
 ### Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Primitive78/strobe/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mathieufro/strobe/main/install.sh | bash
 ```
 
 This clones the repo, builds from source, installs to `~/.strobe/`, and configures MCP for Claude Code.
@@ -109,7 +109,7 @@ This clones the repo, builds from source, installs to `~/.strobe/`, and configur
 ### Manual Install
 
 ```bash
-git clone https://github.com/Primitive78/strobe.git
+git clone https://github.com/mathieufro/strobe.git
 cd strobe
 
 # Build agent (TypeScript, must be first)

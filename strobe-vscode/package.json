@@ -8,7 +8,7 @@
   "icon": "media/strobe-icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/example/strobe"
+    "url": "https://github.com/mathieufro/strobe"
   },
   "keywords": ["debugger", "instrumentation", "frida", "trace", "profiling", "native"],
   "engines": {
