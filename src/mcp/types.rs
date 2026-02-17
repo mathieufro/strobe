@@ -568,6 +568,8 @@ pub struct DebugTestResponse {
     pub project: Option<crate::test::adapter::ProjectInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crash_info: Option<CrashSummary>,
 }
 
 // ============ debug_test (async start response) ============
@@ -1263,7 +1265,7 @@ pub struct PausedThreadInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatusResponse {
-    pub status: String,             // "running" | "paused" | "exited"
+    pub status: String,             // "running" | "paused" | "exited" | "crashed"
     pub pid: u32,
     pub event_count: u64,
     pub hooked_functions: u32,
@@ -1272,6 +1274,22 @@ pub struct SessionStatusResponse {
     pub logpoints: Vec<LogpointInfo>,
     pub watches: Vec<ActiveWatch>,
     pub paused_threads: Vec<PausedThreadInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crash_info: Option<CrashSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrashSummary {
+    pub signal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_frame: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throw_top_frame: Option<String>,
 }
 
 // ============ debug_ui ============

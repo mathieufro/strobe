@@ -1694,13 +1694,47 @@ impl SessionManager {
             .collect();
         paused_threads.sort_by_key(|t| t.thread_id);
 
-        // Determine status
-        let status = if !paused_threads.is_empty() {
-            "paused".to_string()
+        // Determine status (with crash detection for dead processes)
+        let (status, crash_info) = if !paused_threads.is_empty() {
+            ("paused".to_string(), None)
         } else if is_process_alive(session.pid) {
-            "running".to_string()
+            ("running".to_string(), None)
         } else {
-            "exited".to_string()
+            // Check if the process crashed
+            let crash_events = self.db().query_events(session_id, |q| {
+                q.event_type(crate::db::EventType::Crash).limit(1)
+            }).unwrap_or_default();
+
+            if let Some(crash) = crash_events.first() {
+                let top_frame = crash.backtrace.as_ref()
+                    .and_then(|bt| bt.as_array())
+                    .and_then(|frames| frames.first())
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string());
+
+                let throw_top_frame = crash.throw_backtrace.as_ref()
+                    .and_then(|bt| bt.as_array())
+                    .and_then(|frames| frames.iter().find(|f| {
+                        // Skip __cxa_throw and internal frames to find the actual throw site
+                        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        !name.contains("__cxa_throw") && !name.contains("__cxa_allocate")
+                    }))
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string());
+
+                let summary = crate::mcp::CrashSummary {
+                    signal: crash.signal.clone(),
+                    exception_type: crash.exception_type.clone(),
+                    exception_message: crash.exception_message.clone(),
+                    top_frame,
+                    throw_top_frame,
+                };
+                ("crashed".to_string(), Some(summary))
+            } else {
+                ("exited".to_string(), None)
+            }
         };
 
         Ok(crate::mcp::SessionStatusResponse {
@@ -1713,6 +1747,7 @@ impl SessionManager {
             logpoints,
             watches,
             paused_threads,
+            crash_info,
         })
     }
 

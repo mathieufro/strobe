@@ -1893,6 +1893,9 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             fault_address: json.get("faultAddress").and_then(|v| v.as_str()).map(|s| s.to_string()),
             registers: json.get("registers").cloned(),
             backtrace: json.get("backtrace").cloned(),
+            exception_type: json.get("exceptionType").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            exception_message: json.get("exceptionMessage").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            throw_backtrace: json.get("throwBacktrace").cloned(),
             ..Event::default()
         });
     }

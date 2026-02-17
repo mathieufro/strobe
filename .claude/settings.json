@@ -5,5 +5,9 @@
       "path": "skills/strobe-tdd.md",
       "description": "Guide TDD workflow using Strobe's debug_test tool"
     }
-  ]
+  ],
+  "attribution": {
+    "commit": "Authored-by: Mathieu Frohlich",
+    "pr": ""
+  }
 }

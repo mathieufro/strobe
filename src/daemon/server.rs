@@ -46,6 +46,9 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
             "registers": event.registers,
             "backtrace": event.backtrace,
             "locals": event.locals,
+            "exceptionType": event.exception_type,
+            "exceptionMessage": event.exception_message,
+            "throwBacktrace": event.throw_backtrace,
         });
     }
 
@@ -1901,6 +1904,36 @@ Validation Limits (enforced):
                         None
                     };
 
+                    // Check if the test session had a crash
+                    let crash_info = run_result.session_id.as_ref().and_then(|sid| {
+                        let crash_events = session_manager.db().query_events(sid, |q| {
+                            q.event_type(crate::db::EventType::Crash).limit(1)
+                        }).ok()?;
+                        let crash = crash_events.first()?;
+                        let top_frame = crash.backtrace.as_ref()
+                            .and_then(|bt| bt.as_array())
+                            .and_then(|frames| frames.first())
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string());
+                        let throw_top_frame = crash.throw_backtrace.as_ref()
+                            .and_then(|bt| bt.as_array())
+                            .and_then(|frames| frames.iter().find(|f| {
+                                let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                !name.contains("__cxa_throw") && !name.contains("__cxa_allocate")
+                            }))
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string());
+                        Some(crate::mcp::CrashSummary {
+                            signal: crash.signal.clone(),
+                            exception_type: crash.exception_type.clone(),
+                            exception_message: crash.exception_message.clone(),
+                            top_frame,
+                            throw_top_frame,
+                        })
+                    });
+
                     let response = crate::mcp::DebugTestResponse {
                         framework: run_result.framework,
                         summary: Some(run_result.result.summary),
@@ -1911,6 +1944,7 @@ Validation Limits (enforced):
                         no_tests: if is_compile_failure { Some(true) } else { None },
                         project: None,
                         hint,
+                        crash_info,
                     };
 
                     match serde_json::to_value(response) {

@@ -78,6 +78,9 @@ pub struct Event {
     pub locals: Option<serde_json::Value>,
     pub breakpoint_id: Option<String>,
     pub logpoint_message: Option<String>,
+    pub exception_type: Option<String>,
+    pub exception_message: Option<String>,
+    pub throw_backtrace: Option<serde_json::Value>,
 }
 
 impl Default for Event {
@@ -109,6 +112,9 @@ impl Default for Event {
             locals: None,
             breakpoint_id: None,
             logpoint_message: None,
+            exception_type: None,
+            exception_message: None,
+            throw_backtrace: None,
         }
     }
 }
@@ -243,8 +249,9 @@ const INSERT_EVENT_SQL: &str =
     "INSERT INTO events (id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
      event_type, function_name, function_name_raw, source_file, line_number,
      arguments, return_value, duration_ns, text, sampled, watch_values, pid,
-     signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+     signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message,
+     exception_type, exception_message, throw_backtrace)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 /// Insert a single event row using a connection or transaction.
 fn insert_event_row(conn: &rusqlite::Connection, event: &Event) -> std::result::Result<(), rusqlite::Error> {
@@ -276,6 +283,9 @@ fn insert_event_row(conn: &rusqlite::Connection, event: &Event) -> std::result::
             event.locals.as_ref().map(|v| v.to_string()),
             &event.breakpoint_id,
             &event.logpoint_message,
+            &event.exception_type,
+            &event.exception_message,
+            event.throw_backtrace.as_ref().map(|v| v.to_string()),
         ],
     )?;
     Ok(())
@@ -335,6 +345,9 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         locals: read_json_text(row, 23)?,
         breakpoint_id: row.get(24)?,
         logpoint_message: row.get(25)?,
+        exception_type: row.get(26)?,
+        exception_message: row.get(27)?,
+        throw_backtrace: read_json_text(row, 28)?,
     })
 }
 
@@ -366,7 +379,8 @@ impl Database {
             "SELECT rowid, id, session_id, timestamp_ns, thread_id, thread_name, parent_event_id,
              event_type, function_name, function_name_raw, source_file, line_number,
              arguments, return_value, duration_ns, text, sampled, watch_values, pid,
-             signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message
+             signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message,
+             exception_type, exception_message, throw_backtrace
              FROM events WHERE session_id = ?"
         );
 

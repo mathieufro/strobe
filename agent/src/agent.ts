@@ -50,6 +50,9 @@ interface CrashEvent {
   frameMemory: string | null;
   frameBase: string | null;
   memoryAccess?: { operation: string; address: string };
+  exceptionType?: string;
+  exceptionMessage?: string | null;
+  throwBacktrace?: BacktraceFrame[];
 }
 
 interface ReadRecipe {
@@ -263,6 +266,13 @@ class StrobeAgent {
   // Re-entrancy guard for write(2) interception
   private inOutputCapture: boolean = false;
 
+  // Last C++ exception captured by __cxa_throw hook (overwritten each throw)
+  private lastException: {
+    type: string;
+    message: string | null;
+    backtrace: BacktraceFrame[];
+  } | null = null;
+
   // Per-session output capture limit (50MB)
   private outputBytesCapture: number = 0;
   private maxOutputBytes: number = 50 * 1024 * 1024;
@@ -297,6 +307,10 @@ class StrobeAgent {
       // Install crash/exception handler early — before process resumes —
       // so crashes are caught even if the "initialize" message hasn't arrived yet.
       this.installExceptionHandler();
+
+      // Hook __cxa_throw to capture C++ exception type, message, and throw-site
+      // backtrace before stack unwinding destroys the context.
+      this.installThrowHook();
 
       // Intercept write(2) for stdout/stderr capture (non-fatal if it fails,
       // e.g. with ASAN-instrumented binaries where write() isn't hookable)
@@ -511,6 +525,110 @@ class StrobeAgent {
     });
   }
 
+  private installThrowHook(): void {
+    // __cxa_throw(void* thrown_exception, std::type_info* tinfo, void (*dest)(void*))
+    const cxaThrow = findGlobalExport('__cxa_throw');
+    if (!cxaThrow) {
+      // C programs or statically linked C++ without __cxa_throw — no exception tracing
+      return;
+    }
+
+    // Pre-resolve __cxa_demangle for type name demangling
+    const cxaDemanglePtr = findGlobalExport('__cxa_demangle');
+    let demangleFn: NativeFunction<NativePointer, [NativePointer, NativePointer, NativePointer, NativePointer]> | null = null;
+    if (cxaDemanglePtr) {
+      demangleFn = new NativeFunction(cxaDemanglePtr, 'pointer', ['pointer', 'pointer', 'pointer', 'pointer']);
+    }
+
+    const freePtr = findGlobalExport('free');
+    let freeFn: NativeFunction<void, [NativePointer]> | null = null;
+    if (freePtr) {
+      freeFn = new NativeFunction(freePtr, 'void', ['pointer']);
+    }
+
+    const self = this;
+
+    Interceptor.attach(cxaThrow, {
+      onEnter(args) {
+        try {
+          const thrownException = args[0]; // void* — the exception object
+          const tinfo = args[1];           // std::type_info*
+
+          // 1. Read exception type name from type_info
+          // Itanium ABI layout: [vtable_ptr, const char* __name]
+          let exceptionType = '<unknown>';
+          try {
+            const namePtr = tinfo.add(Process.pointerSize).readPointer();
+            const mangledName = namePtr.readCString();
+            if (mangledName) {
+              // Try to demangle
+              if (demangleFn) {
+                const mangledBuf = Memory.allocUtf8String(mangledName);
+                const statusBuf = Memory.alloc(4);
+                const result = demangleFn(mangledBuf, NULL, NULL, statusBuf);
+                const status = statusBuf.readS32();
+                if (status === 0 && !result.isNull()) {
+                  exceptionType = result.readCString() ?? mangledName;
+                  if (freeFn) freeFn(result);
+                } else {
+                  exceptionType = mangledName;
+                }
+              } else {
+                exceptionType = mangledName;
+              }
+            }
+          } catch (_) {
+            // type_info read failed
+          }
+
+          // 2. Try to read what() for std::exception subclasses
+          // Itanium ABI vtable: vptr[0] = complete dtor, vptr[1] = deleting dtor, vptr[2] = what()
+          let message: string | null = null;
+          try {
+            const vptr = thrownException.readPointer();
+            if (!vptr.isNull()) {
+              const whatFnPtr = vptr.add(Process.pointerSize * 2).readPointer();
+              if (!whatFnPtr.isNull()) {
+                const whatNative = new NativeFunction(whatFnPtr, 'pointer', ['pointer']);
+                const resultPtr = whatNative(thrownException) as NativePointer;
+                if (!resultPtr.isNull()) {
+                  message = resultPtr.readCString();
+                }
+              }
+            }
+          } catch (_) {
+            // what() failed — expected for non-std::exception types (throw 42, etc.)
+          }
+
+          // 3. Capture throw-site backtrace
+          let backtrace: BacktraceFrame[] = [];
+          try {
+            const frames = Thread.backtrace(this.context, Backtracer.ACCURATE);
+            backtrace = frames.slice(0, 20).map((addr: NativePointer) => {
+              const sym = DebugSymbol.fromAddress(addr);
+              return {
+                address: addr.toString(),
+                moduleName: sym.moduleName,
+                name: sym.name,
+                fileName: sym.fileName,
+                lineNumber: sym.lineNumber,
+              };
+            });
+          } catch (_) {
+            // Backtrace capture failed
+          }
+
+          // Store — subsequent throws overwrite; only the last (uncaught) one matters
+          self.lastException = { type: exceptionType, message, backtrace };
+        } catch (_) {
+          // Never crash the target process
+        }
+      }
+    });
+
+    send({ type: 'log', message: 'C++ exception tracing active (__cxa_throw hooked)' });
+  }
+
   private writeCrashFile(crashEvent: CrashEvent): void {
     try {
       const data = JSON.stringify({ type: 'events', events: [crashEvent] });
@@ -610,7 +728,7 @@ class StrobeAgent {
       };
     }
 
-    return {
+    const crashEvent: CrashEvent = {
       id: eventId,
       timestampNs: timestamp,
       threadId: Process.getCurrentThreadId(),
@@ -625,6 +743,15 @@ class StrobeAgent {
       frameBase,
       memoryAccess,
     };
+
+    // Enrich with C++ exception info captured by __cxa_throw hook
+    if (this.lastException) {
+      crashEvent.exceptionType = this.lastException.type;
+      crashEvent.exceptionMessage = this.lastException.message;
+      crashEvent.throwBacktrace = this.lastException.backtrace;
+    }
+
+    return crashEvent;
   }
 
   private createOutputEvent(fd: number, text: string): OutputEvent {

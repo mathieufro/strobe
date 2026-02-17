@@ -97,6 +97,11 @@ impl Database {
         add_column_if_not_exists(&conn, "events", "breakpoint_id", "TEXT")?;
         add_column_if_not_exists(&conn, "events", "logpoint_message", "TEXT")?;
 
+        // C++ exception tracing columns
+        add_column_if_not_exists(&conn, "events", "exception_type", "TEXT")?;
+        add_column_if_not_exists(&conn, "events", "exception_message", "TEXT")?;
+        add_column_if_not_exists(&conn, "events", "throw_backtrace", "JSON")?;
+
         // Test baselines table for historical per-test durations
         conn.execute(
             "CREATE TABLE IF NOT EXISTS test_baselines (
