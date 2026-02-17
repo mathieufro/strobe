@@ -8,6 +8,13 @@ mod macos_tests {
     use super::common::*;
     use std::time::Duration;
 
+    /// Serialize integration tests that spawn the UI test app via Frida.
+    /// Concurrent Frida spawns of GUI apps + macOS AX queries deadlock.
+    fn ui_integration_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     // ---- Unit-level tests (no app needed) ----
 
     #[test]
@@ -23,6 +30,7 @@ mod macos_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ax_tree_from_test_app() {
+        let _guard = ui_integration_lock().lock().await;
         // Launch UI test app
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
@@ -78,6 +86,7 @@ mod macos_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_screenshot_capture() {
+        let _guard = ui_integration_lock().lock().await;
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
@@ -127,6 +136,7 @@ mod macos_tests {
     /// The first query is slower due to permission checks and AX cache warming.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ax_query_latency_reasonable() {
+        let _guard = ui_integration_lock().lock().await;
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
@@ -314,6 +324,7 @@ mod macos_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_screenshot_with_vision_format() {
+        let _guard = ui_integration_lock().lock().await;
         // Test that screenshots can be base64-encoded for vision sidecar
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();

@@ -5,6 +5,8 @@ import { findGlobalExport } from './utils.js';
 import { Tracer, type ResolvedTarget as TracerResolvedTarget } from './tracers/tracer.js';
 import { NativeTracer } from './tracers/native-tracer.js';
 import { PythonTracer } from './tracers/python-tracer.js';
+import { V8Tracer } from './tracers/v8-tracer.js';
+import { JscTracer } from './tracers/jsc-tracer.js';
 
 interface HookInstruction {
   action: 'add' | 'remove';
@@ -231,8 +233,9 @@ function createTracer(runtime: RuntimeType, agent: any): Tracer {
     case 'cpython':
       return new PythonTracer(agent);
     case 'v8':
+      return new V8Tracer(agent);
     case 'jsc':
-      throw new Error(`Runtime '${runtime}' tracer not yet implemented`);
+      return new JscTracer(agent);
     default:
       return new NativeTracer(agent);
   }

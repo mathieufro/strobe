@@ -105,12 +105,23 @@ unsafe fn session_raw_ptr(session: &frida::Session) -> *mut frida_sys::_FridaSes
 unsafe fn create_script_raw(
     session_ptr: *mut frida_sys::_FridaSession,
     source: &str,
+    language: Language,
 ) -> std::result::Result<*mut frida_sys::_FridaScript, String> {
     let source_cstr = CString::new(source).map_err(|e| format!("CString error: {}", e))?;
     let opt = frida_sys::frida_script_options_new();
     if opt.is_null() {
         return Err("Failed to create script options".to_string());
     }
+
+    // For JavaScript sessions, use V8 runtime so the agent runs inside
+    // Node.js's own V8 context (giving access to require, process, etc.)
+    if language == Language::JavaScript {
+        frida_sys::frida_script_options_set_runtime(
+            opt,
+            frida_sys::FridaScriptRuntime_FRIDA_SCRIPT_RUNTIME_V8,
+        );
+    }
+
     let mut error: *mut frida_sys::GError = std::ptr::null_mut();
 
     let script_ptr = frida_sys::frida_session_create_script_sync(
@@ -1076,7 +1087,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     // -------------------------------------------------------
                     let t = std::time::Instant::now();
                     let script_ptr = unsafe {
-                        create_script_raw(raw_session, AGENT_CODE)
+                        create_script_raw(raw_session, AGENT_CODE, language)
                             .map_err(|e| crate::Error::FridaAttachFailed(format!("Script creation failed: {}", e)))?
                     };
                     tracing::debug!("PERF: create_script took {:?}", t.elapsed());
@@ -1821,7 +1832,8 @@ fn handle_child_spawn(
             session_ptrs.insert(child_pid, raw_session);
 
             // Create and load agent script in child
-            match unsafe { create_script_raw(raw_session, AGENT_CODE) } {
+            // Child processes from fork/exec use Native runtime (default)
+            match unsafe { create_script_raw(raw_session, AGENT_CODE, Language::Native) } {
                 Ok(script_ptr) => {
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
                     let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));

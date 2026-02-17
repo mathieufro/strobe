@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crate::db::{Database, Session, SessionStatus, Event};
 use crate::dwarf::{DwarfParser, DwarfHandle};
 use crate::frida_collector::{FridaSpawner, HookResult};
-use crate::symbols::{Language, SymbolResolver, DwarfResolver, PythonResolver};
+use crate::symbols::{Language, SymbolResolver, DwarfResolver, PythonResolver, JsResolver};
 use crate::Result;
 
 /// Map TypeKind to the string the agent expects.
@@ -549,6 +549,24 @@ impl SessionManager {
                 Err(e) => {
                     tracing::warn!("Python resolver task panicked for session {}: {}", sid, e);
                 }
+            }
+        } else if language == Language::JavaScript {
+            let resolvers = Arc::clone(&self.resolvers);
+            let sid = session_id.to_string();
+            let project_root_path = Path::new(project_root).to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                JsResolver::from_project(&project_root_path)
+            }).await {
+                Ok(Ok(resolver)) => {
+                    let count = resolver.function_count();
+                    write_lock(&resolvers).insert(
+                        sid.clone(),
+                        Arc::new(resolver) as Arc<dyn SymbolResolver>,
+                    );
+                    tracing::info!("JsResolver instantiated for session {} ({} functions)", sid, count);
+                }
+                Ok(Err(e)) => tracing::warn!("JS resolver parse failed for {}: {}", sid, e),
+                Err(e) => tracing::warn!("JS resolver task panicked for {}: {}", sid, e),
             }
         }
 
