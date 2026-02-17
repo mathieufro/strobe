@@ -528,6 +528,7 @@ Read globals during function execution (requires DWARF symbols).
 
 ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
 Tests always run inside Frida, so you can add traces at any time without restarting.
+IMPORTANT: Only one test run at a time. Do NOT launch multiple debug_test calls in parallel — run tests sequentially, waiting for each to complete before starting the next.
 
 `debug_test` returns immediately with a `testRunId`. Poll with `debug_test({ action: \"status\", testRunId })`.
 The server blocks up to 15s waiting for completion, so it's safe to call immediately after each response.
@@ -832,7 +833,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nIMPORTANT: Only one test run at a time. Do NOT launch multiple debug_test runs in parallel — each new run kills the previous one. Run tests sequentially.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1780,28 +1781,11 @@ Validation Limits (enforced):
 
         let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
 
-        // Lifecycle guardrail: kill any still-running test sessions before starting a new one.
-        // This prevents resource leaks from stuck/abandoned tests and ensures a clean slate.
+        // Reject if a test is already running — only one at a time.
         {
             let runs = self.test_runs.read().await;
-            let stale_session_ids: Vec<String> = runs.values()
-                .filter(|run| matches!(&run.state, crate::test::TestRunState::Running { .. }))
-                .filter_map(|run| run.session_id.clone())
-                .collect();
-            drop(runs);
-
-            for sid in &stale_session_ids {
-                tracing::warn!("Killing stale test session {} before new test run", sid);
-                let _ = self.session_manager.stop_frida(sid).await;
-                let _ = self.session_manager.stop_session(sid);
-            }
-
-            // Remove killed runs from the map
-            if !stale_session_ids.is_empty() {
-                let mut runs = self.test_runs.write().await;
-                runs.retain(|_, run| {
-                    !matches!(&run.state, crate::test::TestRunState::Running { .. })
-                });
+            if let Some(running) = runs.values().find(|run| matches!(&run.state, crate::test::TestRunState::Running { .. })) {
+                return Err(crate::Error::TestAlreadyRunning(running.id.clone()));
             }
         }
 

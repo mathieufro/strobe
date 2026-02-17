@@ -2160,6 +2160,7 @@ mod session_consolidation_tests {
             logpoints: vec![],
             watches: vec![],
             paused_threads: vec![],
+            crash_info: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "running");

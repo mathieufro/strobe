@@ -278,11 +278,11 @@ fn test_adapter_detection() {
     assert!(err.contains("No test framework detected"));
 
     // Invalid framework name should error
-    let result = runner.detect_adapter(&rust_project, Some("pytest"), None);
+    let result = runner.detect_adapter(&rust_project, Some("unknown_fw"), None);
     assert!(result.is_err(), "Should error on unknown framework");
     let err = result.err().unwrap().to_string();
     eprintln!("Invalid-framework error: {}", err);
-    assert!(err.contains("Unknown framework 'pytest'"));
+    assert!(err.contains("Unknown framework 'unknown_fw'"));
 }
 
 async fn test_details_file_writing(sm: &strobe::daemon::SessionManager) {

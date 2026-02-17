@@ -57,7 +57,6 @@ pub struct StuckDetector {
     pid: u32,
     hard_timeout_ms: u64,
     progress: Arc<Mutex<TestProgress>>,
-    // TODO Phase 2: Add session_manager: Option<Arc<SessionManager>> to check pause state
     /// Returns true if any threads are paused at breakpoints for this session.
     /// When set, suppresses deadlock diagnosis when breakpoints are active.
     has_paused_threads: Option<Arc<dyn Fn() -> bool + Send + Sync>>,

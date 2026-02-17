@@ -380,7 +380,7 @@ impl AgentMessageHandler {
                     tracing::debug!("[{}] Sampling stats: {} functions being sampled", self.session_id, sampling_count);
                 }
             }
-            "read_response" => {
+            "read_response" | "eval_response" => {
                 if let Ok(mut guard) = self.read_response.lock() {
                     if let Some(tx) = guard.take() {
                         let _ = tx.send(payload.clone());

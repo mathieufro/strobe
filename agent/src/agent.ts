@@ -131,7 +131,7 @@ interface WriteMemoryMessage {
 }
 
 interface SetBreakpointMessage {
-  address: string;
+  address?: string;
   id: string;
   condition?: string;
   hitCount?: number;
@@ -146,7 +146,7 @@ interface RemoveBreakpointMessage {
 }
 
 interface SetLogpointMessage {
-  address: string;
+  address?: string;
   id: string;
   message: string;
   condition?: string;
@@ -249,6 +249,7 @@ class StrobeAgent {
   private funcIdToName: Map<number, string> = new Map();
   private funcIdToAddress: Map<number, string> = new Map();  // Track funcId → address for removal
   private addressToFuncId: Map<string, number> = new Map();  // Track address → funcId for removal
+  private fileLineToFuncId: Map<string, number> = new Map(); // "file:line" → funcId for interpreted hook removal
 
   // Phase 2: Breakpoint management
   private breakpoints: Map<string, BreakpointState> = new Map(); // id → state
@@ -421,7 +422,7 @@ class StrobeAgent {
             }, mode);
             if (funcId !== null) {
               this.funcIdToName.set(funcId, target.name);
-              // File:line targets don't have addresses - funcIdToAddress only for native
+              this.fileLineToFuncId.set(`${target.file}:${target.line}`, funcId);
               installed++;
             } else {
               failed++;
@@ -446,9 +447,16 @@ class StrobeAgent {
             }
           }
         }
-        // Remove file:line hooks (not yet implemented)
+        // Remove file:line hooks (interpreted tracers)
         if (message.targets) {
-          // TODO: Implement removal by file:line for interpreted tracers
+          for (const target of message.targets) {
+            const key = `${target.file}:${target.line}`;
+            const funcId = this.fileLineToFuncId.get(key);
+            if (funcId !== undefined) {
+              this.tracer.removeHook(funcId);
+              this.fileLineToFuncId.delete(key);
+            }
+          }
         }
       }
 
@@ -1085,7 +1093,7 @@ class StrobeAgent {
       this.tracer.setImageBase(msg.imageBase);
     }
     const slide = this.tracer.getSlide();
-    const address = ptr(msg.address).add(slide);
+    const address = ptr(msg.address!).add(slide);
     const self = this;
 
     const listener = Interceptor.attach(address, {
@@ -1198,7 +1206,7 @@ class StrobeAgent {
       this.tracer.setImageBase(msg.imageBase);
     }
     const slide = this.tracer.getSlide();
-    const address = ptr(msg.address).add(slide);
+    const address = ptr(msg.address!).add(slide);
 
     const listener = Interceptor.attach(address, {
       onEnter: (args) => {
@@ -1283,6 +1291,18 @@ class StrobeAgent {
     this.logpoints.delete(id);
 
     send({ type: 'logpointRemoved', id });
+  }
+
+  /** Called by PythonTracer's bpHitCallback when a Python breakpoint is reached. */
+  emitBreakpointHit(id: string, line: number): void {
+    send({
+      type: 'paused',
+      threadId: Process.getCurrentThreadId(),
+      breakpointId: id,
+      hits: 1,
+      funcName: null,
+      lineNumber: line,
+    });
   }
 
   removeNativeBreakpoint(id: string): void {
@@ -1583,7 +1603,12 @@ function onEvalVariableMessage(message: { expr: string; label?: string }): void 
   recv('eval_variable', onEvalVariableMessage);
   try {
     const value = agent.tracer.readVariable(message.expr);
-    send({ type: 'eval_response', label: message.label || message.expr, value });
+    // Python eval errors come back as {error: "..."} — propagate as error field
+    if (value && typeof value === 'object' && 'error' in value && Object.keys(value).length === 1) {
+      send({ type: 'eval_response', label: message.label || message.expr, error: value.error });
+    } else {
+      send({ type: 'eval_response', label: message.label || message.expr, value });
+    }
   } catch (e: any) {
     send({ type: 'eval_response', label: message.label || message.expr, error: e.message });
   }
@@ -1604,6 +1629,17 @@ function onResolveMessage(message: { patterns: string[] }): void {
   }
 }
 recv('resolve', onResolveMessage);
+
+// Python breakpoint resume: daemon sends this to unblock a suspended Python thread
+function onResumePythonBp(_message: {}): void {
+  recv('resume_python_bp', onResumePythonBp);
+  if ('resumePythonBreakpoint' in agent.tracer) {
+    (agent.tracer as any).resumePythonBreakpoint();
+  }
+  // Signal back so SetBreakpoint command handler doesn't timeout waiting for confirmation
+  send({ type: 'breakpointSet', id: 'resume', activeCount: 0 });
+}
+recv('resume_python_bp', onResumePythonBp);
 
 // Frida calls rpc.exports.dispose() before script unload — ensures all
 // buffered trace events (CModule ring buffer) and output events are flushed.
