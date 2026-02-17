@@ -1,0 +1,9 @@
+{
+  "skills": [
+    {
+      "name": "strobe-tdd",
+      "path": "skills/strobe-tdd.md",
+      "description": "Guide TDD workflow using Strobe's debug_test tool"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+# Core dependencies with exact working versions for Florence-2
+torch>=2.0.0
+torchvision>=0.15.0
+transformers==4.38.0
+pillow>=10.0.0
+ultralytics>=8.0.0
+
+# Florence-2 specific dependencies
+einops>=0.7.0
+timm>=0.9.0
+
+# Optional: flash-attention for faster inference (optional, skip if build fails)
+# flash-attn>=2.0.0

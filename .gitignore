@@ -1,0 +1,27 @@
+/target/**
+/agent/node_modules
+/agent/dist
+*.db
+*.db-wal
+*.db-shm
+.strobe/
+tests/**/target/
+tests/**/build/
+tests/**/*.dSYM/.worktrees/
+
+# Vision sidecar (Python)
+vision-sidecar/venv/
+vision-sidecar/__pycache__/
+vision-sidecar/**/__pycache__/
+vision-sidecar/*.egg-info/
+vision-sidecar/*.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code extension
+strobe-vscode/node_modules/
+strobe-vscode/dist/
+strobe-vscode/*.vsix

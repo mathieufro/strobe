@@ -1,0 +1,309 @@
+{
+  "name": "strobe",
+  "displayName": "Strobe",
+  "description": "Dynamic instrumentation debugger — trace any function at runtime",
+  "version": "0.1.0",
+  "publisher": "strobe",
+  "license": "MIT",
+  "icon": "media/strobe-icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/strobe"
+  },
+  "keywords": ["debugger", "instrumentation", "frida", "trace", "profiling", "native"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Testing"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "strobe.launch",
+        "title": "Strobe: Launch Program"
+      },
+      {
+        "command": "strobe.stop",
+        "title": "Strobe: Stop Session"
+      },
+      {
+        "command": "strobe.addTracePattern",
+        "title": "Strobe: Add Trace Pattern"
+      },
+      {
+        "command": "strobe.traceFunction",
+        "title": "Strobe: Trace This Function"
+      },
+      {
+        "command": "strobe.refreshTests",
+        "title": "Strobe: Refresh Test List"
+      },
+      {
+        "command": "strobe.runSingleTest",
+        "title": "Strobe: Run Test"
+      },
+      {
+        "command": "strobe.debugSingleTest",
+        "title": "Strobe: Debug Test with Strobe"
+      },
+      {
+        "command": "strobe.setBreakpoint",
+        "title": "Strobe: Set Breakpoint"
+      },
+      {
+        "command": "strobe.addLogpoint",
+        "title": "Strobe: Add Logpoint..."
+      },
+      {
+        "command": "strobe.openMemoryInspector",
+        "title": "Strobe: Open Memory Inspector"
+      },
+      {
+        "command": "strobe.openWatchViewer",
+        "title": "Strobe: Open Watch Viewer"
+      },
+      {
+        "command": "strobe.addWatch",
+        "title": "Strobe: Watch Variable..."
+      },
+      {
+        "command": "strobe.refreshRetainedSessions",
+        "title": "Strobe: Refresh Retained Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "strobe.openRetainedSession",
+        "title": "Strobe: Open Retained Session"
+      },
+      {
+        "command": "strobe.deleteRetainedSession",
+        "title": "Strobe: Delete Retained Session",
+        "icon": "$(trash)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "strobe.submenu",
+          "group": "strobe"
+        }
+      ],
+      "strobe.submenu": [
+        {
+          "command": "strobe.traceFunction",
+          "group": "1_trace"
+        },
+        {
+          "command": "strobe.setBreakpoint",
+          "group": "2_debug"
+        },
+        {
+          "command": "strobe.addLogpoint",
+          "group": "2_debug"
+        },
+        {
+          "command": "strobe.addWatch",
+          "group": "3_memory"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "strobe.openRetainedSession",
+          "when": "viewItem == retainedSession",
+          "group": "inline@1"
+        },
+        {
+          "command": "strobe.deleteRetainedSession",
+          "when": "viewItem == retainedSession",
+          "group": "inline@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "strobe.refreshRetainedSessions",
+          "when": "view == strobe.retainedSessions",
+          "group": "navigation"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "strobe.submenu",
+        "label": "Strobe"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "strobe",
+          "title": "Strobe",
+          "icon": "media/strobe-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "strobe": [
+        {
+          "id": "strobe.session",
+          "name": "Session"
+        },
+        {
+          "id": "strobe.retainedSessions",
+          "name": "Retained Sessions"
+        }
+      ]
+    },
+    "debuggers": [
+      {
+        "type": "strobe",
+        "label": "Strobe",
+        "languages": ["rust", "c", "cpp", "swift", "go"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the executable to debug",
+                "default": "${workspaceFolder}/target/debug/${workspaceFolderBasename}"
+              },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Command-line arguments",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory",
+                "default": "${workspaceFolder}"
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Additional environment variables",
+                "default": {}
+              },
+              "tracePatterns": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Trace patterns to apply at launch (e.g., [\"myapp::*\"])",
+                "default": []
+              }
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "Strobe: Launch",
+            "description": "Launch and debug with Strobe",
+            "body": {
+              "type": "strobe",
+              "request": "launch",
+              "name": "Debug with Strobe",
+              "program": "^\"\\${workspaceFolder}/target/debug/\\${workspaceFolderBasename}\"",
+              "args": [],
+              "cwd": "^\"\\${workspaceFolder}\""
+            }
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "Strobe",
+      "properties": {
+        "strobe.events.maxPerSession": {
+          "type": "number",
+          "default": 200000,
+          "minimum": 1,
+          "maximum": 10000000,
+          "description": "Maximum number of events stored per session (FIFO buffer). Higher values use more memory."
+        },
+        "strobe.test.statusRetryMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 500,
+          "maximum": 60000,
+          "description": "Test status polling interval in milliseconds."
+        },
+        "strobe.trace.serializationDepth": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Default serialization depth for function arguments."
+        },
+        "strobe.memory.pollIntervalMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 100,
+          "maximum": 5000,
+          "description": "Default polling interval for memory reads and watch viewer."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "strobe.launch",
+        "key": "ctrl+shift+f5",
+        "mac": "cmd+shift+f5"
+      },
+      {
+        "command": "strobe.stop",
+        "key": "ctrl+shift+f6",
+        "mac": "cmd+shift+f6"
+      },
+      {
+        "command": "strobe.addTracePattern",
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "strobe.traceFunction",
+        "key": "ctrl+shift+f9",
+        "mac": "cmd+shift+f9",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "strobe.setBreakpoint",
+        "key": "ctrl+shift+f8",
+        "mac": "cmd+shift+f8",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "strobe.openMemoryInspector",
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m"
+      },
+      {
+        "command": "strobe.addWatch",
+        "key": "ctrl+alt+w",
+        "mac": "cmd+alt+w",
+        "when": "editorTextFocus"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "webpack --mode production",
+    "watch": "webpack --mode development --watch",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "^1.68.0",
+    "@vscode/debugprotocol": "^1.68.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.33",
+    "@types/vscode": "^1.109.0",
+    "ts-loader": "^9.5.4",
+    "typescript": "^5.9.3",
+    "webpack": "^5.105.1",
+    "webpack-cli": "^5.1.4"
+  }
+}

@@ -1,0 +1,11 @@
+[project]
+name = "strobe-python-fixture"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: integration tests",
+    "e2e: end-to-end tests",
+]
