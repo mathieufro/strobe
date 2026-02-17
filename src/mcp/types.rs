@@ -196,7 +196,7 @@ impl DebugTraceRequest {
 
 // ============ debug_query ============
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventTypeFilter {
     FunctionEnter,
@@ -294,6 +294,9 @@ pub struct DebugQueryResponse {
     /// True if FIFO eviction happened since the cursor position
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_dropped: Option<bool>,
+    /// Crash event, if the process crashed. Always included regardless of eventType filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crash: Option<serde_json::Value>,
 }
 
 // ============ debug_stop ============
@@ -1969,6 +1972,7 @@ mod query_pagination_tests {
             pids: None,
             last_event_id: Some(99),
             events_dropped: Some(false),
+            crash: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["lastEventId"], 99);
@@ -2160,6 +2164,7 @@ mod session_consolidation_tests {
             logpoints: vec![],
             watches: vec![],
             paused_threads: vec![],
+            crash_info: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "running");

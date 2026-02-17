@@ -1607,6 +1607,16 @@ Validation Limits (enforced):
             None
         };
 
+        // Always check for crash events regardless of eventType filter
+        let crash = if req.event_type.as_ref() != Some(&EventTypeFilter::Crash) {
+            let crash_events = self.session_manager.db().query_events(&req.session_id, |q| {
+                q.event_type(crate::db::EventType::Crash).limit(1)
+            }).unwrap_or_default();
+            crash_events.first().map(|e| format_event(e, true))
+        } else {
+            None // Already included in the main events list
+        };
+
         let pids = self.session_manager.get_all_pids(&req.session_id);
         let response = DebugQueryResponse {
             events: event_values,
@@ -1615,6 +1625,7 @@ Validation Limits (enforced):
             pids: if pids.len() > 1 { Some(pids) } else { None },
             last_event_id,
             events_dropped,
+            crash,
         };
 
         Ok(serde_json::to_value(response)?)

@@ -187,6 +187,8 @@ struct OutputContext {
     event_tx: mpsc::Sender<Event>,
     event_counter: AtomicU64,
     start_ns: i64,
+    /// Accumulated stderr output — shared with process_death_monitor for ASAN parsing.
+    stderr_buffer: Arc<Mutex<String>>,
 }
 
 /// Shared registry of active output contexts, keyed by PID.
@@ -231,6 +233,17 @@ unsafe extern "C" fn raw_on_output(
     }
 
     let event_type = if fd == 1 { EventType::Stdout } else { EventType::Stderr };
+
+    // Accumulate stderr for ASAN crash detection by process_death_monitor
+    if fd == 2 {
+        if let Ok(mut buf) = ctx.stderr_buffer.lock() {
+            // Cap at 256KB to avoid unbounded growth
+            if buf.len() < 256 * 1024 {
+                buf.push_str(&text);
+            }
+        }
+    }
+
     let counter = ctx.event_counter.fetch_add(1, Ordering::Relaxed);
     let now_ns = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -813,6 +826,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     // -------------------------------------------------------
                     // Step 1: Spawn process — method depends on language type
                     // -------------------------------------------------------
+                    let stderr_buffer_outer = Arc::new(Mutex::new(String::new()));
                     let pid = if is_interpreted {
                         // Self-spawn for interpreted languages (Python, etc.)
                         //
@@ -931,6 +945,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             event_tx: event_tx.clone(),
                             event_counter: AtomicU64::new(0),
                             start_ns,
+                            stderr_buffer: stderr_buffer_outer.clone(),
                         });
                         if let Ok(mut reg) = output_registry.lock() {
                             reg.insert(pid, output_ctx);
@@ -1005,6 +1020,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() as i64,
+                            stderr_buffer: stderr_buffer_outer.clone(),
                         });
                         if let Ok(mut reg) = output_registry.lock() {
                             reg.insert(pid, output_ctx);
@@ -1123,6 +1139,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as i64;
+                    let monitor_stderr_buffer = stderr_buffer_outer;
 
                     thread::spawn(move || {
                         process_death_monitor(
@@ -1131,6 +1148,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             monitor_event_tx,
                             monitor_crash_reported,
                             monitor_start_ns,
+                            monitor_stderr_buffer,
                         );
                     });
 
@@ -1770,6 +1788,7 @@ fn handle_child_spawn(
         event_tx: event_tx.clone(),
         event_counter: AtomicU64::new(0),
         start_ns,
+        stderr_buffer: Arc::new(Mutex::new(String::new())),
     });
     if let Ok(mut reg) = output_registry.lock() {
         reg.insert(child_pid, output_ctx);
@@ -1972,15 +1991,15 @@ fn resolve_pattern<'a>(
 
 /// Monitor a spawned process for crash detection.
 /// When the process dies, checks for a crash file written by the agent's
-/// exception handler (synchronous native I/O). Falls back to waitpid
-/// for basic signal info. This ensures crash events are captured even when
-/// GLib can't flush the agent's async send() before the OS kills the process.
+/// exception handler (synchronous native I/O). Falls back to ASAN parsing
+/// from stderr, then waitpid for basic signal info.
 fn process_death_monitor(
     pid: u32,
     session_id: String,
     event_tx: mpsc::Sender<Event>,
     crash_reported: Arc<AtomicBool>,
     start_ns: i64,
+    stderr_buffer: Arc<Mutex<String>>,
 ) {
     // Poll until process is dead
     loop {
@@ -2017,6 +2036,21 @@ fn process_death_monitor(
             }
         }
         tracing::warn!("Crash file for PID {} exists but couldn't be parsed", pid);
+    }
+
+    // Check stderr for sanitizer output (ASAN/TSAN/UBSAN/MSAN)
+    let stderr_snapshot = stderr_buffer.lock().ok()
+        .map(|buf| buf.clone())
+        .unwrap_or_default();
+
+    if let Some(crash_event) = parse_sanitizer_crash(&stderr_snapshot, pid, &session_id, start_ns) {
+        tracing::info!(
+            "Sanitizer crash detected from stderr for PID {} [{}]: {}",
+            pid, session_id,
+            crash_event.exception_type.as_deref().unwrap_or("unknown")
+        );
+        let _ = event_tx.try_send(crash_event);
+        return;
     }
 
     // Last resort: check waitpid for signal-based termination
@@ -2066,6 +2100,173 @@ fn process_death_monitor(
     } else {
         tracing::debug!("Process {} already reaped (waitpid returned {})", pid, result);
     }
+}
+
+/// Parse sanitizer (ASAN/TSAN/UBSAN/MSAN) crash information from stderr output.
+/// Returns a synthetic crash event if sanitizer output is detected.
+fn parse_sanitizer_crash(
+    stderr: &str,
+    pid: u32,
+    session_id: &str,
+    start_ns: i64,
+) -> Option<Event> {
+    // Match: ==PID==ERROR: AddressSanitizer: SEGV on unknown address 0x... (pc 0x... ... T0)
+    // Also matches ThreadSanitizer, MemorySanitizer, UndefinedBehaviorSanitizer
+    let error_line = stderr.lines().find(|line| {
+        line.contains("ERROR: AddressSanitizer:") ||
+        line.contains("ERROR: ThreadSanitizer:") ||
+        line.contains("ERROR: MemorySanitizer:") ||
+        line.contains("ERROR: UndefinedBehaviorSanitizer:")
+    })?;
+
+    // Extract sanitizer type and error type from the ERROR line
+    // e.g. "==12345==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000"
+    let sanitizer_name = if error_line.contains("AddressSanitizer") {
+        "AddressSanitizer"
+    } else if error_line.contains("ThreadSanitizer") {
+        "ThreadSanitizer"
+    } else if error_line.contains("MemorySanitizer") {
+        "MemorySanitizer"
+    } else {
+        "UndefinedBehaviorSanitizer"
+    };
+
+    // Extract error type: text after "Sanitizer: " up to " on" or end of line
+    let error_type = error_line
+        .split(&format!("{}: ", sanitizer_name))
+        .nth(1)
+        .map(|rest| {
+            // Take up to " on " or end of line
+            rest.split(" on ").next().unwrap_or(rest).trim().to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Map sanitizer error types to signal names
+    let signal = match error_type.as_str() {
+        "SEGV" | "access-violation" => "access-violation",
+        "heap-use-after-free" | "heap-buffer-overflow" | "stack-buffer-overflow"
+        | "global-buffer-overflow" | "stack-use-after-return" | "stack-use-after-scope"
+        | "use-after-poison" => "abort",
+        "double-free" | "alloc-dealloc-mismatch" | "new-delete-type-mismatch" => "abort",
+        _ => "abort", // Most sanitizer errors end in abort()
+    };
+
+    // Extract fault address: "on unknown address 0x..." or "on address 0x..."
+    let fault_address = error_line
+        .split("address ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|s| s.to_string());
+
+    // Extract thread ID: "... T0)" or "... T1)"
+    let thread_id: i64 = error_line
+        .rfind(" T")
+        .and_then(|pos| {
+            let rest = &error_line[pos + 2..];
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            num_str.parse::<i64>().ok()
+        })
+        .unwrap_or(0);
+
+    // Parse backtrace frames: "    #N 0xADDR in FUNC FILE:LINE"
+    let mut backtrace_frames: Vec<serde_json::Value> = Vec::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        // Parse: "#0 0x102abc123 in functionName /path/to/file.cpp:42"
+        // or:    "#0 0x102abc123 in functionName (/path/to/lib+0x1234)"
+        let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let rest = parts[1]; // "0xADDR in FUNC FILE:LINE"
+        let addr_end = rest.find(' ').unwrap_or(rest.len());
+        let address = &rest[..addr_end];
+
+        let mut func_name = String::new();
+        let mut source_file = String::new();
+        let mut line_number = 0i32;
+
+        if let Some(in_pos) = rest.find(" in ") {
+            let after_in = &rest[in_pos + 4..];
+            // Function name ends at the next space (before file path)
+            if let Some(space_pos) = after_in.rfind(" /") {
+                func_name = after_in[..space_pos].trim().to_string();
+                let file_part = after_in[space_pos + 1..].trim();
+                // Split "file:line" or "file:line:col"
+                if let Some(colon_pos) = file_part.rfind(':') {
+                    let maybe_num = &file_part[colon_pos + 1..];
+                    if let Ok(n) = maybe_num.parse::<i32>() {
+                        line_number = n;
+                        let before_colon = &file_part[..colon_pos];
+                        // Check for another colon (file:line vs file:line:col)
+                        if let Some(colon2) = before_colon.rfind(':') {
+                            if let Ok(n2) = before_colon[colon2 + 1..].parse::<i32>() {
+                                line_number = n2;
+                                source_file = before_colon[..colon2].to_string();
+                            } else {
+                                source_file = before_colon.to_string();
+                            }
+                        } else {
+                            source_file = before_colon.to_string();
+                        }
+                    } else {
+                        source_file = file_part.to_string();
+                    }
+                } else {
+                    source_file = file_part.to_string();
+                }
+            } else if let Some(paren_pos) = after_in.find(" (") {
+                func_name = after_in[..paren_pos].trim().to_string();
+            } else {
+                func_name = after_in.trim().to_string();
+            }
+        }
+
+        let mut frame = serde_json::json!({
+            "address": address,
+        });
+        if !func_name.is_empty() {
+            frame["function"] = serde_json::json!(func_name);
+        }
+        if !source_file.is_empty() {
+            frame["sourceFile"] = serde_json::json!(source_file);
+        }
+        if line_number > 0 {
+            frame["line"] = serde_json::json!(line_number);
+        }
+        backtrace_frames.push(frame);
+    }
+
+    // Extract SUMMARY line for the exception message
+    let summary = stderr.lines()
+        .find(|line| line.contains("SUMMARY:"))
+        .map(|line| {
+            line.split("SUMMARY: ").nth(1).unwrap_or(line).trim().to_string()
+        })
+        .unwrap_or_else(|| format!("{}: {}", sanitizer_name, error_type));
+
+    let now_ns = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64) - start_ns;
+
+    Some(Event {
+        id: format!("{}-crash-asan-{}", session_id, chrono::Utc::now().timestamp_millis()),
+        session_id: session_id.to_string(),
+        timestamp_ns: now_ns,
+        event_type: EventType::Crash,
+        signal: Some(signal.to_string()),
+        fault_address,
+        thread_id,
+        pid: Some(pid),
+        exception_type: Some(format!("{}: {}", sanitizer_name, error_type)),
+        exception_message: Some(summary),
+        backtrace: if backtrace_frames.is_empty() { None } else { Some(serde_json::json!(backtrace_frames)) },
+        ..Event::default()
+    })
 }
 
 /// Session state on the main thread

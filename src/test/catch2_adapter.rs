@@ -49,10 +49,113 @@ impl TestAdapter for Catch2Adapter {
     fn parse_output(
         &self,
         stdout: &str,
-        _stderr: &str,
-        _exit_code: i32,
+        stderr: &str,
+        exit_code: i32,
     ) -> TestResult {
-        parse_catch2_xml(stdout)
+        let mut result = parse_catch2_xml(stdout);
+
+        // Detect crash: signal death (exit > 128) or sanitizer output in stderr
+        let is_signal_death = exit_code > 128;
+        let has_sanitizer = stderr.contains("ERROR: AddressSanitizer:")
+            || stderr.contains("ERROR: ThreadSanitizer:")
+            || stderr.contains("ERROR: MemorySanitizer:")
+            || stderr.contains("ERROR: UndefinedBehaviorSanitizer:");
+
+        if is_signal_death || has_sanitizer {
+            // Build crash message from sanitizer output or signal
+            let message = if has_sanitizer {
+                // Extract the ERROR and SUMMARY lines
+                let error_line = stderr.lines()
+                    .find(|l| l.contains("ERROR:") && l.contains("Sanitizer:"))
+                    .unwrap_or("Sanitizer error detected");
+                let summary_line = stderr.lines()
+                    .find(|l| l.contains("SUMMARY:"))
+                    .map(|l| l.split("SUMMARY: ").nth(1).unwrap_or(l).trim())
+                    .unwrap_or("");
+
+                if summary_line.is_empty() {
+                    format!("Process crashed: {}", error_line.trim())
+                } else {
+                    format!("Process crashed: {}\n{}", error_line.trim(), summary_line)
+                }
+            } else {
+                let sig = exit_code - 128;
+                let sig_name = match sig {
+                    11 => "SIGSEGV",
+                    6 => "SIGABRT",
+                    10 => "SIGBUS",
+                    8 => "SIGFPE",
+                    4 => "SIGILL",
+                    _ => "unknown signal",
+                };
+                format!("Process crashed with {} (exit code {})", sig_name, exit_code)
+            };
+
+            // Extract source files from sanitizer backtrace for suggested_traces
+            let mut trace_files: Vec<String> = Vec::new();
+            for line in stderr.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') && trimmed.contains(" in ") {
+                    if let Some(file_pos) = trimmed.rfind(" /") {
+                        let file_part = &trimmed[file_pos + 1..];
+                        if let Some(colon) = file_part.find(':') {
+                            let file_path = &file_part[..colon];
+                            if let Some(filename) = Path::new(file_path).file_name().and_then(|n| n.to_str()) {
+                                let trace = format!("@file:{}", filename);
+                                if !trace_files.contains(&trace) {
+                                    trace_files.push(trace);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Find the currently running test (last test that wasn't completed)
+            let crash_test_name = result.all_tests.iter().rev()
+                .find(|t| t.status == TestStatus::Fail)
+                .map(|t| t.name.clone())
+                .or_else(|| {
+                    // If no failed test yet, the crash happened during a running test
+                    // Check if there's a test that started but no OverallResult
+                    None
+                })
+                .unwrap_or_else(|| "unknown (process crashed)".to_string());
+
+            // Only add crash failure if no existing failure covers it
+            let crash_already_reported = result.failures.iter()
+                .any(|f| f.message.contains("crashed") || f.message.contains("Sanitizer"));
+
+            if !crash_already_reported {
+                result.failures.push(TestFailure {
+                    name: crash_test_name.clone(),
+                    file: None,
+                    line: None,
+                    message: message.clone(),
+                    rerun: Some(crash_test_name.clone()),
+                    suggested_traces: trace_files,
+                });
+
+                // Update summary if the crash wasn't already counted
+                if result.summary.failed == 0 {
+                    result.summary.failed = 1;
+                }
+
+                // Add to all_tests if not already present
+                if !result.all_tests.iter().any(|t| t.name == crash_test_name) {
+                    result.all_tests.push(TestDetail {
+                        name: crash_test_name,
+                        status: TestStatus::Fail,
+                        duration_ms: 0,
+                        stdout: None,
+                        stderr: Some(message),
+                        message: None,
+                    });
+                }
+            }
+        }
+
+        result
     }
 
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String> {
