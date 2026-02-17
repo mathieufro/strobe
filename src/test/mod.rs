@@ -150,7 +150,7 @@ impl TestRunner {
                 }
             }
             return Err(crate::Error::ValidationError(
-                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2'", name)
+                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2', 'pytest', 'unittest'", name)
             ));
         }
 

@@ -393,7 +393,7 @@ impl AgentMessageHandler {
                     tracing::debug!("[{}] Sampling stats: {} functions being sampled", self.session_id, sampling_count);
                 }
             }
-            "read_response" => {
+            "read_response" | "eval_response" => {
                 if let Ok(mut guard) = self.read_response.lock() {
                     if let Some(tx) = guard.take() {
                         let _ = tx.send(payload.clone());
@@ -1528,18 +1528,30 @@ fn handle_remove_patterns(
     hooks_ready: &HooksReadySignal,
     functions: &[FunctionTarget],
 ) -> Result<u32> {
-    let func_list: Vec<serde_json::Value> = functions.iter().map(|f| {
-        let mut entry = serde_json::json!({
-            "address": format!("0x{:x}", f.address),
-        });
-        // Include function name for interpreted language hooks (identified by name, not address)
-        if let Some(ref name) = f.name_raw {
-            entry["funcName"] = serde_json::json!(name);
+    // Split targets: native (address > 0) vs interpreted (address == 0)
+    let mut native_funcs: Vec<serde_json::Value> = Vec::new();
+    let mut interpreted_targets: Vec<serde_json::Value> = Vec::new();
+
+    for f in functions {
+        if f.address == 0 {
+            // Interpreted language target (Python, etc.) — identified by file:line
+            interpreted_targets.push(serde_json::json!({
+                "file": f.source_file,
+                "line": f.line_number,
+                "name": f.name,
+            }));
         } else {
-            entry["funcName"] = serde_json::json!(f.name);
+            let mut entry = serde_json::json!({
+                "address": format!("0x{:x}", f.address),
+            });
+            if let Some(ref name) = f.name_raw {
+                entry["funcName"] = serde_json::json!(name);
+            } else {
+                entry["funcName"] = serde_json::json!(f.name);
+            }
+            native_funcs.push(entry);
         }
-        entry
-    }).collect();
+    }
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
     {
@@ -1547,11 +1559,18 @@ fn handle_remove_patterns(
         *guard = Some(signal_tx);
     }
 
-    let hooks_msg = serde_json::json!({
+    let mut hooks_msg = serde_json::json!({
         "type": "hooks",
         "action": "remove",
-        "functions": func_list,
     });
+
+    if !native_funcs.is_empty() {
+        hooks_msg["functions"] = serde_json::json!(native_funcs);
+    }
+
+    if !interpreted_targets.is_empty() {
+        hooks_msg["targets"] = serde_json::json!(interpreted_targets);
+    }
 
     unsafe {
         post_message_raw(script_ptr, &serde_json::to_string(&hooks_msg).unwrap())

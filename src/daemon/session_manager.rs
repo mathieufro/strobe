@@ -762,6 +762,12 @@ impl SessionManager {
 
         let depth = req.depth.unwrap_or(1);
 
+        // For interpreted languages (Python/JS), use eval_variable via agent
+        let lang = read_lock(&self.languages).get(&req.session_id).copied().unwrap_or(Language::Native);
+        if lang == Language::Python || lang == Language::JavaScript {
+            return self.execute_interpreted_read(&req).await;
+        }
+
         // Build read recipes from targets
         let mut recipes: Vec<serde_json::Value> = Vec::new();
         let mut response_results: Vec<ReadResult> = Vec::new();
@@ -941,6 +947,59 @@ impl SessionManager {
             .ok_or_else(|| crate::Error::Frida("No Frida spawner available".to_string()))?;
 
         spawner.write_memory(session_id, recipes_json).await
+    }
+
+    /// Execute debug_read for interpreted languages (Python/JS) using eval_variable.
+    /// Sends each expression to the agent and collects results.
+    async fn execute_interpreted_read(
+        &self,
+        req: &crate::mcp::DebugReadRequest,
+    ) -> Result<serde_json::Value> {
+        use crate::mcp::*;
+        let mut results: Vec<ReadResult> = Vec::new();
+
+        for target in &req.targets {
+            let expr = target.variable.as_deref()
+                .or(target.address.as_deref())
+                .unwrap_or("None");
+
+            // Send eval_variable through read_memory channel (reuses response signal)
+            let msg = serde_json::json!({
+                "type": "eval_variable",
+                "expr": expr,
+                "label": expr,
+            });
+            let msg_str = serde_json::to_string(&msg)?;
+            let response = self.send_read_memory(&req.session_id, msg_str).await;
+
+            match response {
+                Ok(resp) => {
+                    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+                        results.push(ReadResult {
+                            target: expr.to_string(),
+                            error: Some(err.to_string()),
+                            ..Default::default()
+                        });
+                    } else {
+                        let value = resp.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                        results.push(ReadResult {
+                            target: expr.to_string(),
+                            value: Some(value),
+                            ..Default::default()
+                        });
+                    }
+                }
+                Err(e) => {
+                    results.push(ReadResult {
+                        target: expr.to_string(),
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        Ok(serde_json::to_value(DebugReadResponse { results })?)
     }
 
     /// Execute a debug_write request end-to-end: validate, resolve DWARF, build recipes,
@@ -1218,6 +1277,12 @@ impl SessionManager {
         let session = self.db.get_session(session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
+        // For interpreted languages, use file+line directly (no DWARF)
+        let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Native);
+        if lang == Language::Python || lang == Language::JavaScript {
+            return self.set_interpreted_breakpoint(session_id, id, function, file, line, condition, hit_count).await;
+        }
+
         // Get DWARF parser for address resolution
         let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
         let dwarf = dwarf_handle.get().await?;
@@ -1310,6 +1375,100 @@ impl SessionManager {
         })
     }
 
+    /// Set a breakpoint for interpreted languages (Python/JS) — uses file+line, no DWARF.
+    async fn set_interpreted_breakpoint(
+        &self,
+        session_id: &str,
+        id: Option<String>,
+        function: Option<String>,
+        file: Option<String>,
+        line: Option<u32>,
+        condition: Option<String>,
+        hit_count: Option<u32>,
+    ) -> Result<crate::mcp::BreakpointInfo> {
+        let (resolved_file, resolved_line) = if let (Some(f), Some(l)) = (file.clone(), line) {
+            (f, l)
+        } else if let Some(func_pattern) = function.as_deref() {
+            // Try to resolve function name via PythonResolver
+            let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Python);
+            let resolvers = read_lock(&self.resolvers);
+            if let Some(resolver) = resolvers.get(session_id) {
+                let session = self.db.get_session(session_id)?
+                    .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+                let project_root = std::path::Path::new(&session.project_root);
+                let symbols = resolver.resolve_breakpoint_pattern(func_pattern, project_root)
+                    .unwrap_or_default();
+                if let Some(sym) = symbols.first() {
+                    match sym {
+                        crate::symbols::ResolvedTarget::SourceLocation { file, line, .. } => (file.clone(), *line),
+                        crate::symbols::ResolvedTarget::Address { file, line, .. } => {
+                            (file.clone().unwrap_or_default(), line.unwrap_or(0))
+                        }
+                    }
+                } else {
+                    return Err(crate::Error::ValidationError(
+                        format!("No {} function matching '{}' found", lang, func_pattern)
+                    ));
+                }
+            } else {
+                return Err(crate::Error::ValidationError(
+                    "No symbol resolver for this session — specify file+line directly".to_string()
+                ));
+            }
+        } else {
+            return Err(crate::Error::ValidationError(
+                "Breakpoint must specify either function or file+line".to_string()
+            ));
+        };
+
+        let breakpoint_id = id.unwrap_or_else(|| format!("bp-{}", uuid::Uuid::new_v4()));
+        let func_name = function.clone();
+
+        // Send setBreakpoint to agent with file+line (no address/imageBase)
+        let mut spawner_guard = self.frida_spawner.write().await;
+        let spawner = spawner_guard.as_mut()
+            .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
+
+        let message = serde_json::json!({
+            "type": "setBreakpoint",
+            "id": breakpoint_id,
+            "file": resolved_file,
+            "line": resolved_line,
+            "condition": condition,
+            "hitCount": hit_count.unwrap_or(0),
+            "funcName": func_name,
+        });
+
+        spawner.set_breakpoint(session_id, message).await?;
+
+        // Store breakpoint state
+        let bp = Breakpoint {
+            id: breakpoint_id.clone(),
+            target: if let Some(f) = function {
+                BreakpointTarget::Function(f)
+            } else {
+                BreakpointTarget::Line {
+                    file: resolved_file.clone(),
+                    line: resolved_line,
+                }
+            },
+            address: 0, // No native address for interpreted languages
+            condition,
+            hit_count: hit_count.unwrap_or(0),
+            hits: 0,
+        };
+
+        self.add_breakpoint(session_id, bp)?;
+
+        Ok(crate::mcp::BreakpointInfo {
+            id: breakpoint_id,
+            function: func_name,
+            file: Some(resolved_file),
+            line: Some(resolved_line),
+            address: "interpreted".to_string(),
+        })
+    }
+
     /// Continue execution after a breakpoint pause
     pub async fn debug_continue_async(
         &self,
@@ -1326,6 +1485,30 @@ impl SessionManager {
         }
 
         let action = action.unwrap_or_else(|| "continue".to_string());
+
+        // For interpreted languages, send resume_python_bp message (stepping not supported)
+        let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Native);
+        if lang == Language::Python || lang == Language::JavaScript {
+            if action != "continue" {
+                return Err(crate::Error::ValidationError(
+                    format!("Stepping ('{}') is not supported for interpreted languages — use 'continue'", action)
+                ));
+            }
+            let mut spawner_guard = self.frida_spawner.write().await;
+            let spawner = spawner_guard.as_mut()
+                .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
+            spawner.send_hook_message(session_id, serde_json::json!({"type": "resume_python_bp"})).await?;
+            for (thread_id, _) in &paused {
+                self.remove_paused_thread(session_id, *thread_id);
+            }
+            return Ok(crate::mcp::DebugContinueResponse {
+                status: "running".to_string(),
+                breakpoint_id: None,
+                file: None,
+                line: None,
+                function: None,
+            });
+        }
 
         // Get session info for DWARF access
         let session = self.db.get_session(session_id)?
@@ -1471,6 +1654,12 @@ impl SessionManager {
         let session = self.db.get_session(session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
+        // For interpreted languages, use file+line directly (no DWARF)
+        let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Native);
+        if lang == Language::Python || lang == Language::JavaScript {
+            return self.set_interpreted_logpoint(session_id, id, function, file, line, message, condition).await;
+        }
+
         let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
         let dwarf = dwarf_handle.get().await?;
 
@@ -1557,6 +1746,97 @@ impl SessionManager {
         })
     }
 
+    /// Set a logpoint for interpreted languages (Python/JS) — uses file+line, no DWARF.
+    async fn set_interpreted_logpoint(
+        &self,
+        session_id: &str,
+        id: Option<String>,
+        function: Option<String>,
+        file: Option<String>,
+        line: Option<u32>,
+        message: String,
+        condition: Option<String>,
+    ) -> Result<crate::mcp::LogpointInfo> {
+        let (resolved_file, resolved_line) = if let (Some(f), Some(l)) = (file.clone(), line) {
+            (f, l)
+        } else if let Some(func_pattern) = function.as_deref() {
+            let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Python);
+            let resolvers = read_lock(&self.resolvers);
+            if let Some(resolver) = resolvers.get(session_id) {
+                let session = self.db.get_session(session_id)?
+                    .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+                let project_root = std::path::Path::new(&session.project_root);
+                let symbols = resolver.resolve_breakpoint_pattern(func_pattern, project_root)
+                    .unwrap_or_default();
+                if let Some(sym) = symbols.first() {
+                    match sym {
+                        crate::symbols::ResolvedTarget::SourceLocation { file, line, .. } => (file.clone(), *line),
+                        crate::symbols::ResolvedTarget::Address { file, line, .. } => {
+                            (file.clone().unwrap_or_default(), line.unwrap_or(0))
+                        }
+                    }
+                } else {
+                    return Err(crate::Error::ValidationError(
+                        format!("No {} function matching '{}' found", lang, func_pattern)
+                    ));
+                }
+            } else {
+                return Err(crate::Error::ValidationError(
+                    "No symbol resolver for this session — specify file+line directly".to_string()
+                ));
+            }
+        } else {
+            return Err(crate::Error::ValidationError(
+                "Logpoint must specify either function or file+line".to_string()
+            ));
+        };
+
+        let logpoint_id = id.unwrap_or_else(|| format!("lp-{}", uuid::Uuid::new_v4()));
+        let func_name = function.clone();
+
+        let mut spawner_guard = self.frida_spawner.write().await;
+        let spawner = spawner_guard.as_mut()
+            .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
+
+        let msg = serde_json::json!({
+            "type": "setLogpoint",
+            "id": logpoint_id,
+            "file": resolved_file,
+            "line": resolved_line,
+            "message": message,
+            "condition": condition,
+            "funcName": func_name,
+        });
+
+        spawner.set_logpoint(session_id, msg).await?;
+
+        let lp = Logpoint {
+            id: logpoint_id.clone(),
+            target: if let Some(f) = function {
+                BreakpointTarget::Function(f)
+            } else {
+                BreakpointTarget::Line {
+                    file: resolved_file.clone(),
+                    line: resolved_line,
+                }
+            },
+            address: 0,
+            message: message.clone(),
+            condition,
+        };
+
+        self.add_logpoint(session_id, lp)?;
+
+        Ok(crate::mcp::LogpointInfo {
+            id: logpoint_id,
+            message,
+            function: func_name,
+            file: Some(resolved_file),
+            line: Some(resolved_line),
+            address: "interpreted".to_string(),
+        })
+    }
+
     // ========== Phase 2: Breakpoint management (sync helpers) ==========
 
     pub fn add_breakpoint(&self, session_id: &str, breakpoint: Breakpoint) -> Result<()> {
@@ -1602,7 +1882,14 @@ impl SessionManager {
                         tracing::warn!("Failed to resume thread {} paused on breakpoint {}: {}", thread_id, breakpoint_id, e);
                     }
                 }
-                self.remove_paused_thread(session_id, *thread_id);
+                // Only clear paused state if the thread is still paused at THIS breakpoint.
+                // Between the agent removal (which unblocks the thread) and here, the thread
+                // may have already hit a different breakpoint and been re-paused — clearing
+                // unconditionally would lose that new pause state.
+                if self.get_pause_info(session_id, *thread_id)
+                    .map_or(true, |current| current.breakpoint_id == breakpoint_id) {
+                    self.remove_paused_thread(session_id, *thread_id);
+                }
             }
         }
 
