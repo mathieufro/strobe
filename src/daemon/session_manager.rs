@@ -1396,7 +1396,7 @@ impl SessionManager {
                 let session = self.db.get_session(session_id)?
                     .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
                 let project_root = std::path::Path::new(&session.project_root);
-                let symbols = resolver.resolve_pattern(func_pattern, project_root)
+                let symbols = resolver.resolve_breakpoint_pattern(func_pattern, project_root)
                     .unwrap_or_default();
                 if let Some(sym) = symbols.first() {
                     match sym {
@@ -1766,7 +1766,7 @@ impl SessionManager {
                 let session = self.db.get_session(session_id)?
                     .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
                 let project_root = std::path::Path::new(&session.project_root);
-                let symbols = resolver.resolve_pattern(func_pattern, project_root)
+                let symbols = resolver.resolve_breakpoint_pattern(func_pattern, project_root)
                     .unwrap_or_default();
                 if let Some(sym) = symbols.first() {
                     match sym {
@@ -1882,7 +1882,14 @@ impl SessionManager {
                         tracing::warn!("Failed to resume thread {} paused on breakpoint {}: {}", thread_id, breakpoint_id, e);
                     }
                 }
-                self.remove_paused_thread(session_id, *thread_id);
+                // Only clear paused state if the thread is still paused at THIS breakpoint.
+                // Between the agent removal (which unblocks the thread) and here, the thread
+                // may have already hit a different breakpoint and been re-paused — clearing
+                // unconditionally would lose that new pause state.
+                if self.get_pause_info(session_id, *thread_id)
+                    .map_or(true, |current| current.breakpoint_id == breakpoint_id) {
+                    self.remove_paused_thread(session_id, *thread_id);
+                }
             }
         }
 

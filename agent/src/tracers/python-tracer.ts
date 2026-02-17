@@ -139,25 +139,18 @@ export class PythonTracer implements Tracer {
   }
 
   /**
-   * Install or update the sys.settrace hook with current hook patterns.
-   * Uses Python's own tracing API — version-independent, no struct offsets.
+   * Build Python assignment code for the three data lists.
+   * These are module-level globals in __main__ that the trace function reads
+   * via LOAD_GLOBAL (late binding), so updating them is sufficient — no need
+   * to redefine _strobe_trace or call settrace again.
    */
-  private syncTraceHooks(): void {
-    if (!this.traceCallback || !this.PyRun_SimpleString) return;
-
-    // Get the raw hex addresses for use in Python ctypes
-    const callbackAddr = (this.traceCallback as NativePointer).toString();
-    const logCallbackAddr = this.logCallback ? (this.logCallback as NativePointer).toString() : '0';
-    const bpHitCallbackAddr = this.bpHitCallback ? (this.bpHitCallback as NativePointer).toString() : '0';
-
-    // Build hook lookup entries for Python: (file_suffix, first_lineno, funcId)
+  private buildTraceDataAssignments(): string {
     const hookEntries: string[] = [];
     for (const [funcId, hook] of this.hooks) {
       const file = (hook.file || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
       hookEntries.push(`('${file}', ${hook.line || 0}, ${funcId})`);
     }
 
-    // Build logpoint entries: (file_suffix, line, lp_id, msg_template)
     const logpointEntries: string[] = [];
     for (const lp of this.logpoints.values()) {
       const file = (lp.file || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
@@ -165,7 +158,6 @@ export class PythonTracer implements Tracer {
       logpointEntries.push(`('${file}', ${lp.line}, '${lp.id}', '${msg}')`);
     }
 
-    // Build breakpoint entries: (file_suffix, line, bp_id, condition)
     const bpEntries: string[] = [];
     for (const bp of this.breakpoints.values()) {
       const file = (bp.file || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
@@ -173,27 +165,42 @@ export class PythonTracer implements Tracer {
       bpEntries.push(`('${file}', ${bp.line}, '${bp.id}', '${cond}')`);
     }
 
-    const hasLineEvents = logpointEntries.length > 0 || bpEntries.length > 0;
+    return `_strobe_hooks = [${hookEntries.join(', ')}]
+_strobe_logpoints = [${logpointEntries.join(', ')}]
+_strobe_breakpoints = [${bpEntries.join(', ')}]`;
+  }
 
-    const lineHandler = hasLineEvents ? `
-    elif event == 'line':
-        fname = frame.f_code.co_filename
-        fline = frame.f_lineno
-        for lp_file, lp_line, lp_id, lp_msg in _strobe_logpoints:
-            if fname.endswith(lp_file) and fline == lp_line:
-                try:
-                    msg = lp_msg.format(**{**frame.f_globals, **frame.f_locals})
-                except Exception as _e:
-                    msg = f'{lp_msg} [fmt error: {_e}]'
-                _strobe_log_cb(lp_id.encode(), fline, msg.encode())
-                break
-        for bp_file, bp_line, bp_id, bp_cond in _strobe_breakpoints:
-            if fname.endswith(bp_file) and fline == bp_line:
-                if not bp_cond or eval(bp_cond, frame.f_globals, frame.f_locals):
-                    _strobe_bp_hit_cb(bp_id.encode(), fline)
-                    _strobe_bp_event.wait()
-                    _strobe_bp_event.clear()
-                break` : '';
+  /**
+   * Install or update the sys.settrace hook with current hook patterns.
+   *
+   * First call: defines the trace function, callbacks, and installs via
+   * settrace_all_threads(). Subsequent calls: only update the data lists.
+   * This avoids re-calling settrace_all_threads() from the Frida agent
+   * thread, which doesn't properly reinstall for existing Python threads
+   * in Python 3.12+ (the root cause of the breakpoint remove+add bug).
+   */
+  private syncTraceHooks(): void {
+    if (!this.traceCallback || !this.PyRun_SimpleString) return;
+
+    // If trace is already installed, just update the data lists.
+    // The existing _strobe_trace function reads _strobe_hooks, _strobe_breakpoints,
+    // and _strobe_logpoints via LOAD_GLOBAL, so it picks up new values immediately.
+    if (this.traceInstalled) {
+      const code = this.buildTraceDataAssignments();
+      const result = this.runPython(code);
+      if (result === 0) {
+        send({ type: 'log', message: `PythonTracer: updated data — ${this.hooks.size} hooks, ${this.logpoints.size} logpoints, ${this.breakpoints.size} breakpoints` });
+      } else {
+        send({ type: 'log', message: 'PythonTracer: FAILED to update trace data' });
+      }
+      return;
+    }
+
+    // First-time installation — define everything + settrace_all_threads
+    const callbackAddr = (this.traceCallback as NativePointer).toString();
+    const logCallbackAddr = this.logCallback ? (this.logCallback as NativePointer).toString() : '0';
+    const bpHitCallbackAddr = this.bpHitCallback ? (this.bpHitCallback as NativePointer).toString() : '0';
+    const dataAssignments = this.buildTraceDataAssignments();
 
     const pythonCode = `
 import sys, ctypes, threading
@@ -215,24 +222,42 @@ import builtins as _b
 _strobe_bp_event = getattr(_b, '_strobe_bp_event', None) or threading.Event()
 setattr(_b, '_strobe_bp_event', _strobe_bp_event)
 
-# Hook lookup: (file_suffix, first_lineno, funcId)
-_strobe_hooks = [${hookEntries.join(', ')}]
-
-# Logpoint lookup: (file_suffix, line, lp_id, msg_template)
-_strobe_logpoints = [${logpointEntries.join(', ')}]
-
-# Breakpoint lookup: (file_suffix, line, bp_id, condition)
-_strobe_breakpoints = [${bpEntries.join(', ')}]
+# Data lists (updated in-place on subsequent syncs without redefining the trace function)
+${dataAssignments}
 
 def _strobe_trace(frame, event, arg):
-    if event == 'call':
-        co = frame.f_code
-        fname = co.co_filename
-        fline = co.co_firstlineno
-        for file_pat, line_pat, fid in _strobe_hooks:
-            if fname.endswith(file_pat) and fline == line_pat:
-                _strobe_cb(fname.encode('utf-8'), co.co_name.encode('utf-8'), frame.f_lineno, fid)
-                break${lineHandler}
+    try:
+        if event == 'call':
+            co = frame.f_code
+            fname = co.co_filename
+            fline = co.co_firstlineno
+            for file_pat, line_pat, fid in _strobe_hooks:
+                if fname.endswith(file_pat) and fline == line_pat:
+                    _strobe_cb(fname.encode('utf-8'), co.co_name.encode('utf-8'), frame.f_lineno, fid)
+                    break
+        elif event == 'line':
+            fname = frame.f_code.co_filename
+            fline = frame.f_lineno
+            for lp_file, lp_line, lp_id, lp_msg in _strobe_logpoints:
+                if fname.endswith(lp_file) and fline == lp_line:
+                    try:
+                        msg = lp_msg.format(**{**frame.f_globals, **frame.f_locals})
+                    except Exception as _e:
+                        msg = f'{lp_msg} [fmt error: {_e}]'
+                    _strobe_log_cb(lp_id.encode(), fline, msg.encode())
+                    break
+            for bp_file, bp_line, bp_id, bp_cond in _strobe_breakpoints:
+                if fname.endswith(bp_file) and fline == bp_line:
+                    if not bp_cond or eval(bp_cond, frame.f_globals, frame.f_locals):
+                        _strobe_bp_hit_cb(bp_id.encode(), fline)
+                        _strobe_bp_event.wait()
+                        _strobe_bp_event.clear()
+                    break
+    except Exception as _strobe_err:
+        import builtins as _be
+        if not hasattr(_be, '_strobe_errors'):
+            _be._strobe_errors = []
+        _be._strobe_errors.append(f'{type(_strobe_err).__name__}: {_strobe_err}')
     return _strobe_trace
 
 if hasattr(threading, 'settrace_all_threads'):
@@ -358,7 +383,15 @@ else:
   removeHook(id: number): void {
     this.hooks.delete(id);
     if (this.traceInstalled) {
-      this.syncTraceHooks();
+      // Surgically remove from Python's hook list without full resync.
+      // Full syncTraceHooks() + threading.settrace_all_threads() can break
+      // tracing when called rapidly in succession (e.g., remove then add).
+      this.runPython(`
+try:
+    _strobe_hooks = [h for h in _strobe_hooks if h[2] != ${id}]
+except NameError:
+    pass
+`);
     }
   }
 
@@ -394,7 +427,22 @@ else:
 
   removeBreakpoint(id: string): void {
     this.breakpoints.delete(id);
-    if (this.traceInstalled) this.syncTraceHooks();
+    if (this.traceInstalled) {
+      // Surgically remove from Python's breakpoint list without full resync.
+      // Also signal _strobe_bp_event to unblock any thread that may be paused
+      // at this breakpoint. This handles the race where the BP fires again
+      // between debug_continue and the removal (the timer can re-trigger the
+      // old BP before it's removed from the Python list).
+      const safeId = id.replace(/'/g, "\\'");
+      this.runPython(`
+try:
+    _strobe_breakpoints = [bp for bp in _strobe_breakpoints if bp[2] != '${safeId}']
+    import builtins as _b
+    _b._strobe_bp_event.set()
+except NameError:
+    pass
+`);
+    }
   }
 
   resumePythonBreakpoint(): void {
@@ -428,7 +476,15 @@ else:
 
   removeLogpoint(id: string): void {
     this.logpoints.delete(id);
-    if (this.traceInstalled) this.syncTraceHooks();
+    if (this.traceInstalled) {
+      const safeId = id.replace(/'/g, "\\'");
+      this.runPython(`
+try:
+    _strobe_logpoints = [lp for lp in _strobe_logpoints if lp[2] != '${safeId}']
+except NameError:
+    pass
+`);
+    }
   }
 
   readVariable(expr: string): any {

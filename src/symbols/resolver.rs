@@ -68,7 +68,15 @@ pub enum VariableResolution {
 /// Implementations: DwarfResolver (native), PythonResolver, JSResolver
 pub trait SymbolResolver: Send + Sync {
     /// Resolve a glob pattern to concrete function targets.
+    /// For tracing hooks: returns the function definition line (matches co_firstlineno).
     fn resolve_pattern(&self, pattern: &str, project_root: &Path) -> crate::Result<Vec<ResolvedTarget>>;
+
+    /// Resolve a function pattern for breakpoints.
+    /// For Python: returns the first executable line in the function body (not the `def` line).
+    /// Default: falls back to resolve_pattern (correct for native/DWARF).
+    fn resolve_breakpoint_pattern(&self, pattern: &str, project_root: &Path) -> crate::Result<Vec<ResolvedTarget>> {
+        self.resolve_pattern(pattern, project_root)
+    }
 
     /// Resolve file:line to a hookable target.
     fn resolve_line(&self, file: &str, line: u32) -> crate::Result<Option<ResolvedTarget>>;
