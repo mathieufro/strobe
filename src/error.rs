@@ -44,7 +44,7 @@ pub enum Error {
     #[error("TEST_RUN_NOT_FOUND: No test run found with ID '{0}'.")]
     TestRunNotFound(String),
 
-    #[error("TEST_ALREADY_RUNNING: A test is already running (ID: '{0}'). Wait for it to complete or poll its status before starting another. Only one test run at a time.")]
+    #[error("TEST_ALREADY_RUNNING: A test is already running for this connection or project (ID: '{0}'). Wait for it to complete or poll its status.")]
     TestAlreadyRunning(String),
 
     #[error("NO_CODE_AT_LINE: No executable code at {file}:{line}. Valid lines: {nearest_lines}")]

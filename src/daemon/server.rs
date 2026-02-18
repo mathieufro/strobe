@@ -528,7 +528,7 @@ Read globals during function execution (requires DWARF symbols).
 
 ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
 Tests always run inside Frida, so you can add traces at any time without restarting.
-IMPORTANT: Only one test run at a time. Do NOT launch multiple debug_test calls in parallel — run tests sequentially, waiting for each to complete before starting the next.
+IMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test calls in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.
 
 `debug_test` returns immediately with a `testRunId`. Poll with `debug_test({ action: \"status\", testRunId })`.
 The server blocks up to 15s waiting for completion, so it's safe to call immediately after each response.
@@ -833,7 +833,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nIMPORTANT: Only one test run at a time. Do NOT launch multiple debug_test runs in parallel — each new run kills the previous one. Run tests sequentially.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nIMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test runs in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -934,6 +934,16 @@ Validation Limits (enforced):
             pending.remove(connection_id);
         }
 
+        // Collect test session IDs so we can retain their DB data
+        // (the spawned task may still need events for final output)
+        let test_session_ids: HashSet<String> = {
+            let runs = self.test_runs.read().await;
+            runs.values()
+                .filter(|r| r.connection_id == connection_id)
+                .filter_map(|r| r.session_id.clone())
+                .collect()
+        };
+
         // Stop any sessions owned by this connection
         let session_ids = {
             let mut sessions = self.connection_sessions.write().await;
@@ -945,7 +955,27 @@ Validation Limits (enforced):
                 if session.status == crate::db::SessionStatus::Running {
                     tracing::info!("Cleaning up session {} after client disconnect", session_id);
                     let _ = self.session_manager.stop_frida(&session_id).await;
-                    let _ = self.session_manager.stop_session(&session_id).await;
+                    if test_session_ids.contains(&session_id) {
+                        // Retain DB data — spawned task needs events for final output
+                        let _ = self.session_manager.stop_session_retain(&session_id).await;
+                    } else {
+                        let _ = self.session_manager.stop_session(&session_id).await;
+                    }
+                }
+            }
+        }
+
+        // Transition running test runs from this connection to Failed
+        {
+            let mut runs = self.test_runs.write().await;
+            for run in runs.values_mut() {
+                if run.connection_id == connection_id {
+                    if matches!(&run.state, crate::test::TestRunState::Running { .. }) {
+                        run.state = crate::test::TestRunState::Failed {
+                            error: "Client disconnected".to_string(),
+                            completed_at: std::time::Instant::now(),
+                        };
+                    }
                 }
             }
         }
@@ -1792,15 +1822,7 @@ Validation Limits (enforced):
 
         let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
 
-        // Reject if a test is already running — only one at a time.
-        {
-            let runs = self.test_runs.read().await;
-            if let Some(running) = runs.values().find(|run| matches!(&run.state, crate::test::TestRunState::Running { .. })) {
-                return Err(crate::Error::TestAlreadyRunning(running.id.clone()));
-            }
-        }
-
-        // Detect framework name for the start response
+        // Detect framework name for the start response (outside lock)
         let runner = crate::test::TestRunner::new();
         let project_root_path = std::path::Path::new(&req.project_root);
         let framework_name = runner.detect_adapter(
@@ -1809,34 +1831,55 @@ Validation Limits (enforced):
             req.command.as_deref(),
         )?.name().to_string();
 
-        // Create shared progress tracker
+        // Create shared progress tracker (outside lock)
         let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test::TestProgress::new()));
+        let progress_clone = std::sync::Arc::clone(&progress);
         let test_run_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-
-        // Generate session_id upfront so it's available in TestRun immediately
         let session_id = format!("test-{}-{}", framework_name, &uuid::Uuid::new_v4().to_string()[..8]);
 
-        // Clone everything needed for the spawned task
-        let progress_clone = std::sync::Arc::clone(&progress);
-        let session_manager = std::sync::Arc::clone(&self.session_manager);
-        let connection_id_owned = connection_id.to_string();
-        let session_id_clone = session_id.clone();
-        let run_id = test_run_id.clone();
-        let test_runs = std::sync::Arc::clone(&self.test_runs);
-        let req_clone = req.clone();
-
-        // Insert Running state BEFORE spawning to avoid race where task
-        // completes before the entry exists in the map.
+        // Atomic check + insert under a single write lock (fixes TOCTOU race)
         {
             let mut runs = self.test_runs.write().await;
+
+            // Per-connection: only one running test per connection
+            if let Some(running) = runs.values().find(|run| {
+                run.connection_id == connection_id
+                    && matches!(&run.state, crate::test::TestRunState::Running { .. })
+            }) {
+                return Err(crate::Error::TestAlreadyRunning(running.id.clone()));
+            }
+
+            // Per-project: only one running test per project_root (avoids cargo lock conflicts)
+            if let Some(running) = runs.values().find(|run| {
+                run.project_root == req.project_root
+                    && matches!(&run.state, crate::test::TestRunState::Running { .. })
+            }) {
+                return Err(crate::Error::TestAlreadyRunning(running.id.clone()));
+            }
+
             runs.insert(test_run_id.clone(), crate::test::TestRun {
                 id: test_run_id.clone(),
                 state: crate::test::TestRunState::Running { progress },
                 fetched: false,
-                session_id: Some(session_id),
+                session_id: Some(session_id.clone()),
                 project_root: req.project_root.clone(),
+                connection_id: connection_id.to_string(),
             });
         }
+
+        // Register test session for disconnect cleanup
+        {
+            let mut sessions = self.connection_sessions.write().await;
+            sessions.entry(connection_id.to_string()).or_default().push(session_id.clone());
+        }
+
+        // Clone everything needed for the spawned task
+        let session_manager = std::sync::Arc::clone(&self.session_manager);
+        let connection_id_owned = connection_id.to_string();
+        let session_id_clone = session_id;
+        let run_id = test_run_id.clone();
+        let test_runs = std::sync::Arc::clone(&self.test_runs);
+        let req_clone = req.clone();
 
         tokio::spawn(async move {
             let runner = crate::test::TestRunner::new();
@@ -2097,20 +2140,34 @@ Validation Limits (enforced):
     }
 
     async fn cleanup_stale_test_runs(&self) {
-        let mut runs = self.test_runs.write().await;
-        let now = std::time::Instant::now();
-        runs.retain(|_id, run| {
-            match &run.state {
-                crate::test::TestRunState::Running { .. } => true,
-                crate::test::TestRunState::Completed { completed_at, .. }
-                | crate::test::TestRunState::Failed { completed_at, .. } => {
-                    let age = now.duration_since(*completed_at);
-                    let expired = (run.fetched && age > Duration::from_secs(300))
-                        || age > Duration::from_secs(1800);
-                    !expired
+        let mut sessions_to_delete: Vec<String> = Vec::new();
+
+        {
+            let mut runs = self.test_runs.write().await;
+            let now = std::time::Instant::now();
+            runs.retain(|_id, run| {
+                match &run.state {
+                    crate::test::TestRunState::Running { .. } => true,
+                    crate::test::TestRunState::Completed { completed_at, .. }
+                    | crate::test::TestRunState::Failed { completed_at, .. } => {
+                        let age = now.duration_since(*completed_at);
+                        let expired = (run.fetched && age > Duration::from_secs(300))
+                            || age > Duration::from_secs(1800);
+                        if expired {
+                            if let Some(ref sid) = run.session_id {
+                                sessions_to_delete.push(sid.clone());
+                            }
+                        }
+                        !expired
+                    }
                 }
-            }
-        });
+            });
+        }
+
+        // Clean up retained DB sessions outside the lock
+        for sid in sessions_to_delete {
+            let _ = self.session_manager.db().delete_session(&sid);
+        }
     }
 
     // Phase 2: Active debugging tools

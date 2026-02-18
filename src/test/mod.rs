@@ -122,6 +122,8 @@ pub struct TestRun {
     pub session_id: Option<String>,
     /// Project root for baseline lookup.
     pub project_root: String,
+    /// Connection that owns this test run (for per-connection isolation).
+    pub connection_id: String,
 }
 
 pub struct TestRunner {
@@ -561,6 +563,7 @@ mod tests {
             fetched: false,
             session_id: Some("session-xyz".to_string()),
             project_root: "/project".to_string(),
+            connection_id: "conn-1".to_string(),
         };
         assert_eq!(run.session_id.as_deref(), Some("session-xyz"));
     }
