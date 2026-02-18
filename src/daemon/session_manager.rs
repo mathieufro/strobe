@@ -446,7 +446,7 @@ impl SessionManager {
     /// Get or start a background DWARF parse. Returns a handle immediately.
     /// If the binary was already parsed (or is being parsed), returns the cached handle.
     /// Failed parses are evicted from cache so that retries (e.g. after dsymutil) work.
-    pub fn get_or_start_dwarf_parse(&self, binary_path: &str) -> DwarfHandle {
+    pub fn get_or_start_dwarf_parse(&self, binary_path: &str, search_root: Option<&str>) -> DwarfHandle {
         // Include mtime in cache key so rebuilds invalidate the cache
         let mtime = std::fs::metadata(binary_path)
             .and_then(|m| m.modified())
@@ -474,7 +474,7 @@ impl SessionManager {
             }
         }
 
-        let handle = DwarfHandle::spawn_parse(binary_path);
+        let handle = DwarfHandle::spawn_parse(binary_path, search_root);
         cache.insert(cache_key, handle.clone());
         handle
     }
@@ -508,7 +508,7 @@ impl SessionManager {
         let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
 
         // Start background DWARF parse (or get cached handle)
-        let dwarf_handle = self.get_or_start_dwarf_parse(command);
+        let dwarf_handle = self.get_or_start_dwarf_parse(command, Some(project_root));
 
         // For native binaries, instantiate DwarfResolver once parse completes
         if language == Language::Native {
@@ -1213,7 +1213,7 @@ impl SessionManager {
             None => return Ok(None),
         };
 
-        let mut handle = self.get_or_start_dwarf_parse(&session.binary_path);
+        let mut handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
         match handle.get().await {
             Ok(parser) => Ok(Some(parser)),
             Err(e) => Err(e),
@@ -1302,7 +1302,7 @@ impl SessionManager {
         }
 
         // Get DWARF parser for address resolution
-        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
+        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
         let dwarf = dwarf_handle.get().await?;
 
         let breakpoint_id = id.unwrap_or_else(|| format!("bp-{}", uuid::Uuid::new_v4().to_string()));
@@ -1535,7 +1535,7 @@ impl SessionManager {
         // For stepping actions, we need DWARF info
         // Each address is (addr, no_slide): no_slide=true for runtime addresses (e.g., return address)
         let (one_shot_addresses, image_base) = if action != "continue" {
-            let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
+            let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
             let dwarf = dwarf_handle.get().await?;
             let ib = dwarf.image_base;
 
@@ -1678,7 +1678,7 @@ impl SessionManager {
             return self.set_interpreted_logpoint(session_id, id, function, file, line, message, condition).await;
         }
 
-        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path);
+        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
         let dwarf = dwarf_handle.get().await?;
 
         let logpoint_id = id.unwrap_or_else(|| format!("lp-{}", uuid::Uuid::new_v4().to_string()));

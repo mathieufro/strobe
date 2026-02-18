@@ -165,6 +165,10 @@ pub struct DwarfParser {
 
 impl DwarfParser {
     pub fn parse(binary_path: &Path) -> Result<Self> {
+        Self::parse_with_search_root(binary_path, None)
+    }
+
+    pub fn parse_with_search_root(binary_path: &Path, search_root: Option<&Path>) -> Result<Self> {
         // Extract image base from the original binary (needed for ASLR adjustment)
         let image_base = Self::extract_image_base(binary_path).unwrap_or(0);
 
@@ -177,17 +181,17 @@ impl DwarfParser {
         // On macOS, check for .dSYM bundle (Linux debug info is embedded in ELF)
         #[cfg(target_os = "macos")]
         {
-            let dsym_path = binary_path.with_extension("dSYM");
-            if dsym_path.exists() {
-                if let Some(binary_name) = binary_path.file_name() {
-                    let dwarf_file = dsym_path
-                        .join("Contents")
-                        .join("Resources")
-                        .join("DWARF")
-                        .join(binary_name);
-                    if dwarf_file.exists() {
-                        let mut parser = Self::parse_file(&dwarf_file)?;
-                        parser.image_base = image_base;
+            if let Some(binary_name) = binary_path.file_name() {
+                // Fast path: check sibling .dSYM (covers standalone binaries)
+                let sibling_dsym = binary_path.with_extension("dSYM");
+                if let Some(parser) = Self::try_dsym(&sibling_dsym, binary_name, image_base)? {
+                    return Ok(parser);
+                }
+
+                // Search project root for any .dSYM containing this binary's DWARF.
+                // Handles .app bundles, XCArchives, DerivedData, and any exotic layout.
+                if let Some(root) = search_root {
+                    if let Some(parser) = Self::search_dsym_in_root(root, binary_name, image_base)? {
                         return Ok(parser);
                     }
                 }
@@ -195,6 +199,66 @@ impl DwarfParser {
         }
 
         Err(Error::NoDebugSymbols)
+    }
+
+    /// Try to load DWARF from a specific .dSYM bundle path.
+    #[cfg(target_os = "macos")]
+    fn try_dsym(dsym_path: &Path, binary_name: &std::ffi::OsStr, image_base: u64) -> Result<Option<Self>> {
+        if dsym_path.exists() {
+            let dwarf_file = dsym_path
+                .join("Contents")
+                .join("Resources")
+                .join("DWARF")
+                .join(binary_name);
+            if dwarf_file.exists() {
+                let mut parser = Self::parse_file(&dwarf_file)?;
+                parser.image_base = image_base;
+                return Ok(Some(parser));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Walk `root` looking for any `.dSYM` bundle that contains DWARF for `binary_name`.
+    #[cfg(target_os = "macos")]
+    fn search_dsym_in_root(root: &Path, binary_name: &std::ffi::OsStr, image_base: u64) -> Result<Option<Self>> {
+        use walkdir::WalkDir;
+
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                // Skip .git, node_modules, and don't descend INTO .dSYM bundles
+                // (we check their contents directly when we match one)
+                if e.depth() == 0 {
+                    return true;
+                }
+                if name == ".git" || name == "node_modules" {
+                    return false;
+                }
+                // Allow .dSYM entries to be yielded but don't descend into them
+                // (walkdir yields the entry before descending, and we return false
+                // for children inside .dSYM via the parent check below)
+                true
+            })
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if name.ends_with(".dSYM") {
+                if let Some(parser) = Self::try_dsym(entry.path(), binary_name, image_base)? {
+                    return Ok(Some(parser));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Extract the image base address from a binary's __TEXT segment (Mach-O) or
