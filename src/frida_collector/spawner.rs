@@ -248,8 +248,8 @@ unsafe extern "C" fn raw_on_output(
     // Accumulate stderr for ASAN crash detection by process_death_monitor
     if fd == 2 {
         if let Ok(mut buf) = ctx.stderr_buffer.lock() {
-            // Cap at 256KB to avoid unbounded growth
-            if buf.len() < 256 * 1024 {
+            // Cap at 2MB to handle large sanitizer reports (many thread backtraces)
+            if buf.len() < 2 * 1024 * 1024 {
                 buf.push_str(&text);
             }
         }
@@ -272,7 +272,9 @@ unsafe extern "C" fn raw_on_output(
         ..Event::default()
     };
 
-    let _ = ctx.event_tx.try_send(event);
+    if let Err(e) = ctx.event_tx.try_send(event) {
+        tracing::warn!("Device output event dropped for PID {}: {}", ctx.pid, e);
+    }
 }
 
 /// Post a JSON message to a raw script.
@@ -987,10 +989,26 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             }
                         }
 
-                        if let Some(ref env_vars) = env {
+                        // Always build envp so we can inject sanitizer log_path.
+                        // Sanitizer output (ASAN/TSAN/UBSAN) is redirected to a temp file
+                        // for reliable capture — the agent's write(2) hook fails on ASAN
+                        // binaries, and Frida's device output signal may not drain all
+                        // pipe data before session cleanup after process death.
+                        {
                             let mut merged: std::collections::HashMap<String, String> = std::env::vars().collect();
-                            for (k, v) in env_vars.iter() {
-                                merged.insert(k.clone(), v.clone());
+                            if let Some(ref env_vars) = env {
+                                for (k, v) in env_vars.iter() {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                            }
+                            let sanitizer_log_path = format!("/tmp/.strobe-sanitizer-{}", session_id);
+                            for key in ["ASAN_OPTIONS", "TSAN_OPTIONS", "UBSAN_OPTIONS"] {
+                                let existing = merged.get(key).cloned().unwrap_or_default();
+                                let sep = if existing.is_empty() { "" } else { ":" };
+                                merged.insert(
+                                    key.to_string(),
+                                    format!("{}{}log_path={}", existing, sep, sanitizer_log_path),
+                                );
                             }
                             let env_tuples: Vec<(&str, &str)> = merged
                                 .iter()
@@ -2042,6 +2060,42 @@ fn process_death_monitor(
     // Give the agent's async crash event time to arrive via GLib
     std::thread::sleep(std::time::Duration::from_millis(500));
 
+    // Check for sanitizer log file (written via ASAN_OPTIONS=log_path=...).
+    // This is the primary sanitizer capture path — the agent's write(2) hook
+    // fails on ASAN binaries, and Frida's device output signal may not drain
+    // all pipe data on process death. The log file is always complete.
+    let sanitizer_log_path = format!("/tmp/.strobe-sanitizer-{}.{}", session_id, pid);
+    let sanitizer_output = std::fs::read_to_string(&sanitizer_log_path)
+        .ok()
+        .filter(|s| !s.is_empty());
+    if sanitizer_output.is_some() {
+        let _ = std::fs::remove_file(&sanitizer_log_path);
+    }
+
+    if let Some(ref output) = sanitizer_output {
+        let now_ns = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64) - start_ns;
+
+        tracing::info!(
+            "Read sanitizer log file for PID {} [{}] ({} bytes)",
+            pid, session_id, output.len()
+        );
+
+        // Emit the full sanitizer report as a stderr event so it's queryable
+        let event = Event {
+            id: format!("{}-sanitizer-output-{}", session_id, chrono::Utc::now().timestamp_millis()),
+            session_id: session_id.clone(),
+            timestamp_ns: now_ns,
+            event_type: EventType::Stderr,
+            text: Some(output.clone()),
+            pid: Some(pid),
+            ..Event::default()
+        };
+        let _ = event_tx.try_send(event);
+    }
+
     // If agent already reported the crash via the normal GLib path, just clean up
     if crash_reported.load(Ordering::Acquire) {
         let crash_file = format!("/tmp/.strobe-crash-{}.json", pid);
@@ -2069,7 +2123,21 @@ fn process_death_monitor(
         tracing::warn!("Crash file for PID {} exists but couldn't be parsed", pid);
     }
 
-    // Check stderr for sanitizer output (ASAN/TSAN/UBSAN/MSAN)
+    // Parse sanitizer log file for structured crash event (if we have it)
+    if let Some(ref output) = sanitizer_output {
+        if let Some(crash_event) = parse_sanitizer_crash(output, pid, &session_id, start_ns) {
+            tracing::info!(
+                "Sanitizer crash detected from log file for PID {} [{}]: {}",
+                pid, session_id,
+                crash_event.exception_type.as_deref().unwrap_or("unknown")
+            );
+            let _ = event_tx.try_send(crash_event);
+            return;
+        }
+    }
+
+    // Check stderr buffer for sanitizer output (fallback for cases where
+    // log_path wasn't set or sanitizer wrote to stderr directly)
     let stderr_snapshot = stderr_buffer.lock().ok()
         .map(|buf| buf.clone())
         .unwrap_or_default();
