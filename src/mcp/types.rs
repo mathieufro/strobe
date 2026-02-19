@@ -1346,6 +1346,7 @@ pub struct UiStats {
 pub struct DebugUiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree: Option<String>,
+    /// Absolute path to the saved PNG screenshot file (in `<projectRoot>/screenshots/`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

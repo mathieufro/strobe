@@ -577,8 +577,8 @@ Read/write variables in a running process without setting up traces:
 Inspect the UI of a running process — accessibility tree and screenshots.
 
 - `debug_ui({ sessionId, mode: \"tree\" })` — accessibility tree as compact text
-- `debug_ui({ sessionId, mode: \"screenshot\" })` — base64-encoded PNG of the window
-- `debug_ui({ sessionId, mode: \"both\" })` — tree + screenshot in one call
+- `debug_ui({ sessionId, mode: \"screenshot\" })` — PNG saved to `<projectRoot>/screenshots/`, returns file path
+- `debug_ui({ sessionId, mode: \"both\" })` — tree + screenshot file in one call
 - `debug_ui({ sessionId, mode: \"tree\", verbose: true })` — JSON format instead of compact text
 
 ### Output Format (compact text, default)
@@ -859,7 +859,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_ui".to_string(),
-                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and/or a screenshot. Use mode to select output.".to_string(),
+                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and/or a screenshot saved as PNG to <projectRoot>/screenshots/. Use mode to select output.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2408,7 +2408,7 @@ Validation Limits (enforced):
             }
         }
 
-        // Capture screenshot
+        // Capture screenshot → write PNG file to <project_root>/screenshots/
         if needs_screenshot {
             #[cfg(target_os = "macos")]
             {
@@ -2417,8 +2417,23 @@ Validation Limits (enforced):
                     crate::ui::capture::capture_window_screenshot(pid)
                 }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
 
-                use base64::Engine;
-                screenshot_output = Some(base64::engine::general_purpose::STANDARD.encode(&png_bytes));
+                let screenshots_dir = std::path::PathBuf::from(&session.project_root).join("screenshots");
+                std::fs::create_dir_all(&screenshots_dir).map_err(|e| {
+                    crate::Error::Internal(format!("Failed to create screenshots directory: {}", e))
+                })?;
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let filename = format!("{}.png", timestamp);
+                let file_path = screenshots_dir.join(&filename);
+
+                std::fs::write(&file_path, &png_bytes).map_err(|e| {
+                    crate::Error::Internal(format!("Failed to write screenshot: {}", e))
+                })?;
+
+                screenshot_output = Some(file_path.to_string_lossy().to_string());
             }
 
             #[cfg(not(target_os = "macos"))]
