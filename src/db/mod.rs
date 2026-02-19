@@ -442,4 +442,96 @@ mod tests {
         let err_msg = result.err().unwrap().to_string();
         assert!(!err_msg.contains("no such column"), "Column logpoint_message should exist");
     }
+
+    #[test]
+    fn test_fifo_eviction_preserves_stdout_stderr() {
+        let (_dir, db) = test_db_with_session("s1");
+
+        // Insert 5 trace events + 3 stdout events + 2 stderr events = 10 total
+        let mut events = Vec::new();
+        for i in 0..5 {
+            events.push(Event {
+                id: format!("trace-{}", i), session_id: "s1".into(),
+                timestamp_ns: i as i64 * 100, thread_id: 1,
+                event_type: EventType::FunctionEnter, function_name: format!("func_{}", i),
+                ..Default::default()
+            });
+        }
+        for i in 0..3 {
+            events.push(Event {
+                id: format!("stdout-{}", i), session_id: "s1".into(),
+                timestamp_ns: i as i64 * 100 + 50, thread_id: 1,
+                event_type: EventType::Stdout, text: Some(format!("line {}\n", i)),
+                ..Default::default()
+            });
+        }
+        for i in 0..2 {
+            events.push(Event {
+                id: format!("stderr-{}", i), session_id: "s1".into(),
+                timestamp_ns: i as i64 * 100 + 75, thread_id: 1,
+                event_type: EventType::Stderr, text: Some(format!("err {}\n", i)),
+                ..Default::default()
+            });
+        }
+
+        let stats = db.insert_events_with_limit(&events, 10).unwrap();
+        assert_eq!(stats.events_inserted, 10);
+        assert_eq!(stats.events_deleted, 0);
+
+        // Now insert 5 more trace events with limit=10 — should evict 5 oldest trace events
+        let more: Vec<Event> = (0..5).map(|i| Event {
+            id: format!("trace-new-{}", i), session_id: "s1".into(),
+            timestamp_ns: 1000 + i as i64 * 100, thread_id: 1,
+            event_type: EventType::FunctionEnter, function_name: format!("new_func_{}", i),
+            ..Default::default()
+        }).collect();
+
+        let stats = db.insert_events_with_limit(&more, 10).unwrap();
+        assert_eq!(stats.events_inserted, 5);
+        assert_eq!(stats.events_deleted, 5); // 5 old trace events evicted
+
+        // All stdout and stderr events must survive
+        let stdout = db.query_events("s1", |q| q.event_type(EventType::Stdout)).unwrap();
+        assert_eq!(stdout.len(), 3, "stdout events must not be evicted");
+
+        let stderr = db.query_events("s1", |q| q.event_type(EventType::Stderr)).unwrap();
+        assert_eq!(stderr.len(), 2, "stderr events must not be evicted");
+
+        // Only new trace events should remain (old ones evicted)
+        let traces = db.query_events("s1", |q| q.event_type(EventType::FunctionEnter)).unwrap();
+        assert_eq!(traces.len(), 5, "only new trace events should remain");
+        assert!(traces.iter().all(|e| e.function_name.starts_with("new_func_")));
+    }
+
+    #[test]
+    fn test_fifo_eviction_with_only_output_events() {
+        let (_dir, db) = test_db_with_session("s1");
+
+        // Fill buffer with 5 stdout events
+        let events: Vec<Event> = (0..5).map(|i| Event {
+            id: format!("stdout-{}", i), session_id: "s1".into(),
+            timestamp_ns: i as i64 * 100, thread_id: 1,
+            event_type: EventType::Stdout, text: Some(format!("line {}\n", i)),
+            ..Default::default()
+        }).collect();
+
+        db.insert_events_with_limit(&events, 5).unwrap();
+
+        // Insert 3 more stdout events with limit=5 — no trace events to evict,
+        // so output events should NOT be deleted (buffer grows past limit)
+        let more: Vec<Event> = (0..3).map(|i| Event {
+            id: format!("stdout-new-{}", i), session_id: "s1".into(),
+            timestamp_ns: 1000 + i as i64 * 100, thread_id: 1,
+            event_type: EventType::Stdout, text: Some(format!("new line {}\n", i)),
+            ..Default::default()
+        }).collect();
+
+        let stats = db.insert_events_with_limit(&more, 5).unwrap();
+        assert_eq!(stats.events_inserted, 3);
+        assert_eq!(stats.events_deleted, 0, "should not evict output events");
+
+        // All 8 stdout events should exist (buffer exceeded but output is protected)
+        let all = db.query_events("s1", |q| q.event_type(EventType::Stdout)).unwrap();
+        assert_eq!(all.len(), 8);
+    }
 }

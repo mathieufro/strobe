@@ -356,7 +356,9 @@ impl AgentMessageHandler {
                                 self.crash_reported.store(true, Ordering::Release);
                                 tracing::info!("Crash event received from agent [{}]", self.session_id);
                             }
-                            let _ = self.event_tx.try_send(event);
+                            if let Err(e) = self.event_tx.try_send(event) {
+                                tracing::warn!("Agent trace event dropped for [{}]: {}", self.session_id, e);
+                            }
                         }
                     }
                 }
