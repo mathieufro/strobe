@@ -161,6 +161,29 @@ pub trait TestAdapter: Send + Sync {
         super::stacks::capture_native_stacks(pid)
     }
 
+    /// Build command for a user-provided binary path. Default: error.
+    /// Override for binary-based adapters (Catch2, GTest).
+    fn command_for_binary(
+        &self,
+        _cmd: &str,
+        _level: Option<TestLevel>,
+    ) -> crate::Result<TestCommand> {
+        Err(crate::Error::ValidationError(
+            format!("{} does not support direct binary execution", self.name())
+        ))
+    }
+
+    /// Build command for running a single test on a user-provided binary.
+    fn single_test_for_binary(
+        &self,
+        _cmd: &str,
+        _test_name: &str,
+    ) -> crate::Result<TestCommand> {
+        Err(crate::Error::ValidationError(
+            format!("{} does not support direct binary execution", self.name())
+        ))
+    }
+
     /// Safety-net timeout — per-test tracking via stuck detector is the primary mechanism.
     /// This only fires if something goes catastrophically wrong.
     fn default_timeout(&self, _level: Option<TestLevel>) -> u64 {

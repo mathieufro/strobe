@@ -6,6 +6,10 @@ pub mod unittest_adapter;
 pub mod vitest_adapter;
 pub mod jest_adapter;
 pub mod bun_adapter;
+pub mod deno_adapter;
+pub mod go_adapter;
+pub mod gtest_adapter;
+pub mod mocha_adapter;
 pub mod stacks;
 pub mod stuck_detector;
 pub mod output;
@@ -24,6 +28,10 @@ use unittest_adapter::UnittestAdapter;
 use vitest_adapter::VitestAdapter;
 use jest_adapter::JestAdapter;
 use bun_adapter::BunAdapter;
+use deno_adapter::DenoAdapter;
+use go_adapter::GoTestAdapter;
+use gtest_adapter::GTestAdapter;
+use mocha_adapter::MochaAdapter;
 use stuck_detector::StuckDetector;
 
 /// Phase of a test run lifecycle.
@@ -79,6 +87,19 @@ impl TestProgress {
 
     pub fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// Record a test starting (for stuck detection).
+    pub fn start_test(&mut self, name: String) {
+        self.running_tests.insert(name, Instant::now());
+    }
+
+    /// Record a test finishing (for stuck detection).
+    pub fn finish_test(&mut self, name: &str) {
+        if let Some(started) = self.running_tests.remove(name) {
+            let dur_ms = started.elapsed().as_millis() as u64;
+            self.test_durations.insert(name.to_string(), dur_ms);
+        }
     }
 
     /// Get the "current test" — the one that's been running longest (for stuck detection).
@@ -141,6 +162,10 @@ impl TestRunner {
                 Box::new(VitestAdapter),
                 Box::new(JestAdapter),
                 Box::new(BunAdapter),
+                Box::new(DenoAdapter),
+                Box::new(GoTestAdapter),
+                Box::new(GTestAdapter),
+                Box::new(MochaAdapter),
             ],
         }
     }
@@ -161,7 +186,7 @@ impl TestRunner {
                 }
             }
             return Err(crate::Error::ValidationError(
-                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2', 'pytest', 'unittest', 'vitest', 'jest', 'bun'", name)
+                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2', 'pytest', 'unittest', 'vitest', 'jest', 'bun', 'deno', 'go', 'mocha', 'gtest'", name)
             ));
         }
 
@@ -211,12 +236,12 @@ impl TestRunner {
         let adapter = self.detect_adapter(project_root, framework, command)?;
         let framework_name = adapter.name().to_string();
 
-        // Build command
+        // Build command — dispatch through trait methods for binary-based adapters
         let test_cmd = if let Some(cmd) = command {
             if let Some(test_name) = test {
-                Catch2Adapter::single_test_for_binary(cmd, test_name)
+                adapter.single_test_for_binary(cmd, test_name)?
             } else {
-                Catch2Adapter::command_for_binary(cmd, level)
+                adapter.command_for_binary(cmd, level)?
             }
         } else if let Some(test_name) = test {
             adapter.single_test_command(project_root, test_name)?
@@ -281,6 +306,10 @@ impl TestRunner {
         let progress_fn: Option<fn(&str, &Arc<Mutex<TestProgress>>)> = match framework_name.as_str() {
             "cargo" => Some(cargo_adapter::update_progress),
             "catch2" => Some(catch2_adapter::update_progress),
+            "deno" => Some(deno_adapter::update_progress),
+            "go" => Some(go_adapter::update_progress),
+            "gtest" => Some(gtest_adapter::update_progress),
+            "mocha" => Some(mocha_adapter::update_progress),
             _ => None,
         };
 
@@ -552,7 +581,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("Unknown framework 'generic'"), "got: {}", err);
-        assert!(err.contains("'cargo', 'catch2'"));
+        assert!(err.contains("Supported:"), "got: {}", err);
     }
 
     #[test]

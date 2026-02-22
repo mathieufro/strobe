@@ -170,14 +170,11 @@ impl TestAdapter for Catch2Adapter {
         traces
     }
 
-}
-
-impl Catch2Adapter {
-    /// Build command for a given binary with Catch2 flags.
-    pub fn command_for_binary(
-        binary: &str,
+    fn command_for_binary(
+        &self,
+        cmd: &str,
         level: Option<TestLevel>,
-    ) -> TestCommand {
+    ) -> crate::Result<TestCommand> {
         let mut args = vec!["--reporter".to_string(), "xml".to_string()];
 
         match level {
@@ -187,30 +184,32 @@ impl Catch2Adapter {
             None => {}
         }
 
-        TestCommand {
-            program: binary.to_string(),
+        Ok(TestCommand {
+            program: cmd.to_string(),
             args,
             env: HashMap::new(),
-        }
+        })
     }
 
-    /// Build command for running a single test in a Catch2 binary.
-    /// Wraps in wildcards for substring matching (Catch2 treats bare names as exact).
-    pub fn single_test_for_binary(binary: &str, test_name: &str) -> TestCommand {
+    fn single_test_for_binary(
+        &self,
+        cmd: &str,
+        test_name: &str,
+    ) -> crate::Result<TestCommand> {
         let filter = if test_name.contains('*') {
             test_name.to_string()
         } else {
             format!("*{}*", test_name)
         };
-        TestCommand {
-            program: binary.to_string(),
+        Ok(TestCommand {
+            program: cmd.to_string(),
             args: vec![
                 "--reporter".to_string(),
                 "xml".to_string(),
                 filter,
             ],
             env: HashMap::new(),
-        }
+        })
     }
 }
 

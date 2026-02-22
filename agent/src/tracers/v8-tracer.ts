@@ -26,6 +26,7 @@ export class V8Tracer implements Tracer {
   // Track wrapped functions to avoid double-wrapping
   private wrappedFns: WeakSet<Function> = new WeakSet();
   private origCompile: Function | null = null;
+  private esmHooksRegistered: boolean = false;
 
   constructor(agent: any) {
     this.agent = agent;
@@ -52,6 +53,46 @@ export class V8Tracer implements Tracer {
       send({ type: 'log', message: `V8Tracer: failed to patch Module._compile: ${e}` });
     }
 
+    // Install global trace bridge for ESM hooks.
+    // ESM hook scripts call globalThis.__strobe_trace() which dispatches to Strobe events.
+    try {
+      const self2 = this;
+
+      // Pattern sharing: hook script reads this to know which functions to instrument.
+      // Updated by installHook() whenever patterns change.
+      (globalThis as any).__strobe_hooks = [];
+
+      (globalThis as any).__strobe_trace = function(
+        event: string, funcName: string, file: string, line: number
+      ) {
+        // Match against active hooks — require BOTH name and file to match
+        for (const [, hook] of self2.hooks) {
+          const nameMatch = hook.target.name === funcName;
+          const fileMatch = hook.target.file && file.replace('file://', '').endsWith(hook.target.file);
+          if (nameMatch && fileMatch) {
+            if (event === 'enter') {
+              self2.emitEvent(hook.funcId, hook, file.replace('file://', ''), 'entry');
+            } else if (event === 'exit') {
+              self2.emitEvent(hook.funcId, hook, file.replace('file://', ''), 'exit');
+            }
+            return;
+          }
+          // Fall back to name-only match if no file context in the hook
+          if (nameMatch && !hook.target.file) {
+            if (event === 'enter') {
+              self2.emitEvent(hook.funcId, hook, file.replace('file://', ''), 'entry');
+            }
+            return;
+          }
+        }
+      };
+    } catch (e) {
+      send({ type: 'log', message: `V8Tracer: failed to install __strobe_trace: ${e}` });
+    }
+
+    // Register ESM module hooks for dynamic import() interception
+    this.registerEsmHooks();
+
     send({ type: 'log', message: `V8Tracer: initialized (V8 runtime, Node.js ${process.version})` });
   }
 
@@ -72,6 +113,15 @@ export class V8Tracer implements Tracer {
   installHook(target: ResolvedTarget, mode: HookMode): number | null {
     const funcId = this.nextFuncId++;
     this.hooks.set(funcId, { funcId, target, mode });
+
+    // Sync patterns to globalThis for ESM hooks to read
+    try {
+      (globalThis as any).__strobe_hooks = Array.from(this.hooks.values()).map(h => ({
+        name: h.target.name,
+        file: h.target.file || '',
+        line: h.target.line || 0,
+      }));
+    } catch {}
 
     // Immediately wrap already-loaded modules that match
     try {
@@ -131,6 +181,49 @@ export class V8Tracer implements Tracer {
   getSlide(): NativePointer { return ptr(0); }
 
   // ── Private helpers ─────────────────────────────────────────────────
+
+  // Called from initialize(), not installHook().
+  // Registers module.registerHooks() for intercepting future ESM import() calls.
+  // Only intercepts future loads — static imports that are already loaded are unreachable.
+  // The spawn-time --import hook covers the static import case.
+  private registerEsmHooks(): void {
+    if (this.esmHooksRegistered) return;
+
+    try {
+      const mod = require('node:module') as any;
+      if (typeof mod.registerHooks === 'function') {
+        mod.registerHooks({
+          load(url: string, context: any, nextLoad: Function) {
+            const result = nextLoad(url, context);
+            // Only transform user ESM code (not node_modules, not node: builtins)
+            if (result.format === 'module' && result.source &&
+                !url.includes('node_modules') && !url.startsWith('node:')) {
+              const source = typeof result.source === 'string'
+                ? result.source
+                : new ((globalThis as any).TextDecoder)().decode(result.source);
+              // Regex-based function wrapping: add __strobe_trace calls at function entry
+              const fnRegex = /^(\s*export\s+(?:default\s+)?(?:async\s+)?function\s+)(\w+)\s*\(([^)]*)\)\s*\{/gm;
+              let transformed = source;
+              let m;
+              while ((m = fnRegex.exec(source)) !== null) {
+                const [full, prefix, name, params] = m;
+                transformed = transformed.replace(full,
+                  `${prefix}${name}(${params}) {\n` +
+                  `  if (typeof globalThis.__strobe_trace === 'function') ` +
+                  `globalThis.__strobe_trace('enter', '${name}', '${url}', 0);`);
+              }
+              return { ...result, source: transformed };
+            }
+            return result;
+          }
+        });
+        this.esmHooksRegistered = true;
+        send({ type: 'log', message: 'V8Tracer: ESM hooks registered via module.registerHooks()' });
+      }
+    } catch (e) {
+      send({ type: 'log', message: `V8Tracer: ESM hook registration not available: ${e}` });
+    }
+  }
 
   private fileMatches(filename: string, target: ResolvedTarget): boolean {
     if (!target.file) return false;

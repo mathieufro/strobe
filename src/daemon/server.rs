@@ -835,14 +835,14 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nIMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test runs in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nIMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test runs in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n- C++/Google Test: provide command (path to gtest binary).\n- Go: provide projectRoot (auto-detects go.mod).\n- Deno: provide projectRoot (auto-detects deno.json).\n- Mocha: provide projectRoot (auto-detects .mocharc.yml).\n- Python (pytest/unittest): provide projectRoot.\n- Node.js (Vitest/Jest/Bun): provide projectRoot.\n\nUse this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' polls for results" },
                         "testRunId": { "type": "string", "description": "Test run ID (required for action: 'status')" },
                         "projectRoot": { "type": "string", "description": "Project root for adapter detection (required for action: 'run')" },
-                        "framework": { "type": "string", "enum": ["cargo", "catch2"], "description": "Override auto-detection. Usually not needed — framework is detected from projectRoot (Cargo) or command (Catch2)." },
+                        "framework": { "type": "string", "enum": ["cargo", "catch2", "pytest", "unittest", "vitest", "jest", "bun", "deno", "go", "mocha", "gtest"], "description": "Override auto-detection. Usually not needed — framework is detected from projectRoot or command." },
                         "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
                         "test": { "type": "string", "description": "Run a single test by name (substring match — e.g. 'stuck_detector' runs all tests containing that string)" },
                         "command": { "type": "string", "description": "Path to test binary. Required for C++/Catch2 projects." },

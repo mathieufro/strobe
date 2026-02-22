@@ -86,7 +86,7 @@ impl TestAdapter for BunAdapter {
 }
 
 /// Parse JUnit XML (bun:test --reporter=junit) into TestResult.
-fn parse_junit_xml(xml: &str) -> TestResult {
+pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 

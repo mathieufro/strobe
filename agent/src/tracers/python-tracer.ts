@@ -52,6 +52,17 @@ export class PythonTracer implements Tracer {
   private logCallback: NativePointer | null = null;
   private bpHitCallback: NativePointer | null = null;
   private traceInstalled: boolean = false;
+  private settraceInstalled: boolean = false;
+
+  // Default to 3.11 (safe fallback — settrace path). Only upgrade to monitoring
+  // when version is confirmed via Py_GetVersion.
+  private cpythonVersion: { major: number; minor: number } = { major: 3, minor: 11 };
+
+  // Class-level getter — NOT inside a method body (TypeScript syntax constraint).
+  private get useMonitoring(): boolean {
+    return this.cpythonVersion.major > 3 ||
+      (this.cpythonVersion.major === 3 && this.cpythonVersion.minor >= 12);
+  }
 
   // CPython API function pointers
   private PyRun_SimpleString: NativePointer | null = null;
@@ -77,6 +88,18 @@ export class PythonTracer implements Tracer {
 
     if (!this.PyRun_SimpleString || !this.PyGILState_Ensure || !this.PyGILState_Release) {
       throw new Error('CPython API symbols not found (PyRun_SimpleString, PyGILState_Ensure, PyGILState_Release)');
+    }
+
+    // Detect CPython version for sys.monitoring support (PEP 669, 3.12+)
+    const PyGetVersion = findGlobalExport('Py_GetVersion');
+    if (PyGetVersion) {
+      const fn = new NativeFunction(PyGetVersion, 'pointer', []);
+      const versionStr = (fn() as NativePointer).readUtf8String() || '';
+      const match = versionStr.match(/^(\d+)\.(\d+)/);
+      if (match) {
+        this.cpythonVersion = { major: parseInt(match[1]), minor: parseInt(match[2]) };
+        send({ type: 'log', message: `PythonTracer: detected CPython ${match[1]}.${match[2]}` });
+      }
     }
 
     // Start periodic flush timer for event batching
@@ -128,9 +151,19 @@ export class PythonTracer implements Tracer {
   }
 
   dispose(): void {
-    // Remove sys.settrace
     if (this.traceInstalled) {
-      this.runPython('import sys; sys.settrace(None)');
+      if (this.useMonitoring) {
+        this.runPython(`
+import sys, builtins as _b
+if getattr(_b, '_strobe_monitoring_active', False):
+    sys.monitoring.set_events(0, 0)
+    sys.monitoring.free_tool_id(0)
+    setattr(_b, '_strobe_monitoring_active', False)
+sys.settrace(None)
+`);
+      } else {
+        this.runPython('import sys; sys.settrace(None)');
+      }
       this.traceInstalled = false;
     }
     if (this.flushTimer) {
@@ -191,9 +224,26 @@ _strobe_breakpoints = [${bpEntries.join(', ')}]`;
     // The existing _strobe_trace function reads _strobe_hooks, _strobe_breakpoints,
     // and _strobe_logpoints via LOAD_GLOBAL, so it picks up new values immediately.
     if (this.traceInstalled) {
-      const code = this.buildTraceDataAssignments();
+      let code = this.buildTraceDataAssignments();
+
+      // On 3.12+, settrace may not be installed yet if no breakpoints/logpoints
+      // existed during first installation. Install it now if needed.
+      const needsSettrace = this.useMonitoring && !this.settraceInstalled
+        && (this.breakpoints.size > 0 || this.logpoints.size > 0);
+      if (needsSettrace) {
+        code += `
+import sys, threading
+if hasattr(threading, 'settrace_all_threads'):
+    threading.settrace_all_threads(_strobe_trace)
+else:
+    sys.settrace(_strobe_trace)
+    threading.settrace(_strobe_trace)
+`;
+      }
+
       const result = this.runPython(code);
       if (result === 0) {
+        if (needsSettrace) this.settraceInstalled = true;
         send({ type: 'log', message: `PythonTracer: updated data — ${this.hooks.size} hooks, ${this.logpoints.size} logpoints, ${this.breakpoints.size} breakpoints` });
       } else {
         send({ type: 'log', message: 'PythonTracer: FAILED to update trace data' });
@@ -201,14 +251,15 @@ _strobe_breakpoints = [${bpEntries.join(', ')}]`;
       return;
     }
 
-    // First-time installation — define everything + settrace_all_threads
+    // First-time installation — version-aware dual-mode tracing
     const callbackAddr = (this.traceCallback as NativePointer).toString();
     const logCallbackAddr = this.logCallback ? (this.logCallback as NativePointer).toString() : '0';
     const bpHitCallbackAddr = this.bpHitCallback ? (this.bpHitCallback as NativePointer).toString() : '0';
     const dataAssignments = this.buildTraceDataAssignments();
 
-    const pythonCode = `
-import sys, ctypes, threading
+    // Common preamble: callbacks, data lists, bp event, GIL helpers
+    const preamble = `
+import sys, ctypes, threading, builtins as _b
 
 # Trace callback: void(char*, char*, int, int)
 _STROBE_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int)
@@ -223,7 +274,6 @@ _STROBE_BP_HIT_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int)
 _strobe_bp_hit_cb = _STROBE_BP_HIT_CB_TYPE(${bpHitCallbackAddr})
 
 # Suspension event for Python breakpoints — persisted in builtins across resync calls
-import builtins as _b
 _strobe_bp_event = getattr(_b, '_strobe_bp_event', None) or threading.Event()
 setattr(_b, '_strobe_bp_event', _strobe_bp_event)
 
@@ -233,7 +283,11 @@ ctypes.pythonapi.PyEval_RestoreThread.argtypes = [ctypes.c_void_p]
 
 # Data lists (updated in-place on subsequent syncs without redefining the trace function)
 ${dataAssignments}
+`;
 
+    // Settrace-based trace function for breakpoints/logpoints (needs frame objects)
+    // Also used as the full tracer on Python < 3.12
+    const settraceBlock = `
 def _strobe_trace(frame, event, arg):
     try:
         if event == 'call':
@@ -277,17 +331,71 @@ def _strobe_trace(frame, event, arg):
             _be._strobe_errors = []
         _be._strobe_errors.append(f'{type(_strobe_err).__name__}: {_strobe_err}')
     return _strobe_trace
+`;
 
+    let pythonCode: string;
+
+    if (this.useMonitoring) {
+      // Python 3.12+: sys.monitoring for function enter (interpreter-global),
+      // sys.settrace for breakpoints/logpoints (needs frame objects).
+      pythonCode = preamble + `
+# --- sys.monitoring for PY_START (interpreter-global, no per-thread issues) ---
+_strobe_monitoring_ok = False
+try:
+    sys.monitoring.use_tool_id(0, "strobe")
+    sys.monitoring.set_events(0, sys.monitoring.events.PY_START)
+
+    def _strobe_on_start(code, offset):
+        fname = code.co_filename
+        fline = code.co_firstlineno
+        for file_pat, line_pat, fid in _strobe_hooks:
+            if fname.endswith(file_pat) and fline == line_pat:
+                _strobe_cb(fname.encode('utf-8'), code.co_name.encode('utf-8'), fline, fid)
+                return
+
+    sys.monitoring.register_callback(0, sys.monitoring.events.PY_START, _strobe_on_start)
+    setattr(_b, '_strobe_monitoring_active', True)
+    _strobe_monitoring_ok = True
+except ValueError:
+    # Tool ID 0 already in use — fall back to settrace
+    pass
+
+# --- sys.settrace for breakpoints/logpoints, OR as fallback if monitoring failed ---
+` + settraceBlock + `
+if _strobe_monitoring_ok:
+    # Only install settrace if we have breakpoints or logpoints
+    if _strobe_breakpoints or _strobe_logpoints:
+        if hasattr(threading, 'settrace_all_threads'):
+            threading.settrace_all_threads(_strobe_trace)
+        else:
+            sys.settrace(_strobe_trace)
+            threading.settrace(_strobe_trace)
+else:
+    # Monitoring failed — full settrace fallback
+    if hasattr(threading, 'settrace_all_threads'):
+        threading.settrace_all_threads(_strobe_trace)
+    else:
+        sys.settrace(_strobe_trace)
+        threading.settrace(_strobe_trace)
+`;
+    } else {
+      // Python < 3.12: settrace-only approach (existing behavior)
+      pythonCode = preamble + settraceBlock + `
 if hasattr(threading, 'settrace_all_threads'):
     threading.settrace_all_threads(_strobe_trace)
 else:
     sys.settrace(_strobe_trace)
     threading.settrace(_strobe_trace)
 `;
+    }
 
     const result = this.runPython(pythonCode);
     if (result === 0) {
       this.traceInstalled = true;
+      // Track whether settrace was installed: always on <3.12, on 3.12+ only if bp/lp exist
+      if (!this.useMonitoring || this.breakpoints.size > 0 || this.logpoints.size > 0) {
+        this.settraceInstalled = true;
+      }
       send({ type: 'log', message: `PythonTracer: sys.settrace installed with ${this.hooks.size} hooks, ${this.logpoints.size} logpoints, ${this.breakpoints.size} breakpoints` });
     } else {
       send({ type: 'log', message: 'PythonTracer: FAILED to install sys.settrace' });
@@ -421,7 +529,18 @@ except NameError:
     this.breakpoints.clear();
     this.logpoints.clear();
     if (this.traceInstalled) {
-      this.runPython('import sys; sys.settrace(None)');
+      if (this.useMonitoring) {
+        this.runPython(`
+import sys, builtins as _b
+if getattr(_b, '_strobe_monitoring_active', False):
+    sys.monitoring.set_events(0, 0)
+    sys.monitoring.free_tool_id(0)
+    setattr(_b, '_strobe_monitoring_active', False)
+sys.settrace(None)
+`);
+      } else {
+        this.runPython('import sys; sys.settrace(None)');
+      }
       this.traceInstalled = false;
     }
   }

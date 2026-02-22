@@ -107,15 +107,25 @@ unsafe fn create_script_raw(
     source: &str,
     language: Language,
 ) -> std::result::Result<*mut frida_sys::_FridaScript, String> {
+    create_script_raw_with_options(session_ptr, source, language, false)
+}
+
+unsafe fn create_script_raw_with_options(
+    session_ptr: *mut frida_sys::_FridaSession,
+    source: &str,
+    language: Language,
+    is_bun: bool,
+) -> std::result::Result<*mut frida_sys::_FridaScript, String> {
     let source_cstr = CString::new(source).map_err(|e| format!("CString error: {}", e))?;
     let opt = frida_sys::frida_script_options_new();
     if opt.is_null() {
         return Err("Failed to create script options".to_string());
     }
 
-    // For JavaScript sessions, use V8 runtime so the agent runs inside
+    // For Node.js JavaScript sessions, use V8 runtime so the agent runs inside
     // Node.js's own V8 context (giving access to require, process, etc.)
-    if language == Language::JavaScript {
+    // Bun uses JSC, not V8 — skip V8 runtime for Bun sessions.
+    if language == Language::JavaScript && !is_bun {
         frida_sys::frida_script_options_set_runtime(
             opt,
             frida_sys::FridaScriptRuntime_FRIDA_SCRIPT_RUNTIME_V8,
@@ -1106,8 +1116,13 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     // Step 3: Create and load agent script (common path)
                     // -------------------------------------------------------
                     let t = std::time::Instant::now();
+                    let cmd_basename = std::path::Path::new(&command)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    let is_bun = cmd_basename.contains("bun");
                     let script_ptr = unsafe {
-                        create_script_raw(raw_session, AGENT_CODE, language)
+                        create_script_raw_with_options(raw_session, AGENT_CODE, language, is_bun)
                             .map_err(|e| crate::Error::FridaAttachFailed(format!("Script creation failed: {}", e)))?
                     };
                     tracing::debug!("PERF: create_script took {:?}", t.elapsed());

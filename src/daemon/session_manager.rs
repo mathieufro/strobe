@@ -102,6 +102,56 @@ fn is_process_alive(pid: u32) -> bool {
     matches!(err.raw_os_error(), Some(libc::EPERM))
 }
 
+/// Generate the ESM hook registration script for Node.js sessions.
+/// Returns a file:// URL suitable for --import.
+fn generate_esm_hook_script(session_id: &str) -> std::io::Result<String> {
+    let script_path = format!("/tmp/strobe-esm-hooks-{}.mjs", session_id);
+    let script_content = r#"
+// Strobe ESM hook registration script — injected via NODE_OPTIONS=--import
+// Intercepts ESM module loads and wraps exported functions with __strobe_trace calls.
+
+import { createRequire } from 'node:module';
+
+// Source transformation: wrap exported functions with tracing calls.
+function transformSource(source, url) {
+  let transformed = source;
+  const fnRegex = /^(\s*export\s+(?:default\s+)?(?:async\s+)?function\s+)(\w+)\s*\(([^)]*)\)\s*\{/gm;
+  let match;
+  while ((match = fnRegex.exec(source)) !== null) {
+    const [full, prefix, name, params] = match;
+    transformed = transformed.replace(full,
+      `${prefix}${name}(${params}) {\n` +
+      `  if (typeof globalThis.__strobe_trace === 'function') globalThis.__strobe_trace('enter', '${name}', '${url}', 0);`);
+  }
+  return transformed;
+}
+
+// Try registerHooks (Node 22.15+ / 23.5+) — synchronous, preferred
+try {
+  const mod = createRequire(import.meta.url)('node:module');
+  if (typeof mod.registerHooks === 'function') {
+    mod.registerHooks({
+      load(url, context, nextLoad) {
+        const result = nextLoad(url, context);
+        if (result.format === 'module' && result.source &&
+            !url.includes('node_modules') && !url.startsWith('node:')) {
+          const source = typeof result.source === 'string'
+            ? result.source
+            : new TextDecoder().decode(result.source);
+          return { ...result, source: transformSource(source, url) };
+        }
+        return result;
+      }
+    });
+  }
+} catch (e) {
+  // registerHooks not available — Node < 22.15
+}
+"#;
+    std::fs::write(&script_path, script_content)?;
+    Ok(format!("file://{}", script_path))
+}
+
 /// Kill orphaned processes from previous Strobe runs.
 /// Only kills processes whose PPID == 1 (re-parented to launchd/init),
 /// which proves their parent died — they're definitively orphaned.
@@ -339,6 +389,9 @@ impl SessionManager {
         write_lock(&self.languages).remove(id);
         write_lock(&self.resolvers).remove(id);
 
+        // Clean up temp ESM hook script
+        let _ = std::fs::remove_file(format!("/tmp/strobe-esm-hooks-{}.mjs", id));
+
         Ok(count)
     }
 
@@ -372,6 +425,9 @@ impl SessionManager {
         write_lock(&self.paused_threads).remove(id);
         write_lock(&self.languages).remove(id);
         write_lock(&self.resolvers).remove(id);
+
+        // Clean up temp ESM hook script
+        let _ = std::fs::remove_file(format!("/tmp/strobe-esm-hooks-{}.mjs", id));
 
         Ok(count)
     }
@@ -584,6 +640,35 @@ impl SessionManager {
             }
         }
 
+        // For Node.js sessions, inject ESM hook script via NODE_OPTIONS.
+        // Using NODE_OPTIONS instead of --import CLI flag because it works with npx, tsx, etc.
+        let mut esm_env_overlay: Option<HashMap<String, String>> = None;
+        if language == Language::JavaScript {
+            let cmd_basename = Path::new(command)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let is_node = cmd_basename.contains("node") || cmd_basename == "npx"
+                || cmd_basename == "tsx" || cmd_basename == "ts-node";
+            if is_node {
+                if let Ok(hook_url) = generate_esm_hook_script(session_id) {
+                    let existing = env
+                        .and_then(|e| e.get("NODE_OPTIONS"))
+                        .cloned()
+                        .unwrap_or_default();
+                    let new_opts = if existing.is_empty() {
+                        format!("--import={}", hook_url)
+                    } else {
+                        format!("{} --import={}", existing, hook_url)
+                    };
+                    let mut overlay = env.cloned().unwrap_or_default();
+                    overlay.insert("NODE_OPTIONS".to_string(), new_opts);
+                    esm_env_overlay = Some(overlay);
+                }
+            }
+        }
+        let effective_env = esm_env_overlay.as_ref().or(env);
+
         // Create event channel
         let (tx, mut rx) = mpsc::channel::<Event>(10000);
 
@@ -692,7 +777,7 @@ impl SessionManager {
             args,
             cwd,
             project_root,
-            env,
+            effective_env,
             dwarf_handle,
             image_base,
             tx,
