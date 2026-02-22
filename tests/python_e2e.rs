@@ -26,16 +26,19 @@ async fn test_python_e2e_scenarios() {
     let script_str = python_script.to_str().unwrap();
     let project_str = python_project.to_str().unwrap();
 
-    eprintln!("=== Scenario 1/3: Python output capture ===");
+    eprintln!("=== Scenario 1/4: Python output capture ===");
     scenario_python_output_capture(&sm, script_str, project_str).await;
 
-    eprintln!("\n=== Scenario 2/3: Python function tracing ===");
+    eprintln!("\n=== Scenario 2/4: Python function tracing ===");
     scenario_python_tracing(&sm, script_str, project_str).await;
 
-    eprintln!("\n=== Scenario 3/3: Python pattern matching ===");
+    eprintln!("\n=== Scenario 3/4: Python pattern matching ===");
     scenario_python_pattern_matching(&sm, script_str, project_str).await;
 
-    eprintln!("\n=== All 3 Python E2E scenarios passed ===");
+    eprintln!("\n=== Scenario 4/4: Python decorated function tracing ===");
+    scenario_python_decorated_tracing(&sm, script_str, project_str).await;
+
+    eprintln!("\n=== All 4 Python E2E scenarios passed ===");
 }
 
 fn is_python3_available() -> bool {
@@ -223,6 +226,76 @@ async fn scenario_python_pattern_matching(
     let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id).await;
     eprintln!("✓ Python @file: pattern matching works");
+}
+
+// ─── Scenario 4: Decorated Function Tracing ──────────────────────────
+
+async fn scenario_python_decorated_tracing(
+    sm: &strobe::daemon::SessionManager,
+    script: &str,
+    project_root: &str,
+) {
+    let session_id = "py-decorated";
+    let python3 = get_python3_path().expect("python3 should be available");
+
+    sm.create_session(session_id, script, project_root, 0).unwrap();
+
+    // Launch fixture in "decorators" mode — loops calling decorated_process()
+    let _pid = sm
+        .spawn_with_frida(
+            session_id,
+            &python3,
+            &[script.to_string(), "decorators".to_string()],
+            None,
+            project_root,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Add trace pattern for the decorated function
+    let _ = sm
+        .update_frida_patterns(
+            session_id,
+            Some(&["modules.audio.decorated_process".to_string()]),
+            None,
+            None,
+        )
+        .await;
+
+    // Wait for trace events — decorated functions require name matching or
+    // line tolerance since decorators shift co_firstlineno
+    let events = poll_events_typed(
+        sm,
+        session_id,
+        Duration::from_secs(10),
+        EventType::FunctionEnter,
+        |evs| evs.len() >= 3,
+    )
+    .await;
+
+    assert!(
+        events.len() >= 3,
+        "Expected at least 3 trace events from decorated_process, got {}. \
+         Decorated function tracing may not be working correctly.",
+        events.len()
+    );
+
+    // Verify the traced function name matches
+    let names: Vec<&str> = events.iter()
+        .map(|e| e.function_name.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("decorated_process")),
+        "Expected 'decorated_process' in traced function names, got: {:?}",
+        names
+    );
+
+    let _ = sm.stop_frida(session_id).await;
+    let _ = sm.stop_session(session_id).await;
+    eprintln!("✓ Python decorated function tracing works");
 }
 
 // ─── Test Runner Integration Tests ───────────────────────────────────

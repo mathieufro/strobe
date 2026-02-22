@@ -283,6 +283,53 @@ fn test_adapter_detection() {
     let err = result.err().unwrap().to_string();
     eprintln!("Invalid-framework error: {}", err);
     assert!(err.contains("Unknown framework 'unknown_fw'"));
+
+    // --- Deno adapter detection ---
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deno.json"), "{}").unwrap();
+        let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
+        assert_eq!(adapter.name(), "deno", "Should detect Deno from deno.json");
+        let confidence = adapter.detect(dir.path(), None);
+        assert!(confidence >= 90, "Deno confidence should be >= 90, got {}", confidence);
+        eprintln!("Deno adapter detected (confidence={})", confidence);
+    }
+
+    // --- Go adapter detection ---
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/test\n\ngo 1.21\n").unwrap();
+        let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
+        assert_eq!(adapter.name(), "go", "Should detect Go from go.mod");
+        let confidence = adapter.detect(dir.path(), None);
+        assert!(confidence >= 90, "Go confidence should be >= 90, got {}", confidence);
+        eprintln!("Go adapter detected (confidence={})", confidence);
+    }
+
+    // --- Mocha adapter detection ---
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".mocharc.yml"), "spec: test/**/*.spec.js\n").unwrap();
+        let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
+        assert_eq!(adapter.name(), "mocha", "Should detect Mocha from .mocharc.yml");
+        let confidence = adapter.detect(dir.path(), None);
+        assert!(confidence >= 90, "Mocha confidence should be >= 90, got {}", confidence);
+        eprintln!("Mocha adapter detected (confidence={})", confidence);
+    }
+
+    // --- GTest adapter detection (via CMakeLists.txt) ---
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.14)\nfind_package(GTest REQUIRED)\n",
+        ).unwrap();
+        let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
+        assert_eq!(adapter.name(), "gtest", "Should detect GTest from CMakeLists.txt with gtest keyword");
+        let confidence = adapter.detect(dir.path(), None);
+        assert!(confidence >= 85, "GTest confidence should be >= 85, got {}", confidence);
+        eprintln!("GTest adapter detected (confidence={})", confidence);
+    }
 }
 
 async fn test_details_file_writing(sm: &strobe::daemon::SessionManager) {

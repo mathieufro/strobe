@@ -103,8 +103,8 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 /// Generate the ESM hook registration script for Node.js sessions.
-/// Returns a file:// URL suitable for --import.
-fn generate_esm_hook_script(session_id: &str) -> std::io::Result<String> {
+/// Returns (file_path, file:// URL) — caller stores the path for cleanup.
+fn generate_esm_hook_script(session_id: &str) -> std::io::Result<(String, String)> {
     // Use timestamp + pid to avoid predictable temp file paths
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -191,7 +191,8 @@ try {
 }
 "#;
     std::fs::write(&script_path, script_content)?;
-    Ok(format!("file://{}", script_path))
+    let url = format!("file://{}", script_path);
+    Ok((script_path, url))
 }
 
 /// Kill orphaned processes from previous Strobe runs.
@@ -308,6 +309,8 @@ pub struct SessionManager {
     languages: Arc<RwLock<HashMap<String, Language>>>,
     /// Symbol resolvers per session (DwarfResolver, PythonResolver, etc.)
     resolvers: Arc<RwLock<HashMap<String, Arc<dyn SymbolResolver>>>>,
+    /// Temp ESM hook script paths per session (for cleanup on stop)
+    esm_hook_paths: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl SessionManager {
@@ -333,6 +336,7 @@ impl SessionManager {
             paused_threads: Arc::new(RwLock::new(HashMap::new())),
             languages: Arc::new(RwLock::new(HashMap::new())),
             resolvers: Arc::new(RwLock::new(HashMap::new())),
+            esm_hook_paths: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -432,7 +436,9 @@ impl SessionManager {
         write_lock(&self.resolvers).remove(id);
 
         // Clean up temp ESM hook script
-        let _ = std::fs::remove_file(format!("/tmp/strobe-esm-hooks-{}.mjs", id));
+        if let Some(path) = write_lock(&self.esm_hook_paths).remove(id) {
+            let _ = std::fs::remove_file(&path);
+        }
 
         Ok(count)
     }
@@ -469,7 +475,9 @@ impl SessionManager {
         write_lock(&self.resolvers).remove(id);
 
         // Clean up temp ESM hook script
-        let _ = std::fs::remove_file(format!("/tmp/strobe-esm-hooks-{}.mjs", id));
+        if let Some(path) = write_lock(&self.esm_hook_paths).remove(id) {
+            let _ = std::fs::remove_file(&path);
+        }
 
         Ok(count)
     }
@@ -693,7 +701,8 @@ impl SessionManager {
             let is_node = cmd_basename.contains("node") || cmd_basename == "npx"
                 || cmd_basename == "tsx" || cmd_basename == "ts-node";
             if is_node {
-                if let Ok(hook_url) = generate_esm_hook_script(session_id) {
+                if let Ok((hook_path, hook_url)) = generate_esm_hook_script(session_id) {
+                    write_lock(&self.esm_hook_paths).insert(session_id.to_string(), hook_path);
                     let existing = env
                         .and_then(|e| e.get("NODE_OPTIONS"))
                         .cloned()

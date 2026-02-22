@@ -141,6 +141,16 @@ pub fn python_fixture_project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python")
 }
 
+/// Return the Node.js ESM target path.
+pub fn node_esm_target() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/node_esm_target.mjs")
+}
+
+/// Return the Bun multi-hook target path.
+pub fn bun_multi_hook_target() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bun_multi_hook_target.ts")
+}
+
 /// Create a SessionManager with a temp database.
 pub fn create_session_manager() -> (strobe::daemon::SessionManager, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
