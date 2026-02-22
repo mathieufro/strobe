@@ -41,6 +41,7 @@ mod macos_tests {
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -96,6 +97,7 @@ mod macos_tests {
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -146,6 +148,7 @@ mod macos_tests {
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -335,6 +338,7 @@ mod macos_tests {
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 

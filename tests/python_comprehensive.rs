@@ -101,6 +101,7 @@ async fn test_python_output(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -167,6 +168,7 @@ async fn test_python_tracing(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -231,6 +233,7 @@ async fn test_python_crashes(
             project_root,
             None,
             false,
+            None,
         )
         .await;
 
@@ -287,6 +290,7 @@ async fn test_python_threads(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -446,6 +450,7 @@ async fn test_python_pattern_updates(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();

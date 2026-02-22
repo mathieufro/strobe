@@ -16,7 +16,7 @@ async fn test_stepping_suite() {
     {
         let session_id = "step-over-test";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -50,7 +50,7 @@ async fn test_stepping_suite() {
     {
         let session_id = "step-into-test";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -82,7 +82,7 @@ async fn test_stepping_suite() {
     {
         let session_id = "step-out-test";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -116,7 +116,7 @@ async fn test_stepping_suite() {
     {
         let session_id = "validation-test";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -148,7 +148,7 @@ async fn test_stepping_suite() {
     {
         let session_id = "no-pause-test";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -166,7 +166,7 @@ async fn test_stepping_suite() {
     {
         let session_id = "logpoint-test";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -209,7 +209,7 @@ async fn test_stepping_suite() {
     {
         let session_id = "multi-bp-test";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();

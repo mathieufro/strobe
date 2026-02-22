@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("NO_DEBUG_SYMBOLS: Binary has no DWARF debug info. Ask user permission to modify build configuration to compile with debug symbols.")]
+    #[error("NO_DEBUG_SYMBOLS: Binary has no DWARF debug info. Search the project for .dSYM bundles (glob: \"**/*.dSYM\") and re-launch with symbolsPath, or ask the user to compile with debug symbols (-g flag).")]
     NoDebugSymbols,
 
     #[error("SIP_BLOCKED: macOS System Integrity Protection prevents Frida attachment.")]

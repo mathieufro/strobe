@@ -14,7 +14,7 @@ async fn test_breakpoint_suite() {
     {
         let session_id = "bp-test-func";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -49,7 +49,7 @@ async fn test_breakpoint_suite() {
     {
         let session_id = "bp-test-line";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -81,7 +81,7 @@ async fn test_breakpoint_suite() {
     {
         let session_id = "bp-test-cond";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -112,7 +112,7 @@ async fn test_breakpoint_suite() {
     {
         let session_id = "bp-test-remove";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
@@ -145,7 +145,7 @@ async fn test_breakpoint_suite() {
     {
         let session_id = "bp-test-validation";
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();

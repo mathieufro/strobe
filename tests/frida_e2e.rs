@@ -84,7 +84,7 @@ async fn scenario_output_capture(
     let session_id = "e2e-output";
 
     let pid = sm
-        .spawn_with_frida(session_id, binary, &["hello".to_string()], None, project_root, None, false)
+        .spawn_with_frida(session_id, binary, &["hello".to_string()], None, project_root, None, false, None)
         .await
         .unwrap();
     sm.create_session(session_id, binary, project_root, pid).unwrap();
@@ -139,6 +139,7 @@ async fn scenario_cpp_tracing(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -207,6 +208,7 @@ async fn scenario_rust_tracing(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -268,6 +270,7 @@ async fn scenario_crash_null(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -354,6 +357,7 @@ async fn scenario_crash_abort(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -412,6 +416,7 @@ async fn scenario_fork_workers(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -461,6 +466,7 @@ async fn scenario_fork_exec(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -508,6 +514,7 @@ async fn scenario_duration_query(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -586,6 +593,7 @@ async fn scenario_time_range_query(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -648,6 +656,7 @@ async fn scenario_pattern_add_remove(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -701,6 +710,7 @@ async fn scenario_watch_variables(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -805,6 +815,7 @@ async fn scenario_multithreaded(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -884,6 +895,7 @@ async fn scenario_read_oneshot(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -986,6 +998,7 @@ async fn scenario_read_struct(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1083,6 +1096,7 @@ async fn scenario_read_poll(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();

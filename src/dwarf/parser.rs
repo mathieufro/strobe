@@ -169,8 +169,19 @@ impl DwarfParser {
     }
 
     pub fn parse_with_search_root(binary_path: &Path, search_root: Option<&Path>) -> Result<Self> {
+        Self::parse_with_options(binary_path, search_root, None)
+    }
+
+    pub fn parse_with_options(binary_path: &Path, search_root: Option<&Path>, symbols_path: Option<&Path>) -> Result<Self> {
         // Extract image base from the original binary (needed for ASLR adjustment)
         let image_base = Self::extract_image_base(binary_path).unwrap_or(0);
+
+        // If an explicit symbols path was provided, try it first
+        if let Some(sym_path) = symbols_path {
+            if let Some(parser) = Self::try_explicit_symbols(sym_path, binary_path, image_base)? {
+                return Ok(parser);
+            }
+        }
 
         // First try the binary itself
         if let Ok(mut parser) = Self::parse_file(binary_path) {
@@ -199,6 +210,38 @@ impl DwarfParser {
         }
 
         Err(Error::NoDebugSymbols)
+    }
+
+    /// Try to load DWARF from an explicitly provided symbols path.
+    /// Handles: direct DWARF files, .dSYM bundles (by structure, not extension), and
+    /// directories containing .dSYM bundles.
+    fn try_explicit_symbols(sym_path: &Path, binary_path: &Path, image_base: u64) -> Result<Option<Self>> {
+        // Try as direct DWARF/ELF file
+        if sym_path.is_file() {
+            if let Ok(mut parser) = Self::parse_file(sym_path) {
+                parser.image_base = image_base;
+                return Ok(Some(parser));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        if sym_path.is_dir() {
+            if let Some(binary_name) = binary_path.file_name() {
+                // Try as dSYM bundle structure (Contents/Resources/DWARF/<binary>)
+                // regardless of directory extension — the LLM may pass paths with
+                // any naming convention
+                if let Some(parser) = Self::try_dsym(sym_path, binary_name, image_base)? {
+                    return Ok(Some(parser));
+                }
+
+                // If it's a directory containing .dSYM bundles
+                if let Some(parser) = Self::search_dsym_in_root(sym_path, binary_name, image_base)? {
+                    return Ok(Some(parser));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Try to load DWARF from a specific .dSYM bundle path.

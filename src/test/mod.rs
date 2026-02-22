@@ -254,6 +254,7 @@ impl TestRunner {
             project_root.to_str().unwrap_or("."),
             Some(&combined_env),
             has_trace_patterns, // defer_resume: install hooks before running
+            None, // symbols_path: test runner uses automatic resolution
         ).await?;
 
         // Apply trace patterns BEFORE resuming the process

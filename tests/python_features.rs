@@ -94,6 +94,7 @@ async fn spawn_session(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();

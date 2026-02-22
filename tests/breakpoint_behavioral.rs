@@ -49,7 +49,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -119,7 +120,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -159,7 +161,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -192,7 +195,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -235,7 +239,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["threads".to_string()],
                 None, project_root, None, false,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -286,7 +291,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "100".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -334,7 +340,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 
@@ -379,7 +386,8 @@ async fn test_breakpoint_behavioral_suite() {
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
 

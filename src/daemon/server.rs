@@ -523,6 +523,7 @@ Read globals during function execution (requires DWARF symbols).
 - Do NOT use broad `@file:` patterns (`@file:src`). Be specific: `@file:parser.cpp`
 - If hookedFunctions: 0 → check for missing .dSYM, inline functions, or try `@file:` patterns
 - If hook limit warnings appear, narrow patterns — do NOT retry the same broad pattern
+- If you see SYMBOL_HINT in warnings: search for .dSYM bundles in the project (glob: `**/*.dSYM`), then stop session and re-launch with `symbolsPath` pointing to the found .dSYM
 
 ## Running Tests
 
@@ -614,7 +615,8 @@ Inspect the UI of a running process — accessibility tree and screenshots.
                         "args": { "type": "array", "items": { "type": "string" }, "description": "Command line arguments" },
                         "cwd": { "type": "string", "description": "Working directory" },
                         "projectRoot": { "type": "string", "description": "Root directory for user code detection" },
-                        "env": { "type": "object", "description": "Additional environment variables" }
+                        "env": { "type": "object", "description": "Additional environment variables" },
+                        "symbolsPath": { "type": "string", "description": "Explicit path to debug symbols (.dSYM bundle, DWARF file, or directory containing .dSYM bundles). Use when automatic symbol resolution fails." }
                     },
                     "required": ["command", "projectRoot"]
                 }),
@@ -1067,6 +1069,7 @@ Validation Limits (enforced):
             &req.project_root,
             req.env.as_ref(),
             false, // debug_launch: resume immediately
+            req.symbols_path.as_deref(),
         ).await {
             Ok(pid) => {
                 // Update PID now that we know it
@@ -1207,10 +1210,25 @@ Validation Limits (enforced):
                     Ok(result) => result,
                     Err(e) => {
                         tracing::warn!("Failed to update Frida patterns for {}: {}", session_id, e);
+                        let err_str = e.to_string();
+                        let mut warnings = vec![format!("Hook installation failed: {}", err_str)];
+
+                        // Guide the LLM to find symbols when automatic resolution fails
+                        if err_str.contains("NO_DEBUG_SYMBOLS") {
+                            warnings.push(
+                                "SYMBOL_HINT: Debug symbols not found automatically. To resolve: \
+                                 use your file search tools to find .dSYM bundles (glob pattern: \"**/*.dSYM\") \
+                                 in the project directory. Once found, stop this session with debug_session and \
+                                 re-launch with debug_launch including symbolsPath pointing to the .dSYM path. \
+                                 If no .dSYM exists, try running `dsymutil <binary_path>` to generate one, or \
+                                 ensure the binary is compiled with debug symbols (-g flag).".to_string()
+                            );
+                        }
+
                         crate::frida_collector::HookResult {
                             installed: 0,
                             matched: 0,
-                            warnings: vec![format!("Hook installation failed: {}", e)],
+                            warnings,
                         }
                     }
                 };

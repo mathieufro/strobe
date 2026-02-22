@@ -33,7 +33,8 @@ async fn test_phase2a_gap_suite() {
                 project_root,
                 None,
                 false,
-            )
+                None,
+        )
             .await
             .unwrap();
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid)
@@ -104,6 +105,7 @@ async fn test_phase2a_gap_suite() {
                 project_root,
                 None,
                 true, // defer_resume so we can install hooks first
+                None,
             )
             .await
             .unwrap();

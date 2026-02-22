@@ -82,6 +82,7 @@ async fn scenario_python_output_capture(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -141,6 +142,7 @@ async fn scenario_python_tracing(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -198,6 +200,7 @@ async fn scenario_python_pattern_matching(
             project_root,
             None,
             false,
+            None,
         )
         .await
         .unwrap();

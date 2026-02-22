@@ -447,6 +447,10 @@ impl SessionManager {
     /// If the binary was already parsed (or is being parsed), returns the cached handle.
     /// Failed parses are evicted from cache so that retries (e.g. after dsymutil) work.
     pub fn get_or_start_dwarf_parse(&self, binary_path: &str, search_root: Option<&str>) -> DwarfHandle {
+        self.get_or_start_dwarf_parse_with_symbols(binary_path, search_root, None)
+    }
+
+    pub fn get_or_start_dwarf_parse_with_symbols(&self, binary_path: &str, search_root: Option<&str>, symbols_path: Option<&str>) -> DwarfHandle {
         // Include mtime in cache key so rebuilds invalidate the cache
         let mtime = std::fs::metadata(binary_path)
             .and_then(|m| m.modified())
@@ -474,7 +478,7 @@ impl SessionManager {
             }
         }
 
-        let handle = DwarfHandle::spawn_parse(binary_path, search_root);
+        let handle = DwarfHandle::spawn_parse(binary_path, search_root, symbols_path);
         cache.insert(cache_key, handle.clone());
         handle
     }
@@ -494,6 +498,7 @@ impl SessionManager {
         project_root: &str,
         env: Option<&std::collections::HashMap<String, String>>,
         defer_resume: bool,
+        symbols_path: Option<&str>,
     ) -> Result<u32> {
         // Kill orphaned instances from previous runs (PPID == 1 means parent died).
         // Checks: exact binary name, known test fixtures, and target/debug/deps binaries.
@@ -508,7 +513,7 @@ impl SessionManager {
         let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
 
         // Start background DWARF parse (or get cached handle)
-        let dwarf_handle = self.get_or_start_dwarf_parse(command, Some(project_root));
+        let dwarf_handle = self.get_or_start_dwarf_parse_with_symbols(command, Some(project_root), symbols_path);
 
         // For native binaries, instantiate DwarfResolver once parse completes
         if language == Language::Native {

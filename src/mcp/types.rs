@@ -15,6 +15,10 @@ pub struct DebugLaunchRequest {
     pub project_root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Explicit path to debug symbols (.dSYM bundle or DWARF file).
+    /// Use when automatic symbol resolution fails in complex projects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbols_path: Option<String>,
 }
 
 impl DebugLaunchRequest {
@@ -527,6 +531,10 @@ pub struct DebugTestRequest {
     pub watches: Option<WatchUpdate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Explicit path to debug symbols (.dSYM bundle or DWARF file).
+    /// Use when automatic symbol resolution fails in complex projects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbols_path: Option<String>,
 }
 
 impl DebugTestRequest {

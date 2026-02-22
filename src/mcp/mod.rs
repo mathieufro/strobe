@@ -18,6 +18,7 @@ mod tests {
             cwd: None,
             project_root: "/home/user/project".to_string(),
             env: None,
+            symbols_path: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
