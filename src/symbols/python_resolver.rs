@@ -6,8 +6,10 @@ use rustpython_parser::{parse, ast, Mode};
 use super::resolver::*;
 
 pub struct PythonResolver {
-    /// Parsed function definitions: qualified_name → (file_path, line_number)
-    functions: HashMap<String, (PathBuf, u32)>,
+    /// Parsed function definitions: qualified_name → (file_path, def_line, body_first_line)
+    /// def_line: the `def` keyword line (used for tracing hooks matching co_firstlineno)
+    /// body_first_line: first executable line in the function body (used for breakpoints)
+    functions: HashMap<String, (PathBuf, u32, u32)>,
 }
 
 /// Directories to exclude from Python source scanning.
@@ -15,8 +17,8 @@ fn is_python_excluded(name: &str) -> bool {
     matches!(name,
         "__pycache__" | "venv" | ".venv" | "env" | ".env" |
         "node_modules" | ".git" | ".tox" | ".mypy_cache" |
-        ".pytest_cache" | "dist" | "build" | "*.egg-info"
-    )
+        ".pytest_cache" | "dist" | "build"
+    ) || name.ends_with(".egg-info") || name.ends_with(".dist-info")
 }
 
 /// Build a lookup table of byte-offset → 1-indexed line number.
@@ -39,10 +41,11 @@ fn offset_to_line(line_starts: &[u32], offset: u32) -> u32 {
 }
 
 /// Extract function/class method definitions from a Python source string.
+/// Returns: qualified_name → (file_path, def_line, body_first_line)
 pub fn extract_functions_from_source(
     source: &str,
     file_path: &Path,
-) -> crate::Result<HashMap<String, (PathBuf, u32)>> {
+) -> crate::Result<HashMap<String, (PathBuf, u32, u32)>> {
     let ast = parse(source, Mode::Module, "<input>")
         .map_err(|e| crate::Error::Internal(format!("Python parse error in {:?}: {}", file_path, e)))?;
 
@@ -59,7 +62,7 @@ fn extract_from_module(
     file_path: &Path,
     prefix: &[String],
     line_starts: &[u32],
-    functions: &mut HashMap<String, (PathBuf, u32)>,
+    functions: &mut HashMap<String, (PathBuf, u32, u32)>,
 ) {
     match module {
         ast::Mod::Module(m) => {
@@ -71,12 +74,52 @@ fn extract_from_module(
     }
 }
 
+/// Get the line number of the first statement in a function body.
+/// Falls back to def_line + 1 if the body is empty.
+fn body_first_line(body: &[ast::Stmt], line_starts: &[u32], def_line: u32) -> u32 {
+    body.first()
+        .map(|stmt| {
+            let offset = match stmt {
+                ast::Stmt::FunctionDef(f) => f.range.start().to_u32(),
+                ast::Stmt::AsyncFunctionDef(f) => f.range.start().to_u32(),
+                ast::Stmt::ClassDef(c) => c.range.start().to_u32(),
+                ast::Stmt::Return(r) => r.range.start().to_u32(),
+                ast::Stmt::Delete(d) => d.range.start().to_u32(),
+                ast::Stmt::Assign(a) => a.range.start().to_u32(),
+                ast::Stmt::AugAssign(a) => a.range.start().to_u32(),
+                ast::Stmt::AnnAssign(a) => a.range.start().to_u32(),
+                ast::Stmt::For(f) => f.range.start().to_u32(),
+                ast::Stmt::AsyncFor(f) => f.range.start().to_u32(),
+                ast::Stmt::While(w) => w.range.start().to_u32(),
+                ast::Stmt::If(i) => i.range.start().to_u32(),
+                ast::Stmt::With(w) => w.range.start().to_u32(),
+                ast::Stmt::AsyncWith(w) => w.range.start().to_u32(),
+                ast::Stmt::Match(m) => m.range.start().to_u32(),
+                ast::Stmt::Raise(r) => r.range.start().to_u32(),
+                ast::Stmt::Try(t) => t.range.start().to_u32(),
+                ast::Stmt::TryStar(t) => t.range.start().to_u32(),
+                ast::Stmt::Assert(a) => a.range.start().to_u32(),
+                ast::Stmt::Import(i) => i.range.start().to_u32(),
+                ast::Stmt::ImportFrom(i) => i.range.start().to_u32(),
+                ast::Stmt::Global(g) => g.range.start().to_u32(),
+                ast::Stmt::Nonlocal(n) => n.range.start().to_u32(),
+                ast::Stmt::Expr(e) => e.range.start().to_u32(),
+                ast::Stmt::Pass(p) => p.range.start().to_u32(),
+                ast::Stmt::Break(b) => b.range.start().to_u32(),
+                ast::Stmt::Continue(c) => c.range.start().to_u32(),
+                _ => return def_line + 1,
+            };
+            offset_to_line(line_starts, offset)
+        })
+        .unwrap_or(def_line + 1)
+}
+
 fn extract_from_stmt(
     stmt: &ast::Stmt,
     file_path: &Path,
     prefix: &[String],
     line_starts: &[u32],
-    functions: &mut HashMap<String, (PathBuf, u32)>,
+    functions: &mut HashMap<String, (PathBuf, u32, u32)>,
 ) {
     match stmt {
         ast::Stmt::FunctionDef(f) => {
@@ -85,11 +128,12 @@ fn extract_from_stmt(
             } else {
                 format!("{}.{}", prefix.join("."), f.name)
             };
-            let line = offset_to_line(line_starts, f.range.start().to_u32());
-            functions.insert(qualified_name.clone(), (file_path.to_path_buf(), line));
+            let def_line = offset_to_line(line_starts, f.range.start().to_u32());
+            let body_line = body_first_line(&f.body, line_starts, def_line);
+            functions.insert(qualified_name.clone(), (file_path.to_path_buf(), def_line, body_line));
 
             let mut new_prefix = prefix.to_vec();
-            new_prefix.push(qualified_name);
+            new_prefix.push(f.name.to_string());
             for nested_stmt in &f.body {
                 extract_from_stmt(nested_stmt, file_path, &new_prefix, line_starts, functions);
             }
@@ -100,11 +144,12 @@ fn extract_from_stmt(
             } else {
                 format!("{}.{}", prefix.join("."), f.name)
             };
-            let line = offset_to_line(line_starts, f.range.start().to_u32());
-            functions.insert(qualified_name.clone(), (file_path.to_path_buf(), line));
+            let def_line = offset_to_line(line_starts, f.range.start().to_u32());
+            let body_line = body_first_line(&f.body, line_starts, def_line);
+            functions.insert(qualified_name.clone(), (file_path.to_path_buf(), def_line, body_line));
 
             let mut new_prefix = prefix.to_vec();
-            new_prefix.push(qualified_name);
+            new_prefix.push(f.name.to_string());
             for nested_stmt in &f.body {
                 extract_from_stmt(nested_stmt, file_path, &new_prefix, line_starts, functions);
             }
@@ -141,13 +186,13 @@ impl PythonResolver {
                             // Qualify with module path relative to project_root
                             let rel = path.strip_prefix(project_root).unwrap_or(path);
                             let module_path = python_module_path(rel);
-                            for (name, (file, line)) in fns {
+                            for (name, (file, def_line, body_line)) in fns {
                                 let qualified = if module_path.is_empty() {
                                     name
                                 } else {
                                     format!("{}.{}", module_path, name)
                                 };
-                                all_functions.insert(qualified, (file, line));
+                                all_functions.insert(qualified, (file, def_line, body_line));
                             }
                         }
                     }
@@ -167,7 +212,7 @@ impl PythonResolver {
     #[cfg(test)]
     pub fn from_functions(fns: Vec<(String, (PathBuf, u32))>) -> Self {
         Self {
-            functions: fns.into_iter().collect(),
+            functions: fns.into_iter().map(|(name, (file, line))| (name, (file, line, line + 1))).collect(),
         }
     }
 }
@@ -187,12 +232,12 @@ impl SymbolResolver for PythonResolver {
         if pattern.starts_with("@file:") {
             let file_substr = &pattern[6..];
             return Ok(self.functions.iter()
-                .filter(|(_, (file, _))| {
+                .filter(|(_, (file, _, _))| {
                     file.to_string_lossy().contains(file_substr)
                 })
-                .map(|(name, (file, line))| ResolvedTarget::SourceLocation {
+                .map(|(name, (file, def_line, _body_line))| ResolvedTarget::SourceLocation {
                     file: file.to_string_lossy().to_string(),
-                    line: *line,
+                    line: *def_line,
                     name: name.clone(),
                 })
                 .collect());
@@ -202,9 +247,36 @@ impl SymbolResolver for PythonResolver {
         let matcher = crate::dwarf::PatternMatcher::new_with_separator(pattern, '.');
         Ok(self.functions.iter()
             .filter(|(name, _)| matcher.matches(name))
-            .map(|(name, (file, line))| ResolvedTarget::SourceLocation {
+            .map(|(name, (file, def_line, _body_line))| ResolvedTarget::SourceLocation {
                 file: file.to_string_lossy().to_string(),
-                line: *line,
+                line: *def_line,
+                name: name.clone(),
+            })
+            .collect())
+    }
+
+    /// For breakpoints, resolve to the first executable line in the function body,
+    /// not the `def` line. Python's sys.settrace 'line' events never fire on the
+    /// `def` line itself — only on executable lines within the body.
+    fn resolve_breakpoint_pattern(&self, pattern: &str, _project_root: &Path) -> crate::Result<Vec<ResolvedTarget>> {
+        if pattern.starts_with("@file:") {
+            let file_substr = &pattern[6..];
+            return Ok(self.functions.iter()
+                .filter(|(_, (file, _, _))| file.to_string_lossy().contains(file_substr))
+                .map(|(name, (file, _def_line, body_line))| ResolvedTarget::SourceLocation {
+                    file: file.to_string_lossy().to_string(),
+                    line: *body_line,
+                    name: name.clone(),
+                })
+                .collect());
+        }
+
+        let matcher = crate::dwarf::PatternMatcher::new_with_separator(pattern, '.');
+        Ok(self.functions.iter()
+            .filter(|(name, _)| matcher.matches(name))
+            .map(|(name, (file, _def_line, body_line))| ResolvedTarget::SourceLocation {
+                file: file.to_string_lossy().to_string(),
+                line: *body_line,
                 name: name.clone(),
             })
             .collect())
@@ -212,11 +284,11 @@ impl SymbolResolver for PythonResolver {
 
     fn resolve_line(&self, file: &str, line: u32) -> crate::Result<Option<ResolvedTarget>> {
         // For Python, file:line is directly usable — find matching function name
-        for (name, (func_file, func_line)) in &self.functions {
-            if func_file.to_string_lossy().contains(file) && *func_line == line {
+        for (name, (func_file, def_line, _body_line)) in &self.functions {
+            if func_file.to_string_lossy().contains(file) && *def_line == line {
                 return Ok(Some(ResolvedTarget::SourceLocation {
                     file: func_file.to_string_lossy().to_string(),
-                    line: *func_line,
+                    line: *def_line,
                     name: name.clone(),
                 }));
             }
@@ -322,12 +394,31 @@ def outer():
     }
 
     #[test]
+    fn test_extract_deeply_nested_functions() {
+        let source = r#"
+def outer():
+    def inner():
+        def deepest():
+            pass
+        return deepest
+    return inner
+"#;
+        let functions = extract_functions_from_source(source, Path::new("deep.py")).unwrap();
+        assert!(functions.contains_key("outer"));
+        assert!(functions.contains_key("outer.inner"));
+        assert!(functions.contains_key("outer.inner.deepest"),
+            "Depth-3 nesting should be outer.inner.deepest, got: {:?}", functions.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
     fn test_excluded_directories() {
         assert!(is_python_excluded("__pycache__"));
         assert!(is_python_excluded("venv"));
         assert!(is_python_excluded(".venv"));
         assert!(is_python_excluded("node_modules"));
         assert!(is_python_excluded(".git"));
+        assert!(is_python_excluded("mypackage.egg-info"));
+        assert!(is_python_excluded("foo.dist-info"));
         assert!(!is_python_excluded("modules"));
         assert!(!is_python_excluded("tests"));
     }

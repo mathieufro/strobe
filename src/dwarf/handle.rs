@@ -15,12 +15,21 @@ pub struct DwarfHandle {
 
 impl DwarfHandle {
     /// Start a background DWARF parse via `spawn_blocking`. Returns immediately.
-    pub fn spawn_parse(binary_path: &str) -> Self {
+    /// If `search_root` is provided, it will be searched for .dSYM bundles when
+    /// the binary doesn't have embedded DWARF (common on macOS).
+    /// If `symbols_path` is provided, it will be tried first (explicit dSYM or DWARF file).
+    pub fn spawn_parse(binary_path: &str, search_root: Option<&str>, symbols_path: Option<&str>) -> Self {
         let (tx, rx) = watch::channel(None);
         let path = binary_path.to_string();
+        let root = search_root.map(|s| s.to_string());
+        let sym_path = symbols_path.map(|s| s.to_string());
 
         tokio::task::spawn_blocking(move || {
-            let result = DwarfParser::parse(Path::new(&path))
+            let result = DwarfParser::parse_with_options(
+                    Path::new(&path),
+                    root.as_deref().map(Path::new),
+                    sym_path.as_deref().map(Path::new),
+                )
                 .map(Arc::new)
                 .map_err(|e| e.to_string());
             let _ = tx.send(Some(result));

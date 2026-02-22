@@ -105,12 +105,23 @@ unsafe fn session_raw_ptr(session: &frida::Session) -> *mut frida_sys::_FridaSes
 unsafe fn create_script_raw(
     session_ptr: *mut frida_sys::_FridaSession,
     source: &str,
+    language: Language,
 ) -> std::result::Result<*mut frida_sys::_FridaScript, String> {
     let source_cstr = CString::new(source).map_err(|e| format!("CString error: {}", e))?;
     let opt = frida_sys::frida_script_options_new();
     if opt.is_null() {
         return Err("Failed to create script options".to_string());
     }
+
+    // For JavaScript sessions, use V8 runtime so the agent runs inside
+    // Node.js's own V8 context (giving access to require, process, etc.)
+    if language == Language::JavaScript {
+        frida_sys::frida_script_options_set_runtime(
+            opt,
+            frida_sys::FridaScriptRuntime_FRIDA_SCRIPT_RUNTIME_V8,
+        );
+    }
+
     let mut error: *mut frida_sys::GError = std::ptr::null_mut();
 
     let script_ptr = frida_sys::frida_session_create_script_sync(
@@ -187,6 +198,8 @@ struct OutputContext {
     event_tx: mpsc::Sender<Event>,
     event_counter: AtomicU64,
     start_ns: i64,
+    /// Accumulated stderr output — shared with process_death_monitor for ASAN parsing.
+    stderr_buffer: Arc<Mutex<String>>,
 }
 
 /// Shared registry of active output contexts, keyed by PID.
@@ -231,6 +244,17 @@ unsafe extern "C" fn raw_on_output(
     }
 
     let event_type = if fd == 1 { EventType::Stdout } else { EventType::Stderr };
+
+    // Accumulate stderr for ASAN crash detection by process_death_monitor
+    if fd == 2 {
+        if let Ok(mut buf) = ctx.stderr_buffer.lock() {
+            // Cap at 2MB to handle large sanitizer reports (many thread backtraces)
+            if buf.len() < 2 * 1024 * 1024 {
+                buf.push_str(&text);
+            }
+        }
+    }
+
     let counter = ctx.event_counter.fetch_add(1, Ordering::Relaxed);
     let now_ns = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -248,7 +272,9 @@ unsafe extern "C" fn raw_on_output(
         ..Event::default()
     };
 
-    let _ = ctx.event_tx.try_send(event);
+    if let Err(e) = ctx.event_tx.try_send(event) {
+        tracing::warn!("Device output event dropped for PID {}: {}", ctx.pid, e);
+    }
 }
 
 /// Post a JSON message to a raw script.
@@ -330,7 +356,9 @@ impl AgentMessageHandler {
                                 self.crash_reported.store(true, Ordering::Release);
                                 tracing::info!("Crash event received from agent [{}]", self.session_id);
                             }
-                            let _ = self.event_tx.try_send(event);
+                            if let Err(e) = self.event_tx.try_send(event) {
+                                tracing::warn!("Agent trace event dropped for [{}]: {}", self.session_id, e);
+                            }
                         }
                     }
                 }
@@ -380,7 +408,7 @@ impl AgentMessageHandler {
                     tracing::debug!("[{}] Sampling stats: {} functions being sampled", self.session_id, sampling_count);
                 }
             }
-            "read_response" => {
+            "read_response" | "eval_response" => {
                 if let Ok(mut guard) = self.read_response.lock() {
                     if let Some(tx) = guard.take() {
                         let _ = tx.send(payload.clone());
@@ -813,6 +841,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     // -------------------------------------------------------
                     // Step 1: Spawn process — method depends on language type
                     // -------------------------------------------------------
+                    let stderr_buffer_outer = Arc::new(Mutex::new(String::new()));
                     let pid = if is_interpreted {
                         // Self-spawn for interpreted languages (Python, etc.)
                         //
@@ -931,6 +960,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             event_tx: event_tx.clone(),
                             event_counter: AtomicU64::new(0),
                             start_ns,
+                            stderr_buffer: stderr_buffer_outer.clone(),
                         });
                         if let Ok(mut reg) = output_registry.lock() {
                             reg.insert(pid, output_ctx);
@@ -961,10 +991,26 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             }
                         }
 
-                        if let Some(ref env_vars) = env {
+                        // Always build envp so we can inject sanitizer log_path.
+                        // Sanitizer output (ASAN/TSAN/UBSAN) is redirected to a temp file
+                        // for reliable capture — the agent's write(2) hook fails on ASAN
+                        // binaries, and Frida's device output signal may not drain all
+                        // pipe data before session cleanup after process death.
+                        {
                             let mut merged: std::collections::HashMap<String, String> = std::env::vars().collect();
-                            for (k, v) in env_vars.iter() {
-                                merged.insert(k.clone(), v.clone());
+                            if let Some(ref env_vars) = env {
+                                for (k, v) in env_vars.iter() {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                            }
+                            let sanitizer_log_path = format!("/tmp/.strobe-sanitizer-{}", session_id);
+                            for key in ["ASAN_OPTIONS", "TSAN_OPTIONS", "UBSAN_OPTIONS"] {
+                                let existing = merged.get(key).cloned().unwrap_or_default();
+                                let sep = if existing.is_empty() { "" } else { ":" };
+                                merged.insert(
+                                    key.to_string(),
+                                    format!("{}{}log_path={}", existing, sep, sanitizer_log_path),
+                                );
                             }
                             let env_tuples: Vec<(&str, &str)> = merged
                                 .iter()
@@ -1005,6 +1051,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() as i64,
+                            stderr_buffer: stderr_buffer_outer.clone(),
                         });
                         if let Ok(mut reg) = output_registry.lock() {
                             reg.insert(pid, output_ctx);
@@ -1060,7 +1107,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     // -------------------------------------------------------
                     let t = std::time::Instant::now();
                     let script_ptr = unsafe {
-                        create_script_raw(raw_session, AGENT_CODE)
+                        create_script_raw(raw_session, AGENT_CODE, language)
                             .map_err(|e| crate::Error::FridaAttachFailed(format!("Script creation failed: {}", e)))?
                     };
                     tracing::debug!("PERF: create_script took {:?}", t.elapsed());
@@ -1088,9 +1135,10 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
 
                     unsafe { register_handler_raw(script_ptr, handler) };
 
-                    unsafe {
-                        load_script_raw(script_ptr)
-                            .map_err(|e| crate::Error::FridaAttachFailed(format!("Script load failed: {}", e)))?;
+                    let load_result = unsafe { load_script_raw(script_ptr) };
+                    if let Err(e) = load_result {
+                        unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
+                        return Err(crate::Error::FridaAttachFailed(format!("Script load failed: {}", e)));
                     }
                     tracing::debug!("PERF: script load + handler setup took {:?}", t.elapsed());
 
@@ -1123,6 +1171,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as i64;
+                    let monitor_stderr_buffer = stderr_buffer_outer;
 
                     thread::spawn(move || {
                         process_death_monitor(
@@ -1131,6 +1180,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             monitor_event_tx,
                             monitor_crash_reported,
                             monitor_start_ns,
+                            monitor_stderr_buffer,
                         );
                     });
 
@@ -1510,18 +1560,30 @@ fn handle_remove_patterns(
     hooks_ready: &HooksReadySignal,
     functions: &[FunctionTarget],
 ) -> Result<u32> {
-    let func_list: Vec<serde_json::Value> = functions.iter().map(|f| {
-        let mut entry = serde_json::json!({
-            "address": format!("0x{:x}", f.address),
-        });
-        // Include function name for interpreted language hooks (identified by name, not address)
-        if let Some(ref name) = f.name_raw {
-            entry["funcName"] = serde_json::json!(name);
+    // Split targets: native (address > 0) vs interpreted (address == 0)
+    let mut native_funcs: Vec<serde_json::Value> = Vec::new();
+    let mut interpreted_targets: Vec<serde_json::Value> = Vec::new();
+
+    for f in functions {
+        if f.address == 0 {
+            // Interpreted language target (Python, etc.) — identified by file:line
+            interpreted_targets.push(serde_json::json!({
+                "file": f.source_file,
+                "line": f.line_number,
+                "name": f.name,
+            }));
         } else {
-            entry["funcName"] = serde_json::json!(f.name);
+            let mut entry = serde_json::json!({
+                "address": format!("0x{:x}", f.address),
+            });
+            if let Some(ref name) = f.name_raw {
+                entry["funcName"] = serde_json::json!(name);
+            } else {
+                entry["funcName"] = serde_json::json!(f.name);
+            }
+            native_funcs.push(entry);
         }
-        entry
-    }).collect();
+    }
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
     {
@@ -1529,11 +1591,18 @@ fn handle_remove_patterns(
         *guard = Some(signal_tx);
     }
 
-    let hooks_msg = serde_json::json!({
+    let mut hooks_msg = serde_json::json!({
         "type": "hooks",
         "action": "remove",
-        "functions": func_list,
     });
+
+    if !native_funcs.is_empty() {
+        hooks_msg["functions"] = serde_json::json!(native_funcs);
+    }
+
+    if !interpreted_targets.is_empty() {
+        hooks_msg["targets"] = serde_json::json!(interpreted_targets);
+    }
 
     unsafe {
         post_message_raw(script_ptr, &serde_json::to_string(&hooks_msg).unwrap())
@@ -1728,6 +1797,19 @@ fn handle_write_memory(
     Err(crate::Error::WriteFailed("Memory write timed out (5s)".to_string()))
 }
 
+/// Get the parent PID of a process.
+fn get_ppid(pid: u32) -> Option<u32> {
+    std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
+}
+
 /// Handle a child process spawned via fork/exec.
 /// Attaches Frida to the child, loads the agent, and registers it for output capture.
 fn handle_child_spawn(
@@ -1736,7 +1818,8 @@ fn handle_child_spawn(
     output_registry: &OutputRegistry,
     session_ptrs: &mut HashMap<u32, *mut frida_sys::_FridaSession>,
 ) {
-    // Find which session this child belongs to by checking the output registry
+    // Find which session this child belongs to by checking the output registry.
+    // Use the child's PPID to find the correct parent session.
     let parent_info = {
         let reg = match output_registry.lock() {
             Ok(g) => g,
@@ -1746,10 +1829,12 @@ fn handle_child_spawn(
                 return;
             }
         };
-        // Find any active session to associate the child with
-        reg.values()
-            .next()
-            .map(|ctx| (ctx.session_id.clone(), ctx.event_tx.clone(), ctx.start_ns))
+        // Look up by parent PID first, fall back to any session for single-session case
+        let ppid = get_ppid(child_pid);
+        let ctx = ppid
+            .and_then(|pp| reg.get(&pp))
+            .or_else(|| reg.values().next());
+        ctx.map(|c| (c.session_id.clone(), c.event_tx.clone(), c.start_ns))
     };
 
     let (session_id, event_tx, start_ns) = match parent_info {
@@ -1770,6 +1855,7 @@ fn handle_child_spawn(
         event_tx: event_tx.clone(),
         event_counter: AtomicU64::new(0),
         start_ns,
+        stderr_buffer: Arc::new(Mutex::new(String::new())),
     });
     if let Ok(mut reg) = output_registry.lock() {
         reg.insert(child_pid, output_ctx);
@@ -1783,7 +1869,8 @@ fn handle_child_spawn(
             session_ptrs.insert(child_pid, raw_session);
 
             // Create and load agent script in child
-            match unsafe { create_script_raw(raw_session, AGENT_CODE) } {
+            // Child processes from fork/exec use Native runtime (default)
+            match unsafe { create_script_raw(raw_session, AGENT_CODE, Language::Native) } {
                 Ok(script_ptr) => {
                     let hooks_ready: HooksReadySignal = Arc::new(Mutex::new(None));
                     let read_response: ReadResponseSignal = Arc::new(Mutex::new(None));
@@ -1805,6 +1892,7 @@ fn handle_child_spawn(
                         register_handler_raw(script_ptr, handler);
                         if let Err(e) = load_script_raw(script_ptr) {
                             tracing::error!("Failed to load script in child {}: {}", child_pid, e);
+                            frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void);
                             let _ = device.resume(child_pid);
                             return;
                         }
@@ -1972,15 +2060,15 @@ fn resolve_pattern<'a>(
 
 /// Monitor a spawned process for crash detection.
 /// When the process dies, checks for a crash file written by the agent's
-/// exception handler (synchronous native I/O). Falls back to waitpid
-/// for basic signal info. This ensures crash events are captured even when
-/// GLib can't flush the agent's async send() before the OS kills the process.
+/// exception handler (synchronous native I/O). Falls back to ASAN parsing
+/// from stderr, then waitpid for basic signal info.
 fn process_death_monitor(
     pid: u32,
     session_id: String,
     event_tx: mpsc::Sender<Event>,
     crash_reported: Arc<AtomicBool>,
     start_ns: i64,
+    stderr_buffer: Arc<Mutex<String>>,
 ) {
     // Poll until process is dead
     loop {
@@ -1991,6 +2079,42 @@ fn process_death_monitor(
 
     // Give the agent's async crash event time to arrive via GLib
     std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Check for sanitizer log file (written via ASAN_OPTIONS=log_path=...).
+    // This is the primary sanitizer capture path — the agent's write(2) hook
+    // fails on ASAN binaries, and Frida's device output signal may not drain
+    // all pipe data on process death. The log file is always complete.
+    let sanitizer_log_path = format!("/tmp/.strobe-sanitizer-{}.{}", session_id, pid);
+    let sanitizer_output = std::fs::read_to_string(&sanitizer_log_path)
+        .ok()
+        .filter(|s| !s.is_empty());
+    if sanitizer_output.is_some() {
+        let _ = std::fs::remove_file(&sanitizer_log_path);
+    }
+
+    if let Some(ref output) = sanitizer_output {
+        let now_ns = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64) - start_ns;
+
+        tracing::info!(
+            "Read sanitizer log file for PID {} [{}] ({} bytes)",
+            pid, session_id, output.len()
+        );
+
+        // Emit the full sanitizer report as a stderr event so it's queryable
+        let event = Event {
+            id: format!("{}-sanitizer-output-{}", session_id, chrono::Utc::now().timestamp_millis()),
+            session_id: session_id.clone(),
+            timestamp_ns: now_ns,
+            event_type: EventType::Stderr,
+            text: Some(output.clone()),
+            pid: Some(pid),
+            ..Event::default()
+        };
+        let _ = event_tx.try_send(event);
+    }
 
     // If agent already reported the crash via the normal GLib path, just clean up
     if crash_reported.load(Ordering::Acquire) {
@@ -2017,6 +2141,35 @@ fn process_death_monitor(
             }
         }
         tracing::warn!("Crash file for PID {} exists but couldn't be parsed", pid);
+    }
+
+    // Parse sanitizer log file for structured crash event (if we have it)
+    if let Some(ref output) = sanitizer_output {
+        if let Some(crash_event) = parse_sanitizer_crash(output, pid, &session_id, start_ns) {
+            tracing::info!(
+                "Sanitizer crash detected from log file for PID {} [{}]: {}",
+                pid, session_id,
+                crash_event.exception_type.as_deref().unwrap_or("unknown")
+            );
+            let _ = event_tx.try_send(crash_event);
+            return;
+        }
+    }
+
+    // Check stderr buffer for sanitizer output (fallback for cases where
+    // log_path wasn't set or sanitizer wrote to stderr directly)
+    let stderr_snapshot = stderr_buffer.lock().ok()
+        .map(|buf| buf.clone())
+        .unwrap_or_default();
+
+    if let Some(crash_event) = parse_sanitizer_crash(&stderr_snapshot, pid, &session_id, start_ns) {
+        tracing::info!(
+            "Sanitizer crash detected from stderr for PID {} [{}]: {}",
+            pid, session_id,
+            crash_event.exception_type.as_deref().unwrap_or("unknown")
+        );
+        let _ = event_tx.try_send(crash_event);
+        return;
     }
 
     // Last resort: check waitpid for signal-based termination
@@ -2066,6 +2219,173 @@ fn process_death_monitor(
     } else {
         tracing::debug!("Process {} already reaped (waitpid returned {})", pid, result);
     }
+}
+
+/// Parse sanitizer (ASAN/TSAN/UBSAN/MSAN) crash information from stderr output.
+/// Returns a synthetic crash event if sanitizer output is detected.
+fn parse_sanitizer_crash(
+    stderr: &str,
+    pid: u32,
+    session_id: &str,
+    start_ns: i64,
+) -> Option<Event> {
+    // Match: ==PID==ERROR: AddressSanitizer: SEGV on unknown address 0x... (pc 0x... ... T0)
+    // Also matches ThreadSanitizer, MemorySanitizer, UndefinedBehaviorSanitizer
+    let error_line = stderr.lines().find(|line| {
+        line.contains("ERROR: AddressSanitizer:") ||
+        line.contains("ERROR: ThreadSanitizer:") ||
+        line.contains("ERROR: MemorySanitizer:") ||
+        line.contains("ERROR: UndefinedBehaviorSanitizer:")
+    })?;
+
+    // Extract sanitizer type and error type from the ERROR line
+    // e.g. "==12345==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000"
+    let sanitizer_name = if error_line.contains("AddressSanitizer") {
+        "AddressSanitizer"
+    } else if error_line.contains("ThreadSanitizer") {
+        "ThreadSanitizer"
+    } else if error_line.contains("MemorySanitizer") {
+        "MemorySanitizer"
+    } else {
+        "UndefinedBehaviorSanitizer"
+    };
+
+    // Extract error type: text after "Sanitizer: " up to " on" or end of line
+    let error_type = error_line
+        .split(&format!("{}: ", sanitizer_name))
+        .nth(1)
+        .map(|rest| {
+            // Take up to " on " or end of line
+            rest.split(" on ").next().unwrap_or(rest).trim().to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Map sanitizer error types to signal names
+    let signal = match error_type.as_str() {
+        "SEGV" | "access-violation" => "access-violation",
+        "heap-use-after-free" | "heap-buffer-overflow" | "stack-buffer-overflow"
+        | "global-buffer-overflow" | "stack-use-after-return" | "stack-use-after-scope"
+        | "use-after-poison" => "abort",
+        "double-free" | "alloc-dealloc-mismatch" | "new-delete-type-mismatch" => "abort",
+        _ => "abort", // Most sanitizer errors end in abort()
+    };
+
+    // Extract fault address: "on unknown address 0x..." or "on address 0x..."
+    let fault_address = error_line
+        .split("address ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|s| s.to_string());
+
+    // Extract thread ID: "... T0)" or "... T1)"
+    let thread_id: i64 = error_line
+        .rfind(" T")
+        .and_then(|pos| {
+            let rest = &error_line[pos + 2..];
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            num_str.parse::<i64>().ok()
+        })
+        .unwrap_or(0);
+
+    // Parse backtrace frames: "    #N 0xADDR in FUNC FILE:LINE"
+    let mut backtrace_frames: Vec<serde_json::Value> = Vec::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        // Parse: "#0 0x102abc123 in functionName /path/to/file.cpp:42"
+        // or:    "#0 0x102abc123 in functionName (/path/to/lib+0x1234)"
+        let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let rest = parts[1]; // "0xADDR in FUNC FILE:LINE"
+        let addr_end = rest.find(' ').unwrap_or(rest.len());
+        let address = &rest[..addr_end];
+
+        let mut func_name = String::new();
+        let mut source_file = String::new();
+        let mut line_number = 0i32;
+
+        if let Some(in_pos) = rest.find(" in ") {
+            let after_in = &rest[in_pos + 4..];
+            // Function name ends at the next space (before file path)
+            if let Some(space_pos) = after_in.rfind(" /") {
+                func_name = after_in[..space_pos].trim().to_string();
+                let file_part = after_in[space_pos + 1..].trim();
+                // Split "file:line" or "file:line:col"
+                if let Some(colon_pos) = file_part.rfind(':') {
+                    let maybe_num = &file_part[colon_pos + 1..];
+                    if let Ok(n) = maybe_num.parse::<i32>() {
+                        line_number = n;
+                        let before_colon = &file_part[..colon_pos];
+                        // Check for another colon (file:line vs file:line:col)
+                        if let Some(colon2) = before_colon.rfind(':') {
+                            if let Ok(n2) = before_colon[colon2 + 1..].parse::<i32>() {
+                                line_number = n2;
+                                source_file = before_colon[..colon2].to_string();
+                            } else {
+                                source_file = before_colon.to_string();
+                            }
+                        } else {
+                            source_file = before_colon.to_string();
+                        }
+                    } else {
+                        source_file = file_part.to_string();
+                    }
+                } else {
+                    source_file = file_part.to_string();
+                }
+            } else if let Some(paren_pos) = after_in.find(" (") {
+                func_name = after_in[..paren_pos].trim().to_string();
+            } else {
+                func_name = after_in.trim().to_string();
+            }
+        }
+
+        let mut frame = serde_json::json!({
+            "address": address,
+        });
+        if !func_name.is_empty() {
+            frame["function"] = serde_json::json!(func_name);
+        }
+        if !source_file.is_empty() {
+            frame["sourceFile"] = serde_json::json!(source_file);
+        }
+        if line_number > 0 {
+            frame["line"] = serde_json::json!(line_number);
+        }
+        backtrace_frames.push(frame);
+    }
+
+    // Extract SUMMARY line for the exception message
+    let summary = stderr.lines()
+        .find(|line| line.contains("SUMMARY:"))
+        .map(|line| {
+            line.split("SUMMARY: ").nth(1).unwrap_or(line).trim().to_string()
+        })
+        .unwrap_or_else(|| format!("{}: {}", sanitizer_name, error_type));
+
+    let now_ns = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64) - start_ns;
+
+    Some(Event {
+        id: format!("{}-crash-asan-{}", session_id, chrono::Utc::now().timestamp_millis()),
+        session_id: session_id.to_string(),
+        timestamp_ns: now_ns,
+        event_type: EventType::Crash,
+        signal: Some(signal.to_string()),
+        fault_address,
+        thread_id,
+        pid: Some(pid),
+        exception_type: Some(format!("{}: {}", sanitizer_name, error_type)),
+        exception_message: Some(summary),
+        backtrace: if backtrace_frames.is_empty() { None } else { Some(serde_json::json!(backtrace_frames)) },
+        ..Event::default()
+    })
 }
 
 /// Session state on the main thread

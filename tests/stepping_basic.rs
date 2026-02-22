@@ -15,11 +15,12 @@ async fn test_stepping_suite() {
     // --- Test 1: Step-over basic ---
     {
         let session_id = "step-over-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp_result = sm
             .set_breakpoint_async(
@@ -49,11 +50,12 @@ async fn test_stepping_suite() {
     // --- Test 2: Step-into basic ---
     {
         let session_id = "step-into-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp_result = sm
             .set_breakpoint_async(
@@ -81,11 +83,12 @@ async fn test_stepping_suite() {
     // --- Test 3: Step-out basic ---
     {
         let session_id = "step-out-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp_result = sm
             .set_breakpoint_async(
@@ -115,11 +118,12 @@ async fn test_stepping_suite() {
     // --- Test 4: Continue action validation ---
     {
         let session_id = "validation-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let _bp = sm
             .set_breakpoint_async(
@@ -147,11 +151,12 @@ async fn test_stepping_suite() {
     // --- Test 5: Continue with no paused threads ---
     {
         let session_id = "no-pause-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let result = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
         assert!(result.is_err(), "Should fail when no threads are paused");
@@ -165,11 +170,12 @@ async fn test_stepping_suite() {
     // --- Test 6: Logpoint basic ---
     {
         let session_id = "logpoint-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let lp_result = sm
             .set_logpoint_async(
@@ -208,11 +214,12 @@ async fn test_stepping_suite() {
     // --- Test 7: Multiple breakpoints ---
     {
         let session_id = "multi-bp-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false)
+            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp1 = sm
             .set_breakpoint_async(session_id, Some("bp-1".to_string()), Some("main".to_string()), None, None, None, None)

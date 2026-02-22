@@ -8,6 +8,13 @@ mod macos_tests {
     use super::common::*;
     use std::time::Duration;
 
+    /// Serialize integration tests that spawn the UI test app via Frida.
+    /// Concurrent Frida spawns of GUI apps + macOS AX queries deadlock.
+    fn ui_integration_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     // ---- Unit-level tests (no app needed) ----
 
     #[test]
@@ -23,18 +30,21 @@ mod macos_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ax_tree_from_test_app() {
+        let _guard = ui_integration_lock().lock().await;
         // Launch UI test app
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-ax-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Give the app time to render its window and fully initialize AX tree
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -78,17 +88,20 @@ mod macos_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_screenshot_capture() {
+        let _guard = ui_integration_lock().lock().await;
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-screenshot-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait longer for window to be fully visible and rendered
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -127,17 +140,20 @@ mod macos_tests {
     /// The first query is slower due to permission checks and AX cache warming.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ax_query_latency_reasonable() {
+        let _guard = ui_integration_lock().lock().await;
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-latency-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait for app to fully initialize
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -314,18 +330,21 @@ mod macos_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_screenshot_with_vision_format() {
+        let _guard = ui_integration_lock().lock().await;
         // Test that screenshots can be base64-encoded for vision sidecar
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-vision-format-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
+        None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait longer for window to be fully visible and rendered
         tokio::time::sleep(Duration::from_secs(3)).await;

@@ -15,6 +15,10 @@ pub struct DebugLaunchRequest {
     pub project_root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Explicit path to debug symbols (.dSYM bundle or DWARF file).
+    /// Use when automatic symbol resolution fails in complex projects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbols_path: Option<String>,
 }
 
 impl DebugLaunchRequest {
@@ -196,7 +200,7 @@ impl DebugTraceRequest {
 
 // ============ debug_query ============
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventTypeFilter {
     FunctionEnter,
@@ -294,6 +298,9 @@ pub struct DebugQueryResponse {
     /// True if FIFO eviction happened since the cursor position
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_dropped: Option<bool>,
+    /// Crash event, if the process crashed. Always included regardless of eventType filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crash: Option<serde_json::Value>,
 }
 
 // ============ debug_stop ============
@@ -524,6 +531,10 @@ pub struct DebugTestRequest {
     pub watches: Option<WatchUpdate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Explicit path to debug symbols (.dSYM bundle or DWARF file).
+    /// Use when automatic symbol resolution fails in complex projects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbols_path: Option<String>,
 }
 
 impl DebugTestRequest {
@@ -1343,6 +1354,7 @@ pub struct UiStats {
 pub struct DebugUiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree: Option<String>,
+    /// Absolute path to the saved PNG screenshot file (in `<projectRoot>/screenshots/`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1969,6 +1981,7 @@ mod query_pagination_tests {
             pids: None,
             last_event_id: Some(99),
             events_dropped: Some(false),
+            crash: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["lastEventId"], 99);
@@ -2160,6 +2173,7 @@ mod session_consolidation_tests {
             logpoints: vec![],
             watches: vec![],
             paused_threads: vec![],
+            crash_info: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "running");

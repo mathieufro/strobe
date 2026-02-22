@@ -523,11 +523,13 @@ Read globals during function execution (requires DWARF symbols).
 - Do NOT use broad `@file:` patterns (`@file:src`). Be specific: `@file:parser.cpp`
 - If hookedFunctions: 0 → check for missing .dSYM, inline functions, or try `@file:` patterns
 - If hook limit warnings appear, narrow patterns — do NOT retry the same broad pattern
+- If you see SYMBOL_HINT in warnings: search for .dSYM bundles in the project (glob: `**/*.dSYM`), then stop session and re-launch with `symbolsPath` pointing to the found .dSYM
 
 ## Running Tests
 
 ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
 Tests always run inside Frida, so you can add traces at any time without restarting.
+IMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test calls in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.
 
 `debug_test` returns immediately with a `testRunId`. Poll with `debug_test({ action: \"status\", testRunId })`.
 The server blocks up to 15s waiting for completion, so it's safe to call immediately after each response.
@@ -576,8 +578,8 @@ Read/write variables in a running process without setting up traces:
 Inspect the UI of a running process — accessibility tree and screenshots.
 
 - `debug_ui({ sessionId, mode: \"tree\" })` — accessibility tree as compact text
-- `debug_ui({ sessionId, mode: \"screenshot\" })` — base64-encoded PNG of the window
-- `debug_ui({ sessionId, mode: \"both\" })` — tree + screenshot in one call
+- `debug_ui({ sessionId, mode: \"screenshot\" })` — PNG saved to `<projectRoot>/screenshots/`, returns file path
+- `debug_ui({ sessionId, mode: \"both\" })` — tree + screenshot file in one call
 - `debug_ui({ sessionId, mode: \"tree\", verbose: true })` — JSON format instead of compact text
 
 ### Output Format (compact text, default)
@@ -613,7 +615,8 @@ Inspect the UI of a running process — accessibility tree and screenshots.
                         "args": { "type": "array", "items": { "type": "string" }, "description": "Command line arguments" },
                         "cwd": { "type": "string", "description": "Working directory" },
                         "projectRoot": { "type": "string", "description": "Root directory for user code detection" },
-                        "env": { "type": "object", "description": "Additional environment variables" }
+                        "env": { "type": "object", "description": "Additional environment variables" },
+                        "symbolsPath": { "type": "string", "description": "Explicit path to debug symbols (.dSYM bundle, DWARF file, or directory containing .dSYM bundles). Use when automatic symbol resolution fails." }
                     },
                     "required": ["command", "projectRoot"]
                 }),
@@ -832,7 +835,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nIMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test runs in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n\nUse this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -858,7 +861,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_ui".to_string(),
-                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and/or a screenshot. Use mode to select output.".to_string(),
+                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and/or a screenshot saved as PNG to <projectRoot>/screenshots/. Use mode to select output.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -933,6 +936,16 @@ Validation Limits (enforced):
             pending.remove(connection_id);
         }
 
+        // Collect test session IDs so we can retain their DB data
+        // (the spawned task may still need events for final output)
+        let test_session_ids: HashSet<String> = {
+            let runs = self.test_runs.read().await;
+            runs.values()
+                .filter(|r| r.connection_id == connection_id)
+                .filter_map(|r| r.session_id.clone())
+                .collect()
+        };
+
         // Stop any sessions owned by this connection
         let session_ids = {
             let mut sessions = self.connection_sessions.write().await;
@@ -944,7 +957,27 @@ Validation Limits (enforced):
                 if session.status == crate::db::SessionStatus::Running {
                     tracing::info!("Cleaning up session {} after client disconnect", session_id);
                     let _ = self.session_manager.stop_frida(&session_id).await;
-                    let _ = self.session_manager.stop_session(&session_id).await;
+                    if test_session_ids.contains(&session_id) {
+                        // Retain DB data — spawned task needs events for final output
+                        let _ = self.session_manager.stop_session_retain(&session_id).await;
+                    } else {
+                        let _ = self.session_manager.stop_session(&session_id).await;
+                    }
+                }
+            }
+        }
+
+        // Transition running test runs from this connection to Failed
+        {
+            let mut runs = self.test_runs.write().await;
+            for run in runs.values_mut() {
+                if run.connection_id == connection_id {
+                    if matches!(&run.state, crate::test::TestRunState::Running { .. }) {
+                        run.state = crate::test::TestRunState::Failed {
+                            error: "Client disconnected".to_string(),
+                            completed_at: std::time::Instant::now(),
+                        };
+                    }
                 }
             }
         }
@@ -964,6 +997,13 @@ Validation Limits (enforced):
             return Err(crate::Error::ValidationError(
                 "projectRoot must not contain '..' components".to_string()
             ));
+        }
+        if let Some(ref sp) = req.symbols_path {
+            if sp.contains("..") {
+                return Err(crate::Error::ValidationError(
+                    "symbolsPath must not contain '..' components".to_string()
+                ));
+            }
         }
 
         // Enforce global session limit
@@ -1036,6 +1076,7 @@ Validation Limits (enforced):
             &req.project_root,
             req.env.as_ref(),
             false, // debug_launch: resume immediately
+            req.symbols_path.as_deref(),
         ).await {
             Ok(pid) => {
                 // Update PID now that we know it
@@ -1176,10 +1217,25 @@ Validation Limits (enforced):
                     Ok(result) => result,
                     Err(e) => {
                         tracing::warn!("Failed to update Frida patterns for {}: {}", session_id, e);
+                        let err_str = e.to_string();
+                        let mut warnings = vec![format!("Hook installation failed: {}", err_str)];
+
+                        // Guide the LLM to find symbols when automatic resolution fails
+                        if err_str.contains("NO_DEBUG_SYMBOLS") {
+                            warnings.push(
+                                "SYMBOL_HINT: Debug symbols not found automatically. To resolve: \
+                                 use your file search tools to find .dSYM bundles (glob pattern: \"**/*.dSYM\") \
+                                 in the project directory. Once found, stop this session with debug_session and \
+                                 re-launch with debug_launch including symbolsPath pointing to the .dSYM path. \
+                                 If no .dSYM exists, try running `dsymutil <binary_path>` to generate one, or \
+                                 ensure the binary is compiled with debug symbols (-g flag).".to_string()
+                            );
+                        }
+
                         crate::frida_collector::HookResult {
                             installed: 0,
                             matched: 0,
-                            warnings: vec![format!("Hook installation failed: {}", e)],
+                            warnings,
                         }
                     }
                 };
@@ -1260,6 +1316,7 @@ Validation Limits (enforced):
                                     on_patterns: on_patterns.clone(),
                                     is_expr: false,
                                     expr: None,
+                                    no_slide: true,
                                 });
 
                                 active_watches.push(crate::mcp::ActiveWatch {
@@ -1364,6 +1421,7 @@ Validation Limits (enforced):
                                 on_patterns: on_patterns.clone(),
                                 is_expr: false,
                                 expr: None,
+                                no_slide: false,
                             });
 
                             active_watches.push(crate::mcp::ActiveWatch {
@@ -1398,7 +1456,7 @@ Validation Limits (enforced):
                                 deref_offset: w.deref_offset,
                                 type_name: w.type_name.clone(),
                                 on_patterns: w.on_patterns.clone(),
-                                no_slide: false,
+                                no_slide: w.no_slide,
                             }
                         }).collect();
 
@@ -1607,6 +1665,16 @@ Validation Limits (enforced):
             None
         };
 
+        // Always check for crash events regardless of eventType filter
+        let crash = if req.event_type.as_ref() != Some(&EventTypeFilter::Crash) {
+            let crash_events = self.session_manager.db().query_events(&req.session_id, |q| {
+                q.event_type(crate::db::EventType::Crash).limit(1)
+            }).unwrap_or_default();
+            crash_events.first().map(|e| format_event(e, true))
+        } else {
+            None // Already included in the main events list
+        };
+
         let pids = self.session_manager.get_all_pids(&req.session_id);
         let response = DebugQueryResponse {
             events: event_values,
@@ -1615,6 +1683,7 @@ Validation Limits (enforced):
             pids: if pids.len() > 1 { Some(pids) } else { None },
             last_event_id,
             events_dropped,
+            crash,
         };
 
         Ok(serde_json::to_value(response)?)
@@ -1780,32 +1849,7 @@ Validation Limits (enforced):
 
         let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
 
-        // Lifecycle guardrail: kill any still-running test sessions before starting a new one.
-        // This prevents resource leaks from stuck/abandoned tests and ensures a clean slate.
-        {
-            let runs = self.test_runs.read().await;
-            let stale_session_ids: Vec<String> = runs.values()
-                .filter(|run| matches!(&run.state, crate::test::TestRunState::Running { .. }))
-                .filter_map(|run| run.session_id.clone())
-                .collect();
-            drop(runs);
-
-            for sid in &stale_session_ids {
-                tracing::warn!("Killing stale test session {} before new test run", sid);
-                let _ = self.session_manager.stop_frida(sid).await;
-                let _ = self.session_manager.stop_session(sid);
-            }
-
-            // Remove killed runs from the map
-            if !stale_session_ids.is_empty() {
-                let mut runs = self.test_runs.write().await;
-                runs.retain(|_, run| {
-                    !matches!(&run.state, crate::test::TestRunState::Running { .. })
-                });
-            }
-        }
-
-        // Detect framework name for the start response
+        // Detect framework name for the start response (outside lock)
         let runner = crate::test::TestRunner::new();
         let project_root_path = std::path::Path::new(&req.project_root);
         let framework_name = runner.detect_adapter(
@@ -1814,34 +1858,55 @@ Validation Limits (enforced):
             req.command.as_deref(),
         )?.name().to_string();
 
-        // Create shared progress tracker
+        // Create shared progress tracker (outside lock)
         let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test::TestProgress::new()));
+        let progress_clone = std::sync::Arc::clone(&progress);
         let test_run_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-
-        // Generate session_id upfront so it's available in TestRun immediately
         let session_id = format!("test-{}-{}", framework_name, &uuid::Uuid::new_v4().to_string()[..8]);
 
-        // Clone everything needed for the spawned task
-        let progress_clone = std::sync::Arc::clone(&progress);
-        let session_manager = std::sync::Arc::clone(&self.session_manager);
-        let connection_id_owned = connection_id.to_string();
-        let session_id_clone = session_id.clone();
-        let run_id = test_run_id.clone();
-        let test_runs = std::sync::Arc::clone(&self.test_runs);
-        let req_clone = req.clone();
-
-        // Insert Running state BEFORE spawning to avoid race where task
-        // completes before the entry exists in the map.
+        // Atomic check + insert under a single write lock (fixes TOCTOU race)
         {
             let mut runs = self.test_runs.write().await;
+
+            // Per-connection: only one running test per connection
+            if let Some(running) = runs.values().find(|run| {
+                run.connection_id == connection_id
+                    && matches!(&run.state, crate::test::TestRunState::Running { .. })
+            }) {
+                return Err(crate::Error::TestAlreadyRunning(running.id.clone()));
+            }
+
+            // Per-project: only one running test per project_root (avoids cargo lock conflicts)
+            if let Some(running) = runs.values().find(|run| {
+                run.project_root == req.project_root
+                    && matches!(&run.state, crate::test::TestRunState::Running { .. })
+            }) {
+                return Err(crate::Error::TestAlreadyRunning(running.id.clone()));
+            }
+
             runs.insert(test_run_id.clone(), crate::test::TestRun {
                 id: test_run_id.clone(),
                 state: crate::test::TestRunState::Running { progress },
                 fetched: false,
-                session_id: Some(session_id),
+                session_id: Some(session_id.clone()),
                 project_root: req.project_root.clone(),
+                connection_id: connection_id.to_string(),
             });
         }
+
+        // Register test session for disconnect cleanup
+        {
+            let mut sessions = self.connection_sessions.write().await;
+            sessions.entry(connection_id.to_string()).or_default().push(session_id.clone());
+        }
+
+        // Clone everything needed for the spawned task
+        let session_manager = std::sync::Arc::clone(&self.session_manager);
+        let connection_id_owned = connection_id.to_string();
+        let session_id_clone = session_id;
+        let run_id = test_run_id.clone();
+        let test_runs = std::sync::Arc::clone(&self.test_runs);
+        let req_clone = req.clone();
 
         tokio::spawn(async move {
             let runner = crate::test::TestRunner::new();
@@ -2102,20 +2167,34 @@ Validation Limits (enforced):
     }
 
     async fn cleanup_stale_test_runs(&self) {
-        let mut runs = self.test_runs.write().await;
-        let now = std::time::Instant::now();
-        runs.retain(|_id, run| {
-            match &run.state {
-                crate::test::TestRunState::Running { .. } => true,
-                crate::test::TestRunState::Completed { completed_at, .. }
-                | crate::test::TestRunState::Failed { completed_at, .. } => {
-                    let age = now.duration_since(*completed_at);
-                    let expired = (run.fetched && age > Duration::from_secs(300))
-                        || age > Duration::from_secs(1800);
-                    !expired
+        let mut sessions_to_delete: Vec<String> = Vec::new();
+
+        {
+            let mut runs = self.test_runs.write().await;
+            let now = std::time::Instant::now();
+            runs.retain(|_id, run| {
+                match &run.state {
+                    crate::test::TestRunState::Running { .. } => true,
+                    crate::test::TestRunState::Completed { completed_at, .. }
+                    | crate::test::TestRunState::Failed { completed_at, .. } => {
+                        let age = now.duration_since(*completed_at);
+                        let expired = (run.fetched && age > Duration::from_secs(300))
+                            || age > Duration::from_secs(1800);
+                        if expired {
+                            if let Some(ref sid) = run.session_id {
+                                sessions_to_delete.push(sid.clone());
+                            }
+                        }
+                        !expired
+                    }
                 }
-            }
-        });
+            });
+        }
+
+        // Clean up retained DB sessions outside the lock
+        for sid in sessions_to_delete {
+            let _ = self.session_manager.db().delete_session(&sid);
+        }
     }
 
     // Phase 2: Active debugging tools
@@ -2356,7 +2435,7 @@ Validation Limits (enforced):
             }
         }
 
-        // Capture screenshot
+        // Capture screenshot → write PNG file to <project_root>/screenshots/
         if needs_screenshot {
             #[cfg(target_os = "macos")]
             {
@@ -2365,8 +2444,23 @@ Validation Limits (enforced):
                     crate::ui::capture::capture_window_screenshot(pid)
                 }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
 
-                use base64::Engine;
-                screenshot_output = Some(base64::engine::general_purpose::STANDARD.encode(&png_bytes));
+                let screenshots_dir = std::path::PathBuf::from(&session.project_root).join("screenshots");
+                std::fs::create_dir_all(&screenshots_dir).map_err(|e| {
+                    crate::Error::Internal(format!("Failed to create screenshots directory: {}", e))
+                })?;
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let filename = format!("{}.png", timestamp);
+                let file_path = screenshots_dir.join(&filename);
+
+                std::fs::write(&file_path, &png_bytes).map_err(|e| {
+                    crate::Error::Internal(format!("Failed to write screenshot: {}", e))
+                })?;
+
+                screenshot_output = Some(file_path.to_string_lossy().to_string());
             }
 
             #[cfg(not(target_os = "macos"))]

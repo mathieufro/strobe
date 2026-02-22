@@ -3,6 +3,9 @@ pub mod cargo_adapter;
 pub mod catch2_adapter;
 pub mod pytest_adapter;
 pub mod unittest_adapter;
+pub mod vitest_adapter;
+pub mod jest_adapter;
+pub mod bun_adapter;
 pub mod stacks;
 pub mod stuck_detector;
 pub mod output;
@@ -18,6 +21,9 @@ use cargo_adapter::CargoTestAdapter;
 use catch2_adapter::Catch2Adapter;
 use pytest_adapter::PytestAdapter;
 use unittest_adapter::UnittestAdapter;
+use vitest_adapter::VitestAdapter;
+use jest_adapter::JestAdapter;
+use bun_adapter::BunAdapter;
 use stuck_detector::StuckDetector;
 
 /// Phase of a test run lifecycle.
@@ -116,6 +122,8 @@ pub struct TestRun {
     pub session_id: Option<String>,
     /// Project root for baseline lookup.
     pub project_root: String,
+    /// Connection that owns this test run (for per-connection isolation).
+    pub connection_id: String,
 }
 
 pub struct TestRunner {
@@ -130,6 +138,9 @@ impl TestRunner {
                 Box::new(Catch2Adapter),
                 Box::new(PytestAdapter),
                 Box::new(UnittestAdapter),
+                Box::new(VitestAdapter),
+                Box::new(JestAdapter),
+                Box::new(BunAdapter),
             ],
         }
     }
@@ -150,7 +161,7 @@ impl TestRunner {
                 }
             }
             return Err(crate::Error::ValidationError(
-                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2'", name)
+                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2', 'pytest', 'unittest', 'vitest', 'jest', 'bun'", name)
             ));
         }
 
@@ -243,6 +254,7 @@ impl TestRunner {
             project_root.to_str().unwrap_or("."),
             Some(&combined_env),
             has_trace_patterns, // defer_resume: install hooks before running
+            None, // symbols_path: test runner uses automatic resolution
         ).await?;
 
         // Apply trace patterns BEFORE resuming the process
@@ -552,6 +564,7 @@ mod tests {
             fetched: false,
             session_id: Some("session-xyz".to_string()),
             project_root: "/project".to_string(),
+            connection_id: "conn-1".to_string(),
         };
         assert_eq!(run.session_id.as_deref(), Some("session-xyz"));
     }

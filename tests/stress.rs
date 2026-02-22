@@ -139,6 +139,9 @@ fn create_event(session_id: &str, seq: usize) -> Event {
         locals: None,
         breakpoint_id: None,
         logpoint_message: None,
+        exception_type: None,
+        exception_message: None,
+        throw_backtrace: None,
         rowid: None,
     }
 }

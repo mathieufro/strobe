@@ -42,14 +42,16 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 1: Logpoint produces events without pausing ===");
     {
         let session_id = "lp-nopause";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Set logpoint (not breakpoint)
         let lp = sm
@@ -140,14 +142,16 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 2: Logpoint removal ===");
     {
         let session_id = "lp-remove";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let lp = sm
             .set_logpoint_async(
@@ -186,14 +190,16 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 3: Logpoint with conditional ===");
     {
         let session_id = "lp-cond";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Logpoint with condition "false" — should never log
         let lp = sm
@@ -242,14 +248,16 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 4: debug_write global variable ===");
     {
         let session_id = "write-global";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
                 &["write-target".to_string()],
                 None, project_root, None, false,
-            )
+                None,
+        )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait a moment for the process to start its loop
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -308,14 +316,16 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 5: Breakpoint pause + debug_write + continue ===");
     {
         let session_id = "bp-write-cont";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
                 &["write-target".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Set breakpoint on process_buffer (called in write-target loop)
         let bp = sm
@@ -390,16 +400,18 @@ async fn test_logpoint_and_write_suite() {
 
     // === Test 6: CModule trace + breakpoint coexistence ===
     println!("\n=== Test 6: CModule trace + breakpoint coexistence ===");
-    {
+    'test6: {
         let session_id = "coexist";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Install CModule trace FIRST
         sm.add_patterns(session_id, &["audio::process_buffer".to_string()])
@@ -423,7 +435,7 @@ async fn test_logpoint_and_write_suite() {
                 sm.stop_session(session_id).await.unwrap();
                 println!("  SKIPPED");
                 // Continue to next test instead of returning
-                return;
+                break 'test6;
             }
         }
 
@@ -485,14 +497,16 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 7: Logpoint + breakpoint coexistence ===");
     {
         let session_id = "lp-bp-coex";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
                 None, project_root, None, true,
-            )
+                None,
+        )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Logpoint on generate_sine
         let lp = sm

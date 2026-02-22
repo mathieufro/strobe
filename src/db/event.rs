@@ -571,6 +571,11 @@ impl Database {
 
     /// Insert events with automatic cleanup to enforce per-session limits.
     /// If inserting would exceed max_events_per_session, oldest events are deleted first.
+    ///
+    /// FIFO eviction only targets trace events (function_enter, function_exit,
+    /// variable_snapshot). Output events (stdout, stderr, crash, pause, logpoint,
+    /// condition_error) are preserved so that test output is never truncated by
+    /// high-throughput tracing.
     pub fn insert_events_with_limit(
         &self,
         events: &[Event],
@@ -586,7 +591,7 @@ impl Database {
         let mut stats = EventInsertStats::default();
         let mut session_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-        // Count current events per session
+        // Count ALL current events per session (total determines when limit is exceeded).
         for event in events {
             if !session_counts.contains_key(&event.session_id) {
                 let count: i64 = tx.query_row(
@@ -608,6 +613,11 @@ impl Database {
                 .push(event);
         }
 
+        // Event types safe to evict — high-volume trace data.
+        // Output events (stdout, stderr, crash, etc.) are never evicted so test
+        // results and error messages survive even under heavy tracing.
+        const EVICTABLE_TYPES: &str = "'function_enter','function_exit','variable_snapshot'";
+
         // For each session, cleanup if needed, then insert
         for (session_id, session_events) in events_by_session {
             let current_count = session_counts.get(&session_id).copied().unwrap_or(0);
@@ -615,15 +625,22 @@ impl Database {
 
             if new_count > max_events_per_session {
                 let to_delete = new_count - max_events_per_session;
-                let deleted = tx.execute(
+
+                // Only evict trace events, preserving stdout/stderr/crash/etc.
+                let query = format!(
                     "DELETE FROM events
                      WHERE session_id = ?
                      AND id IN (
                          SELECT id FROM events
                          WHERE session_id = ?
+                         AND event_type IN ({})
                          ORDER BY timestamp_ns ASC
                          LIMIT ?
                      )",
+                    EVICTABLE_TYPES
+                );
+                let deleted = tx.execute(
+                    &query,
                     params![&session_id, &session_id, to_delete as i64],
                 )?;
 

@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("NO_DEBUG_SYMBOLS: Binary has no DWARF debug info. Ask user permission to modify build configuration to compile with debug symbols.")]
+    #[error("NO_DEBUG_SYMBOLS: Binary has no DWARF debug info. Search the project for .dSYM bundles (glob: \"**/*.dSYM\") and re-launch with symbolsPath, or ask the user to compile with debug symbols (-g flag).")]
     NoDebugSymbols,
 
     #[error("SIP_BLOCKED: macOS System Integrity Protection prevents Frida attachment.")]
@@ -43,6 +43,9 @@ pub enum Error {
 
     #[error("TEST_RUN_NOT_FOUND: No test run found with ID '{0}'.")]
     TestRunNotFound(String),
+
+    #[error("TEST_ALREADY_RUNNING: A test is already running for this connection or project (ID: '{0}'). Wait for it to complete or poll its status.")]
+    TestAlreadyRunning(String),
 
     #[error("NO_CODE_AT_LINE: No executable code at {file}:{line}. Valid lines: {nearest_lines}")]
     NoCodeAtLine { file: String, line: u32, nearest_lines: String },
