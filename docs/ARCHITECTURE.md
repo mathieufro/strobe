@@ -50,7 +50,8 @@ Tracing scope depends on context. "Trace everything" is wrong for TDD workflows 
 | C/C++ | DWARF | `DW_AT_decl_file` |
 | Rust | DWARF | Same |
 | Go | DWARF | Same |
-| TS/JS (future) | Source maps | `sources` array |
+| Python | AST | `rustpython-parser` extracts qualified names from `.py` files |
+| JS/TS | Source maps + regex | `JsResolver` parses source, resolves via `sourcemap` crate |
 
 **Traced:** `src/main.rs`, `lib/utils.c`
 **Not traced:** `/usr/lib/libc.so`, `~/.cargo/registry/...`
@@ -325,11 +326,21 @@ src/
 │   └── spawner.rs                 # Frida FFI, process spawn, agent injection
 ├── dwarf/
 │   └── parser.rs                  # DWARF parsing, function/variable extraction
+├── symbols/
+│   ├── mod.rs                     # SymbolResolver trait, Language enum
+│   ├── dwarf_resolver.rs          # Native C/C++/Rust resolver (DWARF-based)
+│   ├── python_resolver.rs         # Python resolver (AST-based via rustpython-parser)
+│   └── js_resolver.rs             # JS/TS resolver (regex + source maps)
 └── test/
     ├── mod.rs                     # Test orchestration, async runs
     ├── adapter.rs                 # TestAdapter trait
     ├── cargo_adapter.rs           # Rust test adapter
     ├── catch2_adapter.rs          # C++ test adapter
+    ├── pytest_adapter.rs          # Python pytest adapter
+    ├── unittest_adapter.rs        # Python unittest adapter
+    ├── vitest_adapter.rs          # JS/TS Vitest adapter
+    ├── jest_adapter.rs            # JS/TS Jest adapter
+    ├── bun_adapter.rs             # JS/TS Bun test adapter
     └── stuck_detector.rs          # Deadlock/hang detection
 ```
 
@@ -344,6 +355,8 @@ Responsibilities:
 - Hot function detection with auto-sampling
 - Watch variable reads at function entry/exit
 - Intercept crash signals (exception handler captures registers, stack, frame memory)
+- Runtime detection: auto-detects V8 (Node.js), JavaScriptCore (Bun), CPython, or native
+- Language-specific tracers for each runtime
 - Send events to daemon via Frida messaging
 
 **Note:** stdout/stderr capture happens at the Frida Device level (not in the agent), using `FRIDA_STDIO_PIPE`. This works reliably with ASAN/sanitizer binaries.
@@ -351,9 +364,14 @@ Responsibilities:
 ```
 agent/
 ├── src/
-│   ├── agent.ts             # Main agent — hook installation, output capture, message handling
+│   ├── agent.ts             # Main agent — runtime detection, message dispatch
 │   ├── cmodule-tracer.ts    # High-perf native CModule tracing callbacks (10-50x faster)
-│   └── rate-tracker.ts      # Hot function detection and auto-sampling
+│   ├── rate-tracker.ts      # Hot function detection and auto-sampling
+│   └── tracers/
+│       ├── native-tracer.ts   # C/C++/Rust — Interceptor + CModule hooks
+│       ├── v8-tracer.ts       # Node.js — Module._compile patching + Proxy wrapping
+│       ├── jsc-tracer.ts      # Bun — JSObjectCallAsFunction native hook
+│       └── python-tracer.ts   # Python — sys.settrace via CPython API
 ├── package.json
 └── tsconfig.json
 ```
@@ -887,37 +905,53 @@ Frida agent adds memory overhead. Minimized by:
 
 The architecture is designed for easy extension. Three clear interfaces:
 
-### Adding a New Collector (Language Support)
+### Adding Language Support
 
-Collectors handle runtime instrumentation. Each collector implements the `Collector` trait:
+Multi-language support is implemented via two extension points:
+
+**1. Symbol Resolver** (Rust-side, `src/symbols/`) — resolves trace patterns to source locations:
 
 ```rust
-pub trait Collector: Send + Sync {
-    fn attach(&mut self, target: &Target) -> Result<SessionId>;
-    fn detach(&mut self, session: SessionId) -> Result<()>;
-    fn set_trace_patterns(&mut self, session: SessionId, patterns: Vec<Pattern>) -> Result<()>;
-    fn set_breakpoint(&mut self, session: SessionId, bp: Breakpoint) -> Result<BreakpointId>;
-    fn remove_breakpoint(&mut self, session: SessionId, bp_id: BreakpointId) -> Result<()>;
-    fn set_logpoint(&mut self, session: SessionId, lp: Logpoint) -> Result<LogpointId>;
-    fn remove_logpoint(&mut self, session: SessionId, lp_id: LogpointId) -> Result<()>;
-    fn resume(&mut self, session: SessionId, action: ResumeAction) -> Result<()>;
-    fn write_memory(&mut self, session: SessionId, targets: Vec<WriteTarget>) -> Result<Vec<WriteResult>>;
-    fn poll_events(&mut self, session: SessionId) -> Result<Vec<TraceEvent>>;
+pub trait SymbolResolver: Send + Sync {
+    fn resolve_pattern(&self, pattern: &str, root: &Path) -> Result<Vec<ResolvedTarget>>;
+    fn resolve_variable(&self, name: &str) -> Option<VariableResolution>;
+}
+```
+
+**2. Tracer** (Agent-side, `agent/src/tracers/`) — installs hooks in the target runtime:
+
+```typescript
+interface Tracer {
+    installHook(target: HookTarget, mode: HookMode): void;
+    removeHook(target: HookTarget): void;
+    syncTraceHooks(): void;
 }
 ```
 
 **To add a new language:**
-1. Implement `Collector` trait
-2. Emit events conforming to `TraceEvent` schema
-3. Register with `CollectorManager`
+1. Implement `SymbolResolver` in Rust for pattern resolution
+2. Implement a `Tracer` in TypeScript for runtime hook installation
+3. Add language detection in `session_manager.rs::detect_language`
+4. Wire the resolver in `SessionManager::create_session`
 
-**Current/planned collectors:**
+**Current implementations:**
 
-| Collector | Languages | Implementation |
-|-----------|-----------|----------------|
-| Frida | C/C++/Rust/Go/native | `frida-rust` bindings |
-| CDP | JavaScript/TypeScript | WebSocket to Chrome DevTools |
-| Python | Python | `sys.settrace` or Frida |
+| Language | Resolver | Tracer | Status |
+|----------|----------|--------|--------|
+| C/C++/Rust | `DwarfResolver` (DWARF) | `NativeTracer` (Interceptor + CModule) | Full |
+| Python (3.11+) | `PythonResolver` (AST) | `PythonTracer` (sys.settrace) | Output capture shipped, function tracing pending |
+| JavaScript (Node.js) | `JsResolver` (regex + source maps) | `V8Tracer` (Module._compile + Proxy) | Full |
+| JavaScript (Bun) | `JsResolver` (regex + source maps) | `JscTracer` (JSObjectCallAsFunction) | Partial (single-hook attribution) |
+| Go | `DwarfResolver` (DWARF) | `NativeTracer` | Basic (DWARF only, no goroutine awareness) |
+
+**Planned (not yet implemented):**
+
+| Language | Approach | Notes |
+|----------|----------|-------|
+| Deno | V8-based (similar to Node.js) | Language detection exists, tracer/adapter needed |
+| Java/Kotlin | ART hooks (Android) | Future phase |
+
+> **Note:** The docs previously described a `Collector` trait and `CollectorManager` abstraction. In practice, all language support is built on Frida as the single runtime backend, with language-specific `SymbolResolver` + `Tracer` pairs providing the abstraction. A CDP (Chrome DevTools Protocol) collector for standalone JS debugging is a future possibility but not currently implemented.
 
 ### Adding an I/O Channel (Phase 6+)
 
@@ -993,20 +1027,25 @@ pub trait TestAdapter: Send + Sync {
 
 **Built-in adapters:**
 
-| Framework | Language | Detection | Output Format | Stack Capture |
-|-----------|----------|-----------|---------------|---------------|
-| cargo test | Rust | `Cargo.toml` (confidence 90) | JSON (`--format json`) | OS-level (native) |
-| Catch2 | C/C++ | `--list-tests` probe (confidence 85) | XML (`--reporter xml`) | OS-level (native) |
-| Generic | Any | Always (confidence 1, fallback) | Regex heuristics | OS-level best-effort |
+| Framework | Language | Detection | Confidence | Output Format | Stack Capture |
+|-----------|----------|-----------|------------|---------------|---------------|
+| cargo test | Rust | `Cargo.toml` | 90 | JSON (`--format json`) | OS-level (native) |
+| Catch2 | C/C++ | `--list-tests` probe | 85 | XML (`--reporter xml`) | OS-level (native) |
+| pytest | Python | `pytest.ini`, `pyproject.toml`, `conftest.py` | 90 | JSON (`--json-report`) | OS-level |
+| unittest | Python | `test_*.py` files | 70 | Text (parsed) | OS-level |
+| Vitest | JS/TS | `vitest.config.*` or `package.json` | 95 | JSON (`--reporter=json`) | OS-level |
+| Jest | JS/TS | `jest.config.*` or `package.json` | 92 | JSON (`--json`) | OS-level |
+| Bun test | JS/TS | `bun.lockb` or `package.json` | 85 | JUnit XML (`--reporter=junit`) | OS-level |
+| Generic | Any | Always (fallback) | 1 | Regex heuristics | OS-level best-effort |
 
 **Future adapters (community contributions):**
 
 | Framework | Language | Detection | Stack Capture |
 |-----------|----------|-----------|---------------|
-| pytest | Python | `pytest.ini`, `pyproject.toml` | `py-spy dump --pid` |
-| Jest/Vitest | JS/TS | `jest.config.*`, `vitest.config.*` | SIGUSR1 + inspector |
+| Deno test | JS/TS | `deno.json` | SIGUSR1 + inspector |
 | go test | Go | `go.mod` | SIGABRT → goroutine dump |
 | Google Test | C/C++ | `gtest` in CMakeLists | OS-level (native) |
+| Mocha | JS/TS | `.mocharc.*` | SIGUSR1 + inspector |
 
 ### Event Schema (Shared by All Collectors)
 
@@ -1078,27 +1117,23 @@ See [specs/2026-02-07-ui-observation-interaction-io-channels.md](specs/2026-02-0
 
 ---
 
-## Future: Additional Languages (Phase 9)
+## Future: Additional Languages & Runtimes
 
-### CDP Collector (JavaScript/TypeScript)
+### Current Language Status
 
-Chrome DevTools Protocol for Node.js, browser apps, Electron.
+| Language | Tracing | Test Runner | Status |
+|----------|---------|-------------|--------|
+| C/C++/Rust | Full (Frida native hooks) | Cargo + Catch2 | Shipped |
+| Python | Infrastructure (sys.settrace pending) | Pytest + Unittest | Shipped (output capture), tracing pending |
+| JavaScript (Node.js) | Full (V8 tracer) | Jest + Vitest | Shipped |
+| JavaScript (Bun) | Partial (JSC tracer) | Bun test | Shipped (single-hook limitation) |
 
-Will share:
-- Same MCP interface
-- Same SQLite storage
-- Same event schema
-- Same I/O channel model
+### Planned
 
-Different:
-- Uses CDP instead of Frida
-- Connects to Node.js --inspect or Chrome remote debugging
-- Native async/await tracing instead of function hooks
+- **Deno** — Language detection exists; needs V8-based tracer adaptation + `deno test` adapter
+- **Go** — Enhanced DWARF support, goroutine awareness, `go test` adapter
+- **Java/Kotlin** — Via ART hooks on Android
 
-The LLM uses the same tools regardless of whether target is native or JS.
+### CDP Collector (Future Alternative)
 
-### Other Languages
-
-- Python (via sys.settrace or Frida)
-- Go (enhanced DWARF support, goroutine awareness)
-- Java/Kotlin (via ART hooks on Android)
+Chrome DevTools Protocol could provide an alternative to Frida-based JS tracing for Node.js, browser apps, and Electron. Would connect via `--inspect` flag. Not currently implemented — the V8Tracer approach via Frida covers the primary use cases.

@@ -49,8 +49,13 @@ Use `debug_test` MCP tool for Strobe's own test framework — never run test bin
 | `src/mcp/types.rs` | MCP request/response types, validation constants |
 | `src/test/mod.rs` | Test orchestration, async test runs |
 | `src/test/stuck_detector.rs` | Deadlock/hang detection via CPU sampling + stack comparison |
-| `agent/src/agent.ts` | Main Frida agent — hook installation, output capture |
+| `src/symbols/python_resolver.rs` | Python symbol resolution (AST-based via rustpython-parser) |
+| `src/symbols/js_resolver.rs` | JS/TS symbol resolution (regex + source maps) |
+| `agent/src/agent.ts` | Main Frida agent — runtime detection, tracer dispatch |
 | `agent/src/cmodule-tracer.ts` | High-perf native CModule tracing callbacks |
+| `agent/src/tracers/v8-tracer.ts` | Node.js tracer (Module._compile + Proxy wrapping) |
+| `agent/src/tracers/jsc-tracer.ts` | Bun tracer (JSObjectCallAsFunction hook) |
+| `agent/src/tracers/python-tracer.ts` | Python tracer (sys.settrace via CPython API) |
 
 ## Development Patterns
 

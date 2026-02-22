@@ -55,11 +55,12 @@ LLM: "Found it - memory pool exhaustion in ViewManager::setView(). Here's the fi
 │  - debug_launch: start app (captures stdout/stderr)          │
 │  - debug_trace: add patterns, watches for deeper insight     │
 │  - debug_query: read output, search traces, find patterns    │
-│  - debug_read: inspect variables live (Phase 1e — planned)   │
+│  - debug_memory: inspect/write variables live                │
+│  - debug_breakpoint: set breakpoints and logpoints           │
+│  - debug_continue: resume/step after breakpoint pause        │
 │  - debug_test: run tests, get structured results             │
-│  - debug_test_status: poll async test progress               │
-│  - debug_stop: end session and clean up                      │
-│  - debug_list_sessions / debug_delete_session                │
+│  - debug_session: stop, status, list, delete sessions        │
+│  - debug_ui: query UI state (AX tree, screenshot)            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -106,7 +107,7 @@ Pause only when it matters. Set conditions on field values, hit counts. The LLM 
 
 ### Test Instrumentation (TDD Workflow)
 
-Universal, machine-readable test output for any framework. `debug_test` auto-detects the test framework (cargo, Catch2, or custom) and starts an **async** test run (fast direct subprocess when no tracing is requested). It returns a `testRunId`; `debug_test_status` returns structured results: failures with file:line, error messages, and suggested trace patterns.
+Universal, machine-readable test output for any framework. `debug_test` auto-detects the test framework (cargo, Catch2, pytest, Jest, Vitest, Bun test, or custom) and starts an **async** test run (fast direct subprocess when no tracing is requested). Poll with `debug_test({ action: "status", testRunId })` for structured results: failures with file:line, error messages, and suggested trace patterns.
 
 On failure, the LLM reruns a single test with tracing (Frida path activates automatically). Smart stuck detection catches deadlocks and infinite loops in ~8 seconds via multi-signal analysis (CPU + stack sampling), captures thread backtraces before killing, so the LLM sees the deadlock graph directly. No more waiting 10 minutes for a stuck test to timeout.
 
@@ -163,9 +164,9 @@ This is not for:
 **Validation:** App crashes → LLM gets full context. App forks → events tracked across processes.
 
 ### Phase 1d: Test Instrumentation
-- `debug_test` + `debug_test_status`: async test execution with progress polling
+- `debug_test`: async test execution with progress polling
 - Backend-agnostic `TestAdapter` trait: detection, command construction, parsing, trace suggestions, stack capture
-- Built-in adapters: cargo test (Rust), Catch2 (C/C++), Generic fallback
+- Built-in adapters: cargo test (Rust), Catch2 (C/C++), pytest + unittest (Python), Jest + Vitest (JS/TS), Bun test
 - Smart stuck detection: multi-signal (output silence + CPU delta + stack sampling), catches deadlocks/infinite loops in ~8s
 - Thread backtrace capture before killing stuck tests — LLM sees deadlock graph directly
 - Automatic path switching: direct subprocess (fast) vs Frida (instrumented) based on whether tracing requested
@@ -176,8 +177,8 @@ This is not for:
 
 **Validation:** Universal structured output. Stuck tests caught in seconds. LLM never re-runs tests just to parse output.
 
-### Phase 1e: Live Memory Reads (planned)
-- `debug_read`: on-demand memory snapshots from running processes without breakpoints
+### Phase 1e: Live Memory Access
+- `debug_memory`: on-demand memory reads/writes from running processes
 - Read DWARF-resolved variables or raw addresses, struct traversal with configurable depth
 - Polling mode: sample variables at intervals, events interleave with traces in timeline
 - Buffer dumps written to file (not in-chat)
@@ -185,10 +186,10 @@ This is not for:
 **Validation:** LLM inspects live state without stopping execution. Polling reveals variable changes in context of function calls.
 
 ### Phase 2: Active Debugging
-- Conditional breakpoints
-- State inspection when paused
-- Resume execution
-- MCP tools: `debug_breakpoint`, `debug_inspect`, `debug_continue`
+- Conditional breakpoints and logpoints (`debug_breakpoint`)
+- State inspection when paused (`debug_memory`)
+- Resume/step execution (`debug_continue`)
+- Stepping: step-over, step-into, step-out via DWARF line tables
 
 **Validation:** Set a breakpoint on a condition, inspect variables when it hits, find a bug you couldn't find with traces alone.
 
@@ -207,29 +208,29 @@ This is not for:
 
 **Validation:** LLM sees native and custom-painted UI elements in one tree, describes the UI, correlates with traces.
 
-### Phase 5: UI Interaction
+### Phase 5: Multi-Language Support
+- Python: output capture, AST-based symbol resolution, pytest + unittest adapters (function tracing pending)
+- JavaScript/TypeScript: V8 tracer (Node.js), JSC tracer (Bun), JS symbol resolver with source maps
+- Test adapters: Jest, Vitest, Bun test — all with structured output parsing
+- Language auto-detection from command, file extensions, and project files
+
+**Validation:** LLM launches Node.js app, adds traces, queries function timeline. LLM runs `debug_test` on a TS project — Vitest auto-detected, structured failures returned.
+
+### Phase 6: UI Interaction (planned)
 - Intent-based actions: `click`, `set_value`, `type`, `select`, `drag`, `key`
 - VLM-powered motor layer: classifies unknown widgets, learns interaction model, caches profiles
 - MCP tools: `debug_ui_action`
 
-**Validation:** LLM sets a JUCE knob value via intent — motor layer figures out the drag mechanics autonomously.
-
-### Phase 6: I/O Channels + Scenario Runner
+### Phase 7: I/O Channels + Scenario Runner (planned)
 - Universal I/O channel abstraction: `InputChannel` / `OutputChannel` traits
-- Wraps existing capabilities (stdout/stderr, traces, UI) as channels
-- Scenario runner (`debug_test_scenario`): flat action list, on failure → process stays alive, LLM debugs
-- MCP tools: `debug_channel_send`, `debug_channel_query`, `debug_test_scenario`
-
-**Validation:** Autonomous synth test — UI knob + MIDI input + trace assertion in one scenario, no human in the loop.
-
-### Phase 7: Concrete I/O Channels
-- MIDI (CoreMIDI / ALSA), Audio (CoreAudio tap / JACK), Network (Frida socket intercept), File (FSEvents / inotify)
-- Each implements channel traits — automatically works with scenario runner
+- Scenario runner (`debug_test_scenario`): flat action list, on failure → process stays alive
+- MIDI (CoreMIDI / ALSA), Audio (CoreAudio / JACK), Network (Frida intercept), File (FSEvents / inotify)
 
 ### Future Phases
-- **Phase 8: Advanced Threading Tools** - Lock tracing, deadlock detection, race condition hints
-- **Phase 9: Additional Languages & Runtimes** - JavaScript/TypeScript (CDP), Python, Go, Java/Kotlin
-- **Phase 10+:** Windows support, distributed tracing
+- **Advanced Threading Tools** - Lock tracing, deadlock detection, race condition hints
+- **Additional Languages** - Deno, Go (`go test` adapter), Java/Kotlin (ART hooks)
+- **Windows Support** - PDB parsing, named pipes, UI Automation
+- **Distributed Tracing** - Cross-service request correlation
 - **Commercial features:** CI/CD integration, auto-test generation, regression detection
 
 ## Architecture
@@ -243,8 +244,7 @@ Built on [Frida](https://frida.re/) for dynamic binary instrumentation. Frida ca
 - **Multi-process** - Automatically follows fork/exec, tags events with PID
 - **Multi-threaded** - Thread ID and name on every event, thread-aware queries
 - **Symbol demangling** - Full C++/Rust demangling, raw names also available
-
-Future phases add [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) for JavaScript/TypeScript debugging.
+- **Multi-language** - Native (C/C++/Rust via DWARF), Python (AST + sys.settrace), JavaScript/TypeScript (V8/JSC tracers + source maps)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for technical details.
 
@@ -319,13 +319,19 @@ strobe/
 │   ├── daemon/              # Server, session manager
 │   ├── frida_collector/     # Frida FFI, process spawn
 │   ├── dwarf/               # DWARF symbol parsing
+│   ├── symbols/             # Language-specific resolvers (Python, JS/TS)
 │   ├── db/                  # SQLite storage
 │   ├── mcp/                 # MCP protocol types
-│   ├── test/                # Test runner + adapters
+│   ├── test/                # Test runner + adapters (7 frameworks)
 │   └── config.rs            # Settings system
 ├── agent/                   # TypeScript Frida agent
 │   └── src/
-│       ├── agent.ts         # Main agent
+│       ├── agent.ts         # Main agent, runtime detection
+│       ├── tracers/         # Language-specific tracers
+│       │   ├── native-tracer.ts   # C/C++/Rust via CModule
+│       │   ├── v8-tracer.ts       # Node.js via Module._compile
+│       │   ├── jsc-tracer.ts      # Bun via JSObjectCallAsFunction
+│       │   └── python-tracer.ts   # Python via sys.settrace
 │       └── cmodule-tracer.ts # High-perf native hooks
 └── docs/                    # Documentation
 ```

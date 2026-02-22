@@ -14,7 +14,7 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 | 2 | Active Debugging (breakpoints, stepping) | **Shipped** |
 | 3 | VS Code Extension | **Shipped** |
 | 4 | UI Observation (AX tree + AI vision) | **Shipped** |
-| 5 | Multi-Language (Python, JS/TS) | **Partial** — Python infrastructure shipped, runtime tracing pending |
+| 5 | Multi-Language (Python, JS/TS) | **Shipped** — Python infrastructure + JS/TS tracers + all test adapters |
 | 6 | UI Interaction | Planned |
 | 7 | I/O Channels | Planned |
 | 8 | Autonomous Test Scenarios | Planned |
@@ -131,7 +131,10 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 | C | Full | Catch2 adapter | DWARF |
 | C++ | Full | Catch2 adapter | DWARF + demangling |
 | Rust | Full | Cargo adapter | DWARF + demangling |
-| Python (3.11+) | Output capture only (tracing pending) | Pytest + Unittest adapters | AST-based symbol resolution |
+| Python (3.11+) | Output capture (function tracing pending) | Pytest + Unittest adapters | AST-based symbol resolution |
+| JavaScript (Node.js) | Full (V8 tracer via Module._compile + Proxy) | Jest + Vitest adapters | Source map resolution |
+| JavaScript (Bun) | Partial (JSC tracer, single-hook attribution) | Bun test adapter | Source map resolution |
+| TypeScript | Full (via Node.js/Bun with source maps) | Jest + Vitest + Bun adapters | Source map resolution |
 
 ### Error Handling
 
@@ -756,7 +759,7 @@ interface Tracer {
 }
 ```
 
-Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolver` + `PythonTracer`.
+Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolver` + `PythonTracer`. JavaScript uses `JsResolver` + `V8Tracer` (Node.js) or `JscTracer` (Bun).
 
 ### Python Support (CPython 3.11+)
 
@@ -793,9 +796,42 @@ Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolve
 3. Pattern `modules.audio.*` → matches `modules.audio.process_buffer`, etc.
 4. Returns `ResolvedTarget::SourceLocation { file, line, name }` (not addresses)
 
-### JavaScript/TypeScript Support
+### JavaScript/TypeScript Support (Node.js, Bun)
 
-**Status:** Scaffolding only. V8 and JavaScriptCore runtime detection exist in agent but tracers not yet implemented.
+**Shipped:**
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| Language detection | Shipped | Auto-detects from command (`node`, `bun`, `npx`, `tsx`), file extension (`.js`, `.ts`), project files (`package.json`, `bun.lockb`, `deno.json`) |
+| Symbol resolution | Shipped | Regex-based function extraction + source map resolution via `sourcemap` crate. Qualified names: `Class.method` |
+| Pattern matching | Shipped | Dot separator for JS namespaces. `*`, `**`, `@file:` all work |
+| Output capture | Shipped | Self-spawn with piped stdout/stderr |
+| V8 tracer (Node.js) | Shipped | Patches `Module._compile` to intercept module loading, wraps exports via Proxy for enter/exit events, handles async functions |
+| JSC tracer (Bun) | Shipped | Hooks `JSObjectCallAsFunction` at native level. Single-hook attribution only — multiple hooks can't discriminate which function was called (needs JSC struct navigation) |
+| Test adapters | Shipped | VitestAdapter (confidence 95), JestAdapter (confidence 92), BunAdapter (confidence 85) |
+| Resolver integration | Shipped | SessionManager wires `JsResolver` for JavaScript sessions |
+
+**Known limitations:**
+
+| Limitation | Details |
+|------------|---------|
+| JSC multi-hook attribution | Bun tracer can only attribute events when a single hook is installed. Multiple hooks require JSC version-specific struct navigation (deferred) |
+| No Deno runtime support | Language detection recognizes `deno.json`, but no Deno-specific tracer or test adapter exists |
+| No Mocha adapter | Mocha test framework not supported (Jest, Vitest, and Bun test cover most use cases) |
+
+**How Node.js tracing works:**
+1. Self-spawn via `std::process::Command`
+2. Pipe stdout/stderr, attach Frida after ~100ms
+3. Agent detects V8 runtime via `_ZN2v87Isolate10GetCurrentEv` symbol probe
+4. V8Tracer patches `Module._compile` to intercept `require()` calls
+5. Wraps exported functions with `Proxy` — captures enter/exit events transparently
+6. Handles async functions (tracks Promise resolution for exit events)
+
+**How Bun tracing works:**
+1. Self-spawn, pipe stdout/stderr, attach Frida
+2. Agent detects JavaScriptCore via `_WTFCrash`/`_JSObjectCallAsFunction` symbol probe
+3. JscTracer hooks `JSObjectCallAsFunction` at the native level
+4. Emits events when hooked JS functions are called
 
 ### Built-in Test Adapters
 
@@ -805,6 +841,9 @@ Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolve
 | Catch2Adapter | C++ | Binary probe (`--list-tests`) | 85 |
 | PytestAdapter | Python | `pyproject.toml`/`pytest.ini`/`conftest.py` | 90 |
 | UnittestAdapter | Python | Fallback for Python projects | 70 |
+| VitestAdapter | JS/TS | `vitest.config.*` or `package.json` | 95 |
+| JestAdapter | JS/TS | `jest.config.*` or `package.json` | 92 |
+| BunAdapter | JS/TS | `bun.lockb` or `package.json` | 85 |
 
 ### Validation Criteria
 
@@ -819,6 +858,20 @@ Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolve
 2. PythonResolver matches 4 functions via AST
 3. sys.settrace hook fires on matched functions
 4. LLM queries timeline for function enter/exit events
+
+**Scenario C: Node.js function tracing**
+1. LLM calls `debug_launch({ command: "node", args: ["server.js"], projectRoot: "..." })`
+2. stdout/stderr captured immediately
+3. LLM calls `debug_trace({ sessionId, add: ["Router.*", "auth.validate"] })`
+4. JsResolver matches functions via source analysis + source maps
+5. V8Tracer wraps matched exports — enter/exit events flow into timeline
+6. LLM queries `debug_query({ function: { contains: "validate" } })` — finds the bug
+
+**Scenario D: Vitest structured output**
+1. LLM calls `debug_test({ projectRoot: "/path/to/ts-project" })`
+2. VitestAdapter auto-detected (confidence 95), runs `vitest run --reporter=json`
+3. Response: structured summary with failures, file:line, messages, suggested traces
+4. LLM fixes code, reruns — no turns wasted parsing output
 
 ---
 
@@ -1003,9 +1056,10 @@ Write/delete files, watch for app file changes via FSEvents (macOS) / inotify (L
 - Race condition hints
 
 ### Phase 10: Additional Languages & Runtimes
-- JavaScript/TypeScript via V8/JSC inspector or sys.settrace equivalent (scaffolding exists in agent)
-- Go (enhanced DWARF support, goroutine awareness)
+- Deno (test adapter + runtime tracer — language detection already exists)
+- Go (enhanced DWARF support, goroutine awareness, `go test` adapter)
 - Java/Kotlin (via ART hooks on Android)
+- Google Test adapter for C++ (`gtest` detection via CMakeLists)
 
 ### Phase 11: Windows Support
 - Frida works on Windows
