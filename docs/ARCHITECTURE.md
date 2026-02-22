@@ -237,9 +237,9 @@ Errors are opportunities for LLM-guided resolution:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     MCP Client (LLM)                             │
-│  debug_launch | debug_trace | debug_query | debug_stop          │
-│  debug_test | debug_test_status | debug_read (planned)          │
-│  debug_list_sessions | debug_delete_session                     │
+│  debug_launch | debug_trace | debug_query | debug_session        │
+│  debug_test | debug_breakpoint | debug_continue | debug_memory  │
+│  debug_ui                                                       │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ MCP (JSON-RPC over stdio)
@@ -331,17 +331,29 @@ src/
 │   ├── dwarf_resolver.rs          # Native C/C++/Rust resolver (DWARF-based)
 │   ├── python_resolver.rs         # Python resolver (AST-based via rustpython-parser)
 │   └── js_resolver.rs             # JS/TS resolver (regex + source maps)
-└── test/
-    ├── mod.rs                     # Test orchestration, async runs
-    ├── adapter.rs                 # TestAdapter trait
-    ├── cargo_adapter.rs           # Rust test adapter
-    ├── catch2_adapter.rs          # C++ test adapter
-    ├── pytest_adapter.rs          # Python pytest adapter
-    ├── unittest_adapter.rs        # Python unittest adapter
-    ├── vitest_adapter.rs          # JS/TS Vitest adapter
-    ├── jest_adapter.rs            # JS/TS Jest adapter
-    ├── bun_adapter.rs             # JS/TS Bun test adapter
-    └── stuck_detector.rs          # Deadlock/hang detection
+├── test/
+│   ├── mod.rs                     # Test orchestration, async runs
+│   ├── adapter.rs                 # TestAdapter trait
+│   ├── cargo_adapter.rs           # Rust test adapter
+│   ├── catch2_adapter.rs          # C++ test adapter
+│   ├── pytest_adapter.rs          # Python pytest adapter
+│   ├── unittest_adapter.rs        # Python unittest adapter
+│   ├── vitest_adapter.rs          # JS/TS Vitest adapter
+│   ├── jest_adapter.rs            # JS/TS Jest adapter
+│   ├── bun_adapter.rs             # JS/TS Bun test adapter
+│   ├── deno_adapter.rs            # JS/TS Deno test adapter
+│   ├── go_adapter.rs              # Go test adapter
+│   ├── gtest_adapter.rs           # C++ Google Test adapter
+│   ├── mocha_adapter.rs           # JS/TS Mocha adapter
+│   └── stuck_detector.rs          # Deadlock/hang detection
+└── ui/
+    ├── mod.rs                     # UI observation module
+    ├── accessibility.rs           # macOS accessibility tree (AXUIElement)
+    ├── accessibility_linux.rs     # Linux accessibility (AT-SPI)
+    ├── capture.rs                 # Screenshot capture
+    ├── vision.rs                  # Vision-based UI analysis
+    ├── tree.rs                    # UI tree formatting
+    └── merge.rs                   # Tree + vision merge
 ```
 
 ### Frida Agent (TypeScript)
@@ -369,9 +381,9 @@ agent/
 │   ├── rate-tracker.ts      # Hot function detection and auto-sampling
 │   └── tracers/
 │       ├── native-tracer.ts   # C/C++/Rust — Interceptor + CModule hooks
-│       ├── v8-tracer.ts       # Node.js — Module._compile patching + Proxy wrapping
-│       ├── jsc-tracer.ts      # Bun — JSObjectCallAsFunction native hook
-│       └── python-tracer.ts   # Python — sys.settrace via CPython API
+│       ├── v8-tracer.ts       # Node.js — Module._compile + Proxy + ESM hooks
+│       ├── jsc-tracer.ts      # Bun — JSObjectCallAsFunction + JSC C API multi-hook
+│       └── python-tracer.ts   # Python — sys.monitoring (3.12+) / sys.settrace fallback
 ├── package.json
 └── tsconfig.json
 ```
@@ -939,16 +951,11 @@ interface Tracer {
 | Language | Resolver | Tracer | Status |
 |----------|----------|--------|--------|
 | C/C++/Rust | `DwarfResolver` (DWARF) | `NativeTracer` (Interceptor + CModule) | Full |
-| Python (3.11+) | `PythonResolver` (AST) | `PythonTracer` (sys.settrace) | Output capture shipped, function tracing pending |
-| JavaScript (Node.js) | `JsResolver` (regex + source maps) | `V8Tracer` (Module._compile + Proxy) | Full |
-| JavaScript (Bun) | `JsResolver` (regex + source maps) | `JscTracer` (JSObjectCallAsFunction) | Partial (single-hook attribution) |
+| Python (3.12+) | `PythonResolver` (AST) | `PythonTracer` (sys.monitoring + settrace fallback) | Full — dual-mode tracing, name+line matching, tool ID retry |
+| Python (3.11) | `PythonResolver` (AST) | `PythonTracer` (sys.settrace) | Full — settrace with ±5 line tolerance for decorators |
+| JavaScript (Node.js) | `JsResolver` (regex + source maps) | `V8Tracer` (Module._compile + Proxy) | Full — ESM via `module.registerHooks()` source transform |
+| JavaScript (Bun) | `JsResolver` (regex + source maps) | `JscTracer` (JSObjectCallAsFunction + JSC C API) | Output capture only — Bun's release binaries strip JSC symbols |
 | Go | `DwarfResolver` (DWARF) | `NativeTracer` | Basic (DWARF only, no goroutine awareness) |
-
-**Planned (not yet implemented):**
-
-| Language | Approach | Notes |
-|----------|----------|-------|
-| Deno | V8-based (similar to Node.js) | Language detection exists, tracer/adapter needed |
 | Java/Kotlin | ART hooks (Android) | Future phase |
 
 > **Note:** The docs previously described a `Collector` trait and `CollectorManager` abstraction. In practice, all language support is built on Frida as the single runtime backend, with language-specific `SymbolResolver` + `Tracer` pairs providing the abstraction. A CDP (Chrome DevTools Protocol) collector for standalone JS debugging is a future possibility but not currently implemented.
@@ -1036,16 +1043,10 @@ pub trait TestAdapter: Send + Sync {
 | Vitest | JS/TS | `vitest.config.*` or `package.json` | 95 | JSON (`--reporter=json`) | OS-level |
 | Jest | JS/TS | `jest.config.*` or `package.json` | 92 | JSON (`--json`) | OS-level |
 | Bun test | JS/TS | `bun.lockb` or `package.json` | 85 | JUnit XML (`--reporter=junit`) | OS-level |
-| Generic | Any | Always (fallback) | 1 | Regex heuristics | OS-level best-effort |
-
-**Future adapters (community contributions):**
-
-| Framework | Language | Detection | Stack Capture |
-|-----------|----------|-----------|---------------|
-| Deno test | JS/TS | `deno.json` | SIGUSR1 + inspector |
-| go test | Go | `go.mod` | SIGABRT → goroutine dump |
-| Google Test | C/C++ | `gtest` in CMakeLists | OS-level (native) |
-| Mocha | JS/TS | `.mocharc.*` | SIGUSR1 + inspector |
+| Deno test | JS/TS | `deno.json`/`deno.jsonc` | 90 | JSON | OS-level |
+| go test | Go | `go.mod` | 90 | JSON (`-json`) | OS-level |
+| Google Test | C++ | `gtest` in CMakeLists.txt | 85 | XML (`--gtest_output=xml`) | OS-level (native) |
+| Mocha | JS/TS | `.mocharc.*` or `mocha` in `package.json` | 90 | JSON (`--reporter json`) | OS-level |
 
 ### Event Schema (Shared by All Collectors)
 

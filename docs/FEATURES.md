@@ -775,20 +775,15 @@ Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolve
 | Test adapters | Shipped | PytestAdapter (confidence 90), UnittestAdapter (fallback 70) |
 | Resolver integration | Shipped | SessionManager wires `PythonResolver` for Python sessions |
 
-**Pending (runtime):**
-
-| Component | Status | Blocker |
-|-----------|--------|---------|
-| Function tracing | Infrastructure complete | `sys.settrace` hooks not firing at runtime — needs CPython version debugging |
-| Watch variables | Interface done | Needs integration testing with real Python globals |
-| Pytest execution | Adapter works | `pytest-json-report` plugin needs virtual environment on macOS |
-
 **How Python spawning works:**
 1. Self-spawn via `std::process::Command` (not Frida's `device.spawn()` — avoids macOS broken-pipe)
 2. Pipe stdout/stderr directly, reader threads emit events
 3. After ~100ms, attach Frida to running process
 4. Inject agent, which detects `cpython` runtime via symbol probing
-5. `PythonTracer` installs `sys.settrace()` + `threading.settrace_all_threads()` (3.12+)
+5. `PythonTracer` uses dual-mode tracing:
+   - **Python 3.12+**: `sys.monitoring` (PEP 669) — faster, lower overhead. Retries tool IDs 0-5 to avoid conflicts with coverage.py
+   - **Python <3.12**: `sys.settrace()` fallback + `threading.settrace_all_threads()`
+6. Function matching: by qualified name (`co_qualname`) or file+line with ±5 tolerance (handles decorators)
 
 **How Python pattern resolution works:**
 1. `PythonResolver` parses `.py` files via AST (not bytecode)
@@ -807,31 +802,33 @@ Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolve
 | Pattern matching | Shipped | Dot separator for JS namespaces. `*`, `**`, `@file:` all work |
 | Output capture | Shipped | Self-spawn with piped stdout/stderr |
 | V8 tracer (Node.js) | Shipped | Patches `Module._compile` to intercept module loading, wraps exports via Proxy for enter/exit events, handles async functions |
-| JSC tracer (Bun) | Shipped | Hooks `JSObjectCallAsFunction` at native level. Single-hook attribution only — multiple hooks can't discriminate which function was called (needs JSC struct navigation) |
-| Test adapters | Shipped | VitestAdapter (confidence 95), JestAdapter (confidence 92), BunAdapter (confidence 85) |
+| ESM hooks (Node.js) | Shipped | `module.registerHooks()` (Node 22.15+/23.5+) transforms ESM source at load time to inject trace calls |
+| JSC tracer (Bun) | Shipped | Hooks `JSObjectCallAsFunction` via public JSC C API. Multi-hook attribution via `JSObjectGetProperty` name lookup. Requires JSC symbols to be exported (not available in Bun's stripped release binaries) |
+| Test adapters | Shipped | VitestAdapter (95), JestAdapter (92), BunAdapter (85), DenoAdapter (90), MochaAdapter (90) |
 | Resolver integration | Shipped | SessionManager wires `JsResolver` for JavaScript sessions |
 
 **Known limitations:**
 
 | Limitation | Details |
 |------------|---------|
-| JSC multi-hook attribution | Bun tracer can only attribute events when a single hook is installed. Multiple hooks require JSC version-specific struct navigation (deferred) |
-| No Deno runtime support | Language detection recognizes `deno.json`, but no Deno-specific tracer or test adapter exists |
-| No Mocha adapter | Mocha test framework not supported (Jest, Vitest, and Bun test cover most use cases) |
+| Bun JSC symbol stripping | Bun's release binaries statically link JSC and strip all symbols. JSC function tracing (`JSObjectCallAsFunction` hooking) is unavailable — only output capture works. The JSC tracer code supports multi-hook attribution via public JSC C API, but requires a Bun build with exported JSC symbols |
+| ESM function tracing | Node.js ESM modules are instrumented via `module.registerHooks()` source transformation. Pattern-based tracing (`debug_trace`) currently works for CommonJS modules only |
 
 **How Node.js tracing works:**
 1. Self-spawn via `std::process::Command`
 2. Pipe stdout/stderr, attach Frida after ~100ms
-3. Agent detects V8 runtime via `_ZN2v87Isolate10GetCurrentEv` symbol probe
-4. V8Tracer patches `Module._compile` to intercept `require()` calls
-5. Wraps exported functions with `Proxy` — captures enter/exit events transparently
-6. Handles async functions (tracks Promise resolution for exit events)
+3. ESM hook script injected via `NODE_OPTIONS=--import` (transforms ESM source via `module.registerHooks()`)
+4. Agent detects V8 runtime via `_ZN2v87Isolate10GetCurrentEv` symbol probe
+5. V8Tracer patches `Module._compile` to intercept `require()` calls (CommonJS)
+6. Wraps exported functions with `Proxy` — captures enter/exit events transparently
+7. Handles async functions (tracks Promise resolution for exit events)
 
 **How Bun tracing works:**
-1. Self-spawn, pipe stdout/stderr, attach Frida
-2. Agent detects JavaScriptCore via `_WTFCrash`/`_JSObjectCallAsFunction` symbol probe
+1. Self-spawn, pipe stdout/stderr, attach Frida (macOS: re-sign with `get-task-allow`)
+2. Agent detects JavaScriptCore via `JSGlobalContextCreate`/`JSEvaluateScript` symbol probe
 3. JscTracer hooks `JSObjectCallAsFunction` at the native level
-4. Emits events when hooked JS functions are called
+4. Multi-hook attribution: reads `.name` via public JSC C API (`JSObjectGetProperty`)
+5. **Note:** Bun's release binaries strip all JSC symbols — output capture works, function tracing requires a debug build
 
 ### Built-in Test Adapters
 
@@ -844,6 +841,10 @@ Native binaries use `DwarfResolver` + `NativeTracer`. Python uses `PythonResolve
 | VitestAdapter | JS/TS | `vitest.config.*` or `package.json` | 95 |
 | JestAdapter | JS/TS | `jest.config.*` or `package.json` | 92 |
 | BunAdapter | JS/TS | `bun.lockb` or `package.json` | 85 |
+| DenoAdapter | JS/TS | `deno.json`/`deno.jsonc` | 90 |
+| GoTestAdapter | Go | `go.mod` | 90 |
+| MochaAdapter | JS/TS | `.mocharc.*` or `mocha` in `package.json` | 90 |
+| GTestAdapter | C++ | `gtest` in CMakeLists.txt | 85 |
 
 ### Validation Criteria
 
