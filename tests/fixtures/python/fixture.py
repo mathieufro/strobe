@@ -142,9 +142,13 @@ def main():
         asyncio.run(async_main())
 
     elif mode == "decorators":
+        import time
         from modules.audio import decorated_process
-        result = decorated_process(440.0)
-        print(f"[DECORATORS] Result: {result}")
+        print("[DECORATORS] Running decorated function calls...")
+        for i in range(20):
+            result = decorated_process(440.0 + i)
+            time.sleep(0.1)
+        print(f"[DECORATORS] Done, last result: {result}")
 
     else:
         print(f"Unknown mode: {mode}", file=sys.stderr)

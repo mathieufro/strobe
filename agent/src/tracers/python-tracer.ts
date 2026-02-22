@@ -176,7 +176,8 @@ export class PythonTracer implements Tracer {
     const hookEntries: string[] = [];
     for (const [funcId, hook] of this.hooks) {
       const file = (hook.file || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-      hookEntries.push(`('${file}', ${hook.line || 0}, ${funcId})`);
+      const name = (hook.target.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      hookEntries.push(`('${file}', ${hook.line || 0}, ${funcId}, '${name}')`);
     }
 
     const logpointEntries: string[] = [];
@@ -280,9 +281,10 @@ def _strobe_trace(frame, event, arg):
             co = frame.f_code
             fname = co.co_filename
             fline = co.co_firstlineno
-            for file_pat, line_pat, fid in _strobe_hooks:
-                if fname.endswith(file_pat) and fline == line_pat:
-                    _strobe_cb(fname.encode('utf-8'), co.co_name.encode('utf-8'), frame.f_lineno, fid)
+            cname = getattr(co, 'co_qualname', co.co_name)
+            for file_pat, line_pat, fid, name_pat in _strobe_hooks:
+                if fname.endswith(file_pat) and (cname == name_pat or fline == line_pat or (fline > 0 and abs(fline - line_pat) <= 5)):
+                    _strobe_cb(fname.encode('utf-8'), cname.encode('utf-8'), frame.f_lineno, fid)
                     break
         elif event == 'line':
             fname = frame.f_code.co_filename
@@ -334,27 +336,37 @@ def _strobe_trace(frame, event, arg):
       pythonCode = preamble + `
 # --- sys.monitoring for PY_START (interpreter-global, no per-thread issues) ---
 _strobe_monitoring_ok = False
-try:
-    sys.monitoring.use_tool_id(0, "strobe")
-    sys.monitoring.set_events(0, sys.monitoring.events.PY_START)
+_strobe_tool_id = -1
+for _tid in range(6):
+    try:
+        sys.monitoring.use_tool_id(_tid, "strobe")
+        _strobe_tool_id = _tid
+        break
+    except ValueError:
+        continue
 
-    def _strobe_on_start(code, offset):
-        fname = code.co_filename
-        fline = code.co_firstlineno
-        # co_qualname (3.12+) gives the undecorated name; decorators shift co_firstlineno
-        # to the decorator line, so allow a small line-number window for decorated functions
-        cname = getattr(code, 'co_qualname', code.co_name)
-        for file_pat, line_pat, fid in _strobe_hooks:
-            if fname.endswith(file_pat) and (fline == line_pat or (fline > 0 and abs(fline - line_pat) <= 5)):
-                _strobe_cb(fname.encode('utf-8'), cname.encode('utf-8'), fline, fid)
-                return
+if _strobe_tool_id >= 0:
+    try:
+        setattr(_b, '_strobe_tool_id', _strobe_tool_id)
+        sys.monitoring.set_events(_strobe_tool_id, sys.monitoring.events.PY_START)
 
-    sys.monitoring.register_callback(0, sys.monitoring.events.PY_START, _strobe_on_start)
-    setattr(_b, '_strobe_monitoring_active', True)
-    _strobe_monitoring_ok = True
-except ValueError:
-    # Tool ID 0 already in use — fall back to settrace
-    pass
+        def _strobe_on_start(code, offset):
+            fname = code.co_filename
+            fline = code.co_firstlineno
+            cname = getattr(code, 'co_qualname', code.co_name)
+            for file_pat, line_pat, fid, name_pat in _strobe_hooks:
+                if fname.endswith(file_pat) and (cname == name_pat or fline == line_pat or (fline > 0 and abs(fline - line_pat) <= 5)):
+                    _strobe_cb(fname.encode('utf-8'), cname.encode('utf-8'), fline, fid)
+                    return
+
+        sys.monitoring.register_callback(_strobe_tool_id, sys.monitoring.events.PY_START, _strobe_on_start)
+        setattr(_b, '_strobe_monitoring_active', True)
+        _strobe_monitoring_ok = True
+    except Exception:
+        try:
+            sys.monitoring.free_tool_id(_strobe_tool_id)
+        except Exception:
+            pass
 
 # --- sys.settrace for breakpoints/logpoints, OR as fallback if monitoring failed ---
 ` + settraceBlock + `
@@ -537,8 +549,9 @@ except NameError:
       this.runPython(`
 import sys, threading, builtins as _b
 if getattr(_b, '_strobe_monitoring_active', False):
-    sys.monitoring.set_events(0, 0)
-    sys.monitoring.free_tool_id(0)
+    _tid = getattr(_b, '_strobe_tool_id', 0)
+    sys.monitoring.set_events(_tid, 0)
+    sys.monitoring.free_tool_id(_tid)
     setattr(_b, '_strobe_monitoring_active', False)
 if hasattr(threading, 'settrace_all_threads'):
     threading.settrace_all_threads(None)
