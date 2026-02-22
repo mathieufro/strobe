@@ -1135,9 +1135,10 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
 
                     unsafe { register_handler_raw(script_ptr, handler) };
 
-                    unsafe {
-                        load_script_raw(script_ptr)
-                            .map_err(|e| crate::Error::FridaAttachFailed(format!("Script load failed: {}", e)))?;
+                    let load_result = unsafe { load_script_raw(script_ptr) };
+                    if let Err(e) = load_result {
+                        unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
+                        return Err(crate::Error::FridaAttachFailed(format!("Script load failed: {}", e)));
                     }
                     tracing::debug!("PERF: script load + handler setup took {:?}", t.elapsed());
 
@@ -1796,6 +1797,19 @@ fn handle_write_memory(
     Err(crate::Error::WriteFailed("Memory write timed out (5s)".to_string()))
 }
 
+/// Get the parent PID of a process.
+fn get_ppid(pid: u32) -> Option<u32> {
+    std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
+}
+
 /// Handle a child process spawned via fork/exec.
 /// Attaches Frida to the child, loads the agent, and registers it for output capture.
 fn handle_child_spawn(
@@ -1804,7 +1818,8 @@ fn handle_child_spawn(
     output_registry: &OutputRegistry,
     session_ptrs: &mut HashMap<u32, *mut frida_sys::_FridaSession>,
 ) {
-    // Find which session this child belongs to by checking the output registry
+    // Find which session this child belongs to by checking the output registry.
+    // Use the child's PPID to find the correct parent session.
     let parent_info = {
         let reg = match output_registry.lock() {
             Ok(g) => g,
@@ -1814,10 +1829,12 @@ fn handle_child_spawn(
                 return;
             }
         };
-        // Find any active session to associate the child with
-        reg.values()
-            .next()
-            .map(|ctx| (ctx.session_id.clone(), ctx.event_tx.clone(), ctx.start_ns))
+        // Look up by parent PID first, fall back to any session for single-session case
+        let ppid = get_ppid(child_pid);
+        let ctx = ppid
+            .and_then(|pp| reg.get(&pp))
+            .or_else(|| reg.values().next());
+        ctx.map(|c| (c.session_id.clone(), c.event_tx.clone(), c.start_ns))
     };
 
     let (session_id, event_tx, start_ns) = match parent_info {
@@ -1875,6 +1892,7 @@ fn handle_child_spawn(
                         register_handler_raw(script_ptr, handler);
                         if let Err(e) = load_script_raw(script_ptr) {
                             tracing::error!("Failed to load script in child {}: {}", child_pid, e);
+                            frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void);
                             let _ = device.resume(child_pid);
                             return;
                         }

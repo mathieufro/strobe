@@ -17,8 +17,8 @@ fn is_python_excluded(name: &str) -> bool {
     matches!(name,
         "__pycache__" | "venv" | ".venv" | "env" | ".env" |
         "node_modules" | ".git" | ".tox" | ".mypy_cache" |
-        ".pytest_cache" | "dist" | "build" | "*.egg-info"
-    )
+        ".pytest_cache" | "dist" | "build"
+    ) || name.ends_with(".egg-info") || name.ends_with(".dist-info")
 }
 
 /// Build a lookup table of byte-offset → 1-indexed line number.
@@ -133,7 +133,7 @@ fn extract_from_stmt(
             functions.insert(qualified_name.clone(), (file_path.to_path_buf(), def_line, body_line));
 
             let mut new_prefix = prefix.to_vec();
-            new_prefix.push(qualified_name);
+            new_prefix.push(f.name.to_string());
             for nested_stmt in &f.body {
                 extract_from_stmt(nested_stmt, file_path, &new_prefix, line_starts, functions);
             }
@@ -149,7 +149,7 @@ fn extract_from_stmt(
             functions.insert(qualified_name.clone(), (file_path.to_path_buf(), def_line, body_line));
 
             let mut new_prefix = prefix.to_vec();
-            new_prefix.push(qualified_name);
+            new_prefix.push(f.name.to_string());
             for nested_stmt in &f.body {
                 extract_from_stmt(nested_stmt, file_path, &new_prefix, line_starts, functions);
             }
@@ -394,12 +394,31 @@ def outer():
     }
 
     #[test]
+    fn test_extract_deeply_nested_functions() {
+        let source = r#"
+def outer():
+    def inner():
+        def deepest():
+            pass
+        return deepest
+    return inner
+"#;
+        let functions = extract_functions_from_source(source, Path::new("deep.py")).unwrap();
+        assert!(functions.contains_key("outer"));
+        assert!(functions.contains_key("outer.inner"));
+        assert!(functions.contains_key("outer.inner.deepest"),
+            "Depth-3 nesting should be outer.inner.deepest, got: {:?}", functions.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
     fn test_excluded_directories() {
         assert!(is_python_excluded("__pycache__"));
         assert!(is_python_excluded("venv"));
         assert!(is_python_excluded(".venv"));
         assert!(is_python_excluded("node_modules"));
         assert!(is_python_excluded(".git"));
+        assert!(is_python_excluded("mypackage.egg-info"));
+        assert!(is_python_excluded("foo.dist-info"));
         assert!(!is_python_excluded("modules"));
         assert!(!is_python_excluded("tests"));
     }

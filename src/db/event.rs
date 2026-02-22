@@ -591,7 +591,7 @@ impl Database {
         let mut stats = EventInsertStats::default();
         let mut session_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-        // Count current events per session
+        // Count ALL current events per session (total determines when limit is exceeded).
         for event in events {
             if !session_counts.contains_key(&event.session_id) {
                 let count: i64 = tx.query_row(

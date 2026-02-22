@@ -998,6 +998,13 @@ Validation Limits (enforced):
                 "projectRoot must not contain '..' components".to_string()
             ));
         }
+        if let Some(ref sp) = req.symbols_path {
+            if sp.contains("..") {
+                return Err(crate::Error::ValidationError(
+                    "symbolsPath must not contain '..' components".to_string()
+                ));
+            }
+        }
 
         // Enforce global session limit
         // Note: There's a small TOCTOU window between this check and the session
@@ -1309,6 +1316,7 @@ Validation Limits (enforced):
                                     on_patterns: on_patterns.clone(),
                                     is_expr: false,
                                     expr: None,
+                                    no_slide: true,
                                 });
 
                                 active_watches.push(crate::mcp::ActiveWatch {
@@ -1413,6 +1421,7 @@ Validation Limits (enforced):
                                 on_patterns: on_patterns.clone(),
                                 is_expr: false,
                                 expr: None,
+                                no_slide: false,
                             });
 
                             active_watches.push(crate::mcp::ActiveWatch {
@@ -1447,7 +1456,7 @@ Validation Limits (enforced):
                                 deref_offset: w.deref_offset,
                                 type_name: w.type_name.clone(),
                                 on_patterns: w.on_patterns.clone(),
-                                no_slide: false,
+                                no_slide: w.no_slide,
                             }
                         }).collect();
 

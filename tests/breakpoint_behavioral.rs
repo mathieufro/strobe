@@ -44,6 +44,7 @@ async fn test_breakpoint_behavioral_suite() {
     println!("\n=== Test 1: Breakpoint pause and resume ===");
     {
         let session_id = "bp-pause-resume";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -52,7 +53,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
             session_id, Some("bp-1".to_string()),
@@ -115,6 +116,7 @@ async fn test_breakpoint_behavioral_suite() {
     {
         // Part A: condition="false" should NOT pause — validates evaluator actually filters
         let session_id = "bp-cond-false";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -123,7 +125,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
             session_id, Some("bp-false".to_string()),
@@ -156,6 +158,7 @@ async fn test_breakpoint_behavioral_suite() {
 
         // Part B: condition="true" SHOULD pause (control test)
         let session_id = "bp-cond-true";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -164,7 +167,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
             session_id, Some("bp-true".to_string()),
@@ -190,6 +193,7 @@ async fn test_breakpoint_behavioral_suite() {
     println!("\n=== Test 3: Hit count breakpoint ===");
     {
         let session_id = "bp-hitcount";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -198,7 +202,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
             session_id, Some("bp-hit3".to_string()),
@@ -234,6 +238,7 @@ async fn test_breakpoint_behavioral_suite() {
     println!("\n=== Test 4: Multi-thread breakpoint (recv().wait() e2e) ===");
     {
         let session_id = "bp-mt";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -242,7 +247,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
             session_id, Some("bp-mt".to_string()),
@@ -286,6 +291,7 @@ async fn test_breakpoint_behavioral_suite() {
     println!("\n=== Test 5: Session cleanup ===");
     {
         let session_id = "bp-cleanup";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -294,7 +300,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
             session_id, Some("bp-c1".to_string()),
@@ -335,6 +341,7 @@ async fn test_breakpoint_behavioral_suite() {
     println!("\n=== Test 6: Breakpoint removal ===");
     {
         let session_id = "bp-removal";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -343,7 +350,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp = sm.set_breakpoint_async(
             session_id, Some("bp-rm".to_string()),
@@ -381,6 +388,7 @@ async fn test_breakpoint_behavioral_suite() {
     println!("\n=== Test 7: Multiple breakpoints ===");
     {
         let session_id = "bp-multi";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id, binary.to_str().unwrap(),
@@ -389,7 +397,7 @@ async fn test_breakpoint_behavioral_suite() {
                 None,
         )
             .await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         let bp1 = sm.set_breakpoint_async(
             session_id, Some("bp-proc".to_string()),

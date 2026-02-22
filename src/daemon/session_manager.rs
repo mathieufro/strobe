@@ -87,6 +87,7 @@ pub struct ActiveWatchState {
     pub on_patterns: Option<Vec<String>>,
     pub is_expr: bool,
     pub expr: Option<String>,
+    pub no_slide: bool,
 }
 
 /// Check if a process is alive. Returns true if the process exists,
@@ -310,8 +311,6 @@ impl SessionManager {
     }
 
     pub async fn stop_session(&self, id: &str) -> Result<u64> {
-        let count = self.db.count_session_events(id)?;
-
         // Phase 1: Signal database writer task to flush and exit
         if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
             let _ = cancel_tx.send(true);
@@ -322,7 +321,10 @@ impl SessionManager {
             let _ = handle.await; // Wait for writer to finish flushing
         }
 
-        // Phase 3: Now safe to delete session (all events flushed, no FK violations)
+        // Phase 3: Count events AFTER flush so the count is accurate
+        let count = self.db.count_session_events(id)?;
+
+        // Phase 4: Now safe to delete session (all events flushed, no FK violations)
         self.db.delete_session(id)?;
 
         // Clean up in-memory state
@@ -334,6 +336,8 @@ impl SessionManager {
         write_lock(&self.breakpoints).remove(id);
         write_lock(&self.logpoints).remove(id);
         write_lock(&self.paused_threads).remove(id);
+        write_lock(&self.languages).remove(id);
+        write_lock(&self.resolvers).remove(id);
 
         Ok(count)
     }
@@ -341,8 +345,6 @@ impl SessionManager {
     /// Stop a session but retain its DB rows for later inspection.
     /// Cleans up in-memory state and flushes the writer, but does NOT delete from DB.
     pub async fn stop_session_retain(&self, id: &str) -> Result<u64> {
-        let count = self.db.count_session_events(id)?;
-
         // Phase 1: Signal database writer task to flush and exit
         if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
             let _ = cancel_tx.send(true);
@@ -353,7 +355,10 @@ impl SessionManager {
             let _ = handle.await; // Wait for writer to finish flushing
         }
 
-        // Phase 3: Mark session as stopped (but keep it in the DB)
+        // Phase 3: Count events AFTER flush so the count is accurate
+        let count = self.db.count_session_events(id)?;
+
+        // Phase 4: Mark session as stopped (but keep it in the DB)
         self.db.mark_session_stopped(id)?;
 
         // Clean up in-memory state
@@ -365,6 +370,8 @@ impl SessionManager {
         write_lock(&self.breakpoints).remove(id);
         write_lock(&self.logpoints).remove(id);
         write_lock(&self.paused_threads).remove(id);
+        write_lock(&self.languages).remove(id);
+        write_lock(&self.resolvers).remove(id);
 
         Ok(count)
     }
@@ -451,13 +458,15 @@ impl SessionManager {
     }
 
     pub fn get_or_start_dwarf_parse_with_symbols(&self, binary_path: &str, search_root: Option<&str>, symbols_path: Option<&str>) -> DwarfHandle {
-        // Include mtime in cache key so rebuilds invalidate the cache
+        // Include mtime and symbols_path in cache key so rebuilds and symbol overrides invalidate correctly
         let mtime = std::fs::metadata(binary_path)
             .and_then(|m| m.modified())
             .ok();
-        let cache_key = match mtime {
-            Some(t) => format!("{}@{}", binary_path, t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
-            None => binary_path.to_string(),
+        let cache_key = match (mtime, symbols_path) {
+            (Some(t), Some(sp)) => format!("{}@{}@sym:{}", binary_path, t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(), sp),
+            (Some(t), None) => format!("{}@{}", binary_path, t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+            (None, Some(sp)) => format!("{}@sym:{}", binary_path, sp),
+            (None, None) => binary_path.to_string(),
         };
 
         // Fast path: read lock only

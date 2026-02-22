@@ -8,11 +8,39 @@ use super::resolver::*;
 pub type FunctionTable = HashMap<String, (PathBuf, u32)>;
 
 const SKIP_DIRS: &[&str] = &[
-    "node_modules", "dist", "build", ".git", ".next", ".nuxt",
+    "node_modules", "build", ".git", ".next", ".nuxt",
     "coverage", "__pycache__", ".cache", ".turbo", ".svelte-kit",
 ];
 
 const JS_EXTENSIONS: &[&str] = &["js", "ts", "jsx", "tsx", "mjs", "cjs", "mts", "cts"];
+
+/// Strip `//` line comments, but not `//` inside string literals.
+fn strip_line_comment(line: &str) -> &str {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && i + 1 < bytes.len() {
+            i += 2; // skip escaped character
+            continue;
+        }
+        match ch {
+            b'\'' if !in_double_quote && !in_backtick => in_single_quote = !in_single_quote,
+            b'"' if !in_single_quote && !in_backtick => in_double_quote = !in_double_quote,
+            b'`' if !in_single_quote && !in_double_quote => in_backtick = !in_backtick,
+            b'/' if !in_single_quote && !in_double_quote && !in_backtick
+                    && i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                return &line[..i];
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
 
 /// Line-by-line regex extraction of JS/TS function definitions.
 /// Returns a map of qualified name → (file, 1-indexed line).
@@ -29,7 +57,7 @@ pub fn extract_functions_from_source(source: &str, file: &Path) -> crate::Result
         "if", "for", "while", "switch", "catch", "return", "throw", "delete",
         "typeof", "instanceof", "new", "import", "export", "default", "class",
         "const", "let", "var", "async", "await", "yield", "function", "try",
-        "else", "do", "in", "of", "from", "with", "void", "case",
+        "else", "do", "in", "of", "from", "with", "void", "case", "constructor",
     ].iter().copied().collect();
 
     let mut result: FunctionTable = HashMap::new();
@@ -42,16 +70,25 @@ pub fn extract_functions_from_source(source: &str, file: &Path) -> crate::Result
     for (i, line) in source.lines().enumerate() {
         let line_num = (i + 1) as u32;
 
-        // Crude block comment tracking (covers /* ... */ across lines)
+        // Block comment tracking (covers /* ... */ across lines)
         if in_block_comment {
-            if line.contains("*/") { in_block_comment = false; }
+            if let Some(end_idx) = line.find("*/") {
+                in_block_comment = false;
+                // Process remainder of line after */ for brace tracking
+                let remainder = &line[end_idx + 2..];
+                let opens = remainder.chars().filter(|&c| c == '{').count() as i32;
+                let closes = remainder.chars().filter(|&c| c == '}').count() as i32;
+                brace_depth += opens - closes;
+                if brace_depth < 0 { brace_depth = 0; }
+                class_stack.retain(|(_, depth)| brace_depth > *depth);
+            }
             continue;
         }
         if line.contains("/*") && !line.contains("*/") {
             in_block_comment = true;
         }
-        // Skip single-line comments
-        let stripped = if let Some(idx) = line.find("//") { &line[..idx] } else { line };
+        // Strip single-line comments (but not // inside string literals)
+        let stripped = strip_line_comment(line);
         // Skip template literal lines (simple heuristic)
         let backtick_count = stripped.chars().filter(|&c| c == '`').count();
         if backtick_count % 2 != 0 { in_template_literal = !in_template_literal; }
@@ -154,15 +191,6 @@ impl JsResolver {
     }
 }
 
-fn pattern_to_regex(pattern: &str) -> crate::Result<regex::Regex> {
-    // ** → match anything (including dots); * → match non-dot chars
-    let escaped = regex::escape(&pattern.replace("**", "\x00").replace('*', "\x01"))
-        .replace("\x00", ".*")
-        .replace("\x01", "[^.]*");
-    regex::Regex::new(&format!("^{}$", escaped))
-        .map_err(|e| crate::Error::Internal(format!("Bad JS pattern '{}': {}", pattern, e)))
-}
-
 impl SymbolResolver for JsResolver {
     fn resolve_pattern(&self, pattern: &str, _root: &Path) -> crate::Result<Vec<ResolvedTarget>> {
         // Handle @file: patterns
@@ -177,9 +205,10 @@ impl SymbolResolver for JsResolver {
                 .collect());
         }
 
-        let re = pattern_to_regex(pattern)?;
+        // Use project-standard PatternMatcher with '.' as separator for JS
+        let matcher = crate::dwarf::PatternMatcher::new_with_separator(pattern, '.');
         Ok(self.functions.iter()
-            .filter(|(name, _)| re.is_match(name))
+            .filter(|(name, _)| matcher.matches(name))
             .map(|(name, (file, line))| ResolvedTarget::SourceLocation {
                 file: file.to_string_lossy().to_string(),
                 line: *line,
@@ -340,7 +369,7 @@ function top() {}
     #[test]
     fn test_skips_excluded_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        for skip in &["node_modules", "dist", ".git", ".next", "coverage"] {
+        for skip in &["node_modules", ".git", ".next", "coverage"] {
             std::fs::create_dir_all(dir.path().join(skip)).unwrap();
             std::fs::write(dir.path().join(skip).join("index.js"),
                 "function shouldNotAppear() {}").unwrap();
@@ -396,10 +425,11 @@ const typed = <T>(x: T): T => x;
         std::fs::write(js_path.with_extension("js.map"), map_content).unwrap();
 
         let resolver = JsResolver::from_project(dir.path()).unwrap();
-        // Resolution should map line 2 of index.js → line 5 of ../src/index.ts
+        // Resolution should map line 2 of index.js → line 6 of ../src/index.ts
+        // (VLQ ";AAKA" = source line 5 zero-indexed → line 6 one-indexed)
         if let Some((ts_file, ts_line)) = resolver.resolve_sourcemap(&js_path, 2, 0) {
             assert!(ts_file.to_string_lossy().ends_with("index.ts"), "should map to .ts file");
-            assert_eq!(ts_line, 5, "should map to line 5 in TypeScript source");
+            assert_eq!(ts_line, 6, "should map to line 6 in TypeScript source");
         }
     }
 }

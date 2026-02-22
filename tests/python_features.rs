@@ -251,7 +251,15 @@ async fn scenario_breakpoints(
     ).await;
 
     assert!(!pause_events.is_empty(), "Should have at least one pause event");
-    eprintln!("  breakpoint hit! {} pause events", pause_events.len());
+    let pause = &pause_events[0];
+    if let Some(ref sf) = pause.source_file {
+        assert!(sf.contains("audio.py"), "Pause should be in audio.py, got: {}", sf);
+    }
+    if let Some(ln) = pause.line_number {
+        assert_eq!(ln, 7, "Pause should be on line 7");
+    }
+    eprintln!("  breakpoint hit! {} pause events (file={:?} line={:?})",
+        pause_events.len(), pause.source_file, pause.line_number);
 
     // Resume execution
     let continue_result = sm.debug_continue_async(session_id, None).await;

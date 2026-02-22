@@ -7,8 +7,16 @@ pub struct BunAdapter;
 
 impl TestAdapter for BunAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
+        // Check for Vitest/Jest first — Bun as package manager doesn't mean Bun as test runner
+        if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
+            if pkg.contains("\"vitest\"") || pkg.contains("\"jest\"") {
+                // Other framework present — only claim high confidence if bun:test is explicit
+                if pkg.contains("\"bun test\"") || pkg.contains("\"bun:test\"") { return 90; }
+                return 0; // Let Vitest/Jest adapters handle it
+            }
+        }
         if project_root.join("bun.lockb").exists() || project_root.join("bun.lock").exists() {
-            return 95;
+            return 85;
         }
         if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
             if pkg.contains("\"bun test\"") || pkg.contains("\"bun:test\"") { return 90; }
@@ -30,6 +38,7 @@ impl TestAdapter for BunAdapter {
             args: vec![
                 "test".to_string(),
                 "--reporter=junit".to_string(),
+                "--reporter-outfile=/dev/stdout".to_string(),
             ],
             env: HashMap::new(),
         })
@@ -41,6 +50,8 @@ impl TestAdapter for BunAdapter {
             args: vec![
                 "test".to_string(),
                 "--reporter=junit".to_string(),
+                "--reporter-outfile=/dev/stdout".to_string(),
+                "--test-name-pattern".to_string(),
                 test_name.to_string(),
             ],
             env: HashMap::new(),
@@ -287,7 +298,7 @@ AssertionError: Expected 6, got 5
         assert_eq!(adapter.detect(dir.path(), None), 0);
 
         std::fs::write(dir.path().join("bun.lockb"), b"").unwrap();
-        assert!(adapter.detect(dir.path(), None) >= 90, "bun.lockb → high confidence");
+        assert!(adapter.detect(dir.path(), None) >= 85, "bun.lockb → high confidence");
     }
 
     #[test]
@@ -337,5 +348,6 @@ AssertionError: Expected 6, got 5
         let cmd = BunAdapter.suite_command(dir.path(), None, &Default::default()).unwrap();
         assert_eq!(cmd.program, "bun");
         assert!(cmd.args.iter().any(|a| a.contains("junit")));
+        assert!(cmd.args.iter().any(|a| a.contains("reporter-outfile")));
     }
 }

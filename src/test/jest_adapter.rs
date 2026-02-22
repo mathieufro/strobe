@@ -14,6 +14,8 @@ struct JestReport {
     num_failed: u32,
     #[serde(rename = "numPendingTests", default)]
     num_pending: u32,
+    #[serde(rename = "numTodoTests", default)]
+    num_todo: u32,
     #[serde(rename = "testResults", default)]
     test_results: Vec<JestSuite>,
 }
@@ -166,7 +168,7 @@ impl TestAdapter for JestAdapter {
             summary: TestSummary {
                 passed: report.num_passed,
                 failed: report.num_failed,
-                skipped: report.num_pending,
+                skipped: report.num_pending + report.num_todo,
                 stuck: None,
                 duration_ms: total_duration_ms,
             },

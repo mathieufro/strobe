@@ -58,6 +58,11 @@ export class PythonTracer implements Tracer {
   private PyGILState_Ensure: NativePointer | null = null;
   private PyGILState_Release: NativePointer | null = null;
 
+  // Cached NativeFunction wrappers (created once, reused)
+  private _gilEnsure: NativeFunction<number, []> | null = null;
+  private _gilRelease: NativeFunction<void, [number]> | null = null;
+  private _pyRun: NativeFunction<number, [NativePointer]> | null = null;
+
   constructor(agent: any) {
     this.agent = agent;
   }
@@ -162,7 +167,7 @@ export class PythonTracer implements Tracer {
     for (const bp of this.breakpoints.values()) {
       const file = (bp.file || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
       const cond = (bp.condition || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-      bpEntries.push(`('${file}', ${bp.line}, '${bp.id}', '${cond}')`);
+      bpEntries.push(`('${file}', ${bp.line}, '${bp.id}', '${cond}', ${bp.hitCount || 0})`);
     }
 
     return `_strobe_hooks = [${hookEntries.join(', ')}]
@@ -222,6 +227,10 @@ import builtins as _b
 _strobe_bp_event = getattr(_b, '_strobe_bp_event', None) or threading.Event()
 setattr(_b, '_strobe_bp_event', _strobe_bp_event)
 
+# Configure ctypes for GIL release at breakpoints
+ctypes.pythonapi.PyEval_SaveThread.restype = ctypes.c_void_p
+ctypes.pythonapi.PyEval_RestoreThread.argtypes = [ctypes.c_void_p]
+
 # Data lists (updated in-place on subsequent syncs without redefining the trace function)
 ${dataAssignments}
 
@@ -246,11 +255,20 @@ def _strobe_trace(frame, event, arg):
                         msg = f'{lp_msg} [fmt error: {_e}]'
                     _strobe_log_cb(lp_id.encode(), fline, msg.encode())
                     break
-            for bp_file, bp_line, bp_id, bp_cond in _strobe_breakpoints:
+            for bp_file, bp_line, bp_id, bp_cond, bp_hit_count in _strobe_breakpoints:
                 if fname.endswith(bp_file) and fline == bp_line:
+                    if bp_hit_count > 0:
+                        _strobe_bp_hits = getattr(_b, '_strobe_bp_hits', {})
+                        _strobe_bp_hits[bp_id] = _strobe_bp_hits.get(bp_id, 0) + 1
+                        setattr(_b, '_strobe_bp_hits', _strobe_bp_hits)
+                        if _strobe_bp_hits[bp_id] < bp_hit_count:
+                            break
                     if not bp_cond or eval(bp_cond, frame.f_globals, frame.f_locals):
                         _strobe_bp_hit_cb(bp_id.encode(), fline)
+                        # Release GIL before blocking so Frida agent thread can call runPython
+                        _tstate = ctypes.pythonapi.PyEval_SaveThread()
                         _strobe_bp_event.wait()
+                        ctypes.pythonapi.PyEval_RestoreThread(_tstate)
                         _strobe_bp_event.clear()
                     break
     except Exception as _strobe_err:
@@ -285,16 +303,19 @@ else:
       return -1;
     }
 
-    const ensure = new NativeFunction(this.PyGILState_Ensure, 'int', []);
-    const release = new NativeFunction(this.PyGILState_Release, 'void', ['int']);
-    const run = new NativeFunction(this.PyRun_SimpleString, 'int', ['pointer']);
+    // Cache NativeFunction wrappers (created once, reused across calls)
+    if (!this._gilEnsure) {
+      this._gilEnsure = new NativeFunction(this.PyGILState_Ensure, 'int', []);
+      this._gilRelease = new NativeFunction(this.PyGILState_Release, 'void', ['int']);
+      this._pyRun = new NativeFunction(this.PyRun_SimpleString, 'int', ['pointer']);
+    }
 
-    const gilState = ensure();
+    const gilState = this._gilEnsure!();
     try {
       const codeBuf = Memory.allocUtf8String(code);
-      return run(codeBuf) as number;
+      return this._pyRun!(codeBuf) as number;
     } finally {
-      release(gilState);
+      this._gilRelease!(gilState);
     }
   }
 
@@ -397,6 +418,8 @@ except NameError:
 
   removeAllHooks(): void {
     this.hooks.clear();
+    this.breakpoints.clear();
+    this.logpoints.clear();
     if (this.traceInstalled) {
       this.runPython('import sys; sys.settrace(None)');
       this.traceInstalled = false;
@@ -579,8 +602,12 @@ except Exception as _e:
   }
 
   writeVariable(expr: string, value: any): void {
-    const valueStr = typeof value === 'string' ? `"${value}"` : String(value);
-    const result = this.runPython(`${expr} = ${valueStr}`);
+    // Serialize value as JSON and use json.loads() in Python to safely deserialize,
+    // preventing code injection via string interpolation.
+    const safeValue = JSON.stringify(value);
+    const result = this.runPython(
+      `import json as _j; ${expr} = _j.loads(${JSON.stringify(safeValue)})`
+    );
     if (result !== 0) {
       throw new Error(`Failed to write: ${expr}`);
     }

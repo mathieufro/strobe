@@ -24,6 +24,8 @@ async fn test_phase2a_gap_suite() {
     {
         println!("\n=== Test 1: Multi-thread recv().wait() PoC ===");
         let session_id = "mt-pause-poc";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id,
@@ -37,8 +39,7 @@ async fn test_phase2a_gap_suite() {
         )
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid)
-            .unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Set breakpoint on audio::process_buffer — called by multiple threads
         let bp = sm
@@ -96,6 +97,8 @@ async fn test_phase2a_gap_suite() {
     'test2: {
         println!("\n=== Test 2: CModule + Breakpoint Coexistence ===");
         let session_id = "coexist-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
                 session_id,
@@ -109,8 +112,7 @@ async fn test_phase2a_gap_suite() {
             )
             .await
             .unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid)
-            .unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Install CModule trace on audio::process_buffer FIRST
         sm.add_patterns(session_id, &["audio::process_buffer".to_string()])

@@ -37,13 +37,14 @@ mod macos_tests {
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-ax-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
         None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Give the app time to render its window and fully initialize AX tree
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -93,13 +94,14 @@ mod macos_tests {
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-screenshot-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
         None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait longer for window to be fully visible and rendered
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -144,13 +146,14 @@ mod macos_tests {
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-latency-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
         None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait for app to fully initialize
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -334,13 +337,14 @@ mod macos_tests {
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-vision-format-test";
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
             session_id,
             binary.to_str().unwrap(),
             &[], None, project_root, None, false,
         None,
         ).await.unwrap();
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, pid).unwrap();
+        sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait longer for window to be fully visible and rendered
         tokio::time::sleep(Duration::from_secs(3)).await;

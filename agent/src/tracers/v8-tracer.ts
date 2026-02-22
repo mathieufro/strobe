@@ -122,7 +122,9 @@ export class V8Tracer implements Tracer {
   writeVariable(expr: string, value: any): void {
     try {
       new Function('__v', `${expr} = __v`)(value);
-    } catch {}
+    } catch (e) {
+      throw new Error(`Failed to write '${expr}': ${e}`);
+    }
   }
 
   setImageBase(_base: string): void {}
@@ -146,71 +148,71 @@ export class V8Tracer implements Tracer {
     if (!obj) return;
     const seen = new Set<any>();
 
-    const wrap = (container: any, key: string, depth: number) => {
+    const processKey = (container: any, key: string, depth: number, currentPrefix: string) => {
       if (depth > 3) return; // Limit recursion
       const val = container[key];
-      if (typeof val !== 'function' || this.wrappedFns.has(val)) return;
+      if (typeof val === 'function' && !this.wrappedFns.has(val)) {
+        const qualifiedName = currentPrefix ? `${currentPrefix}.${key}` : key;
 
-      const qualifiedName = prefix ? `${prefix}.${key}` : key;
+        // Find matching hook
+        let matchedHook: V8Hook | null = null;
+        for (const [, hook] of this.hooks) {
+          if (!this.fileMatches(filename, hook.target)) continue;
+          if (hook.target.name === qualifiedName || hook.target.name === key) {
+            matchedHook = hook;
+            break;
+          }
+        }
 
-      // Find matching hook
-      let matchedHook: V8Hook | null = null;
-      for (const [, hook] of this.hooks) {
-        if (!this.fileMatches(filename, hook.target)) continue;
-        const targetFuncName = hook.target.name.split('.').pop() ?? hook.target.name;
-        if (targetFuncName === key || hook.target.name === qualifiedName) {
-          matchedHook = hook;
-          break;
+        if (matchedHook) {
+          const hook = matchedHook;
+          const self = this;
+          const wrapped = new Proxy(val, {
+            apply(target, thisArg, args) {
+              self.emitEvent(hook.funcId, hook, filename, 'entry');
+              let result: any;
+              try {
+                result = Reflect.apply(target, thisArg, args);
+              } catch (e) {
+                self.emitEvent(hook.funcId, hook, filename, 'exit');
+                throw e;
+              }
+              // Handle async functions
+              if (result && typeof result.then === 'function') {
+                return result.then((v: any) => {
+                  self.emitEvent(hook.funcId, hook, filename, 'exit');
+                  return v;
+                }, (e: any) => {
+                  self.emitEvent(hook.funcId, hook, filename, 'exit');
+                  throw e;
+                });
+              }
+              self.emitEvent(hook.funcId, hook, filename, 'exit');
+              return result;
+            }
+          });
+          this.wrappedFns.add(val); // Mark original as wrapped
+          try { container[key] = wrapped; } catch {} // May be non-writable
         }
       }
 
-      if (matchedHook) {
-        const hook = matchedHook;
-        const self = this;
-        const wrapped = new Proxy(val, {
-          apply(target, thisArg, args) {
-            self.emitEvent(hook.funcId, hook, filename, 'entry');
-            let result: any;
-            try {
-              result = Reflect.apply(target, thisArg, args);
-            } catch (e) {
-              self.emitEvent(hook.funcId, hook, filename, 'exit');
-              throw e;
-            }
-            // Handle async functions
-            if (result && typeof result.then === 'function') {
-              return result.then((v: any) => {
-                self.emitEvent(hook.funcId, hook, filename, 'exit');
-                return v;
-              }, (e: any) => {
-                self.emitEvent(hook.funcId, hook, filename, 'exit');
-                throw e;
-              });
-            }
-            self.emitEvent(hook.funcId, hook, filename, 'exit');
-            return result;
-          }
-        });
-        this.wrappedFns.add(val); // Mark original as wrapped
-        try { container[key] = wrapped; } catch {} // May be non-writable
-      }
-
       // Recurse into plain objects (e.g. class instances, namespace objects)
-      if (typeof val === 'object' && !seen.has(val)) {
+      if (typeof val === 'object' && val !== null && !seen.has(val)) {
         seen.add(val);
+        const childPrefix = currentPrefix ? `${currentPrefix}.${key}` : key;
         for (const k of Object.keys(val)) {
-          wrap(val, k, depth + 1);
+          processKey(val, k, depth + 1, childPrefix);
         }
       }
     };
 
     for (const key of Object.keys(obj)) {
-      wrap(obj, key, 0);
+      processKey(obj, key, 0, prefix);
     }
     // Also wrap prototype methods for classes
     if (typeof obj === 'function' && obj.prototype) {
       for (const key of Object.getOwnPropertyNames(obj.prototype)) {
-        if (key !== 'constructor') wrap(obj.prototype, key, 0);
+        if (key !== 'constructor') processKey(obj.prototype, key, 0, prefix);
       }
     }
   }

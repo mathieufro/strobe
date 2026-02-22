@@ -40,13 +40,15 @@ export class JscTracer implements Tracer {
     const self = this;
     this.interceptor = Interceptor.attach(hookTarget, {
       onEnter(args) {
-        // args[1] = JSObjectRef (the function being called)
-        // Full JSC struct navigation is a follow-on task (version-specific offsets).
+        if (self.hooks.size === 0) return; // fast-path when no hooks
         const fnPtr = args[1];
+        (this as any)._strobeFnPtr = fnPtr;
         self.tryEmitForJscFunction(fnPtr, 'entry');
       },
       onLeave(_retval) {
-        // Emit exit — funcId matching is best-effort
+        if (self.hooks.size === 0) return; // fast-path
+        const fnPtr = (this as any)._strobeFnPtr;
+        if (fnPtr) self.tryEmitForJscFunction(fnPtr, 'exit');
       }
     });
 
@@ -80,24 +82,24 @@ export class JscTracer implements Tracer {
   setImageBase(_base: string): void {}
   getSlide(): NativePointer { return ptr(0); }
 
-  private tryEmitForJscFunction(fnPtr: NativePointer, event: 'entry' | 'exit'): void {
-    // TODO(follow-on): Navigate JSC struct from fnPtr to function name + source URL + line.
-    // Full implementation requires JSC struct offsets (version-specific).
-    // For now: emit a generic event for the first active hook.
-    for (const [funcId, hook] of this.hooks) {
-      this.eventBuffer.push({
-        id: `${this.sessionId}-jsc-${++this.eventIdCounter}`,
-        sessionId: this.sessionId,
-        timestampNs: Date.now() * 1_000_000,
-        threadId: Process.getCurrentThreadId(),
-        eventType: event === 'entry' ? 'function_enter' : 'function_exit',
-        functionName: hook.target.name,
-        sourceFile: hook.target.file,
-        lineNumber: hook.target.line,
-        pid: Process.id,
-      });
-      break; // One event per call for now
-    }
+  private tryEmitForJscFunction(_fnPtr: NativePointer, event: 'entry' | 'exit'): void {
+    // Without JSC struct navigation (version-specific offsets), we cannot identify
+    // which function is being called from fnPtr alone. Only emit when there's a
+    // single hook so attribution is unambiguous.
+    if (this.hooks.size !== 1) return;
+
+    const [funcId, hook] = this.hooks.entries().next().value;
+    this.eventBuffer.push({
+      id: `${this.sessionId}-jsc-${++this.eventIdCounter}`,
+      sessionId: this.sessionId,
+      timestampNs: Date.now() * 1_000_000,
+      threadId: Process.getCurrentThreadId(),
+      eventType: event === 'entry' ? 'function_enter' : 'function_exit',
+      functionName: hook.target.name,
+      sourceFile: hook.target.file,
+      lineNumber: hook.target.line,
+      pid: Process.id,
+    });
     if (this.eventBuffer.length >= 50) this.flushEvents();
   }
 
