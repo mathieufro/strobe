@@ -65,22 +65,23 @@ export class V8Tracer implements Tracer {
       (globalThis as any).__strobe_trace = function(
         event: string, funcName: string, file: string, line: number
       ) {
+        const cleanFile = file.startsWith('file://') ? file.slice(7) : file;
         // Match against active hooks — require BOTH name and file to match
         for (const [, hook] of self2.hooks) {
           const nameMatch = hook.target.name === funcName;
-          const fileMatch = hook.target.file && file.replace('file://', '').endsWith(hook.target.file);
+          const fileMatch = hook.target.file && cleanFile.endsWith(hook.target.file);
           if (nameMatch && fileMatch) {
             if (event === 'enter') {
-              self2.emitEvent(hook.funcId, hook, file.replace('file://', ''), 'entry');
+              self2.emitEvent(hook.funcId, hook, cleanFile, 'entry');
             } else if (event === 'exit') {
-              self2.emitEvent(hook.funcId, hook, file.replace('file://', ''), 'exit');
+              self2.emitEvent(hook.funcId, hook, cleanFile, 'exit');
             }
             return;
           }
           // Fall back to name-only match if no file context in the hook
           if (nameMatch && !hook.target.file) {
             if (event === 'enter') {
-              self2.emitEvent(hook.funcId, hook, file.replace('file://', ''), 'entry');
+              self2.emitEvent(hook.funcId, hook, cleanFile, 'entry');
             }
             return;
           }
@@ -170,6 +171,11 @@ export class V8Tracer implements Tracer {
   }
 
   writeVariable(expr: string, value: any): void {
+    // Validate expr is a simple assignment target (variable name, attribute access, subscript)
+    // to prevent code injection via expr
+    if (!/^[a-zA-Z_$]\w*(?:\.[a-zA-Z_$]\w*|\[\d+\]|\[['"][^'"]*['"]\])*$/.test(expr)) {
+      throw new Error(`Invalid write target: ${expr}`);
+    }
     try {
       new Function('__v', `${expr} = __v`)(value);
     } catch (e) {
@@ -194,27 +200,37 @@ export class V8Tracer implements Tracer {
       if (typeof mod.registerHooks === 'function') {
         mod.registerHooks({
           load(url: string, context: any, nextLoad: Function) {
-            const result = nextLoad(url, context);
-            // Only transform user ESM code (not node_modules, not node: builtins)
-            if (result.format === 'module' && result.source &&
-                !url.includes('node_modules') && !url.startsWith('node:')) {
-              const source = typeof result.source === 'string'
-                ? result.source
-                : new ((globalThis as any).TextDecoder)().decode(result.source);
-              // Regex-based function wrapping: add __strobe_trace calls at function entry
-              const fnRegex = /^(\s*export\s+(?:default\s+)?(?:async\s+)?function\s+)(\w+)\s*\(([^)]*)\)\s*\{/gm;
-              let transformed = source;
-              let m;
-              while ((m = fnRegex.exec(source)) !== null) {
-                const [full, prefix, name, params] = m;
-                transformed = transformed.replace(full,
-                  `${prefix}${name}(${params}) {\n` +
-                  `  if (typeof globalThis.__strobe_trace === 'function') ` +
-                  `globalThis.__strobe_trace('enter', '${name}', '${url}', 0);`);
+            // Transform ESM source to inject __strobe_trace calls at function entry
+            const transformResult = (result: any) => {
+              // Only transform user ESM code (not node_modules, not node: builtins)
+              if (result.format === 'module' && result.source &&
+                  !url.includes('node_modules') && !url.startsWith('node:')) {
+                const source = typeof result.source === 'string'
+                  ? result.source
+                  : new ((globalThis as any).TextDecoder)().decode(result.source);
+                const fnRegex = /^(\s*export\s+(?:default\s+)?(?:async\s+)?function\s+)(\w+)\s*\(([^)]*)\)\s*\{/gm;
+                let transformed = source;
+                const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                let m;
+                while ((m = fnRegex.exec(source)) !== null) {
+                  const [full, prefix, name, params] = m;
+                  const safeName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                  transformed = transformed.replace(full,
+                    `${prefix}${name}(${params}) {\n` +
+                    `  if (typeof globalThis.__strobe_trace === 'function') ` +
+                    `globalThis.__strobe_trace('enter', '${safeName}', '${safeUrl}', 0);`);
+                }
+                return { ...result, source: transformed };
               }
-              return { ...result, source: transformed };
+              return result;
+            };
+
+            // nextLoad may return a Promise in some Node versions — handle both
+            const resultOrPromise = nextLoad(url, context);
+            if (resultOrPromise && typeof resultOrPromise.then === 'function') {
+              return resultOrPromise.then(transformResult);
             }
-            return result;
+            return transformResult(resultOrPromise);
           }
         });
         this.esmHooksRegistered = true;

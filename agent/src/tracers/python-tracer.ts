@@ -152,19 +152,9 @@ export class PythonTracer implements Tracer {
 
   dispose(): void {
     if (this.traceInstalled) {
-      if (this.useMonitoring) {
-        this.runPython(`
-import sys, builtins as _b
-if getattr(_b, '_strobe_monitoring_active', False):
-    sys.monitoring.set_events(0, 0)
-    sys.monitoring.free_tool_id(0)
-    setattr(_b, '_strobe_monitoring_active', False)
-sys.settrace(None)
-`);
-      } else {
-        this.runPython('import sys; sys.settrace(None)');
-      }
+      this.teardownTracing();
       this.traceInstalled = false;
+      this.settraceInstalled = false;
     }
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
@@ -300,9 +290,16 @@ def _strobe_trace(frame, event, arg):
             for lp_file, lp_line, lp_id, lp_msg in _strobe_logpoints:
                 if fname.endswith(lp_file) and fline == lp_line:
                     try:
-                        msg = lp_msg.format(**{**frame.f_globals, **frame.f_locals})
+                        import re as _re
+                        def _strobe_safe_fmt(m):
+                            k = m.group(1)
+                            if '__' in k or '.' in k or '[' in k:
+                                return m.group(0)
+                            _vars = {**frame.f_globals, **frame.f_locals}
+                            return str(_vars.get(k, m.group(0)))
+                        msg = _re.sub(r'\\{(\\w+)\\}', _strobe_safe_fmt, lp_msg)
                     except Exception as _e:
-                        msg = f'{lp_msg} [fmt error: {_e}]'
+                        msg = lp_msg + ' [fmt error]'
                     _strobe_log_cb(lp_id.encode(), fline, msg.encode())
                     break
             for bp_file, bp_line, bp_id, bp_cond, bp_hit_count in _strobe_breakpoints:
@@ -344,9 +341,12 @@ try:
     def _strobe_on_start(code, offset):
         fname = code.co_filename
         fline = code.co_firstlineno
+        # co_qualname (3.12+) gives the undecorated name; decorators shift co_firstlineno
+        # to the decorator line, so allow a small line-number window for decorated functions
+        cname = getattr(code, 'co_qualname', code.co_name)
         for file_pat, line_pat, fid in _strobe_hooks:
-            if fname.endswith(file_pat) and fline == line_pat:
-                _strobe_cb(fname.encode('utf-8'), code.co_name.encode('utf-8'), fline, fid)
+            if fname.endswith(file_pat) and (fline == line_pat or (fline > 0 and abs(fline - line_pat) <= 5)):
+                _strobe_cb(fname.encode('utf-8'), cname.encode('utf-8'), fline, fid)
                 return
 
     sys.monitoring.register_callback(0, sys.monitoring.events.PY_START, _strobe_on_start)
@@ -525,19 +525,36 @@ except NameError:
     this.breakpoints.clear();
     this.logpoints.clear();
     if (this.traceInstalled) {
-      if (this.useMonitoring) {
-        this.runPython(`
-import sys, builtins as _b
+      this.teardownTracing();
+      this.traceInstalled = false;
+      this.settraceInstalled = false;
+    }
+  }
+
+  /** Shared teardown logic for dispose() and removeAllHooks(). */
+  private teardownTracing(): void {
+    if (this.useMonitoring) {
+      this.runPython(`
+import sys, threading, builtins as _b
 if getattr(_b, '_strobe_monitoring_active', False):
     sys.monitoring.set_events(0, 0)
     sys.monitoring.free_tool_id(0)
     setattr(_b, '_strobe_monitoring_active', False)
-sys.settrace(None)
+if hasattr(threading, 'settrace_all_threads'):
+    threading.settrace_all_threads(None)
+else:
+    sys.settrace(None)
+    threading.settrace(None)
 `);
-      } else {
-        this.runPython('import sys; sys.settrace(None)');
-      }
-      this.traceInstalled = false;
+    } else {
+      this.runPython(`
+import sys, threading
+if hasattr(threading, 'settrace_all_threads'):
+    threading.settrace_all_threads(None)
+else:
+    sys.settrace(None)
+    threading.settrace(None)
+`);
     }
   }
 
@@ -717,6 +734,11 @@ except Exception as _e:
   }
 
   writeVariable(expr: string, value: any): void {
+    // Validate expr is a simple assignment target (variable name, attribute access, subscript)
+    // to prevent code injection via expr itself
+    if (!/^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*|\[\d+\]|\[['"][^'"]*['"]\])*$/.test(expr)) {
+      throw new Error(`Invalid write target: ${expr}`);
+    }
     // Serialize value as JSON and use json.loads() in Python to safely deserialize,
     // preventing code injection via string interpolation.
     const safeValue = JSON.stringify(value);

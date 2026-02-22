@@ -176,8 +176,16 @@ fn parse_go_json(stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
                     let output_text = test_output.remove(&key).unwrap_or_default();
 
                     let (file, line_num) = extract_go_file_line(&file_line_re, &output_text);
+                    // Extract the actual assertion message, skipping test framework lines
+                    // like "=== RUN", "--- FAIL:", and empty lines
                     let message = output_text.lines()
-                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| l.trim())
+                        .filter(|l| {
+                            !l.is_empty()
+                                && !l.starts_with("=== RUN")
+                                && !l.starts_with("--- FAIL:")
+                                && !l.starts_with("--- PASS:")
+                        })
                         .last()
                         .unwrap_or("Test failed")
                         .to_string();
@@ -305,14 +313,28 @@ fn parse_go_json(stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
     }
 }
 
-/// Extract the first file:line location from Go test output.
+/// Extract the best file:line location from Go test output.
+/// Prefers _test.go files over other matches (vendor, stdlib).
 fn extract_go_file_line(re: &Regex, output: &str) -> (Option<String>, Option<u32>) {
-    if let Some(caps) = re.captures(output) {
-        let file = caps.get(1).map(|m| m.as_str().to_string());
-        let line = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
-        (file, line)
-    } else {
-        (None, None)
+    let mut first_match: Option<(String, u32)> = None;
+
+    for caps in re.captures_iter(output) {
+        let file = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let line = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
+
+        // Prefer _test.go files — these are the user's test assertions
+        if file.ends_with("_test.go") {
+            return (Some(file.to_string()), Some(line));
+        }
+
+        if first_match.is_none() && !file.contains("/vendor/") {
+            first_match = Some((file.to_string(), line));
+        }
+    }
+
+    match first_match {
+        Some((file, line)) => (Some(file), Some(line)),
+        None => (None, None),
     }
 }
 
@@ -388,16 +410,24 @@ mod tests {
         let adapter = GoTestAdapter;
 
         // Empty/nonexistent dir → 0
-        let confidence = adapter.detect(Path::new("/tmp/nonexistent_go_project_xyz"), None);
+        let empty = tempfile::tempdir().unwrap();
+        let confidence = adapter.detect(empty.path(), None);
         assert_eq!(confidence, 0);
 
         // A dir with go.mod → 90
-        let tmp = std::env::temp_dir().join("strobe_go_detect_test");
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("go.mod"), "module example.com/foo\n\ngo 1.21\n").unwrap();
-        let confidence = adapter.detect(&tmp, None);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.mod"), "module example.com/foo\n\ngo 1.21\n").unwrap();
+        let confidence = adapter.detect(tmp.path(), None);
         assert!(confidence >= 90, "Expected >= 90 for go.mod, got {}", confidence);
-        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_detect_go_sum_only() {
+        let adapter = GoTestAdapter;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.sum"), "example.com/foo v1.0.0\n").unwrap();
+        let confidence = adapter.detect(tmp.path(), None);
+        assert!(confidence >= 80, "Expected >= 80 for go.sum, got {}", confidence);
     }
 
     #[test]

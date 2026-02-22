@@ -167,10 +167,11 @@ async fn scenario_python_tracing(
     )
     .await;
 
-    // Verify we traced timing functions (if Python tracing is working)
-    // Note: This may not produce traces if PythonTracer hookup isn't complete
-    eprintln!(
-        "Captured {} trace events (Python tracing may need runtime hookup)",
+    // Verify we traced timing functions
+    assert!(
+        events.len() >= 5,
+        "Expected at least 5 trace events from timing module, got {}. \
+         Python tracing may not be working correctly.",
         events.len()
     );
 

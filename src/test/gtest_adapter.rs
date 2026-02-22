@@ -127,6 +127,22 @@ impl TestAdapter for GTestAdapter {
             None => 300_000,
         }
     }
+
+    fn command_for_binary(
+        &self,
+        cmd: &str,
+        level: Option<TestLevel>,
+    ) -> crate::Result<TestCommand> {
+        Ok(GTestAdapter::command_for_binary(cmd, level))
+    }
+
+    fn single_test_for_binary(
+        &self,
+        cmd: &str,
+        test_name: &str,
+    ) -> crate::Result<TestCommand> {
+        Ok(GTestAdapter::single_test_for_binary(cmd, test_name))
+    }
 }
 
 impl GTestAdapter {
@@ -134,7 +150,7 @@ impl GTestAdapter {
     pub fn command_for_binary(cmd: &str, _level: Option<TestLevel>) -> TestCommand {
         TestCommand {
             program: cmd.to_string(),
-            args: vec!["--gtest_output=json".to_string()],
+            args: vec!["--gtest_output=json:/dev/stdout".to_string()],
             env: HashMap::new(),
         }
     }
@@ -144,7 +160,7 @@ impl GTestAdapter {
         TestCommand {
             program: cmd.to_string(),
             args: vec![
-                "--gtest_output=json".to_string(),
+                "--gtest_output=json:/dev/stdout".to_string(),
                 format!("--gtest_filter={}", test_name),
             ],
             env: HashMap::new(),
@@ -285,6 +301,7 @@ fn extract_file_line(message: &str) -> (Option<String>, Option<u32>) {
 fn parse_gtest_text_fallback(stdout: &str) -> TestResult {
     let mut passed = 0u32;
     let mut failed = 0u32;
+    let mut skipped = 0u32;
     let mut failures = Vec::new();
     let mut all_tests = Vec::new();
     let mut in_summary = false;
@@ -300,7 +317,7 @@ fn parse_gtest_text_fallback(stdout: &str) -> TestResult {
         // Individual test results
         if trimmed.starts_with("[       OK ]") {
             passed += 1;
-            let name = extract_test_name_from_text(trimmed, "[       OK ]");
+            let name = extract_name_after_bracket(trimmed);
             all_tests.push(TestDetail {
                 name,
                 status: TestStatus::Pass,
@@ -309,8 +326,19 @@ fn parse_gtest_text_fallback(stdout: &str) -> TestResult {
                 stderr: None,
                 message: None,
             });
+        } else if trimmed.starts_with("[  SKIPPED ]") {
+            skipped += 1;
+            let name = extract_name_after_bracket(trimmed);
+            all_tests.push(TestDetail {
+                name,
+                status: TestStatus::Skip,
+                duration_ms: 0,
+                stdout: None,
+                stderr: None,
+                message: None,
+            });
         } else if !in_summary && trimmed.starts_with("[  FAILED  ]") && !trimmed.contains("tests listed below") && !trimmed.contains("test,") {
-            let name = extract_test_name_from_text(trimmed, "[  FAILED  ]");
+            let name = extract_name_after_bracket(trimmed);
             // Avoid counting the summary line "N FAILED TESTS" or test list footer
             if !name.is_empty() && !name.starts_with(char::is_numeric) {
                 failed += 1;
@@ -338,7 +366,7 @@ fn parse_gtest_text_fallback(stdout: &str) -> TestResult {
         summary: TestSummary {
             passed,
             failed,
-            skipped: 0,
+            skipped,
             stuck: None,
             duration_ms: 0,
         },
@@ -348,20 +376,12 @@ fn parse_gtest_text_fallback(stdout: &str) -> TestResult {
     }
 }
 
-/// Extract test name from a GTest text output line like "[       OK ] SuiteName.TestName (1 ms)".
-fn extract_test_name_from_text(line: &str, prefix: &str) -> String {
-    let after = line.trim_start_matches(|c: char| c == ' ' || c == '[')
-        .strip_prefix(prefix.trim_start_matches(|c: char| c == ' ' || c == '['))
-        .unwrap_or(line);
-
-    // Alternative: find after the bracket prefix
-    let name_part = if let Some(idx) = line.find(']') {
-        line[idx + 1..].trim()
-    } else {
-        after.trim()
+/// Extract the name portion after the `]` bracket in a GTest line, stripping trailing `(duration)`.
+fn extract_name_after_bracket(line: &str) -> String {
+    let name_part = match line.find(']') {
+        Some(idx) => line[idx + 1..].trim(),
+        None => return String::new(),
     };
-
-    // Remove trailing duration like "(1 ms)"
     if let Some(paren) = name_part.find('(') {
         name_part[..paren].trim().to_string()
     } else {
@@ -375,29 +395,18 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
 
     // [ RUN      ] SuiteName.TestName
     if trimmed.starts_with("[ RUN      ]") {
-        let name = if let Some(idx) = trimmed.find(']') {
-            trimmed[idx + 1..].trim().to_string()
-        } else {
-            return;
-        };
+        let name = extract_name_after_bracket(trimmed);
+        if name.is_empty() { return; }
         let mut p = progress.lock().unwrap();
         if p.phase == super::TestPhase::Compiling {
             p.phase = super::TestPhase::Running;
         }
         p.running_tests.insert(name, std::time::Instant::now());
     }
-    // [       OK ] SuiteName.TestName
+    // [       OK ] SuiteName.TestName (N ms)
     else if trimmed.starts_with("[       OK ]") {
-        let name = if let Some(idx) = trimmed.find(']') {
-            let full = trimmed[idx + 1..].trim();
-            if let Some(paren) = full.find('(') {
-                full[..paren].trim().to_string()
-            } else {
-                full.to_string()
-            }
-        } else {
-            return;
-        };
+        let name = extract_name_after_bracket(trimmed);
+        if name.is_empty() { return; }
         let mut p = progress.lock().unwrap();
         p.passed += 1;
         if let Some(started) = p.running_tests.remove(&name) {
@@ -405,21 +414,20 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
                 .insert(name, started.elapsed().as_millis() as u64);
         }
     }
-    // [  FAILED  ] SuiteName.TestName
+    // [  SKIPPED ] SuiteName.TestName (N ms)
+    else if trimmed.starts_with("[  SKIPPED ]") {
+        let name = extract_name_after_bracket(trimmed);
+        if name.is_empty() { return; }
+        let mut p = progress.lock().unwrap();
+        p.skipped += 1;
+        p.running_tests.remove(&name);
+    }
+    // [  FAILED  ] SuiteName.TestName (N ms)
     else if trimmed.starts_with("[  FAILED  ]")
         && !trimmed.contains("tests listed below")
         && !trimmed.contains("test,")
     {
-        let name = if let Some(idx) = trimmed.find(']') {
-            let full = trimmed[idx + 1..].trim();
-            if let Some(paren) = full.find('(') {
-                full[..paren].trim().to_string()
-            } else {
-                full.to_string()
-            }
-        } else {
-            return;
-        };
+        let name = extract_name_after_bracket(trimmed);
         if name.is_empty() || name.starts_with(char::is_numeric) {
             return;
         }
@@ -430,8 +438,8 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
                 .insert(name, started.elapsed().as_millis() as u64);
         }
     }
-    // [==========] N tests ran
-    else if trimmed.starts_with("[==========]") && trimmed.contains("tests ran") {
+    // [==========] N tests from M test suite ran. (N ms total)
+    else if trimmed.starts_with("[==========]") && trimmed.contains("ran.") {
         let mut p = progress.lock().unwrap();
         p.phase = super::TestPhase::SuitesFinished;
         p.running_tests.clear();
@@ -444,33 +452,25 @@ mod tests {
 
     #[test]
     fn test_detect_gtest_cmake() {
-        let dir = std::env::temp_dir().join("strobe_gtest_detect_cmake");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join("CMakeLists.txt"),
+            dir.path().join("CMakeLists.txt"),
             "find_package(GTest REQUIRED)\ntarget_link_libraries(tests gtest_main)",
         )
         .unwrap();
 
         let adapter = GTestAdapter;
-        let confidence = adapter.detect(&dir, None);
+        let confidence = adapter.detect(dir.path(), None);
         assert!(confidence >= 85, "Expected >= 85, got {}", confidence);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_detect_gtest_no_match() {
-        let dir = std::env::temp_dir().join("strobe_gtest_detect_empty");
-        let _ = std::fs::create_dir_all(&dir);
-        // Ensure no CMakeLists.txt
-        let _ = std::fs::remove_file(dir.join("CMakeLists.txt"));
+        let dir = tempfile::tempdir().unwrap();
 
         let adapter = GTestAdapter;
-        let confidence = adapter.detect(&dir, None);
+        let confidence = adapter.detect(dir.path(), None);
         assert_eq!(confidence, 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -580,7 +580,7 @@ mod tests {
     fn test_command_for_binary() {
         let cmd = GTestAdapter::command_for_binary("/path/to/test_binary", None);
         assert_eq!(cmd.program, "/path/to/test_binary");
-        assert!(cmd.args.contains(&"--gtest_output=json".to_string()));
+        assert!(cmd.args.contains(&"--gtest_output=json:/dev/stdout".to_string()));
         assert!(cmd.env.is_empty());
     }
 
@@ -591,7 +591,7 @@ mod tests {
             "MathTest.Addition",
         );
         assert_eq!(cmd.program, "/path/to/test_binary");
-        assert!(cmd.args.contains(&"--gtest_output=json".to_string()));
+        assert!(cmd.args.contains(&"--gtest_output=json:/dev/stdout".to_string()));
         assert!(cmd
             .args
             .contains(&"--gtest_filter=MathTest.Addition".to_string()));
@@ -623,5 +623,74 @@ mod tests {
         assert_eq!(result.summary.failed, 1);
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].name, "MathTest.BadDivision");
+    }
+
+    #[test]
+    fn test_text_fallback_with_skipped() {
+        let adapter = GTestAdapter;
+        let text_output = "\
+[==========] Running 2 tests from 1 test suite.
+[----------] 2 tests from FeatureTest
+[ RUN      ] FeatureTest.NeedsGPU
+[  SKIPPED ] FeatureTest.NeedsGPU (0 ms)
+[ RUN      ] FeatureTest.Basic
+[       OK ] FeatureTest.Basic (1 ms)
+[----------] 2 tests from FeatureTest (1 ms total)
+[==========] 2 tests from 1 test suite ran. (1 ms total)
+[  PASSED  ] 1 test.";
+
+        let result = adapter.parse_output(text_output, "", 0);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.skipped, 1);
+        assert_eq!(result.summary.failed, 0);
+        assert_eq!(result.all_tests.len(), 2);
+    }
+
+    #[test]
+    fn test_update_progress_lifecycle() {
+        let progress = Arc::new(Mutex::new(super::super::TestProgress::new()));
+
+        // Initial phase is Compiling
+        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Compiling);
+
+        // RUN transitions to Running
+        update_progress("[ RUN      ] MathTest.Addition", &progress);
+        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Running);
+        assert!(progress.lock().unwrap().running_tests.contains_key("MathTest.Addition"));
+
+        // OK increments passed and removes from running
+        update_progress("[       OK ] MathTest.Addition (0 ms)", &progress);
+        assert_eq!(progress.lock().unwrap().passed, 1);
+        assert!(!progress.lock().unwrap().running_tests.contains_key("MathTest.Addition"));
+
+        // FAILED increments failed
+        update_progress("[ RUN      ] MathTest.Bad", &progress);
+        update_progress("[  FAILED  ] MathTest.Bad (1 ms)", &progress);
+        assert_eq!(progress.lock().unwrap().failed, 1);
+
+        // SKIPPED increments skipped
+        update_progress("[  SKIPPED ] MathTest.Skip (0 ms)", &progress);
+        assert_eq!(progress.lock().unwrap().skipped, 1);
+
+        // Summary line triggers SuitesFinished
+        update_progress("[==========] 3 tests from 1 test suite ran. (1 ms total)", &progress);
+        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::SuitesFinished);
+    }
+
+    #[test]
+    fn test_trait_command_for_binary() {
+        // Verify trait dispatch works (not just the associated function)
+        let adapter: &dyn TestAdapter = &GTestAdapter;
+        let cmd = adapter.command_for_binary("/path/to/test", None).unwrap();
+        assert_eq!(cmd.program, "/path/to/test");
+        assert!(cmd.args.iter().any(|a| a.contains("gtest_output")));
+    }
+
+    #[test]
+    fn test_trait_single_test_for_binary() {
+        let adapter: &dyn TestAdapter = &GTestAdapter;
+        let cmd = adapter.single_test_for_binary("/path/to/test", "Suite.Test").unwrap();
+        assert_eq!(cmd.program, "/path/to/test");
+        assert!(cmd.args.iter().any(|a| a.contains("gtest_filter=Suite.Test")));
     }
 }

@@ -40,9 +40,8 @@ struct MochaTest {
     full_title: String,
     #[serde(default)]
     duration: Option<u64>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    file: Option<String>,
+    #[serde(default, rename = "file")]
+    _file: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -140,7 +139,25 @@ impl TestAdapter for MochaAdapter {
 
     fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
         if let Some(report) = extract_mocha_json(stdout).or_else(|| extract_mocha_json(stderr)) {
-            return build_result_from_report(report);
+            let mut result = build_result_from_report(report);
+            // If mocha exited non-zero but the parsed report shows no failures,
+            // the report may be incomplete — flag it
+            if exit_code != 0 && result.summary.failed == 0 && result.failures.is_empty() {
+                result.summary.failed = 1;
+                let preview: String = stderr.chars().take(500).collect();
+                result.failures.push(TestFailure {
+                    name: "Mocha exit code".to_string(),
+                    file: None,
+                    line: None,
+                    message: format!(
+                        "Mocha exited with code {} but reported no test failures.\nstderr: {}",
+                        exit_code, preview
+                    ),
+                    rerun: None,
+                    suggested_traces: vec![],
+                });
+            }
+            return result;
         }
 
         // Fallback: could not parse JSON
@@ -161,7 +178,7 @@ impl TestAdapter for MochaAdapter {
         TestResult {
             summary: TestSummary {
                 passed: 0,
-                failed: 0,
+                failed: failures.len() as u32,
                 skipped: 0,
                 stuck: None,
                 duration_ms: 0,
@@ -481,5 +498,59 @@ mod tests {
         assert_eq!(cmd.program, "npx");
         assert!(cmd.args.iter().any(|a| a == "mocha"));
         assert!(cmd.args.iter().any(|a| a == "json"));
+    }
+
+    #[test]
+    fn test_single_test_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = MochaAdapter
+            .single_test_command(dir.path(), "adds numbers")
+            .unwrap();
+        assert_eq!(cmd.program, "npx");
+        assert!(cmd.args.iter().any(|a| a == "--grep"));
+        assert!(cmd.args.iter().any(|a| a == "adds numbers"));
+    }
+
+    #[test]
+    fn test_parse_pending() {
+        let json = r#"{
+            "stats": { "suites": 1, "tests": 3, "passes": 1, "failures": 0, "pending": 2, "duration": 30 },
+            "passes": [
+                { "title": "adds", "fullTitle": "Calculator adds", "duration": 5, "file": "test/calc.test.js" }
+            ],
+            "failures": [],
+            "pending": [
+                { "title": "multiplies", "fullTitle": "Calculator multiplies", "file": "test/calc.test.js" },
+                { "title": "divides", "fullTitle": "Calculator divides", "file": "test/calc.test.js" }
+            ]
+        }"#;
+        let result = MochaAdapter.parse_output(json, "", 0);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.skipped, 2);
+        assert_eq!(result.summary.failed, 0);
+        assert_eq!(result.all_tests.len(), 3);
+        let skip_count = result.all_tests.iter().filter(|t| t.status == TestStatus::Skip).count();
+        assert_eq!(skip_count, 2, "expected 2 skipped tests");
+    }
+
+    #[test]
+    fn test_parse_nonzero_exit_no_json() {
+        // Non-zero exit with no parseable JSON should report a failure
+        let result = MochaAdapter.parse_output("", "Error: Cannot find module 'mocha'", 1);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].message.contains("Cannot find module"));
+    }
+
+    #[test]
+    fn test_update_progress_passing_failing() {
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(super::super::TestProgress::new()));
+
+        update_progress("  2 passing (50ms)", &progress);
+        assert_eq!(progress.lock().unwrap().passed, 2);
+        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Running);
+
+        update_progress("  1 failing", &progress);
+        assert_eq!(progress.lock().unwrap().failed, 1);
     }
 }

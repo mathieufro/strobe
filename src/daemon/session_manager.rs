@@ -105,7 +105,12 @@ fn is_process_alive(pid: u32) -> bool {
 /// Generate the ESM hook registration script for Node.js sessions.
 /// Returns a file:// URL suitable for --import.
 fn generate_esm_hook_script(session_id: &str) -> std::io::Result<String> {
-    let script_path = format!("/tmp/strobe-esm-hooks-{}.mjs", session_id);
+    // Use timestamp + pid to avoid predictable temp file paths
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let script_path = format!("/tmp/strobe-esm-hooks-{}-{:x}-{}.mjs", session_id, unique, std::process::id());
     let script_content = r#"
 // Strobe ESM hook registration script — injected via NODE_OPTIONS=--import
 // Intercepts ESM module loads and wraps exported functions with __strobe_trace calls.
@@ -117,11 +122,13 @@ function transformSource(source, url) {
   let transformed = source;
   const fnRegex = /^(\s*export\s+(?:default\s+)?(?:async\s+)?function\s+)(\w+)\s*\(([^)]*)\)\s*\{/gm;
   let match;
+  const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   while ((match = fnRegex.exec(source)) !== null) {
     const [full, prefix, name, params] = match;
+    const safeName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     transformed = transformed.replace(full,
       `${prefix}${name}(${params}) {\n` +
-      `  if (typeof globalThis.__strobe_trace === 'function') globalThis.__strobe_trace('enter', '${name}', '${url}', 0);`);
+      `  if (typeof globalThis.__strobe_trace === 'function') globalThis.__strobe_trace('enter', '${safeName}', '${safeUrl}', 0);`);
   }
   return transformed;
 }
@@ -145,7 +152,42 @@ try {
     });
   }
 } catch (e) {
-  // registerHooks not available — Node < 22.15
+  // registerHooks not available — try module.register() for Node 20.6-22.14
+  try {
+    const mod = createRequire(import.meta.url)('node:module');
+    if (typeof mod.register === 'function') {
+      // module.register() loads a separate module — embed the loader inline via data URL.
+      // The loader must be self-contained (can't reference transformSource from this scope).
+      const loaderCode = `
+        const fnRegex = /^(\\s*export\\s+(?:default\\s+)?(?:async\\s+)?function\\s+)(\\w+)\\s*\\(([^)]*)\\)\\s*\\{/gm;
+        export async function load(url, context, nextLoad) {
+          const result = await nextLoad(url, context);
+          if (result.format === 'module' && result.source &&
+              !url.includes('node_modules') && !url.startsWith('node:')) {
+            const source = typeof result.source === 'string'
+              ? result.source
+              : new TextDecoder().decode(result.source);
+            let transformed = source;
+            const safeUrl = url.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+            let m;
+            while ((m = fnRegex.exec(source)) !== null) {
+              const [full, prefix, name, params] = m;
+              const safeName = name.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+              transformed = transformed.replace(full,
+                prefix + name + '(' + params + ') {\\n' +
+                "  if (typeof globalThis.__strobe_trace === 'function') " +
+                "globalThis.__strobe_trace('enter', '" + safeName + "', '" + safeUrl + "', 0);");
+            }
+            return { ...result, source: transformed };
+          }
+          return result;
+        }
+      `;
+      mod.register('data:text/javascript,' + encodeURIComponent(loaderCode), import.meta.url);
+    }
+  } catch (e2) {
+    // module.register also not available — ESM tracing not supported on this Node version
+  }
 }
 "#;
     std::fs::write(&script_path, script_content)?;

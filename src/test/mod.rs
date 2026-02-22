@@ -209,8 +209,15 @@ impl TestRunner {
             Some((adapter, _)) => Ok(adapter),
             None => Err(crate::Error::ValidationError(
                 "No test framework detected. Supported frameworks:\n\
-                 - Cargo (Rust): provide projectRoot pointing to a directory with Cargo.toml\n\
-                 - Catch2 (C++): provide command with path to a test binary".to_string()
+                 - Cargo (Rust): provide projectRoot with Cargo.toml\n\
+                 - Catch2 (C++): provide command with path to test binary\n\
+                 - pytest/unittest (Python): provide projectRoot with pyproject.toml or test files\n\
+                 - Vitest/Jest (Node.js): provide projectRoot with package.json\n\
+                 - Bun: provide projectRoot with bunfig.toml\n\
+                 - Deno: provide projectRoot with deno.json\n\
+                 - Go: provide projectRoot with go.mod\n\
+                 - Mocha: provide projectRoot with .mocharc.* or mocha in package.json\n\
+                 - Google Test (C++): provide command with path to gtest binary".to_string()
             )),
         }
     }
@@ -310,6 +317,7 @@ impl TestRunner {
             "go" => Some(go_adapter::update_progress),
             "gtest" => Some(gtest_adapter::update_progress),
             "mocha" => Some(mocha_adapter::update_progress),
+            "pytest" => Some(pytest_adapter::update_progress),
             _ => None,
         };
 
@@ -570,8 +578,47 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("No test framework detected"), "got: {}", err);
-        assert!(err.contains("Cargo"));
-        assert!(err.contains("Catch2"));
+        assert!(err.contains("Cargo"), "should mention Cargo: {}", err);
+        assert!(err.contains("Catch2"), "should mention Catch2: {}", err);
+        assert!(err.contains("pytest"), "should mention pytest: {}", err);
+        assert!(err.contains("Deno"), "should mention Deno: {}", err);
+        assert!(err.contains("Go"), "should mention Go: {}", err);
+        assert!(err.contains("Mocha"), "should mention Mocha: {}", err);
+        assert!(err.contains("Google Test"), "should mention Google Test: {}", err);
+    }
+
+    #[test]
+    fn test_adapter_detection_deno() {
+        let runner = TestRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deno.json"), "{}").unwrap();
+        let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
+        assert_eq!(adapter.name(), "deno");
+    }
+
+    #[test]
+    fn test_adapter_detection_go() {
+        let runner = TestRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/foo\ngo 1.21\n").unwrap();
+        let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
+        assert_eq!(adapter.name(), "go");
+    }
+
+    #[test]
+    fn test_adapter_detection_mocha() {
+        let runner = TestRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".mocharc.yml"), "timeout: 5000\n").unwrap();
+        let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
+        assert_eq!(adapter.name(), "mocha");
+    }
+
+    #[test]
+    fn test_adapter_detection_gtest_by_name() {
+        let runner = TestRunner::new();
+        let adapter = runner.detect_adapter(Path::new("/nonexistent"), Some("gtest"), None).unwrap();
+        assert_eq!(adapter.name(), "gtest");
     }
 
     #[test]

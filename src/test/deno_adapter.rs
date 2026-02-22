@@ -11,10 +11,10 @@ pub struct DenoAdapter;
 impl TestAdapter for DenoAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
         if project_root.join("deno.json").exists() {
-            return 92;
+            return 90;
         }
         if project_root.join("deno.jsonc").exists() {
-            return 92;
+            return 90;
         }
         if project_root.join("deno.lock").exists() {
             return 85;
@@ -373,5 +373,15 @@ AssertionError: Expected 6, got 5
     #[test]
     fn test_extract_xml_no_xml() {
         assert!(extract_xml("no xml here").is_none());
+    }
+
+    #[test]
+    fn test_detect_deno_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = DenoAdapter;
+
+        std::fs::write(dir.path().join("deno.lock"), "{}").unwrap();
+        let confidence = adapter.detect(dir.path(), None);
+        assert!(confidence >= 85, "deno.lock should yield confidence >= 85, got {}", confidence);
     }
 }
