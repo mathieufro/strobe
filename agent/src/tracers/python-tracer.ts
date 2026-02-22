@@ -277,10 +277,6 @@ _strobe_bp_hit_cb = _STROBE_BP_HIT_CB_TYPE(${bpHitCallbackAddr})
 _strobe_bp_event = getattr(_b, '_strobe_bp_event', None) or threading.Event()
 setattr(_b, '_strobe_bp_event', _strobe_bp_event)
 
-# Configure ctypes for GIL release at breakpoints
-ctypes.pythonapi.PyEval_SaveThread.restype = ctypes.c_void_p
-ctypes.pythonapi.PyEval_RestoreThread.argtypes = [ctypes.c_void_p]
-
 # Data lists (updated in-place on subsequent syncs without redefining the trace function)
 ${dataAssignments}
 `;
@@ -319,10 +315,10 @@ def _strobe_trace(frame, event, arg):
                             break
                     if not bp_cond or eval(bp_cond, frame.f_globals, frame.f_locals):
                         _strobe_bp_hit_cb(bp_id.encode(), fline)
-                        # Release GIL before blocking so Frida agent thread can call runPython
-                        _tstate = ctypes.pythonapi.PyEval_SaveThread()
+                        # threading.Event.wait() releases the GIL internally in CPython,
+                        # allowing the Frida agent thread to call PyRun_SimpleString to resume.
+                        # Do NOT use PyEval_SaveThread/RestoreThread — corrupts thread state on 3.14+.
                         _strobe_bp_event.wait()
-                        ctypes.pythonapi.PyEval_RestoreThread(_tstate)
                         _strobe_bp_event.clear()
                     break
     except Exception as _strobe_err:
