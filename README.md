@@ -39,6 +39,7 @@ Claude Code ──MCP──> strobe daemon ──Frida──> your program
 | `debug_memory` | Read/write process memory, poll variables over time |
 | `debug_test` | Run tests inside Frida (Cargo, Catch2), structured results |
 | `debug_ui` | Query accessibility tree + AI vision for UI element detection |
+| `debug_ui_action` | Interact with UI elements (click, type, set value, key, scroll, drag) |
 
 ### Trace Patterns
 

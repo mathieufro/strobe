@@ -19,7 +19,7 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 | 7 | I/O Channels | Planned |
 | 8 | Autonomous Test Scenarios | Planned |
 
-### Current MCP Tools (9 total)
+### Current MCP Tools (10 total)
 
 | Tool | Purpose | Phase |
 |------|---------|-------|
@@ -32,6 +32,7 @@ Each phase builds on the previous. Each has a clear validation criteria: "What c
 | `debug_breakpoint` | Set/remove breakpoints and logpoints | 2 |
 | `debug_continue` | Resume/step after breakpoint pause | 2 |
 | `debug_ui` | Query UI state (AX tree, screenshot, vision) | 4 |
+| `debug_ui_action` | Interact with UI elements (click, type, set value, key, scroll, drag) | 6 |
 
 ---
 

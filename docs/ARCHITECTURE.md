@@ -239,7 +239,7 @@ Errors are opportunities for LLM-guided resolution:
 │                     MCP Client (LLM)                             │
 │  debug_launch | debug_trace | debug_query | debug_session        │
 │  debug_test | debug_breakpoint | debug_continue | debug_memory  │
-│  debug_ui                                                       │
+│  debug_ui | debug_ui_action                                     │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ MCP (JSON-RPC over stdio)

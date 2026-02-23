@@ -89,7 +89,7 @@ Settings are re-read on every tool call (no caching). Invalid values fall back t
 
 ## MCP Tools
 
-All 9 tools are available. Session limits: 10 per connection, 50 total.
+All 10 tools are available. Session limits: 10 per connection, 50 total.
 
 ### debug_launch
 
@@ -427,6 +427,35 @@ Response:
 ```
 
 Requires macOS. Vision pipeline requires `vision.enabled: true` in settings + Python dependencies.
+
+### debug_ui_action
+
+Interact with UI elements in a running macOS process. Supports click, set value, type text, key press, scroll, and drag.
+
+```
+Request:
+  sessionId: string
+  action: "click" | "set_value" | "type" | "key" | "scroll" | "drag"
+  id?: string                    # Target node ID from debug_ui tree (required except for "key")
+  value?: number | string        # Value to set (for "set_value")
+  text?: string                  # Text to type (for "type")
+  key?: string                   # Key name (for "key") — a-z, 0-9, return, tab, escape, etc.
+  modifiers?: string[]           # Modifier keys: "cmd", "shift", "alt", "ctrl"
+  direction?: "up" | "down" | "left" | "right"  # Scroll direction
+  amount?: number                # Scroll lines (default: 3)
+  toId?: string                  # Drag target node ID (for "drag")
+  settleMs?: number              # Wait before capturing nodeAfter (default: 150)
+
+Response:
+  success: boolean
+  method?: string                # "ax" or "cgevent"
+  nodeBefore?: UiNode            # Element state before action
+  nodeAfter?: UiNode             # Element state after action
+  changed?: boolean              # Whether node state changed
+  error?: string                 # Error message if success=false
+```
+
+Requires macOS. Element IDs come from `debug_ui` tree output.
 
 ## Pattern Syntax
 

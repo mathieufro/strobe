@@ -609,6 +609,28 @@ Inspect the UI of a running process — accessibility tree and screenshots.
 - Use `mode: \"both\"` when you need to see the actual rendered UI alongside the tree
 - Use `verbose: true` when you need structured JSON for programmatic analysis
 
+## UI Interaction (macOS only)
+
+Interact with UI elements in a running process — click, type, set values, send keys, scroll, drag.
+
+- `debug_ui_action({ sessionId, action: \"click\", id: \"btn_abc1\" })` — click a button (AX action, CGEvent fallback)
+- `debug_ui_action({ sessionId, action: \"set_value\", id: \"slider_abc1\", value: 0.5 })` — set numeric or string value
+- `debug_ui_action({ sessionId, action: \"type\", id: \"textfield_abc1\", text: \"hello\" })` — type text into a field
+- `debug_ui_action({ sessionId, action: \"key\", key: \"return\" })` — send a key press (no target id needed)
+- `debug_ui_action({ sessionId, action: \"key\", key: \"s\", modifiers: [\"cmd\"] })` — key with modifiers
+- `debug_ui_action({ sessionId, action: \"scroll\", id: \"list_abc1\", direction: \"down\", amount: 3 })` — scroll element
+- `debug_ui_action({ sessionId, action: \"drag\", id: \"source_abc1\", toId: \"target_abc1\" })` — drag between elements
+
+### Response
+Returns `{ success, method, nodeBefore, nodeAfter, changed, error }`. The `method` field shows whether AX API or CGEvent was used. `nodeBefore`/`nodeAfter` snapshots let you verify the action took effect.
+
+### Tips
+- Get element IDs from `debug_ui({ mode: \"tree\" })` — each node has an `id=` field
+- Actions: `click`, `set_value`, `type`, `key`, `scroll`, `drag`
+- Keys: `a`-`z`, `0`-`9`, `return`, `tab`, `space`, `escape`, `delete`, `up`/`down`/`left`/`right`, `f1`-`f12`
+- Modifiers: `cmd`, `shift`, `alt`, `ctrl`
+- Use `settleMs` to wait for UI animations before capturing `nodeAfter` (default: 150ms)
+
 ## Session Management
 
 - `debug_session({ action: \"status\", sessionId })` — full snapshot: pid, status, hook count, patterns, breakpoints, logpoints, watches, paused threads
