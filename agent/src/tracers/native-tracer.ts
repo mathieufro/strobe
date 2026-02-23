@@ -1,6 +1,6 @@
 // agent/src/tracers/native-tracer.ts
 import { Tracer, ResolvedTarget, HookMode, BreakpointMessage, StepHooksMessage,
-         LogpointMessage, ReadMemoryMessage, WriteMemoryMessage } from './tracer.js';
+         LogpointMessage, ReadMemoryMessage, WriteMemoryMessage, TracerCapabilities } from './tracer.js';
 
 export class NativeTracer implements Tracer {
   private agent: any; // Reference to StrobeAgent for delegation
@@ -84,5 +84,15 @@ export class NativeTracer implements Tracer {
   getSlide(): NativePointer {
     // Get slide from CModuleTracer (single source of truth)
     return this.agent.cmoduleTracer?.getSlide() ?? ptr(0);
+  }
+
+  getCapabilities(): TracerCapabilities {
+    return {
+      functionTracing: true,
+      breakpoints: true,
+      stepping: true,
+      runtimeDetail: 'native',
+      limitations: [],
+    };
   }
 }

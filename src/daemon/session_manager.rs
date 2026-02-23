@@ -311,6 +311,8 @@ pub struct SessionManager {
     resolvers: Arc<RwLock<HashMap<String, Arc<dyn SymbolResolver>>>>,
     /// Temp ESM hook script paths per session (for cleanup on stop)
     esm_hook_paths: Arc<RwLock<HashMap<String, String>>>,
+    /// Runtime capabilities per session (derived at spawn, enriched by agent)
+    capabilities: Arc<RwLock<HashMap<String, crate::mcp::RuntimeCapabilities>>>,
 }
 
 impl SessionManager {
@@ -337,6 +339,7 @@ impl SessionManager {
             languages: Arc::new(RwLock::new(HashMap::new())),
             resolvers: Arc::new(RwLock::new(HashMap::new())),
             esm_hook_paths: Arc::new(RwLock::new(HashMap::new())),
+            capabilities: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -556,6 +559,19 @@ impl SessionManager {
             .unwrap_or(crate::config::StrobeSettings::default().events_max_per_session)
     }
 
+    /// Get runtime capabilities for a session.
+    pub fn get_capabilities(&self, session_id: &str) -> Option<crate::mcp::RuntimeCapabilities> {
+        read_lock(&self.capabilities).get(session_id).cloned()
+    }
+
+    /// Update capabilities with agent-reported enrichment data.
+    pub fn update_capabilities(&self, session_id: &str, agent_payload: &serde_json::Value) {
+        let mut guard = write_lock(&self.capabilities);
+        if let Some(caps) = guard.get_mut(session_id) {
+            crate::capabilities::merge_agent_capabilities(caps, agent_payload);
+        }
+    }
+
     /// Get or start a background DWARF parse. Returns a handle immediately.
     /// If the binary was already parsed (or is being parsed), returns the cached handle.
     /// Failed parses are evicted from cache so that retries (e.g. after dsymutil) work.
@@ -623,6 +639,10 @@ impl SessionManager {
         let language = detect_language(command, Path::new(project_root));
         write_lock(&self.languages).insert(session_id.to_string(), language);
         tracing::info!("Detected language for session {}: {:?}", session_id, language);
+
+        // Derive baseline runtime capabilities (enriched later by agent)
+        let caps = crate::capabilities::derive_capabilities(language, command);
+        write_lock(&self.capabilities).insert(session_id.to_string(), caps);
 
         // Extract image base cheaply (<10ms) — only reads __TEXT segment address
         let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
@@ -1654,18 +1674,38 @@ impl SessionManager {
 
         let action = action.unwrap_or_else(|| "continue".to_string());
 
-        // For interpreted languages, send resume_python_bp message (stepping not supported)
+        // For interpreted languages, send resume message via Frida
         let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Native);
-        if lang == Language::Python || lang == Language::JavaScript {
+        if lang == Language::Python {
             if action != "continue" {
                 return Err(crate::Error::ValidationError(
-                    format!("Stepping ('{}') is not supported for interpreted languages — use 'continue'", action)
+                    format!("Stepping ('{}') is not supported for Python — use 'continue'", action)
                 ));
             }
             let mut spawner_guard = self.frida_spawner.write().await;
             let spawner = spawner_guard.as_mut()
                 .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
             spawner.send_hook_message(session_id, serde_json::json!({"type": "resume_python_bp"})).await?;
+            for (thread_id, _) in &paused {
+                self.remove_paused_thread(session_id, *thread_id);
+            }
+            return Ok(crate::mcp::DebugContinueResponse {
+                status: "running".to_string(),
+                breakpoint_id: None,
+                file: None,
+                line: None,
+                function: None,
+            });
+        }
+
+        if lang == Language::JavaScript {
+            let mut spawner_guard = self.frida_spawner.write().await;
+            let spawner = spawner_guard.as_mut()
+                .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
+            spawner.send_hook_message(session_id, serde_json::json!({
+                "type": "resume_v8_bp",
+                "action": action,
+            })).await?;
             for (thread_id, _) in &paused {
                 self.remove_paused_thread(session_id, *thread_id);
             }
@@ -2192,6 +2232,8 @@ impl SessionManager {
             }
         };
 
+        let capabilities = self.get_capabilities(session_id);
+
         Ok(crate::mcp::SessionStatusResponse {
             status,
             pid: session.pid,
@@ -2203,6 +2245,7 @@ impl SessionManager {
             watches,
             paused_threads,
             crash_info,
+            capabilities,
         })
     }
 

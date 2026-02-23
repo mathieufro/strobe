@@ -2,7 +2,7 @@
 // Python tracer using sys.settrace + NativeCallback (version-independent)
 
 import { Tracer, ResolvedTarget, HookMode, BreakpointMessage, StepHooksMessage,
-         LogpointMessage, ReadMemoryMessage, WriteMemoryMessage } from './tracer.js';
+         LogpointMessage, ReadMemoryMessage, WriteMemoryMessage, TracerCapabilities } from './tracer.js';
 import { findGlobalExport } from '../utils.js';
 
 interface PythonHook {
@@ -772,5 +772,36 @@ except Exception as _e:
 
   resolvePattern(pattern: string): ResolvedTarget[] {
     return [];
+  }
+
+  getCapabilities(): TracerCapabilities {
+    const hasCpythonApi = !!(this.PyRun_SimpleString && this.PyGILState_Ensure && this.PyGILState_Release);
+    const traceMode = this.useMonitoring ? 'sys.monitoring' : 'sys.settrace';
+    const version = `${this.cpythonVersion.major}.${this.cpythonVersion.minor}`;
+
+    if (!hasCpythonApi) {
+      return {
+        functionTracing: false,
+        breakpoints: false,
+        stepping: false,
+        runtimeDetail: 'CPython (API symbols missing)',
+        limitations: [
+          "CPython API symbols not found (PyRun_SimpleString, PyGILState_Ensure, PyGILState_Release). " +
+          "This doesn't appear to be a standard CPython installation. " +
+          "Install standard CPython from python.org or via 'brew install python' and re-launch with the standard python binary.",
+        ],
+      };
+    }
+
+    return {
+      functionTracing: true,
+      breakpoints: true,
+      stepping: false,
+      runtimeDetail: `CPython ${version} (${traceMode})`,
+      limitations: [
+        "Python stepping (step-over/into/out) is not yet supported. Set breakpoints at specific lines instead.",
+        "Memory read/write (raw addresses) not available for Python. Use debug_memory with variable names to inspect Python objects.",
+      ],
+    };
   }
 }

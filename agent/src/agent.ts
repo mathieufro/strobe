@@ -196,8 +196,13 @@ type StepHooksMessage = InstallStepHooksMessage;
 type RuntimeType = 'native' | 'cpython' | 'v8' | 'jsc';
 
 /**
- * Detect the target process runtime by probing for known symbols.
+ * Detect the target process runtime by probing globals and native symbols.
  * Returns 'native' if no interpreter runtime is detected.
+ *
+ * When Frida uses V8 script runtime inside Node.js, the agent runs in Node's
+ * own V8 context — `process` and `require` globals are available.  Symbol-based
+ * detection alone can fail because release Node.js builds strip internal V8
+ * C++ symbols.
  */
 function detectRuntime(): RuntimeType {
   // Check for Python (CPython) symbols
@@ -207,13 +212,25 @@ function detectRuntime(): RuntimeType {
     return 'cpython';
   }
 
-  // Check for V8 (Node.js, Chrome, etc.) symbols
+  // Check for Node.js by looking for the node binary module.
+  // Symbol-based detection fails because release Node.js strips V8 internals.
+  // Frida's V8 context doesn't expose `require`/`process` on globalThis.
+  try {
+    if (Process.findModuleByName('node')) return 'v8';
+  } catch {}
+
+  // Check for V8 symbols (fallback for non-Node V8 embedders like Chrome)
   if (findGlobalExport('_ZN2v88internal7Isolate7currentEv') ||
       findGlobalExport('_ZN2v85Locker4LockEv')) {
     return 'v8';
   }
 
-  // Check for JavaScriptCore (Safari, iOS, etc.) symbols
+  // Check for Bun — exposes Bun global (uses JSC, not V8)
+  try {
+    if (typeof (globalThis as any).Bun !== 'undefined') return 'jsc';
+  } catch {}
+
+  // Check for JavaScriptCore symbols (Safari, iOS, etc.)
   if (findGlobalExport('JSGlobalContextCreate') ||
       findGlobalExport('JSEvaluateScript')) {
     return 'jsc';
@@ -298,6 +315,12 @@ class StrobeAgent {
     const runtime = detectRuntime();
     this.tracer = createTracer(runtime, this);
     send({ type: 'runtime_detected', runtime });
+
+    // Report runtime capabilities — tells the LLM what this session can/can't do
+    try {
+      const caps = this.tracer.getCapabilities();
+      send({ type: 'capabilities', runtime, ...caps });
+    } catch {}
 
     this.sessionStartNs = Date.now() * 1000000;
 
@@ -1643,6 +1666,15 @@ function onResumePythonBp(_message: {}): void {
   send({ type: 'breakpointSet', id: 'resume', activeCount: 0 });
 }
 recv('resume_python_bp', onResumePythonBp);
+
+// V8 breakpoint resume: daemon sends this to unblock a paused V8 Inspector session
+function onResumeV8Bp(message: { action?: string }): void {
+  recv('resume_v8_bp', onResumeV8Bp);
+  if ('handleV8Resume' in agent.tracer) {
+    (agent.tracer as any).handleV8Resume(message.action || 'continue');
+  }
+}
+recv('resume_v8_bp', onResumeV8Bp);
 
 // Frida calls rpc.exports.dispose() before script unload — ensures all
 // buffered trace events (CModule ring buffer) and output events are flushed.

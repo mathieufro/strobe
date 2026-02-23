@@ -185,7 +185,22 @@ pub fn parse_type_hint(hint: &str) -> (u8, String) {
     }
 }
 
-fn hook_status_message(installed: u32, matched: u32, patterns_empty: bool) -> String {
+fn hook_status_message(
+    installed: u32,
+    matched: u32,
+    patterns_empty: bool,
+    capabilities: Option<&crate::mcp::RuntimeCapabilities>,
+) -> String {
+    // When function tracing is unavailable for this runtime, give prescriptive guidance
+    if let Some(caps) = capabilities {
+        if matches!(caps.function_tracing, crate::mcp::CapabilityLevel::None) && !patterns_empty {
+            let first_limitation = caps.limitations.first()
+                .map(|s| s.as_str())
+                .unwrap_or("Function tracing is not available for this runtime.");
+            return format!("Function tracing not available: {}", first_limitation);
+        }
+    }
+
     if installed > 0 && matched > installed {
         format!("{} functions hooked (out of {} matches — excess skipped to stay under limit). Use debug_query to see traced events.", installed, matched)
     } else if installed > 0 {
@@ -1142,11 +1157,14 @@ Validation Limits (enforced):
             )
         };
 
+        let capabilities = self.session_manager.get_capabilities(&session_id);
+
         let response = DebugLaunchResponse {
             session_id,
             pid,
             pending_patterns_applied: pending_count,
             next_steps,
+            capabilities,
         };
 
         Ok(serde_json::to_value(response)?)
@@ -1471,10 +1489,19 @@ Validation Limits (enforced):
                 let mut all_warnings = hook_result.warnings;
                 all_warnings.extend(watch_warnings);
 
+                // Add capability-based warnings when tracing is unavailable
+                let caps = self.session_manager.get_capabilities(session_id);
+                if let Some(ref c) = caps {
+                    if matches!(c.function_tracing, crate::mcp::CapabilityLevel::None) {
+                        all_warnings.extend(c.limitations.clone());
+                    }
+                }
+
                 let status_msg = hook_status_message(
                     hook_result.installed,
                     hook_result.matched,
                     patterns.is_empty(),
+                    caps.as_ref(),
                 );
 
                 let response = DebugTraceResponse {

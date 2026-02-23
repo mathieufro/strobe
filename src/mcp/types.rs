@@ -2,6 +2,49 @@ use serde::{Deserialize, Serialize};
 
 fn default_empty_string() -> String { String::new() }
 
+// ============ Runtime capabilities ============
+
+/// What level of support a capability has.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityLevel {
+    /// Fully supported
+    Full,
+    /// Supported with limitations (see limitations field)
+    Partial,
+    /// Not supported
+    None,
+}
+
+/// Runtime capabilities of a debug session.
+///
+/// Derived at spawn time from the detected language, then enriched
+/// by the agent after tracer initialization. Surfaced in debug_launch,
+/// debug_session(status), and debug_trace responses.
+///
+/// All limitation messages are prescriptive — they tell the LLM exactly
+/// what to do to enable full Strobe functionality.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCapabilities {
+    /// Detected runtime: "native", "cpython", "v8", "jsc"
+    pub runtime: String,
+    /// Human-readable detail (e.g. "CPython 3.14 (sys.monitoring)", "Bun (JSC, stripped)")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_detail: Option<String>,
+    /// Function tracing support
+    pub function_tracing: CapabilityLevel,
+    /// Breakpoint support
+    pub breakpoints: CapabilityLevel,
+    /// Stepping (step-over/into/out) support
+    pub stepping: CapabilityLevel,
+    /// stdout/stderr capture support
+    pub output_capture: CapabilityLevel,
+    /// Actionable limitation messages for the LLM
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub limitations: Vec<String>,
+}
+
 // ============ debug_launch ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +91,9 @@ pub struct DebugLaunchResponse {
     /// Guidance on recommended next steps
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_steps: Option<String>,
+    /// Runtime capabilities — what this session can and can't do, with prescriptive guidance
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<RuntimeCapabilities>,
 }
 
 // ============ debug_trace ============
@@ -1287,6 +1333,9 @@ pub struct SessionStatusResponse {
     pub paused_threads: Vec<PausedThreadInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crash_info: Option<CrashSummary>,
+    /// Runtime capabilities — what this session can and can't do
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<RuntimeCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2174,11 +2223,14 @@ mod session_consolidation_tests {
             watches: vec![],
             paused_threads: vec![],
             crash_info: None,
+            capabilities: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "running");
         assert_eq!(json["pid"], 1234);
         assert_eq!(json["eventCount"], 100);
+        // capabilities should be omitted when None
+        assert!(json.get("capabilities").is_none());
     }
 
     #[test]

@@ -1,14 +1,43 @@
 // agent/src/tracers/v8-tracer.ts
 // V8 runtime tracer — runs INSIDE Node.js's own V8 context.
 // Requires Frida script runtime = V8 (set by spawner.rs for JS sessions).
+//
+// Function tracing: Module._compile hooking + Proxy wrapping (CJS) and
+// module.registerHooks() source transform (ESM).
+//
+// Breakpoints/stepping: V8 Inspector Protocol via require('node:inspector').
+// When V8 pauses at a breakpoint, the Inspector enters a nested message loop
+// that processes V8 platform tasks — Frida messages are delivered as platform
+// tasks, so we can receive resume commands while V8 is paused.
 
 import { Tracer, ResolvedTarget, HookMode, BreakpointMessage,
-         StepHooksMessage, LogpointMessage } from './tracer.js';
+         StepHooksMessage, LogpointMessage, TracerCapabilities } from './tracer.js';
 
 interface V8Hook {
   funcId: number;
   target: ResolvedTarget;
   mode: HookMode;
+}
+
+interface V8BreakpointState {
+  strobeId: string;
+  cdpBreakpointId: string;
+  file: string;
+  line: number;
+  condition?: string;
+  hitCount: number;
+  currentHits: number;
+  funcName?: string;
+}
+
+interface V8LogpointState {
+  strobeId: string;
+  cdpBreakpointId: string;
+  file: string;
+  line: number;
+  message: string;
+  condition?: string;
+  funcName?: string;
 }
 
 // These globals are available because we're running in Node.js's V8 context
@@ -27,6 +56,12 @@ export class V8Tracer implements Tracer {
   private wrappedFns: WeakSet<Function> = new WeakSet();
   private origCompile: Function | null = null;
   private esmHooksRegistered: boolean = false;
+
+  // V8 Inspector session for breakpoints/stepping
+  private inspectorSession: any | null = null;
+  private v8Breakpoints: Map<string, V8BreakpointState> = new Map();
+  private v8Logpoints: Map<string, V8LogpointState> = new Map();
+  private isPaused: boolean = false;
 
   constructor(agent: any) {
     this.agent = agent;
@@ -94,10 +129,54 @@ export class V8Tracer implements Tracer {
     // Register ESM module hooks for dynamic import() interception
     this.registerEsmHooks();
 
+    // Initialize V8 Inspector session for breakpoints/stepping
+    this.initializeInspector();
+
     send({ type: 'log', message: `V8Tracer: initialized (V8 runtime, Node.js ${process.version})` });
   }
 
+  private initializeInspector(): void {
+    try {
+      const inspector = require('node:inspector');
+      this.inspectorSession = new inspector.Session();
+      this.inspectorSession.connect();
+
+      // Enable the Debugger domain
+      this.inspectorSession.post('Debugger.enable', {}, (err: any) => {
+        if (err) {
+          send({ type: 'log', message: `V8Tracer: Debugger.enable failed: ${err}` });
+          this.inspectorSession.disconnect();
+          this.inspectorSession = null;
+          return;
+        }
+        send({ type: 'log', message: 'V8Tracer: Inspector session connected, Debugger enabled' });
+      });
+
+      // Listen for Debugger.paused events
+      this.inspectorSession.on('Debugger.paused', (params: any) => {
+        this.handleDebuggerPaused(params);
+      });
+
+      // Listen for Debugger.resumed events
+      this.inspectorSession.on('Debugger.resumed', () => {
+        this.isPaused = false;
+      });
+    } catch (e) {
+      send({ type: 'log', message: `V8Tracer: Inspector not available: ${e}` });
+      this.inspectorSession = null;
+    }
+  }
+
   dispose(): void {
+    // Clean up inspector session
+    if (this.inspectorSession) {
+      try {
+        this.inspectorSession.post('Debugger.disable');
+        this.inspectorSession.disconnect();
+      } catch {}
+      this.inspectorSession = null;
+    }
+
     // Restore original _compile
     if (this.origCompile) {
       try {
@@ -109,6 +188,8 @@ export class V8Tracer implements Tracer {
     if (this.flushTimer) { clearInterval(this.flushTimer); this.flushTimer = null; }
     this.flushEvents();
     this.hooks.clear();
+    this.v8Breakpoints.clear();
+    this.v8Logpoints.clear();
   }
 
   installHook(target: ResolvedTarget, mode: HookMode): number | null {
@@ -145,11 +226,133 @@ export class V8Tracer implements Tracer {
   removeAllHooks(): void { this.hooks.clear(); }
   activeHookCount(): number { return this.hooks.size; }
 
-  installBreakpoint(_msg: BreakpointMessage): void { /* Phase 2: use V8 Inspector CDP */ }
-  removeBreakpoint(_id: string): void {}
-  installStepHooks(_msg: StepHooksMessage): void {}
-  installLogpoint(_msg: LogpointMessage): void {}
-  removeLogpoint(_id: string): void {}
+  // ── Breakpoints via V8 Inspector ──────────────────────────────────────
+
+  installBreakpoint(msg: BreakpointMessage): void {
+    if (!this.inspectorSession) {
+      send({ type: 'log', message: 'V8Tracer: Cannot set breakpoint — Inspector not available' });
+      return;
+    }
+    if (!msg.file || msg.line === undefined) {
+      send({ type: 'log', message: 'V8Tracer: Breakpoint requires file and line' });
+      return;
+    }
+
+    // Escape regex special chars, match by file suffix to handle relative paths
+    const escaped = msg.file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    this.inspectorSession.post('Debugger.setBreakpointByUrl', {
+      lineNumber: msg.line - 1,  // CDP uses 0-indexed lines
+      urlRegex: `${escaped}$`,
+      condition: msg.condition || undefined,
+    }, (err: any, result: any) => {
+      if (err) {
+        send({ type: 'log', message: `V8Tracer: setBreakpointByUrl failed: ${err}` });
+        return;
+      }
+
+      this.v8Breakpoints.set(msg.id, {
+        strobeId: msg.id,
+        cdpBreakpointId: result.breakpointId,
+        file: msg.file!,
+        line: msg.line!,
+        condition: msg.condition,
+        hitCount: msg.hitCount || 0,
+        currentHits: 0,
+        funcName: msg.funcName,
+      });
+
+      send({
+        type: 'breakpointSet',
+        id: msg.id,
+        address: `js:${msg.file}:${msg.line}`,
+      });
+    });
+  }
+
+  removeBreakpoint(id: string): void {
+    const bp = this.v8Breakpoints.get(id);
+    if (!bp || !this.inspectorSession) return;
+
+    this.inspectorSession.post('Debugger.removeBreakpoint', {
+      breakpointId: bp.cdpBreakpointId,
+    }, (err: any) => {
+      if (err) {
+        send({ type: 'log', message: `V8Tracer: removeBreakpoint failed: ${err}` });
+      }
+    });
+
+    this.v8Breakpoints.delete(id);
+    send({ type: 'breakpointRemoved', id });
+  }
+
+  // ── Stepping ──────────────────────────────────────────────────────────
+
+  installStepHooks(_msg: StepHooksMessage): void {
+    // V8 stepping is handled natively by the Inspector's Debugger.stepOver/stepInto/stepOut.
+    // Step commands are sent in handleV8Resume() when the daemon sends 'resume_v8_bp'
+    // with a step action. No one-shot Interceptor hooks needed.
+  }
+
+  // ── Logpoints ─────────────────────────────────────────────────────────
+
+  installLogpoint(msg: LogpointMessage): void {
+    if (!this.inspectorSession) {
+      send({ type: 'log', message: 'V8Tracer: Cannot set logpoint — Inspector not available' });
+      return;
+    }
+    if (!msg.file || msg.line === undefined) {
+      send({ type: 'log', message: 'V8Tracer: Logpoint requires file and line' });
+      return;
+    }
+
+    const escaped = msg.file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    this.inspectorSession.post('Debugger.setBreakpointByUrl', {
+      lineNumber: msg.line - 1,
+      urlRegex: `${escaped}$`,
+      condition: msg.condition || undefined,
+    }, (err: any, result: any) => {
+      if (err) {
+        send({ type: 'log', message: `V8Tracer: setLogpoint failed: ${err}` });
+        return;
+      }
+
+      this.v8Logpoints.set(msg.id, {
+        strobeId: msg.id,
+        cdpBreakpointId: result.breakpointId,
+        file: msg.file!,
+        line: msg.line!,
+        message: msg.message,
+        condition: msg.condition,
+        funcName: msg.funcName,
+      });
+
+      send({
+        type: 'logpointSet',
+        id: msg.id,
+        address: `js:${msg.file}:${msg.line}`,
+      });
+    });
+  }
+
+  removeLogpoint(id: string): void {
+    const lp = this.v8Logpoints.get(id);
+    if (!lp || !this.inspectorSession) return;
+
+    this.inspectorSession.post('Debugger.removeBreakpoint', {
+      breakpointId: lp.cdpBreakpointId,
+    }, (err: any) => {
+      if (err) {
+        send({ type: 'log', message: `V8Tracer: removeLogpoint failed: ${err}` });
+      }
+    });
+
+    this.v8Logpoints.delete(id);
+    send({ type: 'logpointRemoved', id });
+  }
+
+  // ── Variables ─────────────────────────────────────────────────────────
 
   readVariable(expr: string): any {
     // Running in V8 context — can eval globals directly
@@ -185,6 +388,180 @@ export class V8Tracer implements Tracer {
 
   setImageBase(_base: string): void {}
   getSlide(): NativePointer { return ptr(0); }
+
+  // ── Inspector pause/resume handlers ───────────────────────────────────
+
+  /**
+   * Handle Debugger.paused event from V8 Inspector.
+   * V8 is paused in a nested message loop — Frida messages are still delivered
+   * as V8 platform tasks, so we can receive the daemon's resume command.
+   */
+  private handleDebuggerPaused(params: any): void {
+    const { callFrames, hitBreakpoints, reason } = params;
+    this.isPaused = true;
+
+    const cdpId = hitBreakpoints?.[0];
+
+    // Check logpoints first — auto-resume, never block
+    if (cdpId) {
+      for (const lp of this.v8Logpoints.values()) {
+        if (lp.cdpBreakpointId === cdpId) {
+          this.evaluateAndEmitLogpoint(lp, callFrames);
+          this.inspectorSession.post('Debugger.resume');
+          return;
+        }
+      }
+    }
+
+    // Check breakpoints
+    if (cdpId) {
+      for (const bp of this.v8Breakpoints.values()) {
+        if (bp.cdpBreakpointId === cdpId) {
+          bp.currentHits++;
+          if (bp.hitCount > 0 && bp.currentHits !== bp.hitCount) {
+            // Not at target hit count — resume silently
+            this.inspectorSession.post('Debugger.resume');
+            return;
+          }
+          // Emit paused event — V8 stays paused in nested message loop
+          this.emitPausedEvent(bp.strobeId, bp.funcName, callFrames);
+          return;
+        }
+      }
+    }
+
+    // Step completion (after Debugger.stepOver/stepInto/stepOut)
+    if (reason === 'step') {
+      this.emitPausedEvent(`step-0-${Date.now()}`, null, callFrames);
+      return;
+    }
+
+    // Unknown pause (debugger statement, exception, etc.) — resume
+    this.inspectorSession.post('Debugger.resume');
+  }
+
+  /**
+   * Resume from a V8 breakpoint pause.
+   * Called from the Frida message handler when the daemon sends 'resume_v8_bp'.
+   */
+  handleV8Resume(action: string): void {
+    if (!this.inspectorSession || !this.isPaused) {
+      send({ type: 'log', message: 'V8Tracer: resume called but not paused or no inspector' });
+      return;
+    }
+
+    switch (action) {
+      case 'step-over':
+        this.inspectorSession.post('Debugger.stepOver');
+        break;
+      case 'step-into':
+        this.inspectorSession.post('Debugger.stepInto');
+        break;
+      case 'step-out':
+        this.inspectorSession.post('Debugger.stepOut');
+        break;
+      case 'continue':
+      default:
+        this.inspectorSession.post('Debugger.resume');
+        break;
+    }
+  }
+
+  /**
+   * Send a 'paused' event to the daemon with call frame info.
+   */
+  private emitPausedEvent(breakpointId: string, funcName: string | null | undefined, callFrames: any[]): void {
+    const topFrame = callFrames?.[0];
+    const location = topFrame?.location || {};
+    const lineNumber = (location.lineNumber || 0) + 1; // CDP 0-indexed → Strobe 1-indexed
+
+    // Extract file from top frame URL
+    let file: string | null = null;
+    try {
+      const url = topFrame?.url || '';
+      file = url.startsWith('file://') ? url.slice(7) : url;
+    } catch {}
+
+    const backtrace = this.buildBacktrace(callFrames);
+
+    send({
+      type: 'paused',
+      threadId: 0,  // Node.js is single-threaded
+      breakpointId,
+      hits: 1,
+      funcName: funcName || topFrame?.functionName || null,
+      file,
+      line: lineNumber,
+      returnAddress: null,
+      backtrace,
+      arguments: [],
+    });
+  }
+
+  /**
+   * Build backtrace from V8 Inspector call frames.
+   */
+  private buildBacktrace(callFrames: any[]): any[] {
+    return (callFrames || []).slice(0, 20).map((frame: any) => {
+      const url = frame.url || '';
+      const file = url.startsWith('file://') ? url.slice(7) : url;
+      const line = frame.location ? (frame.location.lineNumber + 1) : null;
+      return {
+        address: `${frame.functionName || '<anonymous>'}@${file}:${line}`,
+        moduleName: null,
+        name: frame.functionName || '<anonymous>',
+        fileName: file || null,
+        lineNumber: line,
+      };
+    });
+  }
+
+  /**
+   * Evaluate logpoint message template and emit event.
+   * Replaces {varName} placeholders with evaluated values from the paused scope.
+   */
+  private evaluateAndEmitLogpoint(lp: V8LogpointState, callFrames: any[]): void {
+    let evaluatedMessage = lp.message;
+    const topFrame = callFrames?.[0];
+
+    if (topFrame && this.inspectorSession) {
+      // Replace {expr} placeholders with evaluated values
+      const placeholders = lp.message.match(/\{([^}]+)\}/g) || [];
+      for (const placeholder of placeholders) {
+        const expr = placeholder.slice(1, -1); // Remove { }
+        try {
+          // evaluateOnCallFrame is synchronous within the nested message loop
+          this.inspectorSession.post('Debugger.evaluateOnCallFrame', {
+            callFrameId: topFrame.callFrameId,
+            expression: expr,
+            returnByValue: true,
+          }, (err: any, result: any) => {
+            if (!err && result?.result?.value !== undefined) {
+              evaluatedMessage = evaluatedMessage.replace(placeholder, String(result.result.value));
+            } else if (!err && result?.result?.description) {
+              evaluatedMessage = evaluatedMessage.replace(placeholder, result.result.description);
+            }
+          });
+        } catch {}
+      }
+    }
+
+    // Emit logpoint event
+    this.eventBuffer.push({
+      id: `${this.sessionId}-lp-${++this.eventIdCounter}`,
+      sessionId: this.sessionId,
+      timestampNs: Date.now() * 1_000_000,
+      threadId: 0,
+      eventType: 'logpoint',
+      breakpointId: lp.strobeId,
+      message: evaluatedMessage,
+      functionName: lp.funcName,
+      sourceFile: lp.file,
+      lineNumber: lp.line,
+      pid: process.pid,
+    });
+    this.flushEvents();
+  }
 
   // ── Private helpers ─────────────────────────────────────────────────
 
@@ -346,5 +723,21 @@ export class V8Tracer implements Tracer {
     const events = this.eventBuffer;
     this.eventBuffer = [];
     send({ type: 'events', events });
+  }
+
+  getCapabilities(): TracerCapabilities {
+    let nodeVersion = 'unknown';
+    try { nodeVersion = process.version; } catch {}
+    const hasInspector = this.inspectorSession !== null;
+    return {
+      functionTracing: true,
+      breakpoints: hasInspector,
+      stepping: hasInspector,
+      runtimeDetail: `Node.js ${nodeVersion} (V8)`,
+      limitations: hasInspector ? [] : [
+        "V8 Inspector not available — breakpoints and stepping are disabled. " +
+        "Function tracing via debug_trace still works fully.",
+      ],
+    };
   }
 }

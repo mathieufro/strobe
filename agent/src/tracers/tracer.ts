@@ -52,6 +52,19 @@ export interface Tracer {
 
   // Runtime resolution fallback (for dynamic functions not in static AST)
   resolvePattern?(pattern: string): ResolvedTarget[];
+
+  // Capability reporting — what this tracer can and can't do
+  getCapabilities(): TracerCapabilities;
+}
+
+// Runtime capability reporting — each tracer reports what it can and can't do,
+// with prescriptive guidance on how to enable missing features.
+export interface TracerCapabilities {
+  functionTracing: boolean;
+  breakpoints: boolean;
+  stepping: boolean;
+  runtimeDetail?: string;
+  limitations: string[];
 }
 
 // Message types used by the tracer interface

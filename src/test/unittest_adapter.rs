@@ -128,7 +128,7 @@ fn has_unittest_test_files(root: &Path) -> bool {
 
 /// Parse unittest verbose output.
 /// Format:
-/// ```
+/// ```text
 /// test_method (test_module.TestClass) ... ok
 /// test_another (test_module.TestClass) ... FAIL
 /// test_skip (test_module.TestClass) ... skipped 'reason'

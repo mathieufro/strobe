@@ -7,7 +7,7 @@
 // Falls back to single-hook-only behavior if JSC API symbols aren't found.
 
 import { Tracer, ResolvedTarget, HookMode, BreakpointMessage,
-         StepHooksMessage, LogpointMessage } from './tracer.js';
+         StepHooksMessage, LogpointMessage, TracerCapabilities } from './tracer.js';
 import { findGlobalExport } from '../utils.js';
 
 interface JscHook {
@@ -39,6 +39,9 @@ export class JscTracer implements Tracer {
   // Cache: JSObjectRef pointer string → function name (avoids repeated API calls)
   private fnNameCache: Map<string, string> = new Map();
 
+  // Whether JSObjectCallAsFunction was found (set during initialize)
+  private hookTargetFound: boolean = false;
+
   constructor(agent: any) { this.agent = agent; }
 
   initialize(sessionId: string): void {
@@ -56,6 +59,7 @@ export class JscTracer implements Tracer {
       send({ type: 'log', message: 'JscTracer: JSObjectCallAsFunction not found — tracing unavailable' });
       return;
     }
+    this.hookTargetFound = true;
 
     const self = this;
     this.interceptor = Interceptor.attach(hookTarget, {
@@ -239,5 +243,51 @@ export class JscTracer implements Tracer {
 
   resolvePattern(_pattern: string): ResolvedTarget[] {
     return [];
+  }
+
+  getCapabilities(): TracerCapabilities {
+    if (!this.hookTargetFound) {
+      return {
+        functionTracing: false,
+        breakpoints: false,
+        stepping: false,
+        runtimeDetail: 'Bun (JSC, symbols stripped)',
+        limitations: [
+          "Bun's release binary strips all JSC symbols, which disables function tracing, breakpoints, and stepping. " +
+          "To get full Strobe instrumentation, build Bun from source in debug mode: " +
+          "git clone https://github.com/oven-sh/bun && cd bun && bun run build — " +
+          "then use ./build/debug/bun-debug instead of bun. " +
+          "Debug builds preserve JSC symbols needed for function tracing.",
+        ],
+      };
+    }
+
+    if (this.jscApiAvailable) {
+      return {
+        functionTracing: true,
+        breakpoints: false,
+        stepping: false,
+        runtimeDetail: 'Bun (JSC, multi-hook)',
+        limitations: [
+          "Breakpoints and stepping are not yet supported for Bun/JSC. " +
+          "Use function tracing via debug_trace and logpoints via debug_breakpoint with a 'message' field.",
+        ],
+      };
+    }
+
+    return {
+      functionTracing: true,
+      breakpoints: false,
+      stepping: false,
+      runtimeDetail: 'Bun (JSC, single-hook only)',
+      limitations: [
+        "JSC C API symbols missing — only one function can be traced at a time. " +
+        "For multi-function tracing, build Bun from source in debug mode: " +
+        "git clone https://github.com/oven-sh/bun && cd bun && bun run build — " +
+        "then use ./build/debug/bun-debug instead of bun.",
+        "Breakpoints and stepping are not yet supported for Bun/JSC. " +
+        "Use function tracing via debug_trace and logpoints via debug_breakpoint with a 'message' field.",
+      ],
+    };
   }
 }

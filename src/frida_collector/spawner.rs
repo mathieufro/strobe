@@ -563,6 +563,19 @@ impl AgentMessageHandler {
                 };
                 let _ = self.event_tx.try_send(event);
             }
+            "runtime_detected" => {
+                let runtime = payload.get("runtime").and_then(|v| v.as_str()).unwrap_or("unknown");
+                tracing::info!("Agent [{}] detected runtime: {}", self.session_id, runtime);
+            }
+            "capabilities" => {
+                let detail = payload.get("runtimeDetail").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let tracing_ok = payload.get("functionTracing").and_then(|v| v.as_bool()).unwrap_or(false);
+                let lims = payload.get("limitations").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                tracing::info!(
+                    "Agent [{}] capabilities: runtime={}, functionTracing={}, limitations={}",
+                    self.session_id, detail, tracing_ok, lims
+                );
+            }
             _ => {
                 tracing::debug!("Unknown message type from agent: {}", msg_type);
             }
@@ -743,8 +756,15 @@ unsafe extern "C" fn destroy_spawn_tx(data: *mut c_void, _closure: *mut frida_sy
 fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
     use frida::{Frida, DeviceManager, DeviceType, SpawnOptions, SpawnStdio};
 
-    let frida = unsafe { Frida::obtain() };
-    let device_manager = DeviceManager::obtain(&frida);
+    // Frida's global state (GLib g_slice allocator, GMainLoop, etc.) must never be
+    // deinitialized: frida_deinit() + frida_init() is not re-entrant — GLib's
+    // thread-local slice allocator crashes on the next DeviceManager::obtain().
+    // Leak the Frida singleton so Frida::drop() (which calls frida_deinit) never runs.
+    static FRIDA: std::sync::OnceLock<&'static Frida> = std::sync::OnceLock::new();
+    let frida: &'static Frida = FRIDA.get_or_init(|| {
+        Box::leak(Box::new(unsafe { Frida::obtain() }))
+    });
+    let device_manager = DeviceManager::obtain(frida);
 
     let devices = device_manager.enumerate_all_devices();
     let mut device = match devices.into_iter().find(|d| d.get_type() == DeviceType::Local) {
@@ -2416,13 +2436,21 @@ pub struct FridaSpawner {
     sessions: HashMap<String, FridaSession>,
     coordinator_tx: std::sync::mpsc::Sender<CoordinatorCommand>,
     session_workers: HashMap<String, std::sync::mpsc::Sender<SessionCommand>>,
+    /// JoinHandles for session worker threads — needed to synchronize shutdown.
+    /// Without this, stop() races: coordinator unrefs the session while the worker
+    /// is still unloading/unreffing the script → use-after-free SIGSEGV.
+    session_worker_handles: HashMap<String, thread::JoinHandle<()>>,
+    /// JoinHandle for the coordinator thread — joined on Drop to ensure Frida's
+    /// global state (DeviceManager, Device, GLib) is fully cleaned up before
+    /// any new FridaSpawner is created.
+    coordinator_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl FridaSpawner {
     pub fn new() -> Self {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
 
-        thread::spawn(move || {
+        let coordinator_handle = thread::spawn(move || {
             coordinator_worker(cmd_rx);
         });
 
@@ -2430,6 +2458,8 @@ impl FridaSpawner {
             sessions: HashMap::new(),
             coordinator_tx: cmd_tx,
             session_workers: HashMap::new(),
+            session_worker_handles: HashMap::new(),
+            coordinator_handle: Some(coordinator_handle),
         }
     }
 
@@ -2471,10 +2501,11 @@ impl FridaSpawner {
         // Spawn dedicated worker thread for this session
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let sid = session_id.to_string();
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             session_worker(sid, spawn_result.script_ptr, spawn_result.hooks_ready, spawn_result.read_response, spawn_result.write_response, pid, session_rx);
         });
         self.session_workers.insert(session_id.to_string(), session_tx);
+        self.session_worker_handles.insert(session_id.to_string(), handle);
 
         let session = FridaSession {
             project_root: project_root.to_string(),
@@ -2727,9 +2758,16 @@ impl FridaSpawner {
     pub async fn stop(&mut self, session_id: &str) -> Result<()> {
         self.sessions.remove(session_id);
 
-        // Phase 1: Shut down session worker (stops script operations)
+        // Phase 1: Shut down session worker (unloads + unrefs script).
+        // CRITICAL: We must wait for the worker thread to finish before Phase 2,
+        // because the coordinator unrefs the Frida *session* GObject. If the worker
+        // is still unreffing the *script* (child of session), that's a use-after-free.
         if let Some(worker_tx) = self.session_workers.remove(session_id) {
             let _ = worker_tx.send(SessionCommand::Shutdown);
+        }
+        if let Some(handle) = self.session_worker_handles.remove(session_id) {
+            // join() blocks until the worker thread exits (script fully cleaned up)
+            let _ = handle.join();
         }
 
         // Phase 2: Kill processes via coordinator (device.kill)
@@ -2881,6 +2919,35 @@ impl FridaSpawner {
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
+    }
+}
+
+impl Drop for FridaSpawner {
+    fn drop(&mut self) {
+        // Send Shutdown to any remaining session workers and join them
+        for (_, tx) in self.session_workers.drain() {
+            let _ = tx.send(SessionCommand::Shutdown);
+        }
+        for (_, handle) in self.session_worker_handles.drain() {
+            let _ = handle.join();
+        }
+        // Drop coordinator_tx to close the channel, causing coordinator_worker to exit
+        // (self.coordinator_tx drops naturally after this block)
+        // But we need to drop it *before* joining, so swap it out
+        let coord_handle = self.coordinator_handle.take();
+        // coordinator_tx is dropped when self drops — but we need it dropped NOW
+        // so the coordinator thread sees the channel close and exits.
+        // We can't explicitly drop a field, but once we take() the handle,
+        // the compiler will drop coordinator_tx when self is fully dropped.
+        // Use a dedicated sender drop to signal the coordinator:
+        drop(std::mem::replace(
+            &mut self.coordinator_tx,
+            // Create a dummy sender that immediately disconnects
+            std::sync::mpsc::channel().0,
+        ));
+        if let Some(handle) = coord_handle {
+            let _ = handle.join();
+        }
     }
 }
 

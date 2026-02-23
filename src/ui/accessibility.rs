@@ -15,11 +15,6 @@ use core_foundation_sys::string::CFStringRef;
 use core_foundation_sys::number::CFNumberRef;
 use std::ffi::c_void;
 
-// Helper to convert attribute name to CFStringRef
-unsafe fn attr_to_cfstring(attr: &str) -> CFStringRef {
-    CFString::new(attr).as_concrete_TypeRef()
-}
-
 /// Check if this process has accessibility permissions.
 /// If `prompt` is true, shows the system dialog asking user to grant permission.
 pub fn check_accessibility_permission(prompt: bool) -> bool {
@@ -132,12 +127,12 @@ unsafe fn build_node(
     }
     *node_count += 1;
 
-    let role = get_ax_string(element, attr_to_cfstring(kAXRoleAttribute))?;
-    let title = get_ax_string(element, attr_to_cfstring(kAXTitleAttribute))
-        .or_else(|| get_ax_string(element, attr_to_cfstring(kAXDescriptionAttribute)));
+    let role = get_ax_string(element, kAXRoleAttribute)?;
+    let title = get_ax_string(element, kAXTitleAttribute)
+        .or_else(|| get_ax_string(element, kAXDescriptionAttribute));
     let value = get_ax_value_string(element);
-    let enabled = get_ax_bool(element, attr_to_cfstring(kAXEnabledAttribute)).unwrap_or(true);
-    let focused = get_ax_bool(element, attr_to_cfstring(kAXFocusedAttribute)).unwrap_or(false);
+    let enabled = get_ax_bool(element, kAXEnabledAttribute).unwrap_or(true);
+    let focused = get_ax_bool(element, kAXFocusedAttribute).unwrap_or(false);
     let bounds = get_ax_bounds(element);
     let actions = get_ax_actions(element);
 
@@ -170,9 +165,10 @@ unsafe fn build_node(
 }
 
 /// Get a string attribute from an AX element.
-unsafe fn get_ax_string(element: AXUIElementRef, attribute: CFStringRef) -> Option<String> {
+unsafe fn get_ax_string(element: AXUIElementRef, attribute: &str) -> Option<String> {
+    let attr = CFString::new(attribute);
     let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attribute, &mut value);
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != 0 || value.is_null() {
         return None;
     }
@@ -181,15 +177,17 @@ unsafe fn get_ax_string(element: AXUIElementRef, attribute: CFStringRef) -> Opti
         CFRelease(value);
         return None;
     }
-    let cf_str = CFString::wrap_under_get_rule(value as CFStringRef);
+    // wrap_under_create_rule: we own this value (AXUIElementCopyAttributeValue follows Create Rule)
+    let cf_str = CFString::wrap_under_create_rule(value as CFStringRef);
     let result = cf_str.to_string();
     Some(result)
 }
 
 /// Get value attribute as string (handles CFString, CFNumber, etc.).
 unsafe fn get_ax_value_string(element: AXUIElementRef) -> Option<String> {
+    let attr = CFString::new(kAXValueAttribute);
     let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr_to_cfstring(kAXValueAttribute), &mut value);
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != 0 || value.is_null() {
         return None;
     }
@@ -219,9 +217,10 @@ unsafe fn get_ax_value_string(element: AXUIElementRef) -> Option<String> {
 }
 
 /// Get a boolean attribute.
-unsafe fn get_ax_bool(element: AXUIElementRef, attribute: CFStringRef) -> Option<bool> {
+unsafe fn get_ax_bool(element: AXUIElementRef, attribute: &str) -> Option<bool> {
+    let attr = CFString::new(attribute);
     let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attribute, &mut value);
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != 0 || value.is_null() {
         return None;
     }
@@ -238,8 +237,9 @@ unsafe fn get_ax_bool(element: AXUIElementRef, attribute: CFStringRef) -> Option
 /// Get bounding box (position + size).
 unsafe fn get_ax_bounds(element: AXUIElementRef) -> Option<Rect> {
     // Position
+    let pos_attr = CFString::new(kAXPositionAttribute);
     let mut pos_value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr_to_cfstring(kAXPositionAttribute), &mut pos_value);
+    let err = AXUIElementCopyAttributeValue(element, pos_attr.as_concrete_TypeRef(), &mut pos_value);
     if err != 0 || pos_value.is_null() {
         return None;
     }
@@ -256,8 +256,9 @@ unsafe fn get_ax_bounds(element: AXUIElementRef) -> Option<Rect> {
     CFRelease(pos_value);
 
     // Size
+    let size_attr = CFString::new(kAXSizeAttribute);
     let mut size_value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr_to_cfstring(kAXSizeAttribute), &mut size_value);
+    let err = AXUIElementCopyAttributeValue(element, size_attr.as_concrete_TypeRef(), &mut size_value);
     if err != 0 || size_value.is_null() {
         return None;
     }
@@ -283,8 +284,9 @@ unsafe fn get_ax_bounds(element: AXUIElementRef) -> Option<Rect> {
 
 /// Get children elements.
 unsafe fn get_ax_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    let attr = CFString::new(kAXChildrenAttribute);
     let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr_to_cfstring(kAXChildrenAttribute), &mut value);
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != 0 || value.is_null() {
         return vec![];
     }
