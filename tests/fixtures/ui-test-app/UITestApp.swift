@@ -14,6 +14,8 @@ struct ContentView: View {
     @State private var textValue: String = "test"
     @State private var toggleValue: Bool = true
     @State private var selectedItem: String? = nil
+    @State private var dragReceived: Bool = false
+    @State private var dragLabel: String = "Drag Me"
 
     var body: some View {
         VStack(spacing: 16) {
@@ -68,8 +70,34 @@ struct ContentView: View {
             .frame(height: 80)
             .accessibilityHidden(true)  // Deliberately hidden from AX
 
+            Divider()
+
+            // Drag targets for testing
+            HStack(spacing: 20) {
+                Text(dragLabel)
+                    .frame(width: 100, height: 40)
+                    .background(Color.blue.opacity(0.3))
+                    .accessibilityIdentifier("drag_source")
+                    .accessibilityLabel("Drag Source")
+                    .draggable("drag_payload")
+
+                Text("Drop Here")
+                    .frame(width: 100, height: 40)
+                    .background(dragReceived ? Color.green.opacity(0.3) : Color.gray.opacity(0.3))
+                    .accessibilityIdentifier("drop_target")
+                    .accessibilityLabel(dragReceived ? "Drop Received" : "Drop Here")
+                    .dropDestination(for: String.self) { items, _ in
+                        if let _ = items.first {
+                            dragReceived = true
+                            return true
+                        }
+                        return false
+                    }
+            }
+            .padding()
+
             Spacer()
         }
-        .frame(width: 400, height: 500)
+        .frame(width: 400, height: 600)
     }
 }

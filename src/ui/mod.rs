@@ -15,3 +15,11 @@ pub use accessibility_linux as accessibility;
 
 pub mod vision;
 pub mod merge;
+
+pub mod input;
+
+#[cfg(target_os = "macos")]
+pub mod input_mac;
+
+#[cfg(target_os = "linux")]
+mod input_linux;

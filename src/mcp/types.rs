@@ -1407,6 +1407,127 @@ pub struct DebugUiResponse {
     pub stats: Option<UiStats>,
 }
 
+// ============ debug_ui_action ============
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiActionType {
+    Click,
+    SetValue,
+    Type,
+    Key,
+    Scroll,
+    Drag,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugUiActionRequest {
+    pub session_id: String,
+    pub action: UiActionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifiers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<ScrollDirection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settle_ms: Option<u64>,
+}
+
+impl DebugUiActionRequest {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.session_id.is_empty() {
+            return Err(crate::Error::ValidationError(
+                "sessionId must not be empty".to_string(),
+            ));
+        }
+
+        // All actions except Key require id
+        if self.action != UiActionType::Key && self.id.is_none() {
+            return Err(crate::Error::ValidationError(
+                "id is required for all actions except 'key'".to_string(),
+            ));
+        }
+
+        match self.action {
+            UiActionType::SetValue => {
+                if self.value.is_none() {
+                    return Err(crate::Error::ValidationError(
+                        "value is required for 'set_value' action".to_string(),
+                    ));
+                }
+            }
+            UiActionType::Type => {
+                if self.text.is_none() {
+                    return Err(crate::Error::ValidationError(
+                        "text is required for 'type' action".to_string(),
+                    ));
+                }
+            }
+            UiActionType::Key => {
+                if self.key.is_none() {
+                    return Err(crate::Error::ValidationError(
+                        "key is required for 'key' action".to_string(),
+                    ));
+                }
+            }
+            UiActionType::Scroll => {
+                if self.direction.is_none() {
+                    return Err(crate::Error::ValidationError(
+                        "direction is required for 'scroll' action".to_string(),
+                    ));
+                }
+            }
+            UiActionType::Drag => {
+                if self.to_id.is_none() {
+                    return Err(crate::Error::ValidationError(
+                        "toId is required for 'drag' action".to_string(),
+                    ));
+                }
+            }
+            UiActionType::Click => {}
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugUiActionResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_before: Option<crate::ui::tree::UiNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_after: Option<crate::ui::tree::UiNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod write_tests {
     use super::*;
@@ -1518,6 +1639,164 @@ mod write_tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("tree").is_some());
         assert_eq!(json["stats"]["axNodes"], 5);
+    }
+}
+
+#[cfg(test)]
+mod ui_action_tests {
+    use super::*;
+
+    #[test]
+    fn test_ui_action_request_valid_click() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Click,
+            id: Some("btn_a1b2".to_string()),
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_ui_action_request_empty_session_id() {
+        let req = DebugUiActionRequest {
+            session_id: "".to_string(),
+            action: UiActionType::Click,
+            id: Some("btn_a1b2".to_string()),
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_ui_action_request_click_missing_id() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Click,
+            id: None,
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("id"));
+    }
+
+    #[test]
+    fn test_ui_action_request_key_no_id_required() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Key,
+            id: None,
+            value: None, text: None,
+            key: Some("s".to_string()),
+            modifiers: Some(vec!["cmd".to_string()]),
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_ui_action_request_key_missing_key_field() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Key,
+            id: None,
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("key"));
+    }
+
+    #[test]
+    fn test_ui_action_request_type_missing_text() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Type,
+            id: Some("txt_1234".to_string()),
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("text"));
+    }
+
+    #[test]
+    fn test_ui_action_request_drag_missing_to_id() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Drag,
+            id: Some("el_1234".to_string()),
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("toId"));
+    }
+
+    #[test]
+    fn test_ui_action_request_scroll_missing_direction() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Scroll,
+            id: Some("lst_1234".to_string()),
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("direction"));
+    }
+
+    #[test]
+    fn test_ui_action_request_set_value_missing_value() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::SetValue,
+            id: Some("sld_1234".to_string()),
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("value"));
+    }
+
+    #[test]
+    fn test_ui_action_request_camel_case_wire_format() {
+        let req = DebugUiActionRequest {
+            session_id: "s1".to_string(),
+            action: UiActionType::Click,
+            id: Some("btn_a1b2".to_string()),
+            value: None, text: None, key: None, modifiers: None,
+            direction: None, amount: None, to_id: None, settle_ms: Some(100),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("sessionId").is_some());
+        assert!(json.get("settleMs").is_some());
+    }
+
+    #[test]
+    fn test_ui_action_response_serialization() {
+        let resp = DebugUiActionResponse {
+            success: true,
+            method: Some("ax".to_string()),
+            node_before: None,
+            node_after: None,
+            changed: Some(true),
+            error: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["method"], "ax");
+        assert_eq!(json["changed"], true);
+        assert!(json.get("error").is_none());
     }
 }
 

@@ -135,6 +135,15 @@ pub fn format_json(nodes: &[UiNode]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&serde_json::json!({ "nodes": nodes }))
 }
 
+/// Compare two UiNode snapshots. Returns true if any observable field changed.
+/// Compares: value, enabled, focused, title. Ignores children and bounds.
+pub fn diff_nodes(before: &UiNode, after: &UiNode) -> bool {
+    before.value != after.value
+        || before.enabled != after.enabled
+        || before.focused != after.focused
+        || before.title != after.title
+}
+
 /// Count nodes recursively.
 pub fn count_nodes(nodes: &[UiNode]) -> usize {
     nodes.iter().map(|n| 1 + count_nodes(&n.children)).sum()
@@ -230,5 +239,98 @@ mod tests {
     fn test_count_nodes() {
         let tree = sample_tree();
         assert_eq!(count_nodes(&tree), 3); // window + button + knob
+    }
+
+    #[test]
+    fn test_diff_nodes_detects_value_change() {
+        let before = UiNode {
+            id: "sld_1234".to_string(),
+            role: "AXSlider".to_string(),
+            title: Some("Volume".to_string()),
+            value: Some("0.5".to_string()),
+            enabled: true,
+            focused: false,
+            bounds: Some(Rect { x: 10.0, y: 20.0, w: 200.0, h: 30.0 }),
+            actions: vec!["AXIncrement".to_string()],
+            source: NodeSource::Ax,
+            children: vec![],
+        };
+        let mut after = before.clone();
+        after.value = Some("0.8".to_string());
+        assert!(diff_nodes(&before, &after));
+    }
+
+    #[test]
+    fn test_diff_nodes_no_change() {
+        let node = UiNode {
+            id: "btn_a1b2".to_string(),
+            role: "AXButton".to_string(),
+            title: Some("Play".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: Some(Rect { x: 10.0, y: 5.0, w: 80.0, h: 30.0 }),
+            actions: vec!["AXPress".to_string()],
+            source: NodeSource::Ax,
+            children: vec![],
+        };
+        assert!(!diff_nodes(&node, &node));
+    }
+
+    #[test]
+    fn test_diff_nodes_detects_focus_change() {
+        let before = UiNode {
+            id: "txt_5678".to_string(),
+            role: "AXTextField".to_string(),
+            title: Some("Name".to_string()),
+            value: Some("hello".to_string()),
+            enabled: true,
+            focused: false,
+            bounds: None,
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![],
+        };
+        let mut after = before.clone();
+        after.focused = true;
+        assert!(diff_nodes(&before, &after));
+    }
+
+    #[test]
+    fn test_diff_nodes_detects_enabled_change() {
+        let before = UiNode {
+            id: "btn_1234".to_string(),
+            role: "AXButton".to_string(),
+            title: None,
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: None,
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![],
+        };
+        let mut after = before.clone();
+        after.enabled = false;
+        assert!(diff_nodes(&before, &after));
+    }
+
+    #[test]
+    fn test_diff_nodes_detects_title_change() {
+        let before = UiNode {
+            id: "btn_1234".to_string(),
+            role: "AXButton".to_string(),
+            title: Some("Play".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: None,
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![],
+        };
+        let mut after = before.clone();
+        after.title = Some("Pause".to_string());
+        assert!(diff_nodes(&before, &after));
     }
 }

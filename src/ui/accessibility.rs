@@ -310,6 +310,88 @@ unsafe fn get_ax_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
     result
 }
 
+/// Find a live AXUIElementRef by stable node ID.
+/// Re-traverses the AX tree from root, matching generate_id() output.
+/// Caller must CFRelease the returned ref when done.
+pub fn find_ax_element(pid: u32, target_id: &str) -> crate::Result<Option<AXUIElementRef>> {
+    if !check_accessibility_permission(false) {
+        return Err(crate::Error::UiNotAvailable(
+            "Accessibility permission required".to_string(),
+        ));
+    }
+
+    unsafe {
+        let app_ref = AXUIElementCreateApplication(pid as i32);
+        if app_ref.is_null() {
+            return Ok(None);
+        }
+
+        let result = find_element_recursive(app_ref, target_id, 0, 0);
+        CFRelease(app_ref as *const c_void);
+        Ok(result)
+    }
+}
+
+/// Walk the app's children to find the target element.
+/// Returns the AXUIElementRef with an extra retain (caller must release).
+unsafe fn find_element_recursive(
+    parent: AXUIElementRef,
+    target_id: &str,
+    sibling_index: usize,
+    depth: usize,
+) -> Option<AXUIElementRef> {
+    if depth > MAX_AX_DEPTH {
+        return None;
+    }
+
+    // Check if this element matches (not at root level)
+    if depth > 0 {
+        if let Some(role) = get_ax_string(parent, kAXRoleAttribute) {
+            let title = get_ax_string(parent, kAXTitleAttribute)
+                .or_else(|| get_ax_string(parent, kAXDescriptionAttribute));
+            let id = generate_id(&role, title.as_deref(), sibling_index);
+            if id == target_id {
+                core_foundation_sys::base::CFRetain(parent as *const c_void);
+                return Some(parent);
+            }
+        }
+    }
+
+    let children = get_ax_children(parent);
+
+    if depth == 0 {
+        // App level: match query_ax_tree behavior — filter MenuBars, use window_index
+        let mut window_index = 0;
+        for child in &children {
+            let role = get_ax_string(*child, kAXRoleAttribute);
+            let is_menu_bar = role.as_deref().map_or(false, |r| r.contains("MenuBar"));
+            if !is_menu_bar {
+                if let Some(found) = find_element_recursive(*child, target_id, window_index, depth + 1) {
+                    for c in &children {
+                        CFRelease(*c as *const c_void);
+                    }
+                    return Some(found);
+                }
+                window_index += 1;
+            }
+        }
+    } else {
+        for (i, child) in children.iter().enumerate() {
+            if let Some(found) = find_element_recursive(*child, target_id, i, depth + 1) {
+                for c in &children {
+                    CFRelease(*c as *const c_void);
+                }
+                return Some(found);
+            }
+        }
+    }
+
+    for c in &children {
+        CFRelease(*c as *const c_void);
+    }
+    None
+}
+
 /// Get available actions.
 unsafe fn get_ax_actions(element: AXUIElementRef) -> Vec<String> {
     let mut names: core_foundation_sys::array::CFArrayRef = std::ptr::null();
