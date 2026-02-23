@@ -905,7 +905,14 @@ Validation Limits (enforced):
             "debug_memory" => self.tool_debug_memory(&call.arguments).await,
             "debug_breakpoint" => self.tool_debug_breakpoint(&call.arguments).await,
             "debug_continue" => self.tool_debug_continue(&call.arguments).await,
-            "debug_ui" => self.tool_debug_ui(&call.arguments).await,
+            "debug_ui" => {
+                let content = self.tool_debug_ui(&call.arguments).await?;
+                let response = McpToolCallResponse {
+                    content,
+                    is_error: None,
+                };
+                return Ok(serde_json::to_value(response)?);
+            }
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -2343,7 +2350,7 @@ Validation Limits (enforced):
         Ok(serde_json::to_value(response)?)
     }
 
-    async fn tool_debug_ui(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn tool_debug_ui(&self, args: &serde_json::Value) -> Result<Vec<McpContent>> {
         let req: crate::mcp::DebugUiRequest = serde_json::from_value(args.clone())?;
         req.validate()?;
 
@@ -2462,7 +2469,7 @@ Validation Limits (enforced):
             }
         }
 
-        // Capture screenshot → write PNG file to <project_root>/screenshots/
+        // Capture screenshot as base64 PNG
         if needs_screenshot {
             #[cfg(target_os = "macos")]
             {
@@ -2471,23 +2478,8 @@ Validation Limits (enforced):
                     crate::ui::capture::capture_window_screenshot(pid)
                 }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
 
-                let screenshots_dir = std::path::PathBuf::from(&session.project_root).join("screenshots");
-                std::fs::create_dir_all(&screenshots_dir).map_err(|e| {
-                    crate::Error::Internal(format!("Failed to create screenshots directory: {}", e))
-                })?;
-
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let filename = format!("{}.png", timestamp);
-                let file_path = screenshots_dir.join(&filename);
-
-                std::fs::write(&file_path, &png_bytes).map_err(|e| {
-                    crate::Error::Internal(format!("Failed to write screenshot: {}", e))
-                })?;
-
-                screenshot_output = Some(file_path.to_string_lossy().to_string());
+                use base64::Engine;
+                screenshot_output = Some(base64::engine::general_purpose::STANDARD.encode(&png_bytes));
             }
 
             #[cfg(not(target_os = "macos"))]
@@ -2500,18 +2492,32 @@ Validation Limits (enforced):
 
         let latency_ms = start.elapsed().as_millis() as u64;
 
-        let response = crate::mcp::DebugUiResponse {
-            tree: tree_output,
-            screenshot: screenshot_output,
-            stats: Some(crate::mcp::UiStats {
-                ax_nodes: ax_count,
-                vision_nodes: vision_count,
-                merged_nodes: merged_count,
-                latency_ms,
-            }),
-        };
+        // Build MCP content parts: text for tree/stats, image for screenshot
+        let mut content = Vec::new();
 
-        Ok(serde_json::to_value(response)?)
+        {
+            let text_response = crate::mcp::DebugUiResponse {
+                tree: tree_output,
+                stats: Some(crate::mcp::UiStats {
+                    ax_nodes: ax_count,
+                    vision_nodes: vision_count,
+                    merged_nodes: merged_count,
+                    latency_ms,
+                }),
+            };
+            content.push(McpContent::Text {
+                text: serde_json::to_string_pretty(&text_response)?,
+            });
+        }
+
+        if let Some(b64) = screenshot_output {
+            content.push(McpContent::Image {
+                data: b64,
+                mime_type: "image/png".to_string(),
+            });
+        }
+
+        Ok(content)
     }
 
 }

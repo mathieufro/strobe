@@ -1403,9 +1403,6 @@ pub struct UiStats {
 pub struct DebugUiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree: Option<String>,
-    /// Absolute path to the saved PNG screenshot file (in `<projectRoot>/screenshots/`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub screenshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<UiStats>,
 }
@@ -1516,12 +1513,10 @@ mod write_tests {
     fn test_debug_ui_response_serde() {
         let resp = DebugUiResponse {
             tree: Some("[window \"Test\" id=w1]".to_string()),
-            screenshot: None,
             stats: Some(UiStats { ax_nodes: 5, vision_nodes: 0, merged_nodes: 0, latency_ms: 12 }),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("tree").is_some());
-        assert!(json.get("screenshot").is_none()); // skip_serializing_if
         assert_eq!(json["stats"]["axNodes"], 5);
     }
 }
