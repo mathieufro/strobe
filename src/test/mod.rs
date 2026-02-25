@@ -318,6 +318,7 @@ impl TestRunner {
             "gtest" => Some(gtest_adapter::update_progress),
             "mocha" => Some(mocha_adapter::update_progress),
             "pytest" => Some(pytest_adapter::update_progress),
+            "vitest" | "jest" | "bun" => Some(vitest_adapter::update_progress),
             _ => None,
         };
 
@@ -367,13 +368,13 @@ impl TestRunner {
                 break;
             }
 
-            // Poll DB for new stdout events and update progress.
+            // Poll DB for new text events (stdout + stderr) and update progress.
             // Use timestamp-based filtering: only fetch events newer than last seen.
             // (Offset-based pagination is broken with DESC ordering — new events
             // arrive at the "top" but offset skips from the top, missing them.)
             if let Some(update_fn) = progress_fn {
                 let mut new_events = session_manager.db().query_events(session_id, |q| {
-                    let mut q = q.event_type(crate::db::EventType::Stdout).limit(500);
+                    let mut q = q.text_output().limit(500);
                     if last_seen_timestamp_ns > 0 {
                         q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
                     }
@@ -411,11 +412,11 @@ impl TestRunner {
         // Let DB writer flush
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Final progress drain — process any remaining stdout events that arrived
-        // after the last poll (e.g., test "ok" events emitted just before process exit).
+        // Final progress drain — process any remaining text events (stdout + stderr) that
+        // arrived after the last poll (e.g., test "ok" events emitted just before process exit).
         if let Some(update_fn) = progress_fn {
             let mut remaining = session_manager.db().query_events(session_id, |q| {
-                let mut q = q.event_type(crate::db::EventType::Stdout).limit_uncapped(5000);
+                let mut q = q.text_output().limit_uncapped(5000);
                 if last_seen_timestamp_ns > 0 {
                     q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
                 }

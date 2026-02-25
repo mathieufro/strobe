@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 
 use super::adapter::*;
+use super::TestProgress;
 
 pub struct VitestAdapter;
 
@@ -202,6 +204,62 @@ impl TestAdapter for VitestAdapter {
             Some(TestLevel::E2e) => 600_000,
             None => 180_000,
         }
+    }
+}
+
+/// Progress updater for vitest. Vitest with --reporter=json emits progress to stderr
+/// and the final JSON report to stdout. We watch both streams; any line arriving means
+/// tests are running (compilation phase is over). Verbose-style stderr lines
+/// (e.g. "✓ src/foo.test.ts (5 tests) 120ms") are also parsed to track counts.
+pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
+    let mut p = progress.lock().unwrap();
+
+    // Transition from Compiling to Running on first output from either stream
+    if p.phase == super::TestPhase::Compiling {
+        p.phase = super::TestPhase::Running;
+    }
+
+    // Parse verbose reporter lines emitted to stderr during test execution.
+    // Format: "✓ src/foo.test.ts (N tests) Xms"  or  "× src/foo.test.ts (N tests | M failed) Xms"
+    let trimmed = line.trim();
+    if trimmed.starts_with('✓') || trimmed.starts_with('\u{2713}') {
+        // Passed suite line — extract test count if available
+        if let Some(n) = parse_suite_test_count(trimmed) {
+            p.passed += n;
+        }
+    } else if trimmed.starts_with('×') || trimmed.starts_with('\u{00d7}') || trimmed.starts_with('❯') {
+        // Failed suite line — try to extract failed count
+        if let Some((passed, failed)) = parse_suite_failed_count(trimmed) {
+            p.passed += passed;
+            p.failed += failed;
+        }
+    }
+}
+
+/// Parse "(N tests) Xms" → N from a vitest verbose suite line.
+fn parse_suite_test_count(line: &str) -> Option<u32> {
+    let open = line.find('(')?;
+    let close = line[open..].find(')')?;
+    let inner = &line[open + 1..open + close];
+    // e.g. "5 tests" or "1 test"
+    inner.split_whitespace().next()?.parse().ok()
+}
+
+/// Parse "(N tests | M failed)" → (passed, failed) from a failed suite line.
+fn parse_suite_failed_count(line: &str) -> Option<(u32, u32)> {
+    let open = line.find('(')?;
+    let close = line[open..].find(')')?;
+    let inner = &line[open + 1..open + close];
+    if inner.contains('|') {
+        let mut parts = inner.splitn(2, '|');
+        let total: u32 = parts.next()?.split_whitespace().next()?.parse().ok()?;
+        let failed_part = parts.next()?.trim();
+        let failed: u32 = failed_part.split_whitespace().next()?.parse().ok()?;
+        Some((total.saturating_sub(failed), failed))
+    } else {
+        // No pipe — all failed
+        let total: u32 = inner.split_whitespace().next()?.parse().ok()?;
+        Some((0, total))
     }
 }
 

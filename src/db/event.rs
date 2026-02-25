@@ -156,6 +156,8 @@ pub struct TraceEventVerbose {
 
 pub struct EventQuery {
     pub event_type: Option<EventType>,
+    /// When true, filter to stdout+stderr only (overrides event_type)
+    pub text_events_only: bool,
     pub function_equals: Option<String>,
     pub function_contains: Option<String>,
     pub source_file_contains: Option<String>,
@@ -176,6 +178,7 @@ impl Default for EventQuery {
     fn default() -> Self {
         Self {
             event_type: None,
+            text_events_only: false,
             function_equals: None,
             function_contains: None,
             source_file_contains: None,
@@ -211,6 +214,12 @@ impl EventQuery {
 
     pub fn event_type(mut self, t: EventType) -> Self {
         self.event_type = Some(t);
+        self
+    }
+
+    /// Filter to stdout and stderr events only (useful for test progress tracking).
+    pub fn text_output(mut self) -> Self {
+        self.text_events_only = true;
         self
     }
 
@@ -386,7 +395,9 @@ impl Database {
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(session_id.to_string())];
 
-        if let Some(ref et) = query.event_type {
+        if query.text_events_only {
+            sql.push_str(" AND event_type IN ('stdout', 'stderr')");
+        } else if let Some(ref et) = query.event_type {
             sql.push_str(" AND event_type = ?");
             params_vec.push(Box::new(et.as_str().to_string()));
         }
@@ -491,7 +502,9 @@ impl Database {
         let mut sql = String::from("SELECT COUNT(*) FROM events WHERE session_id = ?");
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(session_id.to_string())];
 
-        if let Some(ref et) = query.event_type {
+        if query.text_events_only {
+            sql.push_str(" AND event_type IN ('stdout', 'stderr')");
+        } else if let Some(ref et) = query.event_type {
             sql.push_str(" AND event_type = ?");
             params_vec.push(Box::new(et.as_str().to_string()));
         }
