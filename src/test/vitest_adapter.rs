@@ -207,10 +207,12 @@ impl TestAdapter for VitestAdapter {
     }
 }
 
-/// Progress updater for vitest. Vitest with --reporter=json emits progress to stderr
-/// and the final JSON report to stdout. We watch both streams; any line arriving means
-/// tests are running (compilation phase is over). Verbose-style stderr lines
-/// (e.g. "✓ src/foo.test.ts (5 tests) 120ms") are also parsed to track counts.
+/// Progress updater for vitest. Vitest with --reporter=json streams the full result JSON
+/// to stdout in OS pipe-buffer-sized chunks as tests complete. We count occurrences of
+/// `"status":"passed"` etc. in each chunk for live progress tracking.
+///
+/// Also handles verbose reporter-style stderr lines (✓/× suite lines) when
+/// --reporter=verbose is used instead of --reporter=json.
 pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
     let mut p = progress.lock().unwrap();
 
@@ -223,17 +225,35 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
     // Format: "✓ src/foo.test.ts (N tests) Xms"  or  "× src/foo.test.ts (N tests | M failed) Xms"
     let trimmed = line.trim();
     if trimmed.starts_with('✓') || trimmed.starts_with('\u{2713}') {
-        // Passed suite line — extract test count if available
         if let Some(n) = parse_suite_test_count(trimmed) {
             p.passed += n;
+            return;
         }
     } else if trimmed.starts_with('×') || trimmed.starts_with('\u{00d7}') || trimmed.starts_with('❯') {
-        // Failed suite line — try to extract failed count
         if let Some((passed, failed)) = parse_suite_failed_count(trimmed) {
             p.passed += passed;
             p.failed += failed;
+            return;
         }
     }
+
+    // Count individual test results from JSON reporter chunks.
+    // Vitest --reporter=json outputs compact JSON (no spaces after colons).
+    p.passed += count_occurrences(line, "\"status\":\"passed\"");
+    p.failed += count_occurrences(line, "\"status\":\"failed\"");
+    p.skipped += count_occurrences(line, "\"status\":\"pending\"")
+        + count_occurrences(line, "\"status\":\"todo\"")
+        + count_occurrences(line, "\"status\":\"skipped\"");
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> u32 {
+    let mut count = 0u32;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count += 1;
+        start += pos + needle.len();
+    }
+    count
 }
 
 /// Parse "(N tests) Xms" → N from a vitest verbose suite line.
@@ -415,5 +435,60 @@ mod tests {
         let adapter = VitestAdapter;
         let cmd = adapter.single_test_command(dir.path(), "Math addition adds correctly").unwrap();
         assert!(cmd.args.iter().any(|a| a.contains("Math")));
+    }
+
+    #[test]
+    fn test_update_progress_json_chunk_counting() {
+        use std::sync::{Arc, Mutex};
+        use super::super::{TestProgress, TestPhase};
+
+        let mut p0 = TestProgress::new();
+        p0.phase = TestPhase::Running;
+        let progress = Arc::new(Mutex::new(p0));
+
+        // Simulate a JSON chunk with 3 passed and 1 failed assertion
+        let chunk = r#"{"status":"passed","title":"a"},{"status":"passed","title":"b"},{"status":"failed","title":"c"},{"status":"passed","title":"d"}"#;
+        update_progress(chunk, &progress);
+
+        let p = progress.lock().unwrap();
+        assert_eq!(p.passed, 3, "should count 3 passed");
+        assert_eq!(p.failed, 1, "should count 1 failed");
+        assert_eq!(p.skipped, 0);
+    }
+
+    #[test]
+    fn test_update_progress_json_chunk_skipped() {
+        use std::sync::{Arc, Mutex};
+        use super::super::{TestProgress, TestPhase};
+
+        let mut p0 = TestProgress::new();
+        p0.phase = TestPhase::Running;
+        let progress = Arc::new(Mutex::new(p0));
+
+        let chunk = r#"{"status":"pending","title":"a"},{"status":"todo","title":"b"},{"status":"skipped","title":"c"}"#;
+        update_progress(chunk, &progress);
+
+        let p = progress.lock().unwrap();
+        assert_eq!(p.skipped, 3, "should count pending+todo+skipped");
+    }
+
+    #[test]
+    fn test_update_progress_phase_transition() {
+        use std::sync::{Arc, Mutex};
+        use super::super::{TestProgress, TestPhase};
+
+        let progress = Arc::new(Mutex::new(TestProgress::new()));
+        assert_eq!(progress.lock().unwrap().phase, TestPhase::Compiling);
+
+        update_progress("any output", &progress);
+        assert_eq!(progress.lock().unwrap().phase, TestPhase::Running);
+    }
+
+    #[test]
+    fn test_count_occurrences() {
+        assert_eq!(count_occurrences("", "x"), 0);
+        assert_eq!(count_occurrences("aaa", "a"), 3);
+        assert_eq!(count_occurrences(r#""status":"passed","status":"passed""#, r#""status":"passed""#), 2);
+        assert_eq!(count_occurrences("abab", "ab"), 2);
     }
 }
