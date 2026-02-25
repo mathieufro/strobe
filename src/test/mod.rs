@@ -395,6 +395,15 @@ impl TestRunner {
                 }
             }
 
+            // If still Compiling after the process has been alive for a while, transition to
+            // Running. This handles adapters that buffer all stdout until the run completes
+            // (e.g. vitest --reporter=json), so the phase never gets stuck in Compiling.
+            if let Ok(mut p) = progress.lock() {
+                if p.phase == TestPhase::Compiling && start.elapsed().as_secs() >= 3 {
+                    p.phase = TestPhase::Running;
+                }
+            }
+
             tokio::time::sleep(poll_interval).await;
         }
 
