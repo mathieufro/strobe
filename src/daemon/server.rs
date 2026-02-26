@@ -2180,19 +2180,27 @@ Validation Limits (enforced):
                     }
                 }).collect();
 
-                // Build running_tests snapshot with baselines
-                let running_tests_snapshot: Vec<crate::mcp::RunningTestSnapshot> = p.running_tests.iter()
+                // Build running_tests snapshot — cap at 20 longest-running to avoid
+                // flooding the response (Vitest fires onTestCaseReady at collection
+                // time, so hundreds of tests can appear "running" simultaneously).
+                let mut running_tests_snapshot: Vec<crate::mcp::RunningTestSnapshot> = p.running_tests.iter()
                     .map(|(name, started)| {
-                        let baseline = self.session_manager.db()
-                            .get_test_baseline(name, &test_run.project_root)
-                            .unwrap_or(None);
                         crate::mcp::RunningTestSnapshot {
                             name: name.clone(),
                             elapsed_ms: started.elapsed().as_millis() as u64,
-                            baseline_ms: baseline,
+                            baseline_ms: None,
                         }
                     })
                     .collect();
+                running_tests_snapshot.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+                let total_running = running_tests_snapshot.len();
+                running_tests_snapshot.truncate(20);
+                // Only fetch baselines for the displayed tests
+                for t in &mut running_tests_snapshot {
+                    t.baseline_ms = self.session_manager.db()
+                        .get_test_baseline(&t.name, &test_run.project_root)
+                        .unwrap_or(None);
+                }
 
                 // current_test = longest-running test (backward compat + stuck detector)
                 let current_test = p.current_test();
@@ -2218,6 +2226,8 @@ Validation Limits (enforced):
                         current_test_elapsed_ms,
                         current_test_baseline_ms: baseline_ms,
                         running_tests: running_tests_snapshot,
+                        total_running: if total_running > 20 { Some(total_running as u32) } else { None },
+                        compile_message: p.compile_message.clone(),
                     }),
                     result: None,
                     error: None,

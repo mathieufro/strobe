@@ -185,6 +185,9 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
             } else if after_dots.starts_with("FAILED") {
                 p.failed += 1;
                 p.running_tests.remove(name);
+            } else if after_dots.starts_with("ignored") {
+                p.skipped += 1;
+                p.running_tests.remove(name);
             }
         }
     }
@@ -352,6 +355,16 @@ AssertionError: Expected 6, got 5
         let p = progress.lock().unwrap();
         assert_eq!(p.failed, 1);
         assert!(!p.running_tests.contains_key("multiply"));
+    }
+
+    #[test]
+    fn test_update_progress_tracks_ignored() {
+        let progress = Arc::new(Mutex::new(TestProgress::new()));
+
+        update_progress("test skipped feature ... ignored", &progress);
+        let p = progress.lock().unwrap();
+        assert_eq!(p.skipped, 1);
+        assert!(!p.running_tests.contains_key("skipped feature"));
     }
 
     #[test]

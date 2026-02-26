@@ -309,6 +309,17 @@ impl TestAdapter for CargoTestAdapter {
         traces
     }
 
+    fn default_timeout(&self, level: Option<TestLevel>) -> u64 {
+        // Cargo runs multiple test binaries sequentially, and Rust
+        // projects often have E2E tests that spawn external processes.
+        // The default 600s (10min) is insufficient for large suites.
+        match level {
+            Some(TestLevel::Unit) => 120_000,
+            Some(TestLevel::Integration) => 600_000,
+            Some(TestLevel::E2e) => 900_000,
+            None => 900_000, // 15 min: compilation + multiple binaries
+        }
+    }
 }
 
 /// Parse crash messages from cargo stderr.
@@ -412,7 +423,15 @@ fn update_progress_line(line: &str, progress: &std::sync::Arc<std::sync::Mutex<s
     }
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => {
+            // Non-JSON lines from stderr: parse Cargo compilation progress.
+            // "   Compiling strobe v0.1.0 (/Users/alex/strobe)"
+            if let Some(rest) = line.strip_prefix("Compiling ") {
+                let mut p = progress.lock().unwrap();
+                p.compile_message = Some(format!("Compiling {}", rest));
+            }
+            return;
+        }
     };
     let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("");

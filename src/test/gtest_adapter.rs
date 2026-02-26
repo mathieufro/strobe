@@ -97,14 +97,61 @@ impl TestAdapter for GTestAdapter {
     fn parse_output(
         &self,
         stdout: &str,
-        _stderr: &str,
-        _exit_code: i32,
+        stderr: &str,
+        exit_code: i32,
     ) -> TestResult {
         if let Some(result) = parse_gtest_json(stdout) {
             return result;
         }
 
-        parse_gtest_text_fallback(stdout)
+        let result = parse_gtest_text_fallback(stdout);
+
+        // If exit code indicates a crash and no failures were parsed, report a synthetic failure.
+        if exit_code != 0 && result.summary.failed == 0 && result.summary.passed == 0 {
+            let message = if exit_code >= 128 {
+                let signal = exit_code - 128;
+                let signal_name = match signal {
+                    6 => "SIGABRT",
+                    9 => "SIGKILL",
+                    11 => "SIGSEGV",
+                    15 => "SIGTERM",
+                    _ => "signal",
+                };
+                format!(
+                    "Test binary crashed with {} (signal {}, exit code {})",
+                    signal_name, signal, exit_code
+                )
+            } else {
+                format!("Test binary exited with code {}", exit_code)
+            };
+            let preview: String = stderr.chars().take(500).collect();
+            let full_message = if preview.is_empty() {
+                message
+            } else {
+                format!("{}\nstderr: {}", message, preview)
+            };
+            return TestResult {
+                summary: TestSummary {
+                    passed: 0,
+                    failed: 1,
+                    skipped: 0,
+                    stuck: None,
+                    duration_ms: 0,
+                },
+                failures: vec![TestFailure {
+                    name: "(crash)".to_string(),
+                    file: None,
+                    line: None,
+                    message: full_message,
+                    rerun: None,
+                    suggested_traces: vec![],
+                }],
+                stuck: vec![],
+                all_tests: vec![],
+            };
+        }
+
+        result
     }
 
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String> {
@@ -644,6 +691,42 @@ mod tests {
         assert_eq!(result.summary.skipped, 1);
         assert_eq!(result.summary.failed, 0);
         assert_eq!(result.all_tests.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_crash_from_exit_code() {
+        let adapter = GTestAdapter;
+        // Process crashed with SIGSEGV (128 + 11 = 139), no test output
+        let result = adapter.parse_output("", "Segmentation fault", 139);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].message.contains("SIGSEGV"));
+        assert!(result.failures[0].message.contains("Segmentation fault"));
+    }
+
+    #[test]
+    fn test_parse_crash_not_triggered_when_tests_ran() {
+        let adapter = GTestAdapter;
+        // Tests ran and produced output — don't add synthetic crash
+        let json = r#"{
+            "testsuites": [{
+                "name": "MathTest",
+                "tests": 1,
+                "failures": 1,
+                "testsuite": [{
+                    "name": "Bad",
+                    "result": "COMPLETED",
+                    "time": "0.001s",
+                    "classname": "MathTest",
+                    "failures": [{"failure": "Expected 1, got 2"}]
+                }]
+            }]
+        }"#;
+        let result = adapter.parse_output(json, "", 1);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.failures.len(), 1);
+        // Should NOT have a synthetic crash entry
+        assert!(!result.failures[0].name.contains("crash"));
     }
 
     #[test]

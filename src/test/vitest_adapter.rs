@@ -6,6 +6,19 @@ use serde::Deserialize;
 use super::adapter::*;
 use super::TestProgress;
 
+/// Custom Vitest 3.x reporter that streams per-test events to stderr.
+/// Written to a temp file and passed via `--reporter=<path>`.
+/// Vitest 2.x silently ignores the unknown hooks, so this is safe for all versions.
+const REPORTER_JS: &str = include_str!("reporters/vitest-reporter.mjs");
+
+/// Write the custom reporter to a temp file, returning the path.
+/// Content is static so concurrent writes are safe.
+fn ensure_reporter_file() -> String {
+    let path = "/tmp/.strobe-vitest-reporter.mjs";
+    let _ = std::fs::write(path, REPORTER_JS);
+    path.to_string()
+}
+
 pub struct VitestAdapter;
 
 #[derive(Deserialize)]
@@ -70,11 +83,13 @@ impl TestAdapter for VitestAdapter {
         _level: Option<TestLevel>,
         _env: &HashMap<String, String>,
     ) -> crate::Result<TestCommand> {
+        let reporter_path = ensure_reporter_file();
         Ok(TestCommand {
             program: "npx".to_string(),
             args: vec![
                 "vitest".to_string(), "run".to_string(),
                 "--reporter=json".to_string(),
+                format!("--reporter={}", reporter_path),
                 "--no-coverage".to_string(),
             ],
             env: HashMap::new(),
@@ -82,11 +97,13 @@ impl TestAdapter for VitestAdapter {
     }
 
     fn single_test_command(&self, _project_root: &Path, test_name: &str) -> crate::Result<TestCommand> {
+        let reporter_path = ensure_reporter_file();
         Ok(TestCommand {
             program: "npx".to_string(),
             args: vec![
                 "vitest".to_string(), "run".to_string(),
                 "--reporter=json".to_string(),
+                format!("--reporter={}", reporter_path),
                 "--no-coverage".to_string(),
                 "-t".to_string(), test_name.to_string(),
             ],
@@ -207,43 +224,73 @@ impl TestAdapter for VitestAdapter {
     }
 }
 
-/// Progress updater for vitest. Vitest with --reporter=json streams the full result JSON
-/// to stdout in OS pipe-buffer-sized chunks as tests complete. We count occurrences of
-/// `"status":"passed"` etc. in each chunk for live progress tracking.
-///
-/// Also handles verbose reporter-style stderr lines (✓/× suite lines) when
-/// --reporter=verbose is used instead of --reporter=json.
-pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
+/// Progress updater for vitest/jest/bun. Parses STROBE_TEST: protocol events from the
+/// custom reporter (Vitest 3.x) for real-time per-test tracking. Falls back to JSON
+/// chunk counting for older Vitest versions, Jest, and Bun.
+pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
     let mut p = progress.lock().unwrap();
 
-    // Transition from Compiling to Running on first output from either stream
-    if p.phase == super::TestPhase::Compiling {
-        p.phase = super::TestPhase::Running;
+    // Parse STROBE_TEST: protocol events from custom reporter.
+    // Each event is an atomic process.stderr.write() call (<PIPE_BUF), so events
+    // won't be split across chunks. Multiple events may appear in one chunk.
+    let mut found_strobe = false;
+    for segment in text.split("STROBE_TEST:") {
+        let json_str = segment.trim();
+        if json_str.is_empty() || !json_str.starts_with('{') {
+            continue;
+        }
+        // Extract just the JSON object (stop at newline or end)
+        let json_end = json_str.find('\n').unwrap_or(json_str.len());
+        let json = &json_str[..json_end];
+
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+            found_strobe = true;
+            p.has_custom_reporter = true;
+
+            let event = v.get("e").and_then(|e| e.as_str()).unwrap_or("");
+            let name = v.get("n").and_then(|n| n.as_str()).unwrap_or("").to_string();
+
+            match event {
+                "module_start" => {
+                    // File-level execution started — transition from Compiling
+                    if p.phase == super::TestPhase::Compiling {
+                        p.phase = super::TestPhase::Running;
+                    }
+                }
+                "module_end" => {
+                    // File-level execution finished (informational)
+                }
+                "start" => { p.start_test(name); }
+                "pass"  => { p.passed += 1; p.finish_test(&name); }
+                "fail"  => { p.failed += 1; p.finish_test(&name); }
+                "skip"  => { p.skipped += 1; p.finish_test(&name); }
+                _ => {}
+            }
+        }
     }
 
-    // Parse verbose reporter lines emitted to stderr during test execution.
-    // Format: "✓ src/foo.test.ts (N tests) Xms"  or  "× src/foo.test.ts (N tests | M failed) Xms"
-    let trimmed = line.trim();
-    if trimmed.starts_with('✓') || trimmed.starts_with('\u{2713}') {
-        if let Some(n) = parse_suite_test_count(trimmed) {
-            p.passed += n;
-            return;
+    // Fallback: old counting for Vitest 2.x, Jest, and Bun (no STROBE_TEST events)
+    if !found_strobe && !p.has_custom_reporter {
+        let trimmed = text.trim();
+        if trimmed.starts_with('✓') || trimmed.starts_with('\u{2713}') {
+            if let Some(n) = parse_suite_test_count(trimmed) {
+                p.passed += n;
+                return;
+            }
+        } else if trimmed.starts_with('×') || trimmed.starts_with('\u{00d7}') || trimmed.starts_with('❯') {
+            if let Some((passed, failed)) = parse_suite_failed_count(trimmed) {
+                p.passed += passed;
+                p.failed += failed;
+                return;
+            }
         }
-    } else if trimmed.starts_with('×') || trimmed.starts_with('\u{00d7}') || trimmed.starts_with('❯') {
-        if let Some((passed, failed)) = parse_suite_failed_count(trimmed) {
-            p.passed += passed;
-            p.failed += failed;
-            return;
-        }
-    }
 
-    // Count individual test results from JSON reporter chunks.
-    // Vitest --reporter=json outputs compact JSON (no spaces after colons).
-    p.passed += count_occurrences(line, "\"status\":\"passed\"");
-    p.failed += count_occurrences(line, "\"status\":\"failed\"");
-    p.skipped += count_occurrences(line, "\"status\":\"pending\"")
-        + count_occurrences(line, "\"status\":\"todo\"")
-        + count_occurrences(line, "\"status\":\"skipped\"");
+        p.passed += count_occurrences(text, "\"status\":\"passed\"");
+        p.failed += count_occurrences(text, "\"status\":\"failed\"");
+        p.skipped += count_occurrences(text, "\"status\":\"pending\"")
+            + count_occurrences(text, "\"status\":\"todo\"")
+            + count_occurrences(text, "\"status\":\"skipped\"");
+    }
 }
 
 fn count_occurrences(haystack: &str, needle: &str) -> u32 {
@@ -427,6 +474,8 @@ mod tests {
         let cmd = adapter.suite_command(dir.path(), None, &Default::default()).unwrap();
         assert!(cmd.args.iter().any(|a| a.contains("vitest")));
         assert!(cmd.args.iter().any(|a| a.contains("json")), "should use json reporter");
+        assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")),
+            "should include custom reporter");
     }
 
     #[test]
@@ -435,10 +484,14 @@ mod tests {
         let adapter = VitestAdapter;
         let cmd = adapter.single_test_command(dir.path(), "Math addition adds correctly").unwrap();
         assert!(cmd.args.iter().any(|a| a.contains("Math")));
+        assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")),
+            "should include custom reporter");
     }
 
+    // --- STROBE_TEST protocol tests ---
+
     #[test]
-    fn test_update_progress_json_chunk_counting() {
+    fn test_update_progress_strobe_start_and_pass() {
         use std::sync::{Arc, Mutex};
         use super::super::{TestProgress, TestPhase};
 
@@ -446,7 +499,97 @@ mod tests {
         p0.phase = TestPhase::Running;
         let progress = Arc::new(Mutex::new(p0));
 
-        // Simulate a JSON chunk with 3 passed and 1 failed assertion
+        // Test start event
+        update_progress("\nSTROBE_TEST:{\"e\":\"start\",\"n\":\"Math adds\"}\n", &progress);
+        {
+            let p = progress.lock().unwrap();
+            assert!(p.running_tests.contains_key("Math adds"), "start should populate running_tests");
+            assert!(p.has_custom_reporter);
+            assert_eq!(p.passed, 0);
+        }
+
+        // Test pass event
+        update_progress("\nSTROBE_TEST:{\"e\":\"pass\",\"n\":\"Math adds\",\"d\":5}\n", &progress);
+        {
+            let p = progress.lock().unwrap();
+            assert_eq!(p.passed, 1);
+            assert!(!p.running_tests.contains_key("Math adds"), "pass should remove from running_tests");
+            assert!(p.test_durations.contains_key("Math adds"), "should record duration");
+        }
+    }
+
+    #[test]
+    fn test_update_progress_strobe_multiple_events_in_chunk() {
+        use std::sync::{Arc, Mutex};
+        use super::super::{TestProgress, TestPhase};
+
+        let mut p0 = TestProgress::new();
+        p0.phase = TestPhase::Running;
+        let progress = Arc::new(Mutex::new(p0));
+
+        let chunk = "\nSTROBE_TEST:{\"e\":\"start\",\"n\":\"test1\"}\n\
+                     STROBE_TEST:{\"e\":\"pass\",\"n\":\"test1\",\"d\":3}\n\
+                     STROBE_TEST:{\"e\":\"start\",\"n\":\"test2\"}\n\
+                     STROBE_TEST:{\"e\":\"fail\",\"n\":\"test2\",\"d\":10}\n";
+        update_progress(chunk, &progress);
+
+        let p = progress.lock().unwrap();
+        assert_eq!(p.passed, 1);
+        assert_eq!(p.failed, 1);
+        assert!(p.running_tests.is_empty());
+        assert!(p.has_custom_reporter);
+    }
+
+    #[test]
+    fn test_update_progress_strobe_skip() {
+        use std::sync::{Arc, Mutex};
+        use super::super::{TestProgress, TestPhase};
+
+        let mut p0 = TestProgress::new();
+        p0.phase = TestPhase::Running;
+        let progress = Arc::new(Mutex::new(p0));
+
+        // Simulate start then skip — skip should remove from running_tests
+        update_progress("\nSTROBE_TEST:{\"e\":\"start\",\"n\":\"todo test\"}\n", &progress);
+        assert!(progress.lock().unwrap().running_tests.contains_key("todo test"));
+
+        update_progress("\nSTROBE_TEST:{\"e\":\"skip\",\"n\":\"todo test\"}\n", &progress);
+
+        let p = progress.lock().unwrap();
+        assert_eq!(p.skipped, 1);
+        assert!(p.has_custom_reporter);
+        assert!(!p.running_tests.contains_key("todo test"), "skip should remove from running_tests");
+    }
+
+    #[test]
+    fn test_update_progress_strobe_disables_fallback() {
+        use std::sync::{Arc, Mutex};
+        use super::super::{TestProgress, TestPhase};
+
+        let mut p0 = TestProgress::new();
+        p0.phase = TestPhase::Running;
+        let progress = Arc::new(Mutex::new(p0));
+
+        // First: strobe event sets has_custom_reporter
+        update_progress("\nSTROBE_TEST:{\"e\":\"pass\",\"n\":\"a\"}\n", &progress);
+        assert!(progress.lock().unwrap().has_custom_reporter);
+
+        // Second: JSON chunk should be ignored (no double-counting)
+        update_progress(r#"{"status":"passed","title":"b"}"#, &progress);
+        assert_eq!(progress.lock().unwrap().passed, 1, "fallback should be disabled");
+    }
+
+    // --- Fallback path tests (Jest/Bun/Vitest 2.x) ---
+
+    #[test]
+    fn test_update_progress_fallback_json_chunk_counting() {
+        use std::sync::{Arc, Mutex};
+        use super::super::{TestProgress, TestPhase};
+
+        let mut p0 = TestProgress::new();
+        p0.phase = TestPhase::Running;
+        let progress = Arc::new(Mutex::new(p0));
+
         let chunk = r#"{"status":"passed","title":"a"},{"status":"passed","title":"b"},{"status":"failed","title":"c"},{"status":"passed","title":"d"}"#;
         update_progress(chunk, &progress);
 
@@ -454,10 +597,11 @@ mod tests {
         assert_eq!(p.passed, 3, "should count 3 passed");
         assert_eq!(p.failed, 1, "should count 1 failed");
         assert_eq!(p.skipped, 0);
+        assert!(!p.has_custom_reporter, "should not set custom reporter flag");
     }
 
     #[test]
-    fn test_update_progress_json_chunk_skipped() {
+    fn test_update_progress_fallback_skipped() {
         use std::sync::{Arc, Mutex};
         use super::super::{TestProgress, TestPhase};
 
@@ -473,15 +617,21 @@ mod tests {
     }
 
     #[test]
-    fn test_update_progress_phase_transition() {
+    fn test_update_progress_phase_transition_via_module_start() {
         use std::sync::{Arc, Mutex};
         use super::super::{TestProgress, TestPhase};
 
         let progress = Arc::new(Mutex::new(TestProgress::new()));
         assert_eq!(progress.lock().unwrap().phase, TestPhase::Compiling);
 
+        // Random output should NOT transition phase (no more blanket transition)
         update_progress("any output", &progress);
+        assert_eq!(progress.lock().unwrap().phase, TestPhase::Compiling);
+
+        // module_start event should transition from Compiling to Running
+        update_progress("\nSTROBE_TEST:{\"e\":\"module_start\",\"n\":\"src/math.test.ts\"}\n", &progress);
         assert_eq!(progress.lock().unwrap().phase, TestPhase::Running);
+        assert!(progress.lock().unwrap().has_custom_reporter);
     }
 
     #[test]

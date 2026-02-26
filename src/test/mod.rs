@@ -69,6 +69,11 @@ pub struct TestProgress {
     pub warnings: Vec<StuckWarning>,
     /// Wall-clock durations per test (name → ms), populated as tests complete.
     pub test_durations: HashMap<String, u64>,
+    /// Whether the custom STROBE_TEST reporter has been detected.
+    /// When true, disables fallback JSON chunk counting to avoid double-counting.
+    pub has_custom_reporter: bool,
+    /// Last compilation message (e.g., "Compiling strobe v0.1.0"), for progress display.
+    pub compile_message: Option<String>,
 }
 
 impl TestProgress {
@@ -82,6 +87,8 @@ impl TestProgress {
             phase: TestPhase::Compiling,
             warnings: Vec::new(),
             test_durations: HashMap::new(),
+            has_custom_reporter: false,
+            compile_message: None,
         }
     }
 
@@ -318,6 +325,7 @@ impl TestRunner {
             "gtest" => Some(gtest_adapter::update_progress),
             "mocha" => Some(mocha_adapter::update_progress),
             "pytest" => Some(pytest_adapter::update_progress),
+            "unittest" => Some(unittest_adapter::update_progress),
             "vitest" | "jest" | "bun" => Some(vitest_adapter::update_progress),
             _ => None,
         };
@@ -346,7 +354,8 @@ impl TestRunner {
         // Hard timeout kills the process; add grace period for stuck detector to write warnings.
         // hard_timeout is in milliseconds (from adapter.default_timeout).
         let kill_timeout = std::time::Duration::from_millis(hard_timeout + 5_000);
-        let safety_timeout = std::time::Duration::from_secs(600); // 10 min safety net
+        // Safety net: always exceeds kill_timeout so the stuck detector's grace period isn't bypassed.
+        let safety_timeout = std::time::Duration::from_millis(hard_timeout + 60_000);
         let start = std::time::Instant::now();
 
         loop {
@@ -395,12 +404,15 @@ impl TestRunner {
                 }
             }
 
-            // If still Compiling after the process has been alive for a while, transition to
-            // Running. This handles adapters that buffer all stdout until the run completes
-            // (e.g. vitest --reporter=json), so the phase never gets stuck in Compiling.
-            if let Ok(mut p) = progress.lock() {
-                if p.phase == TestPhase::Compiling && start.elapsed().as_secs() >= 3 {
-                    p.phase = TestPhase::Running;
+            // For JS frameworks with buffered reporters (vitest/jest/bun), force transition
+            // from Compiling to Running after 3s IF the custom reporter hasn't already
+            // triggered the transition. Other frameworks (cargo, catch2, go, etc.) manage
+            // their own phase transitions via structured output parsing.
+            if matches!(framework_name.as_str(), "vitest" | "jest" | "bun") {
+                if let Ok(mut p) = progress.lock() {
+                    if p.phase == TestPhase::Compiling && !p.has_custom_reporter && start.elapsed().as_secs() >= 3 {
+                        p.phase = TestPhase::Running;
+                    }
                 }
             }
 

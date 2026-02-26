@@ -9,13 +9,6 @@ mod macos_tests {
     use super::common::*;
     use std::time::Duration;
 
-    /// Serialize integration tests that spawn the UI test app via Frida.
-    /// Concurrent Frida spawns of GUI apps + macOS AX queries deadlock.
-    fn ui_integration_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
     // ---- Unit-level tests (no app needed) ----
 
     #[test]
@@ -25,152 +18,6 @@ mod macos_tests {
             let id = generate_id("button", Some("Play"), 0);
             assert_eq!(id, generate_id("button", Some("Play"), 0));
         }
-    }
-
-    // ---- Integration tests (need running app + AX permissions) ----
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_ax_tree_from_test_app() {
-        let _guard = ui_integration_lock().lock().await;
-        // Launch UI test app
-        let binary = ui_test_app();
-        let project_root = binary.parent().unwrap().to_str().unwrap();
-        let (sm, _temp_dir) = create_session_manager();
-
-        let session_id = "ui-ax-test";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
-        let pid = sm.spawn_with_frida(
-            session_id,
-            binary.to_str().unwrap(),
-            &[], None, project_root, None, false,
-        None,
-        ).await.unwrap();
-        sm.update_session_pid(session_id, pid).unwrap();
-
-        // Give the app time to render its window and fully initialize AX tree
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Query AX tree
-        let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
-        assert!(!nodes.is_empty(), "Should find at least one window");
-
-        // Verify we got a window
-        let window = &nodes[0];
-        assert!(window.role.contains("Window") || window.role == "window",
-            "First node should be a window, got: {}", window.role);
-
-        // Verify tree has children
-        let total = strobe::ui::tree::count_nodes(&nodes);
-        assert!(total >= 3, "Expected at least 3 nodes, got {}", total);
-
-        // Verify compact text format
-        let text = strobe::ui::tree::format_compact(&nodes);
-        assert!(text.contains("id="), "Compact text should contain IDs");
-
-        // Verify stable IDs across calls (allow minor variations due to UI state)
-        let nodes2 = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
-        let text2 = strobe::ui::tree::format_compact(&nodes2);
-
-        // Check that the main window ID is stable
-        assert!(text.contains("w_7cdd"), "First query should contain window ID");
-        assert!(text2.contains("w_7cdd"), "Second query should contain same window ID");
-
-        // Check that most of the tree structure is stable (>90% similarity)
-        let lines1: Vec<&str> = text.lines().collect();
-        let lines2: Vec<&str> = text2.lines().collect();
-        let common_lines = lines1.iter().filter(|l| lines2.contains(l)).count();
-        let similarity = (common_lines as f64) / (lines1.len().max(lines2.len()) as f64);
-        assert!(similarity > 0.9, "Tree structure should be mostly stable (got {:.1}% similar)", similarity * 100.0);
-
-        // Cleanup
-        let _ = sm.stop_frida(session_id).await;
-        sm.stop_session(session_id).await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_screenshot_capture() {
-        let _guard = ui_integration_lock().lock().await;
-        let binary = ui_test_app();
-        let project_root = binary.parent().unwrap().to_str().unwrap();
-        let (sm, _temp_dir) = create_session_manager();
-
-        let session_id = "ui-screenshot-test";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
-        let pid = sm.spawn_with_frida(
-            session_id,
-            binary.to_str().unwrap(),
-            &[], None, project_root, None, false,
-        None,
-        ).await.unwrap();
-        sm.update_session_pid(session_id, pid).unwrap();
-
-        // Wait longer for window to be fully visible and rendered
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Screenshot capture requires Screen Recording permission on macOS
-        // If permission isn't granted, skip this test gracefully
-        match strobe::ui::capture::capture_window_screenshot(pid) {
-            Ok(png_bytes) => {
-                assert!(png_bytes.len() > 100, "PNG should be non-trivial, got {} bytes", png_bytes.len());
-                // Verify PNG header
-                assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47], "Should be valid PNG");
-            }
-            Err(e) => {
-                // Check if this is a permissions/environmental issue vs actual bug
-                let err_msg = format!("{:?}", e);
-                if err_msg.contains("Failed to capture screenshot") || err_msg.contains("No visible window") {
-                    eprintln!("Warning: Screenshot capture failed (likely permissions or window not visible). Error: {}", err_msg);
-                    eprintln!("Grant Screen Recording permission in System Settings > Privacy & Security");
-                    // Don't fail the test - this is environmental
-                } else {
-                    panic!("Unexpected screenshot error: {}", err_msg);
-                }
-            }
-        }
-
-        let _ = sm.stop_frida(session_id).await;
-        sm.stop_session(session_id).await.unwrap();
-    }
-
-    /// Test that subsequent AX tree queries complete in reasonable time.
-    ///
-    /// Threshold: 600ms for a warm (non-first) query. This accounts for:
-    /// - PID validation via proc_pidinfo
-    /// - Full AX tree traversal with recursion
-    /// - System load variance on CI
-    /// The first query is slower due to permission checks and AX cache warming.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_ax_query_latency_reasonable() {
-        let _guard = ui_integration_lock().lock().await;
-        let binary = ui_test_app();
-        let project_root = binary.parent().unwrap().to_str().unwrap();
-        let (sm, _temp_dir) = create_session_manager();
-
-        let session_id = "ui-latency-test";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
-        let pid = sm.spawn_with_frida(
-            session_id,
-            binary.to_str().unwrap(),
-            &[], None, project_root, None, false,
-        None,
-        ).await.unwrap();
-        sm.update_session_pid(session_id, pid).unwrap();
-
-        // Wait for app to fully initialize
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Warm-up query (first query may include permission checks and cache warming)
-        let _ = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
-
-        // Now measure the second query which should be fast
-        let start = std::time::Instant::now();
-        let _nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(elapsed.as_millis() < 600, "Subsequent AX query should be <600ms, took {}ms", elapsed.as_millis());
-
-        let _ = sm.stop_frida(session_id).await;
-        sm.stop_session(session_id).await.unwrap();
     }
 
     #[test]
@@ -184,7 +31,29 @@ mod macos_tests {
         }
     }
 
-    // ---- M3 Vision pipeline E2E tests ----
+    #[test]
+    fn test_ax_query_kernel_pid() {
+        // PID 0 is the kernel — should fail gracefully
+        let result = strobe::ui::accessibility::query_ax_tree(0);
+        match result {
+            Ok(nodes) => assert!(nodes.is_empty(), "Kernel PID should return empty tree"),
+            Err(_) => {} // Error is also acceptable
+        }
+    }
+
+    #[test]
+    fn test_find_ax_element_returns_none_for_bogus_id() {
+        // No process needed — just verify it handles invalid PID gracefully
+        let result = strobe::ui::accessibility::find_ax_element(99999, "btn_0000");
+        // Should return Ok(None) or an error, not panic
+        match result {
+            Ok(None) => {} // expected: no such PID or no such element
+            Err(_) => {}   // also acceptable: permission/PID error
+            Ok(Some(_)) => panic!("Should not find an element for bogus PID"),
+        }
+    }
+
+    // ---- Vision pipeline tests (no UI app needed) ----
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_vision_sidecar_lifecycle() {
@@ -329,58 +198,6 @@ mod macos_tests {
         // The actual error check happens in tool_debug_ui, but we verify config here
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_screenshot_with_vision_format() {
-        let _guard = ui_integration_lock().lock().await;
-        // Test that screenshots can be base64-encoded for vision sidecar
-        let binary = ui_test_app();
-        let project_root = binary.parent().unwrap().to_str().unwrap();
-        let (sm, _temp_dir) = create_session_manager();
-
-        let session_id = "ui-vision-format-test";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
-        let pid = sm.spawn_with_frida(
-            session_id,
-            binary.to_str().unwrap(),
-            &[], None, project_root, None, false,
-        None,
-        ).await.unwrap();
-        sm.update_session_pid(session_id, pid).unwrap();
-
-        // Wait longer for window to be fully visible and rendered
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Screenshot capture requires Screen Recording permission on macOS
-        match strobe::ui::capture::capture_window_screenshot(pid) {
-            Ok(png_bytes) => {
-                // Encode as base64 (format expected by vision sidecar)
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-
-                // Verify it's valid base64 and non-empty
-                assert!(!b64.is_empty(), "Base64 screenshot should be non-empty");
-                assert!(b64.len() > 100, "Base64 screenshot should be substantial");
-
-                // Verify it can be decoded back
-                let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
-                assert_eq!(decoded, png_bytes, "Base64 roundtrip should match");
-            }
-            Err(e) => {
-                let err_msg = format!("{:?}", e);
-                if err_msg.contains("Failed to capture screenshot") || err_msg.contains("No visible window") {
-                    eprintln!("Warning: Screenshot capture failed (likely permissions or window not visible). Error: {}", err_msg);
-                    eprintln!("Grant Screen Recording permission in System Settings > Privacy & Security");
-                    // Don't fail the test - this is environmental
-                } else {
-                    panic!("Unexpected screenshot error: {}", err_msg);
-                }
-            }
-        }
-
-        let _ = sm.stop_frida(session_id).await;
-        sm.stop_session(session_id).await.unwrap();
-    }
-
     #[test]
     fn test_vision_bounds_to_rect_conversion() {
         use strobe::ui::vision::VisionBounds;
@@ -400,18 +217,6 @@ mod macos_tests {
         assert_eq!(rect.y, 20.0);
         assert_eq!(rect.w, 100.0);
         assert_eq!(rect.h, 50.0);
-    }
-
-    // ---- Error path and edge case tests ----
-
-    #[test]
-    fn test_ax_query_kernel_pid() {
-        // PID 0 is the kernel — should fail gracefully
-        let result = strobe::ui::accessibility::query_ax_tree(0);
-        match result {
-            Ok(nodes) => assert!(nodes.is_empty(), "Kernel PID should return empty tree"),
-            Err(_) => {} // Error is also acceptable
-        }
     }
 
     #[test]
@@ -476,17 +281,7 @@ mod macos_tests {
         assert!(code_str.contains("UI_NOT_AVAILABLE"), "UiNotAvailable should map to UI_NOT_AVAILABLE, got: {}", code_str);
     }
 
-    #[test]
-    fn test_find_ax_element_returns_none_for_bogus_id() {
-        // No process needed — just verify it handles invalid PID gracefully
-        let result = strobe::ui::accessibility::find_ax_element(99999, "btn_0000");
-        // Should return Ok(None) or an error, not panic
-        match result {
-            Ok(None) => {} // expected: no such PID or no such element
-            Err(_) => {}   // also acceptable: permission/PID error
-            Ok(Some(_)) => panic!("Should not find an element for bogus PID"),
-        }
-    }
+    // ---- Helpers for integration suite ----
 
     /// Helper: find first node with matching role in tree (recursive)
     fn find_node_by_role_recursive(nodes: &[strobe::ui::tree::UiNode], role: &str) -> Option<String> {
@@ -521,186 +316,290 @@ mod macos_tests {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 
-    /// Consolidated UI action integration test.
-    /// Spawns the UI test app once, tests all 6 action types sequentially.
-    /// Order: AX-only actions first (stable), CGEvent actions last (may disrupt app).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_ui_actions_integration() {
-        let _guard = ui_integration_lock().lock().await;
+    // ---- Consolidated integration test ----
+    //
+    // All tests that spawn the UI test app via Frida are consolidated into a
+    // single test to avoid timeout accumulation. Previously, 5 separate tests
+    // each acquired a serialization lock and spawned the app independently.
+    // The test harness considered them all "started" simultaneously, so later
+    // tests would hit the hard timeout while waiting for the lock.
+    //
+    // This single test spawns the app once, runs all assertions, and cleans up.
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ui_integration_suite() {
         let binary = ui_test_app();
         let project_root = binary.parent().unwrap().to_str().unwrap();
         let (sm, _temp_dir) = create_session_manager();
 
-        let session_id = "ui-actions";
+        let session_id = "ui-suite";
         sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
         let pid = sm.spawn_with_frida(
-            session_id, binary.to_str().unwrap(), &[],
-            None, project_root, None, false, None,
+            session_id,
+            binary.to_str().unwrap(),
+            &[], None, project_root, None, false, None,
         ).await.unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
+        // Give the app time to render its window and fully initialize AX tree
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // ---- Verify find_ax_element positive case ----
-        let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
-        let button_id = find_node_by_role_recursive(&nodes, "AXButton")
-            .expect("Should find a button in the test app");
-        let ax_ref = strobe::ui::accessibility::find_ax_element(pid, &button_id).unwrap();
-        assert!(ax_ref.is_some(), "find_ax_element should locate button by ID");
-        unsafe { core_foundation::base::CFRelease(ax_ref.unwrap() as *const std::ffi::c_void) };
+        // ==== Part 1: AX tree structure ====
+        eprintln!("  [1/5] AX tree structure...");
+        {
+            let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
+            assert!(!nodes.is_empty(), "Should find at least one window");
 
-        // ---- 1. Click (AX action path) ----
-        let req = strobe::mcp::DebugUiActionRequest {
-            session_id: session_id.to_string(),
-            action: strobe::mcp::UiActionType::Click,
-            id: Some(button_id.clone()),
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
-        };
-        let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-        assert!(result.success, "Click should succeed");
-        assert!(result.method.is_some(), "Should report method used");
-        assert!(result.node_after.is_some(), "Should return node_after");
+            // Verify we got a window
+            let window = &nodes[0];
+            assert!(window.role.contains("Window") || window.role == "window",
+                "First node should be a window, got: {}", window.role);
 
-        // ---- 2. Set value (number on slider) ----
-        let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
-        let slider_id = find_node_by_role_recursive(&nodes, "AXSlider")
-            .expect("Should find a slider in test app");
+            // Verify tree has children
+            let total = strobe::ui::tree::count_nodes(&nodes);
+            assert!(total >= 3, "Expected at least 3 nodes, got {}", total);
 
-        let req = strobe::mcp::DebugUiActionRequest {
-            session_id: session_id.to_string(),
-            action: strobe::mcp::UiActionType::SetValue,
-            id: Some(slider_id),
-            value: Some(serde_json::json!(0.8)),
-            text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: Some(200),
-        };
-        let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-        // SwiftUI sliders may not support AXSetAttributeValue — either outcome is valid
-        if result.success {
-            assert_eq!(result.method.as_deref(), Some("ax"));
-        } else {
-            eprintln!("Note: set_value on slider not supported in this SwiftUI version (expected)");
+            // Verify compact text format
+            let text = strobe::ui::tree::format_compact(&nodes);
+            assert!(text.contains("id="), "Compact text should contain IDs");
+
+            // Verify stable IDs across calls
+            let nodes2 = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
+            let text2 = strobe::ui::tree::format_compact(&nodes2);
+
+            // Check that the main window ID is stable
+            assert!(text.contains("w_7cdd"), "First query should contain window ID");
+            assert!(text2.contains("w_7cdd"), "Second query should contain same window ID");
+
+            // Check >90% tree similarity
+            let lines1: Vec<&str> = text.lines().collect();
+            let lines2: Vec<&str> = text2.lines().collect();
+            let common_lines = lines1.iter().filter(|l| lines2.contains(l)).count();
+            let similarity = (common_lines as f64) / (lines1.len().max(lines2.len()) as f64);
+            assert!(similarity > 0.9, "Tree structure should be mostly stable (got {:.1}% similar)", similarity * 100.0);
         }
 
-        // ---- 3. Scroll ----
-        let scroll_id = find_node_by_role_recursive(&nodes, "AXScrollArea")
-            .or_else(|| find_node_by_role_recursive(&nodes, "AXList"))
-            .or_else(|| find_node_by_role_recursive(&nodes, "AXTable"));
+        // ==== Part 2: AX query latency ====
+        eprintln!("  [2/5] AX query latency...");
+        {
+            // Warm-up query (first may include permission checks and cache warming)
+            let _ = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
 
-        if let Some(list_id) = scroll_id {
+            // Measure second query
+            let start = std::time::Instant::now();
+            let _nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(elapsed.as_millis() < 600, "Subsequent AX query should be <600ms, took {}ms", elapsed.as_millis());
+        }
+
+        // ==== Part 3: Screenshot capture ====
+        eprintln!("  [3/5] Screenshot capture...");
+        {
+            match strobe::ui::capture::capture_window_screenshot(pid) {
+                Ok(png_bytes) => {
+                    assert!(png_bytes.len() > 100, "PNG should be non-trivial, got {} bytes", png_bytes.len());
+                    // Verify PNG header
+                    assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47], "Should be valid PNG");
+                }
+                Err(e) => {
+                    let err_msg = format!("{:?}", e);
+                    if err_msg.contains("Failed to capture screenshot") || err_msg.contains("No visible window") {
+                        eprintln!("Warning: Screenshot capture failed (likely permissions). Error: {}", err_msg);
+                    } else {
+                        panic!("Unexpected screenshot error: {}", err_msg);
+                    }
+                }
+            }
+        }
+
+        // ==== Part 4: Screenshot with base64 roundtrip ====
+        eprintln!("  [4/5] Screenshot base64 roundtrip...");
+        {
+            match strobe::ui::capture::capture_window_screenshot(pid) {
+                Ok(png_bytes) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+                    assert!(!b64.is_empty(), "Base64 screenshot should be non-empty");
+                    assert!(b64.len() > 100, "Base64 screenshot should be substantial");
+
+                    let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+                    assert_eq!(decoded, png_bytes, "Base64 roundtrip should match");
+                }
+                Err(e) => {
+                    let err_msg = format!("{:?}", e);
+                    if err_msg.contains("Failed to capture screenshot") || err_msg.contains("No visible window") {
+                        eprintln!("Warning: Screenshot capture failed (likely permissions). Error: {}", err_msg);
+                    } else {
+                        panic!("Unexpected screenshot error: {}", err_msg);
+                    }
+                }
+            }
+        }
+
+        // ==== Part 5: UI actions ====
+        eprintln!("  [5/5] UI actions...");
+        {
+            // Verify find_ax_element positive case
+            let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
+            let button_id = find_node_by_role_recursive(&nodes, "AXButton")
+                .expect("Should find a button in the test app");
+            let ax_ref = strobe::ui::accessibility::find_ax_element(pid, &button_id).unwrap();
+            assert!(ax_ref.is_some(), "find_ax_element should locate button by ID");
+            unsafe { core_foundation::base::CFRelease(ax_ref.unwrap() as *const std::ffi::c_void) };
+
+            // 1. Click (AX action path)
             let req = strobe::mcp::DebugUiActionRequest {
                 session_id: session_id.to_string(),
-                action: strobe::mcp::UiActionType::Scroll,
-                id: Some(list_id),
-                direction: Some(strobe::mcp::ScrollDirection::Down),
-                amount: Some(3),
+                action: strobe::mcp::UiActionType::Click,
+                id: Some(button_id.clone()),
                 value: None, text: None, key: None, modifiers: None,
-                to_id: None, settle_ms: Some(200),
+                direction: None, amount: None, to_id: None, settle_ms: None,
             };
             let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-            assert!(result.success, "scroll should succeed: {:?}", result.error);
-            assert_eq!(result.method.as_deref(), Some("cgevent"));
-        } else {
-            eprintln!("Note: no scrollable element found in tree");
-        }
+            assert!(result.success, "Click should succeed");
+            assert!(result.method.is_some(), "Should report method used");
+            assert!(result.node_after.is_some(), "Should return node_after");
 
-        assert!(process_alive(pid), "Process should still be alive after scroll");
+            // 2. Set value (number on slider)
+            let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
+            let slider_id = find_node_by_role_recursive(&nodes, "AXSlider")
+                .expect("Should find a slider in test app");
 
-        // ---- 4. Drag (best-effort — CGEvent drag unreliable in SwiftUI) ----
-        let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
-        if let (Some(src_id), Some(dst_id)) = (
-            find_node_by_title_recursive(&nodes, "Drag Source"),
-            find_node_by_title_recursive(&nodes, "Drop Here"),
-        ) {
             let req = strobe::mcp::DebugUiActionRequest {
                 session_id: session_id.to_string(),
-                action: strobe::mcp::UiActionType::Drag,
-                id: Some(src_id),
-                to_id: Some(dst_id),
-                value: None, text: None, key: None, modifiers: None,
-                direction: None, amount: None, settle_ms: Some(300),
+                action: strobe::mcp::UiActionType::SetValue,
+                id: Some(slider_id),
+                value: Some(serde_json::json!(0.8)),
+                text: None, key: None, modifiers: None,
+                direction: None, amount: None, to_id: None, settle_ms: Some(200),
             };
             let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-            assert!(result.success, "drag should succeed: {:?}", result.error);
+            if result.success {
+                assert_eq!(result.method.as_deref(), Some("ax"));
+            } else {
+                eprintln!("Note: set_value on slider not supported in this SwiftUI version (expected)");
+            }
+
+            // 3. Scroll
+            let scroll_id = find_node_by_role_recursive(&nodes, "AXScrollArea")
+                .or_else(|| find_node_by_role_recursive(&nodes, "AXList"))
+                .or_else(|| find_node_by_role_recursive(&nodes, "AXTable"));
+
+            if let Some(list_id) = scroll_id {
+                let req = strobe::mcp::DebugUiActionRequest {
+                    session_id: session_id.to_string(),
+                    action: strobe::mcp::UiActionType::Scroll,
+                    id: Some(list_id),
+                    direction: Some(strobe::mcp::ScrollDirection::Down),
+                    amount: Some(3),
+                    value: None, text: None, key: None, modifiers: None,
+                    to_id: None, settle_ms: Some(200),
+                };
+                let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+                assert!(result.success, "scroll should succeed: {:?}", result.error);
+                assert_eq!(result.method.as_deref(), Some("cgevent"));
+            } else {
+                eprintln!("Note: no scrollable element found in tree");
+            }
+
+            assert!(process_alive(pid), "Process should still be alive after scroll");
+
+            // 4. Drag (best-effort — CGEvent drag unreliable in SwiftUI)
+            let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
+            if let (Some(src_id), Some(dst_id)) = (
+                find_node_by_title_recursive(&nodes, "Drag Source"),
+                find_node_by_title_recursive(&nodes, "Drop Here"),
+            ) {
+                let req = strobe::mcp::DebugUiActionRequest {
+                    session_id: session_id.to_string(),
+                    action: strobe::mcp::UiActionType::Drag,
+                    id: Some(src_id),
+                    to_id: Some(dst_id),
+                    value: None, text: None, key: None, modifiers: None,
+                    direction: None, amount: None, settle_ms: Some(300),
+                };
+                let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+                assert!(result.success, "drag should succeed: {:?}", result.error);
+                assert_eq!(result.method.as_deref(), Some("cgevent"));
+                assert!(result.node_before.is_some(), "drag should have node_before");
+            }
+
+            // 5. Set value (string on text field)
+            let text_id = find_node_by_role_recursive(&nodes, "AXTextField")
+                .expect("Should find a text field in test app");
+
+            let req = strobe::mcp::DebugUiActionRequest {
+                session_id: session_id.to_string(),
+                action: strobe::mcp::UiActionType::SetValue,
+                id: Some(text_id.clone()),
+                value: Some(serde_json::json!("programmatic")),
+                text: None, key: None, modifiers: None,
+                direction: None, amount: None, to_id: None, settle_ms: Some(200),
+            };
+            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            if result.success {
+                assert_eq!(result.method.as_deref(), Some("ax"));
+            }
+
+            // 6. Type text
+            let req = strobe::mcp::DebugUiActionRequest {
+                session_id: session_id.to_string(),
+                action: strobe::mcp::UiActionType::Type,
+                id: Some(text_id),
+                text: Some("hello".to_string()),
+                value: None, key: None, modifiers: None,
+                direction: None, amount: None, to_id: None, settle_ms: Some(200),
+            };
+            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            assert!(result.success, "type should succeed: {:?}", result.error);
+            assert!(result.node_after.is_some());
+
+            // 7. Key (no modifier — safe for app stability)
+            let req = strobe::mcp::DebugUiActionRequest {
+                session_id: session_id.to_string(),
+                action: strobe::mcp::UiActionType::Key,
+                id: None,
+                key: Some("tab".to_string()),
+                modifiers: None,
+                value: None, text: None,
+                direction: None, amount: None, to_id: None, settle_ms: Some(100),
+            };
+            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            assert!(result.success, "key should succeed: {:?}", result.error);
             assert_eq!(result.method.as_deref(), Some("cgevent"));
-            assert!(result.node_before.is_some(), "drag should have node_before");
+            assert!(result.node_before.is_none());
+            assert!(result.node_after.is_none());
+
+            // 8. Error case: node not found
+            let req = strobe::mcp::DebugUiActionRequest {
+                session_id: session_id.to_string(),
+                action: strobe::mcp::UiActionType::Click,
+                id: Some("btn_0000".to_string()), // bogus ID
+                value: None, text: None, key: None, modifiers: None,
+                direction: None, amount: None, to_id: None, settle_ms: None,
+            };
+            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("not found"));
+
+            // 9. Error case: unknown key name
+            let req = strobe::mcp::DebugUiActionRequest {
+                session_id: session_id.to_string(),
+                action: strobe::mcp::UiActionType::Key,
+                id: None,
+                key: Some("pagedown".to_string()), // not in keycode table
+                modifiers: None,
+                value: None, text: None,
+                direction: None, amount: None, to_id: None, settle_ms: None,
+            };
+            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            assert!(!result.success, "Unknown key should fail");
+            assert!(result.error.as_deref().unwrap().contains("unknown key"));
         }
 
-        // ---- 5. Set value (string on text field) ----
-        let text_id = find_node_by_role_recursive(&nodes, "AXTextField")
-            .expect("Should find a text field in test app");
-
-        let req = strobe::mcp::DebugUiActionRequest {
-            session_id: session_id.to_string(),
-            action: strobe::mcp::UiActionType::SetValue,
-            id: Some(text_id.clone()),
-            value: Some(serde_json::json!("programmatic")),
-            text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: Some(200),
-        };
-        let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-        if result.success {
-            assert_eq!(result.method.as_deref(), Some("ax"));
-        }
-
-        // ---- 6. Type text ----
-        let req = strobe::mcp::DebugUiActionRequest {
-            session_id: session_id.to_string(),
-            action: strobe::mcp::UiActionType::Type,
-            id: Some(text_id),
-            text: Some("hello".to_string()),
-            value: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: Some(200),
-        };
-        let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-        assert!(result.success, "type should succeed: {:?}", result.error);
-        assert!(result.node_after.is_some());
-
-        // ---- 7. Key (no modifier — safe for app stability) ----
-        let req = strobe::mcp::DebugUiActionRequest {
-            session_id: session_id.to_string(),
-            action: strobe::mcp::UiActionType::Key,
-            id: None,
-            key: Some("tab".to_string()),
-            modifiers: None,
-            value: None, text: None,
-            direction: None, amount: None, to_id: None, settle_ms: Some(100),
-        };
-        let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-        assert!(result.success, "key should succeed: {:?}", result.error);
-        assert_eq!(result.method.as_deref(), Some("cgevent"));
-        assert!(result.node_before.is_none());
-        assert!(result.node_after.is_none());
-
-        // ---- 8. Error case: node not found ----
-        let req = strobe::mcp::DebugUiActionRequest {
-            session_id: session_id.to_string(),
-            action: strobe::mcp::UiActionType::Click,
-            id: Some("btn_0000".to_string()), // bogus ID
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
-        };
-        let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("not found"));
-
-        // ---- 9. Error case: unknown key name ----
-        let req = strobe::mcp::DebugUiActionRequest {
-            session_id: session_id.to_string(),
-            action: strobe::mcp::UiActionType::Key,
-            id: None,
-            key: Some("pagedown".to_string()), // not in keycode table
-            modifiers: None,
-            value: None, text: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
-        };
-        let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
-        assert!(!result.success, "Unknown key should fail");
-        assert!(result.error.as_deref().unwrap().contains("unknown key"));
-
-        // ---- Cleanup ----
+        // ==== Cleanup ====
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).await.unwrap();
     }

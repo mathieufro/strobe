@@ -253,7 +253,7 @@ fn parse_pytest_json_report(stdout: &str, _stderr: &str, _exit_code: i32) -> Tes
                 file,
                 line: test.lineno,
                 message,
-                rerun: Some(format!("-k {}", test.nodeid.split("::").last().unwrap_or(&test.nodeid))),
+                rerun: Some(test.nodeid.split("::").last().unwrap_or(&test.nodeid).to_string()),
                 suggested_traces: vec![],
             });
         }

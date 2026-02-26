@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use regex::Regex;
 
 use super::adapter::*;
+use super::TestProgress;
 
 pub struct UnittestAdapter;
 
@@ -295,6 +297,38 @@ fn extract_python_traces_from_unittest(failure: &TestFailure) -> Vec<String> {
     }
 
     traces
+}
+
+/// Parse unittest verbose output lines and update progress incrementally.
+/// unittest -v writes to stderr: "test_method (test_module.TestClass) ... ok/FAIL/skipped"
+pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
+    let re = Regex::new(r"^(\w+)\s+\(([^)]+)\)\s+\.\.\.\s+(ok|FAIL|ERROR|skipped)").unwrap();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(caps) = re.captures(trimmed) {
+            let test_method = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let test_class = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let outcome = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            let test_name = format!("{}.{}", test_class, test_method);
+
+            let mut p = progress.lock().unwrap();
+            // Transition phase on first test result
+            if p.phase == super::TestPhase::Compiling {
+                p.phase = super::TestPhase::Running;
+            }
+            match outcome {
+                "ok" => { p.passed += 1; p.finish_test(&test_name); }
+                "FAIL" | "ERROR" => { p.failed += 1; p.finish_test(&test_name); }
+                "skipped" => { p.skipped += 1; p.finish_test(&test_name); }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]

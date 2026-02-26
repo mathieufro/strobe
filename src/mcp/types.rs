@@ -695,9 +695,15 @@ pub struct TestProgressSnapshot {
     /// Historical baseline duration for the current test (average of last 10 passed runs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_test_baseline_ms: Option<u64>,
-    /// All currently running tests (cargo runs tests in parallel within a binary).
+    /// All currently running tests (capped to 20 longest-running; see total_running for full count).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub running_tests: Vec<RunningTestSnapshot>,
+    /// Total number of running tests (may exceed running_tests.len() when capped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_running: Option<u32>,
+    /// Last compilation message (e.g., "Compiling strobe v0.1.0"), shown during Compiling phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
