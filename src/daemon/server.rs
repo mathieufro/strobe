@@ -608,6 +608,7 @@ Inspect the UI of a running process — accessibility tree and screenshots.
 - Start with `mode: \"tree\"` — fast, works for standard widgets and most frameworks (JUCE, Qt, Cocoa)
 - Use `mode: \"both\"` when you need to see the actual rendered UI alongside the tree
 - Use `verbose: true` when you need structured JSON for programmatic analysis
+- **App state matters**: Apps rarely start in the state you need to debug. Use `debug_ui_action` to navigate (click tabs, open menus, load files) or ask the user to put the app in the right state before inspecting.
 
 ## UI Interaction (macOS only)
 
@@ -623,6 +624,8 @@ Interact with UI elements in a running process — click, type, set values, send
 
 ### Response
 Returns `{ success, method, nodeBefore, nodeAfter, changed, error }`. The `method` field shows whether AX API or CGEvent was used. `nodeBefore`/`nodeAfter` snapshots let you verify the action took effect.
+
+**Large responses**: `nodeBefore`/`nodeAfter` include the full element subtree, which can be very large for windows or containers. If the result overflows, grep for `\"success\"` and `\"changed\"` — do NOT read the entire response. Use `debug_ui({ mode: \"tree\" })` separately if you need the full tree.
 
 ### Tips
 - Get element IDs from `debug_ui({ mode: \"tree\" })` — each node has an `id=` field
@@ -2597,7 +2600,10 @@ Validation Limits (enforced):
         let pid = session.pid;
         let result = crate::ui::input::execute_ui_action(pid, &req).await?;
 
-        let text = serde_json::to_string_pretty(&result)?;
+        let mut text = serde_json::to_string_pretty(&result)?;
+        if result.success && result.changed == Some(false) {
+            text.push_str("\n\nNote: action succeeded but UI state did not change. Verify you targeted the right element. If repeated actions have no effect, ask the user to navigate the app to the required state.");
+        }
         Ok(vec![McpContent::Text { text }])
     }
 
