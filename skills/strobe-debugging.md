@@ -1,120 +1,88 @@
 ---
 name: strobe-debugging
-description: Investigate bugs using Strobe's dynamic instrumentation — observe first, trace surgically, fix with evidence
+description: Investigate bugs using Strobe's dynamic instrumentation — run first, trace fast, fix with evidence
 ---
 
 # Bug Investigation with Strobe
 
-You have Strobe's dynamic instrumentation tools. Use them. Do NOT guess at bugs by reading code — **observe runtime behavior first**, then fix with evidence.
+**Start with static analysis — most bugs are obvious from reading code.** When it doesn't work, switch to instrumentation. Two equally valid tools:
 
-## The Loop: Observe → Trace → Narrow → Fix
+- **Strobe traces** — discover which functions ran and with what arguments, without touching source
+- **Source log injection** — add `printf`/logging at the exact location you care about, rebuild, rerun
 
-### Step 1: Reproduce
+## Hard Rules
 
-Pick the right entry point based on what the user reported:
+**1. When static analysis hasn't found it: instrument, don't keep reading.**
+Runtime bugs (wrong execution path, compile-time guard, unregistered handler, wrong instance) are invisible in source. Instrument them.
 
-**A) There's a failing test** — run it:
+**2. A hypothesis must be tested at runtime, not confirmed by reading more files.**
+Verify with a trace or log — if right, one run proves it; if wrong, you still have new data.
+
+**3. Never re-run a test without new instrumentation.**
+Re-running without a new trace, log, or code change gives the same failure with no new information.
+
+---
+
+## The Loop
+
+### Step 0: Get a Failing Test (if you don't have one)
+
+If you have a **failing test** — skip to Step 1.
+
+If you have a **bug report or user scenario**, the order is:
+
+**First: static analysis.** Read the relevant code, trace the execution path. Most bugs are obvious and you can fix it right here. If you find it — fix it and verify.
+
+**If static analysis didn't find it: write a reproduction test.**
+
+- **Unit test** when the bug is in a specific, isolatable function
+- **E2e test** when the scenario requires real system state: UI interaction, multi-step workflow, complex object construction. When in doubt, use e2e — it puts you in the exact same situation as the user
+
+Write the smallest test that exercises the exact path. Verify it fails with `debug_test` — a passing test means wrong reproduction, not a fix.
+
+### Step 1: Reproduce and Check Output
+
 ```
 debug_test({ projectRoot, test: "<test_name>" })
-```
-Poll `debug_test_status` until complete. You get structured failures (file, line, message, `suggested_traces`), stuck warnings, and crash data.
-
-**B) It's a runtime bug** (UI glitch, server error, crash, wrong behavior) — launch the program:
-```
-debug_launch({ command: "<binary>", args: [...], projectRoot })
-```
-If you already have a hypothesis from the user's description or from reading code, stage traces *before* launch so you capture the bug on first trigger:
-```
-debug_trace({ add: ["suspect_module::*"] })  // no sessionId = staged for next launch
-debug_launch({ command: "<binary>", args: [...], projectRoot })
-```
-Then tell the user what to do to trigger the bug (click a button, send a request, open a file, etc). Wait for them to confirm they've triggered it.
-
-**C) No test infrastructure and the bug needs a test to reproduce** — stop this workflow. Suggest the user brainstorm a test harness first. Don't try to scaffold one inline.
-
-### Step 2: Check stderr/stdout FIRST
-
-Most bugs are visible in output alone. Before adding any traces:
-
-```
 debug_query({ sessionId, eventType: "stderr" })
-debug_query({ sessionId, eventType: "stdout" })
-debug_query({ sessionId, eventType: "crash" })
 ```
 
-Look for: panics, assertion messages, error logs, ASAN reports, segfaults, HTTP error responses, unexpected output. If the root cause is already clear, skip to Step 5.
+If the cause is clear — fix it. If ambiguous or silent — go to Step 2 immediately.
 
-### Step 3: Trace surgically — on the LIVE session
+### Step 2: Instrument
 
-If you have `suggested_traces` from a test failure, use those. Otherwise, form a hypothesis from the error output and trace the relevant module:
+**Strobe trace** to discover which functions ran:
+```
+debug_trace({ sessionId, add: ["SuspectedClass::*"] })
+debug_query({ sessionId, eventType: "function_enter" })
+```
+If the suspected function never appears — something upstream blocked it. That's the lead.
+
+**Log injection** for specific values or control flow at a precise location:
+```cpp
+printf("[DEBUG] called: id=%d, active=%d\n", id, active);  // remove after fix
+```
+Prefer logs when you know the exact line, or for inlined/templated code Strobe can't hook.
+
+### Step 3: Narrow, Fix, Verify
+
+Use observed evidence to narrow. Watches for variable state: `debug_trace({ sessionId, watches: { add: [{ variable: "g_state", on: ["MyClass::method"] }] } })`
+
+**Fix with evidence.** State it explicitly: "The trace showed X was never called — the `#ifdef` on line 47 prevents it in test builds." If you can't state the evidence, instrument more.
 
 ```
-debug_trace({ sessionId, add: ["<pattern>"] })
+debug_test({ projectRoot, test: "<test_name>" })  // fixed?
+debug_test({ projectRoot })                         // regressions?
 ```
 
-Then query what happened:
+---
 
-```
-debug_query({ sessionId, function: { contains: "<suspect>" } })
-```
+## When hookedFunctions: 0
 
-For runtime bugs where the user triggers the action, use time filters to isolate the relevant window:
-```
-debug_query({ sessionId, timeFrom: "-5s" })
-```
+Quick investigation before falling back to logs:
+1. Try `@file:filename.cpp` — bypasses name mangling
+2. Glob `**/*.dSYM` — if found, re-launch with `symbolsPath`
+3. Try without namespace prefix
+4. Templates/lambdas rarely hook — go straight to log injection
 
-**Pattern strategy**: Start narrow (1-3 patterns, target <50 hooks). Only widen if the narrow view isn't enough. Never use `@usercode` or `*` as a first move.
-
-### Step 4: Go deeper if needed
-
-Pick based on what you learned:
-
-**Watches** — track a global/variable across function calls:
-```
-debug_trace({ sessionId, watches: { add: [{ variable: "g_state", on: ["suspect::fn"] }] } })
-```
-
-**Breakpoints** — pause at a specific condition to inspect state:
-```
-debug_breakpoint({ sessionId, add: [{ function: "suspect::fn", condition: "args[0] == 0" }] })
-```
-
-**Logpoints** — non-blocking printf-style tracing without pausing:
-```
-debug_logpoint({ sessionId, add: [{ function: "suspect::fn", message: "called with {args[0]}" }] })
-```
-
-**Memory reads** — inspect a variable's value right now:
-```
-debug_read({ sessionId, targets: [{ variable: "g_counter" }] })
-```
-
-**Slow function search** — find performance bottlenecks:
-```
-debug_query({ sessionId, minDurationNs: 1000000 })
-```
-
-After each tool, re-query to see the new data. This is an iterative loop — keep going until you understand the root cause.
-
-### Step 5: Fix with evidence
-
-Now you know **exactly** what's wrong from runtime observation. Make the minimal fix.
-
-### Step 6: Verify
-
-If you started from a test, re-run it, then the full suite:
-```
-debug_test({ projectRoot, test: "<test_name>" })   // fixed?
-debug_test({ projectRoot })                          // regressions?
-```
-
-If you started from `debug_launch`, rebuild and relaunch. Ask the user to trigger the bug again and confirm it's resolved.
-
-## Rules
-
-- **If the cause is obvious, just fix it.** Don't instrument for the sake of it. But if you're guessing, observe runtime behavior before changing code.
-- **NEVER run tests via bash** — always use `debug_test`. It gives you structured data + a live Frida session.
-- **Traces are free to add mid-flight** — don't restart the session to add instrumentation.
-- **Start narrow, widen incrementally** — broad patterns generate noise and can crash targets (>100 hooks).
-- **Use `suggested_traces` when available** — they're generated from the failure location, don't ignore them.
-- **For interactive bugs, tell the user what to trigger** — Strobe instruments the live process, but the user needs to drive the UI/requests.
+After 2-3 attempts, switch to source logging. Don't keep trying pattern variations.

@@ -497,11 +497,18 @@ impl Daemon {
 
 ## Workflow
 
-1. Read code, form hypothesis about expected runtime behavior
-2. `debug_launch` with NO prior `debug_trace` — stdout/stderr always captured automatically
-3. Check output first — `debug_query({ eventType: "stderr" })` then stdout. Crashes, ASAN, assertions often suffice.
-4. Trace only if needed — `debug_trace({ sessionId, add: [...] })` on the running session. Do not restart.
-5. Iterate — narrow or widen patterns based on results. Session stays alive.
+1. Read the relevant code — most bugs are obvious from static analysis. Find it and fix it.
+2. If static analysis hasn't found it: run `debug_test` or `debug_launch` and check stderr/stdout first.
+3. If the cause is clear from output: fix it. Done.
+4. If not: instrument — add `debug_trace` and/or inject log statements into source. Do not keep reading files.
+5. Query what actually executed. Narrow with more traces or logs. Session stays alive — no restart needed.
+6. Fix with evidence. Verify.
+
+**CRITICAL RULES:**
+- When static analysis hasn't found it after reading the plausible suspects: switch to instrumentation, not more reading. Runtime bugs (wrong path, #ifdef guard, unregistered handler, wrong instance) are invisible in source.
+- Never re-run a test without first adding a new trace, injecting a log, or making a code change. Same test + no new instrumentation = same result.
+- Silent failures (no output, no assertion message) almost always mean: handler not registered, compile-time guard, wrong instance, or event never fired. Instrument immediately.
+- When `hookedFunctions: 0`: try `@file:filename.cpp`, check for .dSYM, try 2-3 pattern variants — then switch to source-level log injection.
 
 If behavior requires user action (button press, network event), tell the user what to trigger.
 
@@ -536,7 +543,7 @@ Read globals during function execution (requires DWARF symbols).
 
 - Do NOT trace before launch or use `@usercode` — always check stderr first
 - Do NOT use broad `@file:` patterns (`@file:src`). Be specific: `@file:parser.cpp`
-- If hookedFunctions: 0 → check for missing .dSYM, inline functions, or try `@file:` patterns
+- If hookedFunctions: 0 → try `@file:filename.cpp`, check for .dSYM (`**/*.dSYM`), try without namespace prefix. After 2-3 quick attempts, switch to source-level log injection — don't keep trying pattern variations.
 - If hook limit warnings appear, narrow patterns — do NOT retry the same broad pattern
 - If you see SYMBOL_HINT in warnings: search for .dSYM bundles in the project (glob: `**/*.dSYM`), then stop session and re-launch with `symbolsPath` pointing to the found .dSYM
 
@@ -647,7 +654,7 @@ Returns `{ success, method, nodeBefore, nodeAfter, changed, error }`. The `metho
             // ---- Primary tools (8) ----
             McpTool {
                 name: "debug_launch".to_string(),
-                description: "Launch a binary with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Follow the observation loop: 1) Launch clean, 2) Check stderr/stdout first, 3) Add traces only if needed. Applies any pending patterns if debug_trace was called beforehand (advanced usage).".to_string(),
+                description: "Launch a binary with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Follow the observation loop: 1) Launch clean, 2) Check stderr/stdout first, 3) Add traces if output isn't conclusive — do NOT read more source files instead. Applies any pending patterns if debug_trace was called beforehand (advanced usage).".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
