@@ -509,6 +509,8 @@ impl Daemon {
 - Never re-run a test without first adding a new trace, injecting a log, or making a code change. Same test + no new instrumentation = same result.
 - Silent failures (no output, no assertion message) almost always mean: handler not registered, compile-time guard, wrong instance, or event never fired. Instrument immediately.
 - When `hookedFunctions: 0`: try `@file:filename.cpp`, check for .dSYM, try 2-3 pattern variants — then switch to source-level log injection.
+- Do NOT use broad `@file:` patterns (`@file:src`). Be specific: `@file:parser.cpp`
+- If you see SYMBOL_HINT in warnings: glob for `**/*.dSYM`, then re-launch with `symbolsPath`.
 
 If behavior requires user action (button press, network event), tell the user what to trigger.
 
@@ -525,130 +527,32 @@ If behavior requires user action (button press, network event), tell the user wh
 
 ## Watches
 
-Read globals during function execution (requires DWARF symbols).
-- `{ variable: \"gCounter\" }` or `{ variable: \"gClock->counter\" }` — named variables
-- `{ address: \"0x1234\", type: \"f64\", label: \"tempo\" }` — raw address
-- `{ expr: \"ptr(0x5678).readU32()\", label: \"custom\" }` — JS expression
-- Scope to functions: `{ variable: \"gTempo\", on: [\"audio::process\"] }` (supports `*`/`**` wildcards)
-- Max 32 watches; 4 native CModule for best perf.
+Read globals during function execution (requires DWARF symbols). Max 32 watches.
+- `{ variable: \"gCounter\" }` — named variable | `{ variable: \"gClock->counter\" }` — pointer chain
+- `{ address: \"0x1234\", type: \"f64\", label: \"tempo\" }` — raw address | `{ expr: \"...\", label: \"x\" }` — JS expression
+- Scope with `on`: `{ variable: \"gTempo\", on: [\"audio::*\"] }`
 
 ## Queries
 
-- eventType: `stderr`/`stdout` (always captured), `function_enter`/`function_exit` (when tracing), `pause`/`logpoint`/`condition_error`
-- Filters: `function: { contains: \"parse\" }`, `sourceFile: { contains: \"auth\" }`, `verbose: true`
-- Default 50 events. Paginate with `offset`. Check `hasMore`.
-- Cursor-based polling: pass `afterEventId` (from previous response's `lastEventId`) to get only new events. Response includes `eventsDropped: true` if FIFO eviction occurred.
-
-## Mistakes to Avoid
-
-- Do NOT trace before launch or use `@usercode` — always check stderr first
-- Do NOT use broad `@file:` patterns (`@file:src`). Be specific: `@file:parser.cpp`
-- If hookedFunctions: 0 → try `@file:filename.cpp`, check for .dSYM (`**/*.dSYM`), try without namespace prefix. After 2-3 quick attempts, switch to source-level log injection — don't keep trying pattern variations.
-- If hook limit warnings appear, narrow patterns — do NOT retry the same broad pattern
-- If you see SYMBOL_HINT in warnings: search for .dSYM bundles in the project (glob: `**/*.dSYM`), then stop session and re-launch with `symbolsPath` pointing to the found .dSYM
+- eventType: `stderr`/`stdout` (always captured), `function_enter`/`function_exit` (when tracing), `pause`/`logpoint`/`condition_error`/`variable_snapshot`/`crash`
+- Filters: `function: { contains }`, `sourceFile: { contains }`, `verbose: true`
+- Default 50 events. Paginate with `offset`/`afterEventId`. Check `hasMore`.
 
 ## Running Tests
 
-ALWAYS use `debug_test` — never `cargo test` or test binaries via bash.
-Tests always run inside Frida, so you can add traces at any time without restarting.
-IMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test calls in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.
+ALWAYS use `debug_test` — never `cargo test` or test binaries via bash. Only one test run at a time per project.
+`debug_test` returns a `testRunId` immediately. Poll with `debug_test({ action: \"status\", testRunId })` — server blocks up to 15s.
+Status includes `progress.currentTest`, `progress.warnings` (stuck detection), and `sessionId` for live tracing.
+When stuck warnings appear: add traces to investigate, then stop the session.
+Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` (path to test binary).
 
-`debug_test` returns immediately with a `testRunId`. Poll with `debug_test({ action: \"status\", testRunId })`.
-The server blocks up to 15s waiting for completion, so it's safe to call immediately after each response.
+## UI (macOS only)
 
-### Status Response Fields
-- `progress.currentTest` — name of the currently executing test
-- `progress.currentTestElapsedMs` — how long the current test has been running
-- `progress.currentTestBaselineMs` — historical average duration for this test (if known)
-- `progress.warnings` — stuck detection warnings (see below)
-- `sessionId` — Frida session ID for `debug_trace` and `debug_session`
-
-### Stuck Test Detection
-The test runner monitors for stuck tests (deadlocks, infinite loops). When detected,
-status response includes warnings:
-```json
-{ \"warnings\": [{ \"testName\": \"test_auth\", \"idleMs\": 12000,
-  \"diagnosis\": \"0% CPU, stacks unchanged 6s\" }] }
-```
-
-When you see a warning:
-1. Use `debug_trace({ sessionId, add: [\"relevant::patterns\"] })` to investigate
-2. Use `debug_query({ sessionId })` to see what's happening
-3. Use `debug_session({ action: \"stop\", sessionId })` to kill the test when you understand the issue
-
-### Framework Selection
-- **Rust projects**: just provide `projectRoot` — Cargo.toml is auto-detected
-- **C++/Catch2**: provide `command` (path to test binary)
-- Do NOT pass `framework` unless auto-detection fails — it's usually unnecessary
-- Only two frameworks are supported: `cargo` and `catch2`
-
-### Quick Reference
-- Add `tracePatterns` to trace from the start (optional — can add later via `debug_trace`)
-
-## Live Memory Access
-
-Read/write variables in a running process without setting up traces:
-- `debug_memory({ sessionId, targets: [{ variable: \"gTempo\" }] })` — read a global (action defaults to \"read\")
-- `debug_memory({ sessionId, targets: [{ variable: \"gClock->counter\" }] })` — follow pointer chain
-- `debug_memory({ sessionId, targets: [...], depth: 2 })` — expand struct fields
-- `debug_memory({ sessionId, targets: [...], poll: { intervalMs: 100, durationMs: 2000 } })` — sample over time
-- `debug_memory({ action: \"write\", sessionId, targets: [{ variable: \"gTempo\", value: 120.0 }] })` — write a value
-- Poll results: `debug_query({ eventType: \"variable_snapshot\" })`
-
-## UI Observation (macOS only)
-
-Inspect the UI of a running process — accessibility tree and screenshots.
-
-- `debug_ui({ sessionId, mode: \"tree\" })` — accessibility tree as compact text
-- `debug_ui({ sessionId, mode: \"screenshot\" })` — PNG saved to `<projectRoot>/screenshots/`, returns file path
-- `debug_ui({ sessionId, mode: \"screenshot\", id: \"btn_abc1\" })` — cropped screenshot of a specific element
-- `debug_ui({ sessionId, mode: \"both\" })` — tree + screenshot file in one call
-- `debug_ui({ sessionId, mode: \"tree\", verbose: true })` — JSON format instead of compact text
-
-### Output Format (compact text, default)
-```
-[window \"App\" bounds=0,0,800,600]
-  [button \"Play\" bounds=10,5,80,30 enabled focused]
-  [slider \"Volume\" bounds=100,50,200,30 value≈0.75]
-```
-
-### Tips
-- Start with `mode: \"tree\"` — fast, works for standard widgets and most frameworks (JUCE, Qt, Cocoa)
-- Use `mode: \"both\"` when you need to see the actual rendered UI alongside the tree
-- Use `verbose: true` when you need structured JSON for programmatic analysis
-- Pass `id` (from tree output) to crop screenshot to a specific element — useful for large UIs
-- **App state matters**: Apps rarely start in the state you need to debug. Use `debug_ui_action` to navigate (click tabs, open menus, load files) or ask the user to put the app in the right state before inspecting.
-
-## UI Interaction (macOS only)
-
-Interact with UI elements in a running process — click, type, set values, send keys, scroll, drag.
-
-- `debug_ui_action({ sessionId, action: \"click\", id: \"btn_abc1\" })` — click a button (AX action, CGEvent fallback)
-- `debug_ui_action({ sessionId, action: \"set_value\", id: \"slider_abc1\", value: 0.5 })` — set numeric or string value
-- `debug_ui_action({ sessionId, action: \"type\", id: \"textfield_abc1\", text: \"hello\" })` — type text into a field
-- `debug_ui_action({ sessionId, action: \"key\", key: \"return\" })` — send a key press (no target id needed)
-- `debug_ui_action({ sessionId, action: \"key\", key: \"s\", modifiers: [\"cmd\"] })` — key with modifiers
-- `debug_ui_action({ sessionId, action: \"scroll\", id: \"list_abc1\", direction: \"down\", amount: 3 })` — scroll element
-- `debug_ui_action({ sessionId, action: \"drag\", id: \"source_abc1\", toId: \"target_abc1\" })` — drag between elements
-
-### Response
-Returns `{ success, method, nodeBefore, nodeAfter, changed, error }`. The `method` field shows whether AX API or CGEvent was used. `nodeBefore`/`nodeAfter` snapshots let you verify the action took effect.
-
-**Large responses**: `nodeBefore`/`nodeAfter` include the full element subtree, which can be very large for windows or containers. If the result overflows, grep for `\"success\"` and `\"changed\"` — do NOT read the entire response. Use `debug_ui({ mode: \"tree\" })` separately if you need the full tree.
-
-### Tips
-- Get element IDs from `debug_ui({ mode: \"tree\" })` — each node has an `id=` field
-- Actions: `click`, `set_value`, `type`, `key`, `scroll`, `drag`
-- Keys: `a`-`z`, `0`-`9`, `return`, `tab`, `space`, `escape`, `delete`, `up`/`down`/`left`/`right`, `f1`-`f12`
-- Modifiers: `cmd`, `shift`, `alt`, `ctrl`
-- Use `settleMs` to wait for UI animations before capturing `nodeAfter` (default: 150ms)
-
-## Session Management
-
-- `debug_session({ action: \"status\", sessionId })` — full snapshot: pid, status, hook count, patterns, breakpoints, logpoints, watches, paused threads
-- `debug_session({ action: \"stop\", sessionId })` — stop session (add `retain: true` to keep events for post-mortem)
-- `debug_session({ action: \"list\" })` — list retained sessions
-- `debug_session({ action: \"delete\", sessionId })` — delete a retained session"#
+- `debug_ui` returns accessibility tree and/or screenshots. Start with `mode: \"tree\"`.
+- Pass `id` with screenshot mode to crop to a specific element.
+- **App state matters**: use `debug_ui_action` to navigate (click tabs, open menus) before inspecting.
+- `debug_ui_action` returns `{ success, nodeBefore, nodeAfter, changed }` — verify actions took effect.
+- Large `nodeAfter` subtrees: grep for `\"success\"` and `\"changed\"`, don't read entire response."#
     }
 
     async fn handle_tools_list(&self) -> Result<serde_json::Value> {
@@ -656,7 +560,7 @@ Returns `{ success, method, nodeBefore, nodeAfter, changed, error }`. The `metho
             // ---- Primary tools (8) ----
             McpTool {
                 name: "debug_launch".to_string(),
-                description: "Launch a binary with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Follow the observation loop: 1) Launch clean, 2) Check stderr/stdout first, 3) Add traces if output isn't conclusive — do NOT read more source files instead. Applies any pending patterns if debug_trace was called beforehand (advanced usage).".to_string(),
+                description: "Launch a binary with Frida attached. Process stdout/stderr are ALWAYS captured automatically (no tracing needed). Applies any pending patterns if debug_trace was called beforehand (advanced usage).".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -685,29 +589,7 @@ Returns `{ success, method, nodeBefore, nodeAfter, changed, error }`. The `metho
             },
             McpTool {
                 name: "debug_trace".to_string(),
-                description: r#"Add or remove function trace patterns on a RUNNING debug session.
-
-RECOMMENDED WORKFLOW (Observation Loop):
-1. Launch with debug_launch (no prior debug_trace needed)
-2. Query stderr/stdout first - most issues visible in output alone
-3. If output insufficient, add targeted patterns: debug_trace({ sessionId, add: [...] })
-4. Query traces, iterate patterns as needed
-
-When called WITH sessionId (recommended):
-- Immediately installs hooks on running process
-- Returns actual hook count showing pattern matches
-- Start with 1-3 specific patterns (under 50 hooks ideal)
-- hookedFunctions: 0 means patterns didn't match - see status for guidance
-
-When called WITHOUT sessionId (advanced/staging mode):
-- Stages "pending patterns" for next debug_launch by this connection
-- hookedFunctions will be 0 (hooks not installed until launch)
-- Use only when you know exactly what to trace upfront
-- Consider launching clean and observing output first instead
-
-Validation Limits (enforced):
-- watches: max 32 per session
-- watch expressions/variables: max 1KB length, max 10 levels deep (-> or . operators)"#.to_string(),
+                description: "Add or remove function trace patterns on a RUNNING debug session. With sessionId: immediately installs hooks, returns hookedFunctions count (0 means no match). Without sessionId: stages pending patterns for next debug_launch.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -884,7 +766,7 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results.\n\nIMPORTANT: Only one test run at a time per project. Do NOT launch multiple debug_test runs in parallel for the same project — run tests sequentially. Different projects can run tests concurrently.\n\nSupported frameworks:\n- Rust: provide projectRoot (auto-detects Cargo.toml). No command needed.\n- C++/Catch2: provide command (path to test binary).\n- C++/Google Test: provide command (path to gtest binary).\n- Go: provide projectRoot (auto-detects go.mod).\n- Deno: provide projectRoot (auto-detects deno.json).\n- Mocha: provide projectRoot (auto-detects .mocharc.yml).\n- Python (pytest/unittest): provide projectRoot.\n- Node.js (Vitest/Jest/Bun): provide projectRoot.\n\nUse this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results. Only one test run at a time per project. Use this instead of running test commands via bash.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
