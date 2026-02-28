@@ -601,6 +601,7 @@ Inspect the UI of a running process — accessibility tree and screenshots.
 
 - `debug_ui({ sessionId, mode: \"tree\" })` — accessibility tree as compact text
 - `debug_ui({ sessionId, mode: \"screenshot\" })` — PNG saved to `<projectRoot>/screenshots/`, returns file path
+- `debug_ui({ sessionId, mode: \"screenshot\", id: \"btn_abc1\" })` — cropped screenshot of a specific element
 - `debug_ui({ sessionId, mode: \"both\" })` — tree + screenshot file in one call
 - `debug_ui({ sessionId, mode: \"tree\", verbose: true })` — JSON format instead of compact text
 
@@ -615,6 +616,7 @@ Inspect the UI of a running process — accessibility tree and screenshots.
 - Start with `mode: \"tree\"` — fast, works for standard widgets and most frameworks (JUCE, Qt, Cocoa)
 - Use `mode: \"both\"` when you need to see the actual rendered UI alongside the tree
 - Use `verbose: true` when you need structured JSON for programmatic analysis
+- Pass `id` (from tree output) to crop screenshot to a specific element — useful for large UIs
 - **App state matters**: Apps rarely start in the state you need to debug. Use `debug_ui_action` to navigate (click tabs, open menus, load files) or ask the user to put the app in the right state before inspecting.
 
 ## UI Interaction (macOS only)
@@ -908,12 +910,13 @@ Validation Limits (enforced):
             },
             McpTool {
                 name: "debug_ui".to_string(),
-                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and/or a screenshot saved as PNG to <projectRoot>/screenshots/. Use mode to select output.".to_string(),
+                description: "Query the UI state of a running process. Returns accessibility tree (native widgets) and/or a screenshot saved as PNG to <projectRoot>/screenshots/. Use mode to select output. Pass 'id' with screenshot/both mode to crop to a specific element.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "sessionId": { "type": "string", "description": "Session ID (from debug_launch)" },
                         "mode": { "type": "string", "enum": ["tree", "screenshot", "both"], "description": "Output mode: tree (UI element hierarchy), screenshot (PNG image), or both" },
+                        "id": { "type": "string", "description": "Target node ID from debug_ui tree. When provided with screenshot or both mode, crops the screenshot to this element's bounds." },
                         "verbose": { "type": "boolean", "description": "Return JSON instead of compact text (default: false)" }
                     },
                     "required": ["sessionId", "mode"]
@@ -2547,8 +2550,29 @@ Validation Limits (enforced):
             #[cfg(target_os = "macos")]
             {
                 let pid = session.pid;
+                let element_bounds = if let Some(ref target_id) = req.id {
+                    // Resolve element bounds from AX tree
+                    let target_id = target_id.clone();
+                    let nodes = tokio::task::spawn_blocking(move || {
+                        crate::ui::accessibility::query_ax_tree(pid)
+                    }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
+                    let node = crate::ui::tree::find_node_by_id(&nodes, &target_id)
+                        .ok_or_else(|| crate::Error::UiQueryFailed(
+                            format!("Element '{}' not found. Use debug_ui with mode=tree to see current element IDs.", target_id)
+                        ))?;
+                    Some(node.bounds.ok_or_else(|| crate::Error::UiQueryFailed(
+                        format!("Element '{}' has no bounds (may be off-screen or invisible)", target_id)
+                    ))?)
+                } else {
+                    None
+                };
+
                 let png_bytes = tokio::task::spawn_blocking(move || {
-                    crate::ui::capture::capture_window_screenshot(pid)
+                    if let Some(bounds) = element_bounds {
+                        crate::ui::capture::capture_element_screenshot(pid, &bounds)
+                    } else {
+                        crate::ui::capture::capture_window_screenshot(pid)
+                    }
                 }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
 
                 use base64::Engine;
@@ -3523,6 +3547,105 @@ mod tests {
             "debug_session",
             serde_json::json!({ "sessionId": session_id, "action": "stop" }),
             60,
+        ).await;
+    }
+
+    /// E2E: debug_ui localized screenshot — full window, cropped to element, and error cases.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(target_os = "macos")]
+    async fn test_e2e_ui_localized_screenshot() {
+        let binary = build_ui_test_app();
+        let project_root = binary.parent().unwrap().to_str().unwrap();
+        let (daemon, _dir) = test_daemon();
+        let mut initialized = false;
+        let conn_id = "e2e-ui-screenshot";
+
+        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+
+        // Launch
+        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            "debug_launch",
+            serde_json::json!({
+                "command": binary.to_str().unwrap(),
+                "projectRoot": project_root
+            }),
+            10,
+        ).await;
+        let launch_data = extract_mcp_text(&result);
+        let session_id = launch_data["sessionId"].as_str().unwrap();
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // 1. Full window screenshot (no id) — should return image content
+        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            "debug_ui",
+            serde_json::json!({ "sessionId": session_id, "mode": "screenshot" }),
+            20,
+        ).await;
+        assert!(!is_mcp_error(&result), "full screenshot should succeed");
+        let content = result.get("content").unwrap().as_array().unwrap();
+        // Should have text (stats) + image
+        let has_image = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
+        assert!(has_image, "full screenshot should return an image");
+
+        // 2. Get tree to find a button ID
+        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            "debug_ui",
+            serde_json::json!({ "sessionId": session_id, "mode": "tree" }),
+            30,
+        ).await;
+        let tree_content = result.get("content").unwrap().as_array().unwrap();
+        let tree_text = tree_content[0].get("text").unwrap().as_str().unwrap();
+
+        let button_id = tree_text.lines()
+            .find(|l| l.contains("AXButton"))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find(|w| w.starts_with("id="))
+                    .map(|w| w.trim_start_matches("id=").trim_end_matches(']').to_string())
+            })
+            .expect("Should find button ID in tree");
+
+        // 3. Localized screenshot with valid id — should return cropped image
+        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            "debug_ui",
+            serde_json::json!({ "sessionId": session_id, "mode": "screenshot", "id": button_id }),
+            40,
+        ).await;
+        assert!(!is_mcp_error(&result), "localized screenshot should succeed");
+        let content = result.get("content").unwrap().as_array().unwrap();
+        let has_image = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
+        assert!(has_image, "localized screenshot should return an image");
+
+        // 4. "both" mode with id — should return tree text + cropped image
+        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            "debug_ui",
+            serde_json::json!({ "sessionId": session_id, "mode": "both", "id": button_id }),
+            50,
+        ).await;
+        assert!(!is_mcp_error(&result), "both+id should succeed");
+        let content = result.get("content").unwrap().as_array().unwrap();
+        let has_text = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("text"));
+        let has_image = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
+        assert!(has_text, "both mode should return text (tree)");
+        assert!(has_image, "both mode should return image");
+
+        // 5. Localized screenshot with nonexistent id — should return MCP error
+        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            "debug_ui",
+            serde_json::json!({ "sessionId": session_id, "mode": "screenshot", "id": "btn_9999" }),
+            60,
+        ).await;
+        assert!(is_mcp_error(&result), "nonexistent id should be MCP error");
+        let content = result.get("content").unwrap().as_array().unwrap();
+        let err_text = content[0].get("text").unwrap().as_str().unwrap();
+        assert!(err_text.contains("not found"), "Error should mention element not found: {}", err_text);
+
+        // Cleanup
+        let _ = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            "debug_session",
+            serde_json::json!({ "sessionId": session_id, "action": "stop" }),
+            70,
         ).await;
     }
 }

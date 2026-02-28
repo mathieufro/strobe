@@ -135,6 +135,19 @@ pub fn format_json(nodes: &[UiNode]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&serde_json::json!({ "nodes": nodes }))
 }
 
+/// Find a node by ID in a tree of UiNodes.
+pub fn find_node_by_id(nodes: &[UiNode], target_id: &str) -> Option<UiNode> {
+    for node in nodes {
+        if node.id == target_id {
+            return Some(node.clone());
+        }
+        if let Some(found) = find_node_by_id(&node.children, target_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Compare two UiNode snapshots. Returns true if any observable field changed.
 /// Compares: value, enabled, focused, title. Ignores children and bounds.
 pub fn diff_nodes(before: &UiNode, after: &UiNode) -> bool {
@@ -332,5 +345,35 @@ mod tests {
         let mut after = before.clone();
         after.title = Some("Pause".to_string());
         assert!(diff_nodes(&before, &after));
+    }
+
+    #[test]
+    fn test_find_node_by_id_root() {
+        let tree = sample_tree();
+        let found = find_node_by_id(&tree, "w_0001");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().role, "window");
+    }
+
+    #[test]
+    fn test_find_node_by_id_nested() {
+        let tree = sample_tree();
+        let found = find_node_by_id(&tree, "btn_a1b2");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().title.unwrap(), "Play");
+    }
+
+    #[test]
+    fn test_find_node_by_id_deep_child() {
+        let tree = sample_tree();
+        let found = find_node_by_id(&tree, "knb_c3d4");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().role, "knob");
+    }
+
+    #[test]
+    fn test_find_node_by_id_not_found() {
+        let tree = sample_tree();
+        assert!(find_node_by_id(&tree, "nonexistent").is_none());
     }
 }

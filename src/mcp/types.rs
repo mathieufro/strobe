@@ -1379,6 +1379,8 @@ pub struct DebugUiRequest {
     #[serde(default)]
     pub mode: UiMode,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbose: Option<bool>,
@@ -1630,6 +1632,7 @@ mod write_tests {
         let req = DebugUiRequest {
             session_id: "".to_string(),
             mode: UiMode::Tree,
+            id: None,
             vision: None,
             verbose: None,
         };

@@ -599,13 +599,5 @@ unsafe fn set_ax_number_value(element: AXUIElementRef, num: f64) -> Result<(), (
 
 /// Find a node by ID in a tree of UiNodes.
 fn find_node_in_tree(nodes: &[UiNode], target_id: &str) -> Option<UiNode> {
-    for node in nodes {
-        if node.id == target_id {
-            return Some(node.clone());
-        }
-        if let Some(found) = find_node_in_tree(&node.children, target_id) {
-            return Some(found);
-        }
-    }
-    None
+    crate::ui::tree::find_node_by_id(nodes, target_id)
 }
