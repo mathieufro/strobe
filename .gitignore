@@ -7,6 +7,7 @@
 .strobe/
 tests/**/target/
 tests/**/build/
+tests/**/node_modules/
 tests/**/*.dSYM/.worktrees/
 
 # Vision sidecar (Python)

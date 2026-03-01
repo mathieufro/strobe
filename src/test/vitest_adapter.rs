@@ -111,6 +111,22 @@ impl TestAdapter for VitestAdapter {
         })
     }
 
+    fn command_for_binary(
+        &self,
+        cmd: &str,
+        _level: Option<TestLevel>,
+    ) -> crate::Result<TestCommand> {
+        build_custom_command(cmd, None)
+    }
+
+    fn single_test_for_binary(
+        &self,
+        cmd: &str,
+        test_name: &str,
+    ) -> crate::Result<TestCommand> {
+        build_custom_command(cmd, Some(test_name))
+    }
+
     fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
         // Try JSON from stdout first (primary path)
         if let Some(result) = parse_json_output(stdout) {
@@ -163,6 +179,66 @@ impl TestAdapter for VitestAdapter {
             Some(TestLevel::E2e) => 600_000,
             None => 180_000,
         }
+    }
+}
+
+/// Build a TestCommand from a user-provided command string.
+/// Injects vitest reporter flags for JSON + STROBE_TEST output capture.
+///
+/// Supported forms:
+/// - `npx vitest run src/foo.test.ts` — vitest CLI with extra args
+/// - `bun run test:e2e` — npm/bun script (reporters forwarded via --)
+/// - `npm run test` — npm script
+fn build_custom_command(cmd: &str, test_name: Option<&str>) -> crate::Result<TestCommand> {
+    let reporter_path = ensure_reporter_file();
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(crate::Error::ValidationError("Empty command".to_string()));
+    }
+
+    let program = parts[0].to_string();
+    let is_script_runner = parts.len() >= 2
+        && matches!(parts[0], "npm" | "bun" | "yarn" | "pnpm")
+        && parts[1] == "run";
+
+    if is_script_runner {
+        // npm/bun/yarn run <script> — forward vitest flags via --
+        let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        args.push("--".to_string());
+        args.push("--reporter=json".to_string());
+        args.push(format!("--reporter={}", reporter_path));
+        args.push("--no-coverage".to_string());
+        if let Some(name) = test_name {
+            args.push("-t".to_string());
+            args.push(name.to_string());
+        }
+        Ok(TestCommand {
+            program,
+            args,
+            env: HashMap::new(),
+        })
+    } else {
+        // Direct vitest/npx command — inject reporter flags
+        let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+        // Add reporter flags if not already present
+        if !args.iter().any(|a| a.contains("--reporter")) {
+            args.push("--reporter=json".to_string());
+            args.push(format!("--reporter={}", reporter_path));
+        }
+        if !args.iter().any(|a| a.contains("--no-coverage")) {
+            args.push("--no-coverage".to_string());
+        }
+        if let Some(name) = test_name {
+            args.push("-t".to_string());
+            args.push(name.to_string());
+        }
+
+        Ok(TestCommand {
+            program,
+            args,
+            env: HashMap::new(),
+        })
     }
 }
 
@@ -799,5 +875,53 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         let result = parse_strobe_events(stderr).unwrap();
         assert_eq!(result.all_tests.len(), 1, "only pass/fail/skip should produce test entries");
         assert_eq!(result.summary.passed, 1);
+    }
+
+    // --- Custom command tests ---
+
+    #[test]
+    fn test_build_custom_command_direct_vitest() {
+        let cmd = build_custom_command("npx vitest run src/math.test.ts", None).unwrap();
+        assert_eq!(cmd.program, "npx");
+        assert!(cmd.args.contains(&"vitest".to_string()));
+        assert!(cmd.args.contains(&"run".to_string()));
+        assert!(cmd.args.contains(&"src/math.test.ts".to_string()));
+        assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
+        assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")));
+    }
+
+    #[test]
+    fn test_build_custom_command_npm_run() {
+        let cmd = build_custom_command("npm run test:e2e", None).unwrap();
+        assert_eq!(cmd.program, "npm");
+        assert!(cmd.args.contains(&"run".to_string()));
+        assert!(cmd.args.contains(&"test:e2e".to_string()));
+        assert!(cmd.args.contains(&"--".to_string()), "should have -- separator");
+        assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
+    }
+
+    #[test]
+    fn test_build_custom_command_bun_run() {
+        let cmd = build_custom_command("bun run test:e2e:server", None).unwrap();
+        assert_eq!(cmd.program, "bun");
+        assert!(cmd.args.contains(&"run".to_string()));
+        assert!(cmd.args.contains(&"test:e2e:server".to_string()));
+        assert!(cmd.args.contains(&"--".to_string()));
+        assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
+    }
+
+    #[test]
+    fn test_build_custom_command_with_test_filter() {
+        let cmd = build_custom_command("bun run test", Some("my test name")).unwrap();
+        assert!(cmd.args.contains(&"-t".to_string()));
+        assert!(cmd.args.contains(&"my test name".to_string()));
+    }
+
+    #[test]
+    fn test_build_custom_command_direct_with_test_filter() {
+        let cmd = build_custom_command("npx vitest run", Some("my test")).unwrap();
+        assert!(cmd.args.contains(&"-t".to_string()));
+        assert!(cmd.args.contains(&"my test".to_string()));
+        assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
     }
 }

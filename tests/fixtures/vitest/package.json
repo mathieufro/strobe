@@ -1,0 +1,12 @@
+{
+  "name": "strobe-vitest-fixture",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "test:unit": "vitest run src/math.test.js",
+    "test:slow": "vitest run src/slow.test.js"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
+  }
+}
