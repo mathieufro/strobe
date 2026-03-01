@@ -112,92 +112,34 @@ impl TestAdapter for VitestAdapter {
     }
 
     fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
-        // Find JSON in stdout (may have non-JSON prefix from npx)
-        let json_start = stdout.find('{').unwrap_or(0);
-        let json_str = &stdout[json_start..];
-
-        let report: VitestReport = match serde_json::from_str(json_str) {
-            Ok(r) => r,
-            Err(_) => {
-                let failures = if exit_code != 0 {
-                    vec![TestFailure {
-                        name: "Test run crashed".to_string(),
-                        file: None, line: None,
-                        message: format!("Could not parse vitest output.\nstderr: {}", &stderr[..stderr.len().min(500)]),
-                        rerun: None,
-                        suggested_traces: vec![],
-                    }]
-                } else { vec![] };
-                return TestResult {
-                    summary: TestSummary { passed: 0, failed: 0, skipped: 0, stuck: None, duration_ms: 0 },
-                    failures,
-                    stuck: vec![],
-                    all_tests: vec![],
-                };
-            }
-        };
-
-        let stack_re = regex::Regex::new(r"\(([^)]+\.(?:test|spec)\.\w+):(\d+):\d+\)").unwrap();
-        let mut failures = vec![];
-        let mut all_tests = vec![];
-        let mut total_duration_ms = 0u64;
-
-        for suite in &report.test_results {
-            for a in &suite.assertions {
-                let full_name = if !a.full_name.is_empty() {
-                    a.full_name.clone()
-                } else {
-                    let mut parts = a.ancestors.clone();
-                    parts.push(a.title.clone());
-                    parts.join(" ")
-                };
-
-                let duration_ms = a.duration.map(|d| d as u64).unwrap_or(0);
-                total_duration_ms += duration_ms;
-
-                let status = match a.status.as_str() {
-                    "passed" => TestStatus::Pass,
-                    "failed" => TestStatus::Fail,
-                    "todo" | "pending" | "skipped" => TestStatus::Skip,
-                    _ => TestStatus::Skip,
-                };
-
-                all_tests.push(TestDetail {
-                    name: full_name.clone(),
-                    status: status.clone(),
-                    duration_ms,
-                    stdout: None, stderr: None, message: None,
-                });
-
-                if matches!(status, TestStatus::Fail) {
-                    let msg = a.failure_messages.first().cloned().unwrap_or_default();
-                    let (file, line) = stack_re.captures(&msg)
-                        .map(|c| (Some(c[1].to_string()), c[2].parse().ok()))
-                        .unwrap_or((None, None));
-
-                    failures.push(TestFailure {
-                        name: full_name,
-                        file,
-                        line,
-                        message: msg,
-                        rerun: None,
-                        suggested_traces: vec![],
-                    });
-                }
-            }
+        // Try JSON from stdout first (primary path)
+        if let Some(result) = parse_json_output(stdout) {
+            return result;
         }
 
+        // Fallback: build results from STROBE_TEST events in stderr.
+        // This handles cases where vitest hangs during finalization (e.g., afterAll hook)
+        // and never writes JSON to stdout, but the custom reporter already streamed
+        // per-test results to stderr.
+        if let Some(result) = parse_strobe_events(stderr) {
+            return result;
+        }
+
+        // Neither JSON nor STROBE_TEST events — report crash or empty
+        let failures = if exit_code != 0 {
+            vec![TestFailure {
+                name: "Test run crashed".to_string(),
+                file: None, line: None,
+                message: format!("Could not parse vitest output.\nstderr: {}", &stderr[..stderr.len().min(500)]),
+                rerun: None,
+                suggested_traces: vec![],
+            }]
+        } else { vec![] };
         TestResult {
-            summary: TestSummary {
-                passed: report.num_passed,
-                failed: report.num_failed,
-                skipped: report.num_pending + report.num_todo,
-                stuck: None,
-                duration_ms: total_duration_ms,
-            },
+            summary: TestSummary { passed: 0, failed: 0, skipped: 0, stuck: None, duration_ms: 0 },
             failures,
             stuck: vec![],
-            all_tests,
+            all_tests: vec![],
         }
     }
 
@@ -222,6 +164,153 @@ impl TestAdapter for VitestAdapter {
             None => 180_000,
         }
     }
+}
+
+/// Parse vitest JSON reporter output from stdout.
+/// Returns None if stdout has no valid JSON or the JSON has no test results.
+fn parse_json_output(stdout: &str) -> Option<TestResult> {
+    let json_start = stdout.find('{')?;
+    let json_str = &stdout[json_start..];
+
+    let report: VitestReport = serde_json::from_str(json_str).ok()?;
+
+    // Valid JSON but empty testResults — don't treat as success, let caller try fallback
+    if report.test_results.is_empty()
+        && report.num_passed == 0
+        && report.num_failed == 0
+    {
+        return None;
+    }
+
+    let stack_re = regex::Regex::new(r"\(([^)]+\.(?:test|spec)\.\w+):(\d+):\d+\)").unwrap();
+    let mut failures = vec![];
+    let mut all_tests = vec![];
+    let mut total_duration_ms = 0u64;
+
+    for suite in &report.test_results {
+        for a in &suite.assertions {
+            let full_name = if !a.full_name.is_empty() {
+                a.full_name.clone()
+            } else {
+                let mut parts = a.ancestors.clone();
+                parts.push(a.title.clone());
+                parts.join(" ")
+            };
+
+            let duration_ms = a.duration.map(|d| d as u64).unwrap_or(0);
+            total_duration_ms += duration_ms;
+
+            let status = match a.status.as_str() {
+                "passed" => TestStatus::Pass,
+                "failed" => TestStatus::Fail,
+                "todo" | "pending" | "skipped" => TestStatus::Skip,
+                _ => TestStatus::Skip,
+            };
+
+            all_tests.push(TestDetail {
+                name: full_name.clone(),
+                status: status.clone(),
+                duration_ms,
+                stdout: None, stderr: None, message: None,
+            });
+
+            if matches!(status, TestStatus::Fail) {
+                let msg = a.failure_messages.first().cloned().unwrap_or_default();
+                let (file, line) = stack_re.captures(&msg)
+                    .map(|c| (Some(c[1].to_string()), c[2].parse().ok()))
+                    .unwrap_or((None, None));
+
+                failures.push(TestFailure {
+                    name: full_name,
+                    file,
+                    line,
+                    message: msg,
+                    rerun: None,
+                    suggested_traces: vec![],
+                });
+            }
+        }
+    }
+
+    Some(TestResult {
+        summary: TestSummary {
+            passed: report.num_passed,
+            failed: report.num_failed,
+            skipped: report.num_pending + report.num_todo,
+            stuck: None,
+            duration_ms: total_duration_ms,
+        },
+        failures,
+        stuck: vec![],
+        all_tests,
+    })
+}
+
+/// Build TestResult from STROBE_TEST: protocol events in stderr.
+/// Returns None if no STROBE_TEST events are found.
+fn parse_strobe_events(stderr: &str) -> Option<TestResult> {
+    let mut all_tests = vec![];
+    let mut failures = vec![];
+    let mut passed = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    let mut total_duration_ms = 0u64;
+
+    for segment in stderr.split("STROBE_TEST:") {
+        let json_str = segment.trim();
+        if json_str.is_empty() || !json_str.starts_with('{') {
+            continue;
+        }
+        let json_end = json_str.find('\n').unwrap_or(json_str.len());
+        let json = &json_str[..json_end];
+
+        let v: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let event = v.get("e").and_then(|e| e.as_str()).unwrap_or("");
+        let name = v.get("n").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let duration_ms = v.get("d").and_then(|d| d.as_f64()).map(|d| d as u64).unwrap_or(0);
+
+        let status = match event {
+            "pass" => { passed += 1; TestStatus::Pass }
+            "fail" => { failed += 1; TestStatus::Fail }
+            "skip" => { skipped += 1; TestStatus::Skip }
+            _ => continue, // module_start, module_end, start — not result events
+        };
+
+        total_duration_ms += duration_ms;
+
+        all_tests.push(TestDetail {
+            name: name.clone(),
+            status: status.clone(),
+            duration_ms,
+            stdout: None, stderr: None, message: None,
+        });
+
+        if matches!(status, TestStatus::Fail) {
+            failures.push(TestFailure {
+                name,
+                file: None,
+                line: None,
+                message: String::new(),
+                rerun: None,
+                suggested_traces: vec![],
+            });
+        }
+    }
+
+    if all_tests.is_empty() {
+        return None;
+    }
+
+    Some(TestResult {
+        summary: TestSummary { passed, failed, skipped, stuck: None, duration_ms: total_duration_ms },
+        failures,
+        stuck: vec![],
+        all_tests,
+    })
 }
 
 /// Progress updater for vitest/jest/bun. Parses STROBE_TEST: protocol events from the
@@ -640,5 +729,75 @@ mod tests {
         assert_eq!(count_occurrences("aaa", "a"), 3);
         assert_eq!(count_occurrences(r#""status":"passed","status":"passed""#, r#""status":"passed""#), 2);
         assert_eq!(count_occurrences("abab", "ab"), 2);
+    }
+
+    // --- STROBE_TEST fallback tests ---
+
+    #[test]
+    fn test_parse_output_falls_back_to_strobe_events_when_stdout_empty() {
+        let adapter = VitestAdapter;
+        let stderr = r#"
+STROBE_TEST:{"e":"module_start","n":"src/math.test.ts"}
+STROBE_TEST:{"e":"start","n":"Math adds"}
+STROBE_TEST:{"e":"pass","n":"Math adds","d":5}
+STROBE_TEST:{"e":"start","n":"Math subs"}
+STROBE_TEST:{"e":"pass","n":"Math subs","d":3}
+STROBE_TEST:{"e":"module_end","n":"src/math.test.ts","d":10}
+"#;
+        let result = adapter.parse_output("", stderr, 0);
+        assert_eq!(result.summary.passed, 2);
+        assert_eq!(result.summary.failed, 0);
+        assert_eq!(result.all_tests.len(), 2);
+        assert!(result.all_tests.iter().all(|t| t.status == TestStatus::Pass));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_parse_output_falls_back_with_mixed_results() {
+        let adapter = VitestAdapter;
+        let stderr = r#"
+STROBE_TEST:{"e":"pass","n":"test A","d":10}
+STROBE_TEST:{"e":"fail","n":"test B","d":5}
+STROBE_TEST:{"e":"skip","n":"test C"}
+"#;
+        let result = adapter.parse_output("", stderr, 1);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.summary.skipped, 1);
+        assert_eq!(result.all_tests.len(), 3);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].name, "test B");
+    }
+
+    #[test]
+    fn test_parse_output_prefers_json_over_strobe_events() {
+        let adapter = VitestAdapter;
+        // Both JSON stdout and STROBE_TEST events available — JSON wins
+        let stderr = "\nSTROBE_TEST:{\"e\":\"pass\",\"n\":\"extra test\",\"d\":1}\n";
+        let result = adapter.parse_output(PASS_JSON, stderr, 0);
+        assert_eq!(result.summary.passed, 2, "should use JSON counts, not STROBE_TEST");
+        assert_eq!(result.all_tests.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_output_no_json_no_strobe_events() {
+        let adapter = VitestAdapter;
+        let result = adapter.parse_output("", "some random stderr", 1);
+        assert!(result.all_tests.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].name.contains("crashed"));
+    }
+
+    #[test]
+    fn test_parse_strobe_events_ignores_non_result_events() {
+        let stderr = r#"
+STROBE_TEST:{"e":"module_start","n":"file.ts"}
+STROBE_TEST:{"e":"start","n":"test A"}
+STROBE_TEST:{"e":"pass","n":"test A","d":5}
+STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
+"#;
+        let result = parse_strobe_events(stderr).unwrap();
+        assert_eq!(result.all_tests.len(), 1, "only pass/fail/skip should produce test entries");
+        assert_eq!(result.summary.passed, 1);
     }
 }
