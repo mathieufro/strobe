@@ -88,6 +88,7 @@ impl TestAdapter for VitestAdapter {
             program: "npx".to_string(),
             args: vec![
                 "vitest".to_string(), "run".to_string(),
+                "--pool=threads".to_string(),
                 "--reporter=json".to_string(),
                 format!("--reporter={}", reporter_path),
                 "--no-coverage".to_string(),
@@ -102,6 +103,7 @@ impl TestAdapter for VitestAdapter {
             program: "npx".to_string(),
             args: vec![
                 "vitest".to_string(), "run".to_string(),
+                "--pool=threads".to_string(),
                 "--reporter=json".to_string(),
                 format!("--reporter={}", reporter_path),
                 "--no-coverage".to_string(),
@@ -205,6 +207,7 @@ fn build_custom_command(cmd: &str, test_name: Option<&str>) -> crate::Result<Tes
         // npm/bun/yarn run <script> — forward vitest flags via --
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
         args.push("--".to_string());
+        args.push("--pool=threads".to_string());
         args.push("--reporter=json".to_string());
         args.push(format!("--reporter={}", reporter_path));
         args.push("--no-coverage".to_string());
@@ -221,7 +224,10 @@ fn build_custom_command(cmd: &str, test_name: Option<&str>) -> crate::Result<Tes
         // Direct vitest/npx command — inject reporter flags
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
-        // Add reporter flags if not already present
+        // Force threads pool to avoid fork/exec which deadlocks with Frida's spawn gating
+        if !args.iter().any(|a| a.contains("--pool")) {
+            args.push("--pool=threads".to_string());
+        }
         if !args.iter().any(|a| a.contains("--reporter")) {
             args.push("--reporter=json".to_string());
             args.push(format!("--reporter={}", reporter_path));
@@ -638,6 +644,7 @@ mod tests {
         let adapter = VitestAdapter;
         let cmd = adapter.suite_command(dir.path(), None, &Default::default()).unwrap();
         assert!(cmd.args.iter().any(|a| a.contains("vitest")));
+        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should use threads pool to avoid Frida spawn gating deadlock");
         assert!(cmd.args.iter().any(|a| a.contains("json")), "should use json reporter");
         assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")),
             "should include custom reporter");
@@ -649,6 +656,7 @@ mod tests {
         let adapter = VitestAdapter;
         let cmd = adapter.single_test_command(dir.path(), "Math addition adds correctly").unwrap();
         assert!(cmd.args.iter().any(|a| a.contains("Math")));
+        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should use threads pool");
         assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")),
             "should include custom reporter");
     }
@@ -886,6 +894,7 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         assert!(cmd.args.contains(&"vitest".to_string()));
         assert!(cmd.args.contains(&"run".to_string()));
         assert!(cmd.args.contains(&"src/math.test.ts".to_string()));
+        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
         assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")));
     }
@@ -897,6 +906,7 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         assert!(cmd.args.contains(&"run".to_string()));
         assert!(cmd.args.contains(&"test:e2e".to_string()));
         assert!(cmd.args.contains(&"--".to_string()), "should have -- separator");
+        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
     }
 
@@ -907,6 +917,7 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         assert!(cmd.args.contains(&"run".to_string()));
         assert!(cmd.args.contains(&"test:e2e:server".to_string()));
         assert!(cmd.args.contains(&"--".to_string()));
+        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
     }
 
@@ -915,6 +926,7 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         let cmd = build_custom_command("bun run test", Some("my test name")).unwrap();
         assert!(cmd.args.contains(&"-t".to_string()));
         assert!(cmd.args.contains(&"my test name".to_string()));
+        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
     }
 
     #[test]
@@ -922,6 +934,16 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         let cmd = build_custom_command("npx vitest run", Some("my test")).unwrap();
         assert!(cmd.args.contains(&"-t".to_string()));
         assert!(cmd.args.contains(&"my test".to_string()));
+        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
+    }
+
+    #[test]
+    fn test_build_custom_command_respects_explicit_pool() {
+        // If user explicitly passes --pool=forks, don't override
+        let cmd = build_custom_command("npx vitest run --pool=forks", None).unwrap();
+        let pool_args: Vec<_> = cmd.args.iter().filter(|a| a.contains("--pool")).collect();
+        assert_eq!(pool_args.len(), 1, "should not duplicate pool flag");
+        assert_eq!(pool_args[0], "--pool=forks", "should keep user's explicit pool choice");
     }
 }
