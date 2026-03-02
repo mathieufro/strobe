@@ -8,7 +8,7 @@ pub mod capture;
 
 // COMP-3: Linux accessibility stub (AT-SPI not yet implemented)
 #[cfg(target_os = "linux")]
-mod accessibility_linux;
+pub mod accessibility_linux;
 
 #[cfg(target_os = "linux")]
 pub use accessibility_linux as accessibility;

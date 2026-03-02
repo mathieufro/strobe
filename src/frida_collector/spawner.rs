@@ -21,7 +21,7 @@ unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(),
         .to_str()
         .unwrap_or("unknown error")
         .to_string();
-    frida_sys::g_error_free(error);
+    frida_sys::_frida_g_error_free(error);
     Err(msg)
 }
 
