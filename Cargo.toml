@@ -49,6 +49,9 @@ regex = "1"
 # UI vision sidecar (base64 encoding for screenshots sent to Python sidecar)
 base64 = "0.22"
 
+# PNG encoding (shared by macOS capture.rs and Linux capture_linux.rs)
+png = "0.17"
+
 # Python support
 rustpython-parser = "0.4"
 walkdir = "2.5"
@@ -62,12 +65,14 @@ assert_cmd = "2"
 predicates = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# UI screenshot encoding (capture.rs is macOS-only)
-png = "0.17"
 accessibility-sys = "0.2"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 core-graphics = { version = "0.24", features = ["elcapitan", "highsierra"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi = { version = "0.29", features = ["proxies", "connection", "zbus"] }
+x11rb = { version = "0.13", features = ["xtest", "composite"] }
 
 [[bin]]
 name = "strobe"
