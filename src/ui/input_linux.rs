@@ -1,6 +1,9 @@
 //! Linux UI interaction via AT-SPI2 actions and X11 XTest input injection.
 
 use crate::mcp::{DebugUiActionRequest, DebugUiActionResponse};
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::*;
+use x11rb::protocol::xtest;
 
 /// Map key name to X11 keysym. Mirrors the ~50 key names from macOS input_mac.rs.
 fn key_name_to_keysym(name: &str) -> Option<u32> {
@@ -46,6 +49,89 @@ fn key_name_to_keysym(name: &str) -> Option<u32> {
         "super" | "command" | "cmd" | "meta" => Some(0xffeb), // XK_Super_L
         _ => None,
     }
+}
+
+/// Resolve keysym to keycode via the X11 keyboard mapping.
+fn keysym_to_keycode(
+    conn: &impl Connection,
+    keysym: u32,
+) -> Result<u8, String> {
+    let setup = conn.setup();
+    let min_kc = setup.min_keycode;
+    let max_kc = setup.max_keycode;
+
+    let mapping = conn
+        .get_keyboard_mapping(min_kc, max_kc - min_kc + 1)
+        .map_err(|e| format!("get_keyboard_mapping: {}", e))?
+        .reply()
+        .map_err(|e| format!("keyboard mapping reply: {}", e))?;
+
+    let syms_per_kc = mapping.keysyms_per_keycode as usize;
+    for kc in min_kc..=max_kc {
+        let offset = (kc - min_kc) as usize * syms_per_kc;
+        for col in 0..syms_per_kc {
+            if mapping.keysyms[offset + col] == keysym {
+                return Ok(kc);
+            }
+        }
+    }
+
+    Err(format!("No keycode found for keysym 0x{:x}", keysym))
+}
+
+/// Send a fake key press/release via XTest.
+fn xtest_key(
+    conn: &impl Connection,
+    keysym: u32,
+    press: bool,
+) -> Result<(), String> {
+    let keycode = keysym_to_keycode(conn, keysym)?;
+    let event_type = if press { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT };
+    xtest::fake_input(conn, event_type, keycode, 0, 0, 0, 0, 0)
+        .map_err(|e| format!("fake_input: {}", e))?
+        .check()
+        .map_err(|e| format!("fake_input check: {}", e))?;
+    conn.flush().map_err(|e| format!("flush: {}", e))?;
+    Ok(())
+}
+
+/// Send a fake mouse button press/release via XTest.
+fn xtest_button(
+    conn: &impl Connection,
+    button: u8,
+    press: bool,
+    x: i16,
+    y: i16,
+    root: u32,
+) -> Result<(), String> {
+    // Move to position first
+    xtest::fake_input(conn, MOTION_NOTIFY_EVENT, 0, 0, root, x, y, 0)
+        .map_err(|e| format!("motion: {}", e))?
+        .check()
+        .map_err(|e| format!("motion check: {}", e))?;
+
+    let event_type = if press { BUTTON_PRESS_EVENT } else { BUTTON_RELEASE_EVENT };
+    xtest::fake_input(conn, event_type, button, 0, root, 0, 0, 0)
+        .map_err(|e| format!("button: {}", e))?
+        .check()
+        .map_err(|e| format!("button check: {}", e))?;
+    conn.flush().map_err(|e| format!("flush: {}", e))?;
+    Ok(())
+}
+
+/// Move the mouse pointer via XTest.
+fn xtest_motion(
+    conn: &impl Connection,
+    x: i16,
+    y: i16,
+    root: u32,
+) -> Result<(), String> {
+    xtest::fake_input(conn, MOTION_NOTIFY_EVENT, 0, 0, root, x, y, 0)
+        .map_err(|e| format!("motion: {}", e))?
+        .check()
+        .map_err(|e| format!("motion check: {}", e))?;
+    conn.flush().map_err(|e| format!("flush: {}", e))?;
+    Ok(())
 }
 
 pub async fn execute_action(
