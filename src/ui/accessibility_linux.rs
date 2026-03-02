@@ -54,6 +54,41 @@ fn map_atspi_action(action: &str) -> String {
     }
 }
 
+/// Validate that the target PID is owned by the current user.
+fn validate_pid_ownership(pid: u32) -> crate::Result<()> {
+    let status_path = format!("/proc/{}/status", pid);
+    let content = std::fs::read_to_string(&status_path).map_err(|_| {
+        crate::Error::UiQueryFailed(format!(
+            "Cannot read /proc/{}/status — process may not exist",
+            pid
+        ))
+    })?;
+
+    let my_euid = unsafe { libc::geteuid() };
+
+    for line in content.lines() {
+        if let Some(uid_str) = line.strip_prefix("Uid:") {
+            let fields: Vec<&str> = uid_str.split_whitespace().collect();
+            if let Some(real_uid_str) = fields.first() {
+                if let Ok(real_uid) = real_uid_str.parse::<u32>() {
+                    if real_uid != my_euid && my_euid != 0 {
+                        return Err(crate::Error::UiQueryFailed(format!(
+                            "Permission denied: process {} is owned by another user",
+                            pid
+                        )));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(crate::Error::UiQueryFailed(format!(
+        "Cannot determine UID for process {}",
+        pid
+    )))
+}
+
 /// Check if AT-SPI2 bus is available.
 pub fn is_available() -> bool {
     std::process::Command::new("dbus-send")
@@ -153,5 +188,17 @@ mod tests {
     #[test]
     fn test_action_name_mapping_unknown_passthrough() {
         assert_eq!(map_atspi_action("custom-action"), "atspi:custom-action");
+    }
+
+    #[test]
+    fn test_validate_pid_ownership_self() {
+        let pid = std::process::id();
+        assert!(validate_pid_ownership(pid).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pid_ownership_nonexistent() {
+        let result = validate_pid_ownership(999999);
+        assert!(result.is_err());
     }
 }
