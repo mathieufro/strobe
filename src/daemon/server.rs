@@ -29,7 +29,6 @@ pub struct Daemon {
     /// Signaled by idle_timeout_loop to tell the accept loop to exit
     shutdown_signal: Arc<tokio::sync::Notify>,
     /// Vision sidecar for UI element detection
-    #[cfg(target_os = "macos")]
     vision_sidecar: Arc<std::sync::Mutex<crate::ui::vision::VisionSidecar>>,
 }
 
@@ -259,7 +258,6 @@ impl Daemon {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(target_os = "macos")]
             vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
         });
 
@@ -330,7 +328,6 @@ impl Daemon {
             tokio::time::sleep(Duration::from_secs(60)).await;
 
             // Check vision sidecar idle timeout
-            #[cfg(target_os = "macos")]
             {
                 let settings = crate::config::resolve(None);
                 if let Ok(mut sidecar) = self.vision_sidecar.lock() {
@@ -369,7 +366,6 @@ impl Daemon {
         }
 
         // Phase 4: Shutdown vision sidecar if running
-        #[cfg(target_os = "macos")]
         {
             if let Ok(mut sidecar) = self.vision_sidecar.lock() {
                 sidecar.shutdown();
@@ -2334,139 +2330,130 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         // Query AX tree
         if needs_tree {
+            let pid = session.pid;
+
             #[cfg(target_os = "macos")]
-            {
-                let pid = session.pid;
-                let nodes = tokio::task::spawn_blocking(move || {
-                    crate::ui::accessibility::query_ax_tree(pid)
-                }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
+            let nodes = tokio::task::spawn_blocking(move || {
+                crate::ui::accessibility::query_ax_tree(pid)
+            }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
 
-                ax_count = crate::ui::tree::count_nodes(&nodes);
+            #[cfg(target_os = "linux")]
+            let nodes = crate::ui::accessibility::query_ax_tree(pid).await?;
 
-                // Run vision pipeline if requested and enabled
-                let mut final_nodes = nodes;
-                if vision_requested {
-                    let settings = crate::config::resolve(None);
-                    if !settings.vision_enabled {
-                        return Err(crate::Error::UiQueryFailed(
-                            "Vision pipeline requested but not enabled. Set vision.enabled=true in ~/.strobe/settings.json".to_string()
-                        ));
-                    }
+            ax_count = crate::ui::tree::count_nodes(&nodes);
 
-                    // SEC-8: Rate limit vision calls to prevent GPU/CPU exhaustion
-                    // Allow 1 call per second per session
-                    {
-                        use std::sync::{Mutex, OnceLock};
-                        static LAST_VISION_CALL: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>>
-                            = OnceLock::new();
-
-                        let now = std::time::Instant::now();
-                        let rate_limiter = LAST_VISION_CALL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-                        let mut last_calls = rate_limiter.lock().unwrap();
-                        // Prune entries older than 60s to prevent unbounded growth
-                        last_calls.retain(|_, last| now.duration_since(*last) < std::time::Duration::from_secs(60));
-                        if let Some(last_time) = last_calls.get(&req.session_id) {
-                            let elapsed = now.duration_since(*last_time);
-                            if elapsed < std::time::Duration::from_secs(1) {
-                                return Err(crate::Error::UiQueryFailed(
-                                    format!("Vision rate limit exceeded. Please wait {:.1}s before next call.",
-                                        1.0 - elapsed.as_secs_f64())
-                                ));
-                            }
-                        }
-                        last_calls.insert(req.session_id.clone(), now);
-                    } // Lock guard dropped here, before any await points
-
-                    // Capture screenshot for vision
-                    let screenshot_b64 = {
-                        let pid = session.pid;
-                        let png_bytes = tokio::task::spawn_blocking(move || {
-                            crate::ui::capture::capture_window_screenshot(pid)
-                        }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
-
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.encode(&png_bytes)
-                    };
-
-                    // Run vision detection
-                    let vision_elements = {
-                        let mut sidecar = self.vision_sidecar.lock().unwrap();
-                        sidecar.detect(
-                            &screenshot_b64,
-                            settings.vision_confidence_threshold,
-                            settings.vision_iou_merge_threshold,
-                        )?
-                    };
-
-                    // COMP-1: Merge vision into tree and capture accurate stats
-                    let (actual_merged, actual_added) = crate::ui::merge::merge_vision_into_tree(
-                        &mut final_nodes,
-                        &vision_elements,
-                        settings.vision_iou_merge_threshold as f64,
-                    );
-
-                    // Stats semantics:
-                    // - vision_nodes: total vision elements added (pure vision nodes)
-                    // - merged_nodes: AX nodes enhanced with vision data
-                    vision_count = actual_added;
-                    merged_count = actual_merged;
+            // Run vision pipeline if requested and enabled
+            let mut final_nodes = nodes;
+            if vision_requested {
+                let settings = crate::config::resolve(None);
+                if !settings.vision_enabled {
+                    return Err(crate::Error::UiQueryFailed(
+                        "Vision pipeline requested but not enabled. Set vision.enabled=true in ~/.strobe/settings.json".to_string()
+                    ));
                 }
 
-                tree_output = Some(if verbose {
-                    crate::ui::tree::format_json(&final_nodes)?
-                } else {
-                    crate::ui::tree::format_compact(&final_nodes)
-                });
+                // SEC-8: Rate limit vision calls to prevent GPU/CPU exhaustion
+                // Allow 1 call per second per session
+                {
+                    use std::sync::{Mutex, OnceLock};
+                    static LAST_VISION_CALL: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>>
+                        = OnceLock::new();
+
+                    let now = std::time::Instant::now();
+                    let rate_limiter = LAST_VISION_CALL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+                    let mut last_calls = rate_limiter.lock().unwrap();
+                    // Prune entries older than 60s to prevent unbounded growth
+                    last_calls.retain(|_, last| now.duration_since(*last) < std::time::Duration::from_secs(60));
+                    if let Some(last_time) = last_calls.get(&req.session_id) {
+                        let elapsed = now.duration_since(*last_time);
+                        if elapsed < std::time::Duration::from_secs(1) {
+                            return Err(crate::Error::UiQueryFailed(
+                                format!("Vision rate limit exceeded. Please wait {:.1}s before next call.",
+                                    1.0 - elapsed.as_secs_f64())
+                            ));
+                        }
+                    }
+                    last_calls.insert(req.session_id.clone(), now);
+                } // Lock guard dropped here, before any await points
+
+                // Capture screenshot for vision
+                let screenshot_b64 = {
+                    let pid = session.pid;
+                    let png_bytes = tokio::task::spawn_blocking(move || {
+                        crate::ui::capture::capture_window_screenshot(pid)
+                    }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
+
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode(&png_bytes)
+                };
+
+                // Run vision detection
+                let vision_elements = {
+                    let mut sidecar = self.vision_sidecar.lock().unwrap();
+                    sidecar.detect(
+                        &screenshot_b64,
+                        settings.vision_confidence_threshold,
+                        settings.vision_iou_merge_threshold,
+                    )?
+                };
+
+                // COMP-1: Merge vision into tree and capture accurate stats
+                let (actual_merged, actual_added) = crate::ui::merge::merge_vision_into_tree(
+                    &mut final_nodes,
+                    &vision_elements,
+                    settings.vision_iou_merge_threshold as f64,
+                );
+
+                // Stats semantics:
+                // - vision_nodes: total vision elements added (pure vision nodes)
+                // - merged_nodes: AX nodes enhanced with vision data
+                vision_count = actual_added;
+                merged_count = actual_merged;
             }
 
-            #[cfg(not(target_os = "macos"))]
-            {
-                return Err(crate::Error::UiNotAvailable(
-                    "UI observation is only supported on macOS".to_string()
-                ));
-            }
+            tree_output = Some(if verbose {
+                crate::ui::tree::format_json(&final_nodes)?
+            } else {
+                crate::ui::tree::format_compact(&final_nodes)
+            });
         }
 
         // Capture screenshot as base64 PNG
         if needs_screenshot {
-            #[cfg(target_os = "macos")]
-            {
-                let pid = session.pid;
-                let element_bounds = if let Some(ref target_id) = req.id {
-                    // Resolve element bounds from AX tree
-                    let target_id = target_id.clone();
-                    let nodes = tokio::task::spawn_blocking(move || {
-                        crate::ui::accessibility::query_ax_tree(pid)
-                    }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
-                    let node = crate::ui::tree::find_node_by_id(&nodes, &target_id)
-                        .ok_or_else(|| crate::Error::UiQueryFailed(
-                            format!("Element '{}' not found. Use debug_ui with mode=tree to see current element IDs.", target_id)
-                        ))?;
-                    Some(node.bounds.ok_or_else(|| crate::Error::UiQueryFailed(
-                        format!("Element '{}' has no bounds (may be off-screen or invisible)", target_id)
-                    ))?)
+            let pid = session.pid;
+            let element_bounds = if let Some(ref target_id) = req.id {
+                // Resolve element bounds from AX tree
+                let target_id = target_id.clone();
+
+                #[cfg(target_os = "macos")]
+                let nodes = tokio::task::spawn_blocking(move || {
+                    crate::ui::accessibility::query_ax_tree(pid)
+                }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
+
+                #[cfg(target_os = "linux")]
+                let nodes = crate::ui::accessibility::query_ax_tree(pid).await?;
+
+                let node = crate::ui::tree::find_node_by_id(&nodes, &target_id)
+                    .ok_or_else(|| crate::Error::UiQueryFailed(
+                        format!("Element '{}' not found. Use debug_ui with mode=tree to see current element IDs.", target_id)
+                    ))?;
+                Some(node.bounds.ok_or_else(|| crate::Error::UiQueryFailed(
+                    format!("Element '{}' has no bounds (may be off-screen or invisible)", target_id)
+                ))?)
+            } else {
+                None
+            };
+
+            let png_bytes = tokio::task::spawn_blocking(move || {
+                if let Some(bounds) = element_bounds {
+                    crate::ui::capture::capture_element_screenshot(pid, &bounds)
                 } else {
-                    None
-                };
+                    crate::ui::capture::capture_window_screenshot(pid)
+                }
+            }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
 
-                let png_bytes = tokio::task::spawn_blocking(move || {
-                    if let Some(bounds) = element_bounds {
-                        crate::ui::capture::capture_element_screenshot(pid, &bounds)
-                    } else {
-                        crate::ui::capture::capture_window_screenshot(pid)
-                    }
-                }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
-
-                use base64::Engine;
-                screenshot_output = Some(base64::engine::general_purpose::STANDARD.encode(&png_bytes));
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                return Err(crate::Error::UiNotAvailable(
-                    "Screenshot capture is only supported on macOS".to_string()
-                ));
-            }
+            use base64::Engine;
+            screenshot_output = Some(base64::engine::general_purpose::STANDARD.encode(&png_bytes));
         }
 
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -2542,7 +2529,6 @@ mod tests {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(target_os = "macos")]
             vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
         };
 
@@ -2818,7 +2804,6 @@ mod tests {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(target_os = "macos")]
             vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
         };
 
