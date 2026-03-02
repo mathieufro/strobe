@@ -2,11 +2,24 @@ use crate::mcp::DebugUiActionRequest;
 use crate::mcp::DebugUiActionResponse;
 use crate::ui::tree::Rect;
 
-/// Modifier flag constants (match CGEventFlags bit positions).
+/// Modifier flag constants.
+#[cfg(target_os = "macos")]
 pub const MOD_SHIFT: u64 = 0x00020000; // kCGEventFlagMaskShift
+#[cfg(target_os = "macos")]
 pub const MOD_CONTROL: u64 = 0x00040000; // kCGEventFlagMaskControl
+#[cfg(target_os = "macos")]
 pub const MOD_ALTERNATE: u64 = 0x00080000; // kCGEventFlagMaskAlternate
+#[cfg(target_os = "macos")]
 pub const MOD_COMMAND: u64 = 0x00100000; // kCGEventFlagMaskCommand
+
+#[cfg(target_os = "linux")]
+pub const MOD_SHIFT: u64 = 0x1; // X11 ShiftMask
+#[cfg(target_os = "linux")]
+pub const MOD_CONTROL: u64 = 0x4; // X11 ControlMask
+#[cfg(target_os = "linux")]
+pub const MOD_ALTERNATE: u64 = 0x8; // X11 Mod1Mask (Alt)
+#[cfg(target_os = "linux")]
+pub const MOD_COMMAND: u64 = 0x40; // X11 Mod4Mask (Super/Meta)
 
 /// Compute center point of an element's bounding box.
 pub fn element_center(bounds: &Rect) -> (f64, f64) {
@@ -130,6 +143,19 @@ mod tests {
     fn test_modifier_flags_empty() {
         let flags = modifier_string_to_flags(&[]);
         assert_eq!(flags, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_modifier_flags_linux_values() {
+        let shift = modifier_string_to_flags(&["shift".to_string()]);
+        assert_eq!(shift, 0x1);
+        let ctrl = modifier_string_to_flags(&["ctrl".to_string()]);
+        assert_eq!(ctrl, 0x4);
+        let alt = modifier_string_to_flags(&["alt".to_string()]);
+        assert_eq!(alt, 0x8);
+        let cmd = modifier_string_to_flags(&["cmd".to_string()]);
+        assert_eq!(cmd, 0x40);
     }
 
     #[test]
