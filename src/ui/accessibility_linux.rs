@@ -116,6 +116,11 @@ pub fn check_accessibility_permission(_prompt: bool) -> bool {
     is_available()
 }
 
+/// Connect to the AT-SPI2 bus. Internal variant exposed for input_linux.
+pub(crate) async fn connect_internal() -> Result<atspi::AccessibilityConnection> {
+    connect().await
+}
+
 /// Connect to the AT-SPI2 bus.
 async fn connect() -> Result<atspi::AccessibilityConnection> {
     atspi::AccessibilityConnection::new().await.map_err(|e| {
