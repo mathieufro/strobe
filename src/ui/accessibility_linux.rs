@@ -3,9 +3,11 @@
 use crate::ui::tree::{generate_id, Rect, UiNode, NodeSource};
 use crate::Result;
 use atspi::proxy::accessible::ObjectRefExt;
+use std::time::Duration;
 
 const MAX_AX_DEPTH: usize = 50;
 const MAX_AX_NODES: usize = 10_000;
+const DBUS_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Map AT-SPI2 role to macOS AX-style role for cross-platform consistency.
 fn map_atspi_role(role: atspi::Role) -> String {
@@ -56,6 +58,16 @@ pub(crate) fn map_atspi_action(action: &str) -> String {
         "expand or contract" => "AXPress".into(),
         other => format!("atspi:{}", other),
     }
+}
+
+/// Classify a D-Bus/zbus error as a peer disconnect (app exited mid-query).
+fn is_peer_disconnected(err: &dyn std::fmt::Display) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("peer disconnected")
+        || msg.contains("connection closed")
+        || msg.contains("name has no owner")
+        || msg.contains("service unknown")
+        || msg.contains("broken pipe")
 }
 
 /// Validate that the target PID is owned by the current user.
@@ -137,15 +149,31 @@ async fn connect() -> Result<atspi::AccessibilityConnection> {
 pub async fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
     validate_pid_ownership(pid)?;
 
+    match tokio::time::timeout(DBUS_TIMEOUT, query_ax_tree_inner(pid)).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::Error::UiQueryFailed(format!(
+            "AT-SPI2 query timed out for PID {}. The application may be unresponsive.",
+            pid
+        ))),
+    }
+}
+
+async fn query_ax_tree_inner(pid: u32) -> Result<Vec<UiNode>> {
     let connection = connect().await?;
     let conn = connection.connection();
 
     // Get registry root and enumerate applications
     let root = connection.root_accessible_on_registry().await.map_err(|e| {
+        if is_peer_disconnected(&e) {
+            return crate::Error::UiQueryFailed("Process exited during query".into());
+        }
         crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
     })?;
 
     let app_refs = root.get_children().await.map_err(|e| {
+        if is_peer_disconnected(&e) {
+            return crate::Error::UiQueryFailed("Process exited during query".into());
+        }
         crate::Error::UiQueryFailed(format!("Failed to enumerate AT-SPI2 applications: {}", e))
     })?;
 
@@ -185,14 +213,20 @@ pub async fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
     let app = target_proxy.ok_or_else(|| {
         crate::Error::UiQueryFailed(format!(
             "No AT-SPI2 accessible found for PID {}. \
-             The application may not support accessibility (GTK, Qt, Electron apps do).",
+             The application may not support accessibility (GTK, Qt, Electron apps do). \
+             For Electron apps, launch with --force-renderer-accessibility.",
             pid
         ))
     })?;
 
     // Walk the tree from the application root
     let mut node_count = 0;
-    let child_refs = app.get_children().await.unwrap_or_default();
+    let child_refs = app.get_children().await.map_err(|e| {
+        if is_peer_disconnected(&e) {
+            return crate::Error::UiQueryFailed("Process exited during query".into());
+        }
+        crate::Error::UiQueryFailed(format!("Failed to read application children: {}", e))
+    })?;
 
     let mut windows = Vec::new();
     for (i, child_ref) in child_refs.iter().enumerate() {
@@ -395,14 +429,34 @@ pub async fn find_element_by_id(
 ) -> Result<Option<FindResult>> {
     validate_pid_ownership(pid)?;
 
+    let target_owned = target_id.to_string();
+    match tokio::time::timeout(DBUS_TIMEOUT, find_element_by_id_inner(pid, &target_owned)).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::Error::UiQueryFailed(format!(
+            "AT-SPI2 query timed out for PID {}. The application may be unresponsive.",
+            pid
+        ))),
+    }
+}
+
+async fn find_element_by_id_inner(
+    pid: u32,
+    target_id: &str,
+) -> Result<Option<FindResult>> {
     let connection = connect().await?;
     let conn = connection.connection();
 
     let root = connection.root_accessible_on_registry().await.map_err(|e| {
+        if is_peer_disconnected(&e) {
+            return crate::Error::UiQueryFailed("Process exited during query".into());
+        }
         crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
     })?;
 
     let app_refs = root.get_children().await.map_err(|e| {
+        if is_peer_disconnected(&e) {
+            return crate::Error::UiQueryFailed("Process exited during query".into());
+        }
         crate::Error::UiQueryFailed(format!("Failed to enumerate apps: {}", e))
     })?;
 
@@ -598,5 +652,29 @@ mod tests {
     fn test_validate_pid_ownership_nonexistent() {
         let result = validate_pid_ownership(999999);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_pid_ownership_pid1_non_root() {
+        // PID 1 (init) is owned by root — non-root users should be rejected
+        let my_euid = unsafe { libc::geteuid() };
+        let result = validate_pid_ownership(1);
+        if my_euid == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(err_msg.contains("Permission denied") || err_msg.contains("another user"));
+        }
+    }
+
+    #[test]
+    fn test_is_peer_disconnected_detection() {
+        assert!(is_peer_disconnected(&"peer disconnected"));
+        assert!(is_peer_disconnected(&"Connection closed by peer"));
+        assert!(is_peer_disconnected(&"org.freedesktop.DBus.Error.ServiceUnknown: name has no owner"));
+        assert!(is_peer_disconnected(&"Broken pipe"));
+        assert!(!is_peer_disconnected(&"some other error"));
+        assert!(!is_peer_disconnected(&"timeout expired"));
     }
 }
