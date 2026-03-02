@@ -6,12 +6,18 @@ pub mod accessibility;
 #[cfg(target_os = "macos")]
 pub mod capture;
 
-// COMP-3: Linux accessibility stub (AT-SPI not yet implemented)
+// COMP-3: Linux accessibility via AT-SPI2
 #[cfg(target_os = "linux")]
 pub mod accessibility_linux;
 
 #[cfg(target_os = "linux")]
 pub use accessibility_linux as accessibility;
+
+#[cfg(target_os = "linux")]
+pub mod capture_linux;
+
+#[cfg(target_os = "linux")]
+pub use capture_linux as capture;
 
 pub mod vision;
 pub mod merge;
