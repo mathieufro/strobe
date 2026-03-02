@@ -128,13 +128,8 @@ pub fn check_accessibility_permission(_prompt: bool) -> bool {
     is_available()
 }
 
-/// Connect to the AT-SPI2 bus. Internal variant exposed for input_linux.
-pub(crate) async fn connect_internal() -> Result<atspi::AccessibilityConnection> {
-    connect().await
-}
-
 /// Connect to the AT-SPI2 bus.
-async fn connect() -> Result<atspi::AccessibilityConnection> {
+pub(crate) async fn connect() -> Result<atspi::AccessibilityConnection> {
     atspi::AccessibilityConnection::new().await.map_err(|e| {
         crate::Error::UiNotAvailable(format!(
             "AT-SPI2 accessibility bus not available: {}. \
@@ -429,8 +424,7 @@ pub async fn find_element_by_id(
 ) -> Result<Option<FindResult>> {
     validate_pid_ownership(pid)?;
 
-    let target_owned = target_id.to_string();
-    match tokio::time::timeout(DBUS_TIMEOUT, find_element_by_id_inner(pid, &target_owned)).await {
+    match tokio::time::timeout(DBUS_TIMEOUT, find_element_by_id_inner(pid, target_id)).await {
         Ok(result) => result,
         Err(_) => Err(crate::Error::UiQueryFailed(format!(
             "AT-SPI2 query timed out for PID {}. The application may be unresponsive.",

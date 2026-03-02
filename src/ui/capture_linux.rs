@@ -265,13 +265,8 @@ pub fn capture_window_screenshot(pid: u32) -> Result<Vec<u8>> {
     let stride = if h > 0 { image.data.len() / h } else { 0 };
 
     let rgba = match depth {
-        24 | 32 if image.data.len() >= w * h * 4 => {
-            if depth == 24 {
-                bgrx_to_rgba(&image.data, w, h, stride)
-            } else {
-                bgra_to_rgba(&image.data, w, h, stride)
-            }
-        }
+        24 if image.data.len() >= w * h * 4 => bgrx_to_rgba(&image.data, w, h, stride),
+        32 if image.data.len() >= w * h * 4 => bgra_to_rgba(&image.data, w, h, stride),
         _ => {
             return Err(crate::Error::UiQueryFailed(format!(
                 "Unsupported pixel depth: {}", depth

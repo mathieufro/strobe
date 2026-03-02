@@ -328,11 +328,9 @@ impl Daemon {
             tokio::time::sleep(Duration::from_secs(60)).await;
 
             // Check vision sidecar idle timeout
-            {
-                let settings = crate::config::resolve(None);
-                if let Ok(mut sidecar) = self.vision_sidecar.lock() {
-                    sidecar.check_idle_timeout(settings.vision_sidecar_idle_timeout_seconds);
-                }
+            let settings = crate::config::resolve(None);
+            if let Ok(mut sidecar) = self.vision_sidecar.lock() {
+                sidecar.check_idle_timeout(settings.vision_sidecar_idle_timeout_seconds);
             }
 
             let last = *self.last_activity.read().await;
@@ -366,10 +364,8 @@ impl Daemon {
         }
 
         // Phase 4: Shutdown vision sidecar if running
-        {
-            if let Ok(mut sidecar) = self.vision_sidecar.lock() {
-                sidecar.shutdown();
-            }
+        if let Ok(mut sidecar) = self.vision_sidecar.lock() {
+            sidecar.shutdown();
         }
 
         self.cleanup();
