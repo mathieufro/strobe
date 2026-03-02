@@ -621,4 +621,86 @@ mod tests {
     fn test_key_name_unknown() {
         assert_eq!(key_name_to_keysym("nonexistent"), None);
     }
+
+    #[test]
+    fn test_key_name_case_insensitive() {
+        assert_eq!(key_name_to_keysym("Return"), Some(0xff0d));
+        assert_eq!(key_name_to_keysym("ESCAPE"), Some(0xff1b));
+        assert_eq!(key_name_to_keysym("Tab"), Some(0xff09));
+        assert_eq!(key_name_to_keysym("F1"), Some(0xffbe));
+    }
+
+    #[test]
+    fn test_key_name_f13_out_of_range() {
+        assert_eq!(key_name_to_keysym("f13"), None);
+        assert_eq!(key_name_to_keysym("f0"), None);
+    }
+
+    // Action validation tests — these verify the argument checking in execute_action
+    // without needing X11 or AT-SPI2 connections.
+
+    fn make_req(action: UiActionType) -> DebugUiActionRequest {
+        DebugUiActionRequest {
+            session_id: String::new(),
+            action,
+            id: None,
+            key: None,
+            modifiers: None,
+            text: None,
+            value: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_click_requires_element_id() {
+        let req = make_req(UiActionType::Click);
+        let result = execute_action(std::process::id(), &req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_scroll_requires_element_id() {
+        let mut req = make_req(UiActionType::Scroll);
+        req.direction = Some(ScrollDirection::Down);
+        req.amount = Some(3);
+        let result = execute_action(std::process::id(), &req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_type_requires_element_id() {
+        let mut req = make_req(UiActionType::Type);
+        req.text = Some("hello".into());
+        let result = execute_action(std::process::id(), &req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_drag_requires_element_id() {
+        let mut req = make_req(UiActionType::Drag);
+        req.to_id = Some("dest_1234".into());
+        let result = execute_action(std::process::id(), &req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_unknown_key() {
+        let mut req = make_req(UiActionType::Key);
+        req.key = Some("nonexistent_key_xyz".into());
+        let result = execute_action(std::process::id(), &req).await;
+        // Should fail with "Unknown key" if X11 is available, or with X11 error if not
+        assert!(result.is_err());
+    }
 }

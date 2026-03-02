@@ -6,6 +6,7 @@ use x11rb::protocol::xproto::*;
 
 const MAX_IMAGE_WIDTH: u32 = 3840;
 const MAX_IMAGE_HEIGHT: u32 = 2160;
+const DEFAULT_DPI: f64 = 96.0;
 
 /// Convert BGRX pixel data (depth 24, bpp 32) to RGBA.
 /// The X byte is ignored and alpha is set to 255.
@@ -66,6 +67,53 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
             .map_err(|e| crate::Error::Internal(format!("PNG data: {}", e)))?;
     }
     Ok(buf)
+}
+
+/// Detect X11 HiDPI scale factor from the RESOURCE_MANAGER property (Xft.dpi).
+/// Returns 1.0 if no scaling is detected or the property cannot be read.
+/// XWayland windows use X11 coordinates while AT-SPI2 reports screen coordinates
+/// that may differ under HiDPI scaling.
+fn get_x11_scale_factor(conn: &impl Connection, screen: &Screen) -> f64 {
+    let resource_manager = match conn.intern_atom(false, b"RESOURCE_MANAGER") {
+        Ok(cookie) => match cookie.reply() {
+            Ok(reply) => reply.atom,
+            Err(_) => return 1.0,
+        },
+        Err(_) => return 1.0,
+    };
+
+    let reply = match conn.get_property(
+        false,
+        screen.root,
+        resource_manager,
+        AtomEnum::STRING,
+        0,
+        16384,
+    ) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(r) => r,
+            Err(_) => return 1.0,
+        },
+        Err(_) => return 1.0,
+    };
+
+    let resources = match std::str::from_utf8(&reply.value) {
+        Ok(s) => s,
+        Err(_) => return 1.0,
+    };
+
+    for line in resources.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Xft.dpi:") {
+            if let Ok(dpi) = rest.trim().parse::<f64>() {
+                if dpi > 0.0 {
+                    return dpi / DEFAULT_DPI;
+                }
+            }
+        }
+    }
+
+    1.0
 }
 
 struct WindowInfo {
@@ -294,12 +342,16 @@ pub fn capture_element_screenshot(
         }
     };
 
-    // Compute crop coordinates relative to window origin
-    // Element bounds are in screen coordinates, window has (x, y) screen offset
-    let crop_x = ((element_bounds.x - win.x as f64).round().max(0.0) as usize).min(w.saturating_sub(1));
-    let crop_y = ((element_bounds.y - win.y as f64).round().max(0.0) as usize).min(h.saturating_sub(1));
-    let crop_w = (element_bounds.w.round() as usize).min(w - crop_x);
-    let crop_h = (element_bounds.h.round() as usize).min(h - crop_y);
+    // Detect HiDPI scale factor — AT-SPI2 reports screen coordinates which may
+    // differ from X11 window coordinates under XWayland scaling.
+    let scale = get_x11_scale_factor(&conn, screen);
+
+    // Compute crop coordinates relative to window origin, adjusting for scale factor.
+    // AT-SPI2 bounds are in logical (screen) coords; X11 image is in physical (pixel) coords.
+    let crop_x = (((element_bounds.x - win.x as f64) * scale).round().max(0.0) as usize).min(w.saturating_sub(1));
+    let crop_y = (((element_bounds.y - win.y as f64) * scale).round().max(0.0) as usize).min(h.saturating_sub(1));
+    let crop_w = ((element_bounds.w * scale).round() as usize).min(w - crop_x);
+    let crop_h = ((element_bounds.h * scale).round() as usize).min(h - crop_y);
 
     if crop_w == 0 || crop_h == 0 {
         return Err(crate::Error::UiQueryFailed(
@@ -376,5 +428,56 @@ mod tests {
         let rgba = vec![0xFF; 4];
         let result = encode_png(&rgba, 2, 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bgrx_to_rgba_zero_dimensions() {
+        let rgba = bgrx_to_rgba(&[], 0, 0, 0);
+        assert!(rgba.is_empty());
+    }
+
+    #[test]
+    fn test_bgra_to_rgba_zero_dimensions() {
+        let rgba = bgra_to_rgba(&[], 0, 0, 0);
+        assert!(rgba.is_empty());
+    }
+
+    #[test]
+    fn test_encode_png_zero_dimensions() {
+        // 0x0 image with empty data should fail (checked_mul returns Some(0),
+        // and the png encoder rejects 0-dimension images)
+        let result = encode_png(&[], 0, 0);
+        // Either succeeds with degenerate PNG or fails — both are acceptable
+        // The important thing is no panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_encode_png_zero_width_nonzero_height() {
+        let result = encode_png(&[], 0, 10);
+        let _ = result; // no panic
+    }
+
+    #[test]
+    fn test_crop_coordinates_negative_offset_clamped() {
+        // Simulate element bounds to the left/above the window origin.
+        // The .max(0.0) clamp prevents usize underflow.
+        let element_x: f64 = 50.0;
+        let win_x: f64 = 100.0; // window is to the right of element
+        let scale = 1.0;
+
+        let crop_x = (((element_x - win_x) * scale).round().max(0.0) as usize).min(100);
+        assert_eq!(crop_x, 0, "negative offset should clamp to 0");
+    }
+
+    #[test]
+    fn test_crop_coordinates_with_hidpi_scale() {
+        let element_x: f64 = 200.0;
+        let win_x: f64 = 100.0;
+        let scale = 2.0; // 2x HiDPI
+        let w: usize = 1920;
+
+        let crop_x = (((element_x - win_x) * scale).round().max(0.0) as usize).min(w.saturating_sub(1));
+        assert_eq!(crop_x, 200, "100 logical pixels * 2x scale = 200 physical pixels");
     }
 }
