@@ -1,7 +1,11 @@
 //! Linux accessibility via AT-SPI2 (D-Bus).
 
-use crate::ui::tree::UiNode;
+use crate::ui::tree::{generate_id, Rect, UiNode, NodeSource};
 use crate::Result;
+use atspi::proxy::accessible::ObjectRefExt;
+
+const MAX_AX_DEPTH: usize = 50;
+const MAX_AX_NODES: usize = 10_000;
 
 /// Map AT-SPI2 role to macOS AX-style role for cross-platform consistency.
 fn map_atspi_role(role: atspi::Role) -> String {
@@ -46,7 +50,7 @@ fn map_atspi_role(role: atspi::Role) -> String {
 }
 
 /// Map AT-SPI2 action name to macOS AX-style action name.
-fn map_atspi_action(action: &str) -> String {
+pub(crate) fn map_atspi_action(action: &str) -> String {
     match action {
         "click" | "press" | "activate" | "toggle" => "AXPress".into(),
         "expand or contract" => "AXPress".into(),
@@ -112,11 +116,400 @@ pub fn check_accessibility_permission(_prompt: bool) -> bool {
     is_available()
 }
 
+/// Connect to the AT-SPI2 bus.
+async fn connect() -> Result<atspi::AccessibilityConnection> {
+    atspi::AccessibilityConnection::new().await.map_err(|e| {
+        crate::Error::UiNotAvailable(format!(
+            "AT-SPI2 accessibility bus not available: {}. \
+             Enable accessibility: gsettings set org.gnome.desktop.interface toolkit-accessibility true",
+            e
+        ))
+    })
+}
+
 /// Query the AT-SPI2 accessibility tree for a given PID.
-pub async fn query_ax_tree(_pid: u32) -> Result<Vec<UiNode>> {
-    Err(crate::Error::UiNotAvailable(
-        "Linux AT-SPI2 tree walking not yet implemented".to_string(),
-    ))
+/// Returns top-level window nodes (excluding MenuBar).
+pub async fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
+    validate_pid_ownership(pid)?;
+
+    let connection = connect().await?;
+    let conn = connection.connection();
+
+    // Get registry root and enumerate applications
+    let root = connection.root_accessible_on_registry().await.map_err(|e| {
+        crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
+    })?;
+
+    let app_refs = root.get_children().await.map_err(|e| {
+        crate::Error::UiQueryFailed(format!("Failed to enumerate AT-SPI2 applications: {}", e))
+    })?;
+
+    // Create a D-Bus proxy to resolve PIDs from bus names
+    let dbus_proxy = atspi::zbus::fdo::DBusProxy::new(conn).await.map_err(|e| {
+        crate::Error::Internal(format!("D-Bus proxy creation failed: {}", e))
+    })?;
+
+    // Find the application accessible matching the target PID
+    let mut target_proxy = None;
+    for app_ref in &app_refs {
+        if app_ref.is_null() {
+            continue;
+        }
+        let bus_name = match app_ref.name_as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let Ok(bus) = atspi::zbus::names::BusName::try_from(bus_name.as_str()) else {
+            continue;
+        };
+        match dbus_proxy
+            .get_connection_unix_process_id(bus)
+            .await
+        {
+            Ok(app_pid) if app_pid == pid => {
+                if let Ok(proxy) = app_ref.as_accessible_proxy(conn).await {
+                    target_proxy = Some(proxy);
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    let app = target_proxy.ok_or_else(|| {
+        crate::Error::UiQueryFailed(format!(
+            "No AT-SPI2 accessible found for PID {}. \
+             The application may not support accessibility (GTK, Qt, Electron apps do).",
+            pid
+        ))
+    })?;
+
+    // Walk the tree from the application root
+    let mut node_count = 0;
+    let child_refs = app.get_children().await.unwrap_or_default();
+
+    let mut windows = Vec::new();
+    for (i, child_ref) in child_refs.iter().enumerate() {
+        if child_ref.is_null() {
+            continue;
+        }
+        if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
+            if let Some(node) = Box::pin(build_node(conn, &child_proxy, i, 0, &mut node_count)).await {
+                // Skip MenuBar nodes for consistency with macOS
+                if node.role != "AXMenuBar" {
+                    windows.push(node);
+                }
+            }
+        }
+    }
+
+    Ok(windows)
+}
+
+/// Recursively build a UiNode from an AT-SPI2 accessible.
+async fn build_node(
+    conn: &atspi::zbus::Connection,
+    accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+    sibling_index: usize,
+    depth: usize,
+    node_count: &mut usize,
+) -> Option<UiNode> {
+    if depth > MAX_AX_DEPTH || *node_count >= MAX_AX_NODES {
+        return None;
+    }
+    *node_count += 1;
+
+    // Get role
+    let role_enum = accessible.get_role().await.ok()?;
+    let role = map_atspi_role(role_enum);
+
+    // Get name/title
+    let title = match accessible.name().await {
+        Ok(n) if !n.is_empty() => Some(n),
+        _ => accessible.description().await.ok().filter(|s| !s.is_empty()),
+    };
+
+    // Get interfaces
+    let interfaces = accessible.get_interfaces().await.unwrap_or_default();
+
+    // Get bounds via Component interface
+    let bounds = if interfaces.contains(atspi::Interface::Component) {
+        get_component_bounds(conn, accessible).await
+    } else {
+        None
+    };
+
+    // Get actions via Action interface
+    let actions = if interfaces.contains(atspi::Interface::Action) {
+        get_action_names(conn, accessible).await
+    } else {
+        vec![]
+    };
+
+    // Get value via Value interface
+    let value = if interfaces.contains(atspi::Interface::Value) {
+        get_value(conn, accessible).await
+    } else {
+        None
+    };
+
+    // Get state for enabled/focused
+    let states = accessible.get_state().await.unwrap_or_default();
+    let enabled = states.contains(atspi::State::Enabled)
+        || states.contains(atspi::State::Sensitive);
+    let focused = states.contains(atspi::State::Focused);
+
+    let id = generate_id(&role, title.as_deref(), sibling_index);
+
+    // Recurse into children
+    let child_refs = accessible.get_children().await.unwrap_or_default();
+    let mut children = Vec::new();
+    for (i, child_ref) in child_refs.iter().enumerate() {
+        if child_ref.is_null() {
+            continue;
+        }
+        if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
+            if let Some(child_node) = Box::pin(
+                build_node(conn, &child_proxy, i, depth + 1, node_count)
+            ).await {
+                children.push(child_node);
+            }
+        }
+    }
+
+    Some(UiNode {
+        id,
+        role,
+        title,
+        value,
+        enabled,
+        focused,
+        bounds,
+        actions,
+        source: NodeSource::Ax,
+        children,
+    })
+}
+
+/// Get component bounds via ComponentProxy.
+async fn get_component_bounds(
+    conn: &atspi::zbus::Connection,
+    accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+) -> Option<Rect> {
+    let dest = accessible.inner().destination().to_owned();
+    let path = accessible.inner().path().to_owned();
+
+    let comp = atspi::proxy::component::ComponentProxy::builder(conn)
+        .destination(dest).ok()?
+        .path(path).ok()?
+        .cache_properties(atspi::zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+
+    let (x, y, w, h) = comp.get_extents(atspi::CoordType::Screen).await.ok()?;
+    if w > 0 && h > 0 {
+        Some(Rect {
+            x: x as f64,
+            y: y as f64,
+            w: w as f64,
+            h: h as f64,
+        })
+    } else {
+        None
+    }
+}
+
+/// Get action names via ActionProxy.
+async fn get_action_names(
+    conn: &atspi::zbus::Connection,
+    accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+) -> Vec<String> {
+    let dest = accessible.inner().destination().to_owned();
+    let path = accessible.inner().path().to_owned();
+
+    let action_proxy = match atspi::proxy::action::ActionProxy::builder(conn)
+        .destination(dest).ok()
+        .and_then(|b| b.path(path).ok())
+    {
+        Some(b) => match b
+            .cache_properties(atspi::zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+        {
+            Ok(p) => p,
+            Err(_) => return vec![],
+        },
+        None => return vec![],
+    };
+
+    let n = action_proxy.nactions().await.unwrap_or(0);
+    let mut mapped = Vec::new();
+    for i in 0..n {
+        if let Ok(name) = action_proxy.get_name(i).await {
+            mapped.push(map_atspi_action(&name));
+        }
+    }
+    mapped
+}
+
+/// Get value via ValueProxy.
+async fn get_value(
+    conn: &atspi::zbus::Connection,
+    accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+) -> Option<String> {
+    let dest = accessible.inner().destination().to_owned();
+    let path = accessible.inner().path().to_owned();
+
+    let val_proxy = atspi::proxy::value::ValueProxy::builder(conn)
+        .destination(dest).ok()?
+        .path(path).ok()?
+        .cache_properties(atspi::zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+
+    val_proxy.current_value().await.ok().map(|v| format!("{}", v))
+}
+
+/// Result of finding an element — carries the D-Bus destination and path
+/// needed to create action/value proxies.
+pub struct FindResult {
+    pub destination: String,
+    pub path: String,
+    pub node: UiNode,
+    pub interfaces: atspi::InterfaceSet,
+}
+
+/// Find an AT-SPI2 accessible by node ID. Returns the accessible's
+/// destination/path and node for action execution. Used by input_linux.rs.
+pub async fn find_element_by_id(
+    pid: u32,
+    target_id: &str,
+) -> Result<Option<FindResult>> {
+    validate_pid_ownership(pid)?;
+
+    let connection = connect().await?;
+    let conn = connection.connection();
+
+    let root = connection.root_accessible_on_registry().await.map_err(|e| {
+        crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
+    })?;
+
+    let app_refs = root.get_children().await.map_err(|e| {
+        crate::Error::UiQueryFailed(format!("Failed to enumerate apps: {}", e))
+    })?;
+
+    let dbus_proxy = atspi::zbus::fdo::DBusProxy::new(conn).await.map_err(|e| {
+        crate::Error::Internal(format!("D-Bus proxy: {}", e))
+    })?;
+
+    for app_ref in &app_refs {
+        if app_ref.is_null() {
+            continue;
+        }
+        let bus_name = match app_ref.name_as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let Ok(bus) = atspi::zbus::names::BusName::try_from(bus_name.as_str()) else {
+            continue;
+        };
+        if let Ok(app_pid) = dbus_proxy
+            .get_connection_unix_process_id(bus)
+            .await
+        {
+            if app_pid == pid {
+                if let Ok(app_proxy) = app_ref.as_accessible_proxy(conn).await {
+                    let child_refs = app_proxy.get_children().await.unwrap_or_default();
+                    for (i, child_ref) in child_refs.iter().enumerate() {
+                        if child_ref.is_null() {
+                            continue;
+                        }
+                        if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
+                            if let Some(result) = Box::pin(
+                                find_in_subtree(conn, &child_proxy, target_id, i, 0)
+                            ).await {
+                                return Ok(Some(result));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn find_in_subtree(
+    conn: &atspi::zbus::Connection,
+    accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+    target_id: &str,
+    sibling_index: usize,
+    depth: usize,
+) -> Option<FindResult> {
+    if depth > MAX_AX_DEPTH {
+        return None;
+    }
+
+    let role_enum = accessible.get_role().await.ok()?;
+    let role = map_atspi_role(role_enum);
+    let title = accessible.name().await.ok().filter(|s| !s.is_empty());
+    let id = generate_id(&role, title.as_deref(), sibling_index);
+
+    if id == target_id {
+        let interfaces = accessible.get_interfaces().await.unwrap_or_default();
+        let states = accessible.get_state().await.unwrap_or_default();
+        let bounds = if interfaces.contains(atspi::Interface::Component) {
+            get_component_bounds(conn, accessible).await
+        } else {
+            None
+        };
+        let value = if interfaces.contains(atspi::Interface::Value) {
+            get_value(conn, accessible).await
+        } else {
+            None
+        };
+
+        return Some(FindResult {
+            destination: accessible.inner().destination().to_string(),
+            path: accessible.inner().path().to_string(),
+            node: UiNode {
+                id,
+                role,
+                title,
+                value,
+                enabled: states.contains(atspi::State::Enabled)
+                    || states.contains(atspi::State::Sensitive),
+                focused: states.contains(atspi::State::Focused),
+                bounds,
+                actions: vec![],
+                source: NodeSource::Ax,
+                children: vec![],
+            },
+            interfaces,
+        });
+    }
+
+    // Recurse
+    let child_refs = accessible.get_children().await.unwrap_or_default();
+    for (i, child_ref) in child_refs.iter().enumerate() {
+        if child_ref.is_null() {
+            continue;
+        }
+        if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
+            if let Some(result) = Box::pin(
+                find_in_subtree(conn, &child_proxy, target_id, i, depth + 1)
+            ).await {
+                return Some(result);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
