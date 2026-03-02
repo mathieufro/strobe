@@ -143,7 +143,7 @@ fn xtest_motion(
 
 /// Try to perform a click action via AT-SPI2. Returns Some if attempted.
 async fn try_atspi_click(target: &FindResult) -> Option<(bool, String, Option<String>)> {
-    let connection = crate::ui::accessibility_linux::connect_internal().await.ok()?;
+    let connection = crate::ui::accessibility_linux::connect().await.ok()?;
     let conn = connection.connection();
 
     let action_proxy: atspi::proxy::action::ActionProxy<'_> =
@@ -175,7 +175,7 @@ async fn try_atspi_set_value(
     target: &FindResult,
     num: f64,
 ) -> Option<(bool, String, Option<String>)> {
-    let connection = crate::ui::accessibility_linux::connect_internal().await.ok()?;
+    let connection = crate::ui::accessibility_linux::connect().await.ok()?;
     let conn = connection.connection();
 
     let val_proxy: atspi::proxy::value::ValueProxy<'_> =
@@ -514,10 +514,9 @@ fn execute_key_action(
         crate::Error::UiQueryFailed(format!("Unknown key: {}", key_name))
     })?;
 
-    let (conn, screen_num) = x11rb::connect(None).map_err(|e| {
+    let (conn, _screen_num) = x11rb::connect(None).map_err(|e| {
         crate::Error::UiNotAvailable(format!("X11 display not available: {}", e))
     })?;
-    let _root = conn.setup().roots[screen_num].root;
 
     // Press modifier keys
     let modifier_keysyms: Vec<u32> = modifiers

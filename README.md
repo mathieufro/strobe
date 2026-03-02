@@ -123,6 +123,12 @@ cargo build --release
 ./target/release/strobe install
 ```
 
+> **Linux note:** If the Rust build fails with `fatal error: 'time.h' file not found` from bindgen,
+> set the system include paths explicitly:
+> ```bash
+> BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include -I/usr/include/$(uname -m)-linux-gnu" cargo build --release
+> ```
+
 ### Vision Setup (Optional)
 
 AI vision requires Python 3.10-3.12, PyTorch, and OmniParser v2.0 models (~3.5 GB total):
