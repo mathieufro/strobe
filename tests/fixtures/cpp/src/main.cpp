@@ -4,6 +4,7 @@
 #include "crash.h"
 #include "timing.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <unistd.h>

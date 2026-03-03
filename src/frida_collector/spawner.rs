@@ -11,6 +11,19 @@ use crate::Result;
 use super::{HookManager, HookMode};
 use libc;
 
+// On Linux, frida-sys's static devkit prefixes GLib symbols with `_frida_`.
+// `g_error_free` is not re-exported, so we declare the prefixed version directly.
+#[cfg(target_os = "linux")]
+extern "C" {
+    #[link_name = "_frida_g_error_free"]
+    fn g_error_free_platform(error: *mut frida_sys::GError);
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn g_error_free_platform(error: *mut frida_sys::GError) {
+    frida_sys::g_error_free(error);
+}
+
 /// Check a GLib error pointer. Returns Ok(()) if null, or the error message if set.
 /// Frees the GError after extracting the message.
 unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(), String> {
@@ -21,7 +34,7 @@ unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(),
         .to_str()
         .unwrap_or("unknown error")
         .to_string();
-    frida_sys::g_error_free(error);
+    g_error_free_platform(error);
     Err(msg)
 }
 
@@ -2111,7 +2124,6 @@ fn process_death_monitor(
         if !alive { break; }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-
     // Give the agent's async crash event time to arrive via GLib
     std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -2543,7 +2555,6 @@ impl FridaSpawner {
 
         // Use SymbolResolver if available, otherwise fall back to DWARF
         if let Some(resolver) = resolver {
-            // For interpreted languages (Python, JS, etc.)
             use std::path::Path;
             for pattern in patterns {
                 let targets = resolver.resolve_pattern(pattern, Path::new(&session.project_root))?;
@@ -2552,10 +2563,8 @@ impl FridaSpawner {
 
                 let target_list = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
                 for target in targets {
-                    // For interpreted languages, send file:line targets instead of address targets
                     match target {
                         crate::symbols::ResolvedTarget::SourceLocation { file, line, name } => {
-                            // Create a FunctionTarget with file and line
                             target_list.push(FunctionTarget {
                                 address: 0, // No address for interpreted
                                 name: name.clone(),
@@ -2565,7 +2574,12 @@ impl FridaSpawner {
                             });
                         }
                         crate::symbols::ResolvedTarget::Address { address, name, name_raw, file, line } => {
-                            // Native function from resolver (DwarfResolver)
+                            // Skip functions with address 0 — these are declarations or
+                            // fully-inlined functions with no out-of-line body to hook.
+                            if address == 0 {
+                                tracing::debug!("Skipping unhookable function {} (address 0x0)", name);
+                                continue;
+                            }
                             target_list.push(FunctionTarget {
                                 address,
                                 name: name.clone(),
@@ -2587,6 +2601,10 @@ impl FridaSpawner {
 
                 let target = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
                 for func in matches {
+                    if func.low_pc == 0 {
+                        tracing::debug!("Skipping unhookable function {} (low_pc 0x0)", func.name);
+                        continue;
+                    }
                     target.push(FunctionTarget::from(func));
                 }
             }

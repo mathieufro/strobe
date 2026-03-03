@@ -305,6 +305,13 @@ class StrobeAgent {
   private outputFlushTimer: ReturnType<typeof setInterval> | null = null;
   private samplingStatsTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Pre-resolved libc functions for crash file writing.
+  // Resolved during init so the exception handler doesn't need to call
+  // Process.enumerateModules() which is unsafe in signal handler context on Linux.
+  private crashOpenFn: NativeFunction<number, [NativePointer, number, number]> | null = null;
+  private crashWriteFn: NativeFunction<number, [number, NativePointer, number]> | null = null;
+  private crashCloseFn: NativeFunction<number, [number]> | null = null;
+
   constructor() {
     this.platform = createPlatformAdapter();
     this.cmoduleTracer = new CModuleTracer((events) => {
@@ -331,6 +338,19 @@ class StrobeAgent {
     this.outputFlushTimer = setInterval(() => this.flushOutput(), this.outputFlushInterval);
 
     if (!isInterpreted) {
+      // Pre-resolve libc functions for crash file writing.
+      // Must happen before installExceptionHandler() so the handler can use them.
+      // Resolving inside the handler is unsafe on Linux (signal handler context).
+      try {
+        const libcModule = Process.enumerateModules().find(m => m.name.includes('libc')) || Process.mainModule;
+        this.crashOpenFn = new NativeFunction(
+          libcModule.getExportByName('open'), 'int', ['pointer', 'int', 'int']);
+        this.crashWriteFn = new NativeFunction(
+          libcModule.getExportByName('write'), 'long', ['int', 'pointer', 'long']);
+        this.crashCloseFn = new NativeFunction(
+          libcModule.getExportByName('close'), 'int', ['int']);
+      } catch {}
+
       // Install crash/exception handler early — before process resumes —
       // so crashes are caught even if the "initialize" message hasn't arrived yet.
       this.installExceptionHandler();
@@ -541,18 +561,42 @@ class StrobeAgent {
 
   private installExceptionHandler(): void {
     Process.setExceptionHandler((details) => {
-      const crashEvent = this.buildCrashEvent(details);
+      try {
+        const crashEvent = this.buildCrashEvent(details);
 
-      // Write crash data to a temp file using synchronous native I/O.
-      // This bypasses GLib's async message delivery which may not flush
-      // before the OS kills the process (especially on Linux).
-      this.writeCrashFile(crashEvent);
+        // Write crash data to a temp file using synchronous native I/O.
+        // This bypasses GLib's async message delivery which may not flush
+        // before the OS kills the process (especially on Linux).
+        this.writeCrashFile(crashEvent);
 
-      // Also try the normal async path (best effort)
-      send({ type: 'events', events: [crashEvent] });
+        // Flush any buffered output events (stdout/stderr) before the crash event.
+        // Without this, output written just before the crash is lost because the
+        // periodic flush timer never fires — the process is about to die.
+        this.flushOutput();
 
-      // Sleep the crashing thread to give GLib time to flush.
-      Thread.sleep(0.1);
+        // Also try the normal async path (best effort)
+        send({ type: 'events', events: [crashEvent] });
+
+        // Sleep the crashing thread to give GLib time to flush.
+        Thread.sleep(0.1);
+      } catch (_) {
+        // Exception handler itself failed — still try to send a minimal crash event
+        try {
+          send({ type: 'events', events: [{
+            id: `crash-fallback-${Date.now()}`,
+            timestampNs: 0,
+            threadId: (details as any).threadId ?? 0,
+            threadName: null,
+            eventType: 'crash',
+            pid: Process.id,
+            signal: details.type ?? 'unknown',
+            faultAddress: details.address?.toString() ?? null,
+            registers: {},
+            backtrace: [],
+          }] });
+          Thread.sleep(0.1);
+        } catch (_) {}
+      }
 
       // Return false to let the OS handle the crash (terminate the process)
       return false;
@@ -670,14 +714,17 @@ class StrobeAgent {
       const pathBuf = Memory.allocUtf8String(crashPath);
       const dataBuf = Memory.allocUtf8String(data);
 
-      // Get system library exports - try main module first
-      const libcModule = Process.enumerateModules().find(m => m.name.includes('libc')) || Process.mainModule;
-      const openFn = new NativeFunction(
-        libcModule.getExportByName('open'), 'int', ['pointer', 'int', 'int']);
-      const writeFn = new NativeFunction(
-        libcModule.getExportByName('write'), 'long', ['int', 'pointer', 'long']);
-      const closeFn = new NativeFunction(
-        libcModule.getExportByName('close'), 'int', ['int']);
+      // Use pre-resolved libc functions (resolved during init, not in signal context).
+      // Falls back to runtime resolution if pre-resolve failed.
+      let openFn = this.crashOpenFn;
+      let writeFn = this.crashWriteFn;
+      let closeFn = this.crashCloseFn;
+      if (!openFn || !writeFn || !closeFn) {
+        const libcModule = Process.enumerateModules().find(m => m.name.includes('libc')) || Process.mainModule;
+        openFn = new NativeFunction(libcModule.getExportByName('open'), 'int', ['pointer', 'int', 'int']);
+        writeFn = new NativeFunction(libcModule.getExportByName('write'), 'long', ['int', 'pointer', 'long']);
+        closeFn = new NativeFunction(libcModule.getExportByName('close'), 'int', ['int']);
+      }
 
       // O_WRONLY | O_CREAT | O_TRUNC
       const flags = Process.platform === 'linux' ? 0x241 : 0x601;
