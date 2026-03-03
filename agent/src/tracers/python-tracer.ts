@@ -68,6 +68,11 @@ export class PythonTracer implements Tracer {
   private PyRun_SimpleString: NativePointer | null = null;
   private PyGILState_Ensure: NativePointer | null = null;
   private PyGILState_Release: NativePointer | null = null;
+  // Additional symbols for readPythonBuiltin (resolved once during init)
+  private PyImport_ImportModule: NativePointer | null = null;
+  private PyObject_GetAttrString: NativePointer | null = null;
+  private PyUnicode_AsUTF8: NativePointer | null = null;
+  private Py_DecRef: NativePointer | null = null;
 
   // Cached NativeFunction wrappers (created once, reused)
   private _gilEnsure: NativeFunction<number, []> | null = null;
@@ -89,6 +94,14 @@ export class PythonTracer implements Tracer {
     if (!this.PyRun_SimpleString || !this.PyGILState_Ensure || !this.PyGILState_Release) {
       throw new Error('CPython API symbols not found (PyRun_SimpleString, PyGILState_Ensure, PyGILState_Release)');
     }
+
+    // Resolve symbols needed by readPythonBuiltin() upfront.
+    // On some Linux builds (e.g. pyenv), these aren't in the module's export table
+    // so getExportByName() fails — findGlobalExport() searches all modules.
+    this.PyImport_ImportModule = findGlobalExport('PyImport_ImportModule');
+    this.PyObject_GetAttrString = findGlobalExport('PyObject_GetAttrString');
+    this.PyUnicode_AsUTF8 = findGlobalExport('PyUnicode_AsUTF8');
+    this.Py_DecRef = findGlobalExport('Py_DecRef');
 
     // Detect CPython version for sys.monitoring support (PEP 669, 3.12+)
     const PyGetVersion = findGlobalExport('Py_GetVersion');
@@ -680,20 +693,22 @@ except Exception as _e:
     if (!this.PyGILState_Ensure || !this.PyGILState_Release) {
       return { error: 'GIL functions not available' };
     }
-    const libpython = this.findLibPython();
-    if (!libpython) return { error: 'Cannot find libpython' };
+    if (!this.PyImport_ImportModule || !this.PyObject_GetAttrString ||
+        !this.PyUnicode_AsUTF8 || !this.Py_DecRef) {
+      return { error: 'Python C API symbols not available for readPythonBuiltin' };
+    }
 
     const PyImport_ImportModule = new NativeFunction(
-      libpython.getExportByName('PyImport_ImportModule'), 'pointer', ['pointer']
+      this.PyImport_ImportModule, 'pointer', ['pointer']
     );
     const PyObject_GetAttrString = new NativeFunction(
-      libpython.getExportByName('PyObject_GetAttrString'), 'pointer', ['pointer', 'pointer']
+      this.PyObject_GetAttrString, 'pointer', ['pointer', 'pointer']
     );
     const PyUnicode_AsUTF8 = new NativeFunction(
-      libpython.getExportByName('PyUnicode_AsUTF8'), 'pointer', ['pointer']
+      this.PyUnicode_AsUTF8, 'pointer', ['pointer']
     );
     const Py_DecRef = new NativeFunction(
-      libpython.getExportByName('Py_DecRef'), 'void', ['pointer']
+      this.Py_DecRef, 'void', ['pointer']
     );
 
     const ensure = new NativeFunction(this.PyGILState_Ensure, 'int', []);
@@ -726,25 +741,6 @@ except Exception as _e:
     }
   }
 
-  /** Find the loaded libpython module. */
-  private findLibPython(): Module | null {
-    if ((this as any)._libPython) return (this as any)._libPython;
-    for (const mod of Process.enumerateModules()) {
-      if (/libpython3|python3\.\d+/.test(mod.name)) {
-        (this as any)._libPython = mod;
-        return mod;
-      }
-    }
-    // On macOS/Linux the Python executable itself may export symbols
-    const main = Process.mainModule;
-    try {
-      main.getExportByName('PyImport_ImportModule');
-      (this as any)._libPython = main;
-      return main;
-    } catch {
-      return null;
-    }
-  }
 
   writeVariable(expr: string, value: any): void {
     // Validate expr is a simple assignment target (variable name, attribute access, subscript)
