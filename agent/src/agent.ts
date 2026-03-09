@@ -336,6 +336,8 @@ class StrobeAgent {
 
     // Periodic flush for output events
     this.outputFlushTimer = setInterval(() => this.flushOutput(), this.outputFlushInterval);
+    // Don't prevent Node.js from exiting when tests finish (V8 runtime uses Node's setInterval)
+    (this.outputFlushTimer as any).unref?.();
 
     if (!isInterpreted) {
       // Pre-resolve libc functions for crash file writing.
@@ -409,6 +411,7 @@ class StrobeAgent {
         send({ type: 'sampling_stats', stats });
       }
     }, 1000);
+    (this.samplingStatsTimer as any).unref?.();
 
     send({ type: 'initialized', sessionId });
   }
@@ -1083,6 +1086,7 @@ class StrobeAgent {
       });
     }, poll.intervalMs);
 
+    (timer as any).unref?.();
     this.activePollTimer = timer;
   }
 

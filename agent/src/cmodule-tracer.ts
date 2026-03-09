@@ -379,6 +379,7 @@ export class CModuleTracer {
 
     // --- Start drain timer ---
     this.drainTimer = setInterval(() => this.drain(), DRAIN_INTERVAL_MS);
+    (this.drainTimer as any).unref?.();
   }
 
   // -----------------------------------------------------------------------

@@ -70,6 +70,8 @@ export class V8Tracer implements Tracer {
   initialize(sessionId: string): void {
     this.sessionId = sessionId;
     this.flushTimer = setInterval(() => this.flushEvents(), 50);
+    // Don't prevent Node.js from exiting — this timer is purely for batching
+    (this.flushTimer as any).unref?.();
 
     // Patch Module._compile to intercept newly-loaded modules
     try {

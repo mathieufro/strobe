@@ -34,6 +34,8 @@ export class RateTracker {
     ) {
         // Check rates every 100ms
         this.rateCheckTimer = setInterval(() => this.checkRates(), 100);
+        // Don't prevent Node.js from exiting (V8 runtime uses Node's setInterval)
+        (this.rateCheckTimer as any).unref?.();
     }
 
     recordCall(funcId: number): boolean {
