@@ -357,10 +357,23 @@ impl TestRunner {
         // Safety net: always exceeds kill_timeout so the stuck detector's grace period isn't bypassed.
         let safety_timeout = std::time::Duration::from_millis(hard_timeout + 60_000);
         let start = std::time::Instant::now();
+        let mut reaped_status: Option<i32> = None;
 
         loop {
             if !stacks::is_process_alive(pid) {
                 break;
+            }
+
+            // Try to reap zombie — kill(pid, 0) returns true for zombies but
+            // waitpid detects actual exit. Without this, the loop runs until
+            // hard_timeout for every normal test completion.
+            {
+                let mut status: i32 = 0;
+                let wp = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+                if wp > 0 {
+                    reaped_status = Some(status);
+                    break;
+                }
             }
 
             // Hard timeout — kill the process tree (stuck detector has already written warnings)
@@ -457,22 +470,23 @@ impl TestRunner {
         let stdout_buf = collect_output(session_manager.db(), session_id, crate::db::EventType::Stdout);
         let stderr_buf = collect_output(session_manager.db(), session_id, crate::db::EventType::Stderr);
 
-        // Get exit code: try waitpid for real exit code, fall back to test results
+        // Get exit code: use already-reaped status from polling loop, or try waitpid
         let exit_code = {
-            let mut status: i32 = 0;
-            let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
-            if result > 0 {
-                if libc::WIFEXITED(status) {
-                    libc::WEXITSTATUS(status)
-                } else if libc::WIFSIGNALED(status) {
-                    128 + libc::WTERMSIG(status)
-                } else {
-                    -1
-                }
-            } else {
-                // Already reaped or not our child — infer from test results
+            let status = reaped_status.unwrap_or_else(|| {
+                let mut s: i32 = 0;
+                let r = unsafe { libc::waitpid(pid as i32, &mut s, libc::WNOHANG) };
+                if r > 0 { s } else { -1 }
+            });
+            if status == -1 {
+                // Not our child or already reaped — infer from test results
                 let p = progress.lock().unwrap();
                 if p.failed > 0 { 1 } else { 0 }
+            } else if unsafe { libc::WIFEXITED(status) } {
+                unsafe { libc::WEXITSTATUS(status) }
+            } else if unsafe { libc::WIFSIGNALED(status) } {
+                128 + unsafe { libc::WTERMSIG(status) }
+            } else {
+                -1
             }
         };
 
