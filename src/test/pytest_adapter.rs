@@ -6,6 +6,11 @@ use super::adapter::*;
 
 pub struct PytestAdapter;
 
+/// Check whether the project uses uv (presence of uv.lock).
+fn use_uv(project_root: &Path) -> bool {
+    project_root.join("uv.lock").exists()
+}
+
 impl TestAdapter for PytestAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
         // pyproject.toml with [tool.pytest] section
@@ -42,18 +47,17 @@ impl TestAdapter for PytestAdapter {
 
     fn suite_command(
         &self,
-        _project_root: &Path,
+        project_root: &Path,
         level: Option<TestLevel>,
         _env: &HashMap<String, String>,
     ) -> crate::Result<TestCommand> {
-        let mut args = vec![
-            "-m".into(),
-            "pytest".into(),
-            "--tb=short".into(),
-            "-q".into(),
-            "--json-report".into(),
-            "--json-report-file=-".into(),
-        ];
+        let uv = use_uv(project_root);
+        let mut args: Vec<String> = if uv {
+            vec!["run".into(), "pytest".into()]
+        } else {
+            vec!["-m".into(), "pytest".into()]
+        };
+        args.extend(["--tb=short".into(), "-q".into(), "--json-report".into(), "--json-report-file=-".into()]);
         match level {
             Some(TestLevel::Unit) => {
                 args.extend(["-m".into(), "not integration and not e2e".into()]);
@@ -67,24 +71,29 @@ impl TestAdapter for PytestAdapter {
             None => {}
         }
         Ok(TestCommand {
-            program: "python3".into(),
+            program: if uv { "uv".into() } else { "python3".into() },
             args,
             env: HashMap::new(),
         })
     }
 
-    fn single_test_command(&self, _root: &Path, test_name: &str) -> crate::Result<TestCommand> {
+    fn single_test_command(&self, root: &Path, test_name: &str) -> crate::Result<TestCommand> {
+        let uv = use_uv(root);
+        let mut args: Vec<String> = if uv {
+            vec!["run".into(), "pytest".into()]
+        } else {
+            vec!["-m".into(), "pytest".into()]
+        };
+        args.extend([
+            "-k".into(),
+            test_name.into(),
+            "--json-report".into(),
+            "--json-report-file=-".into(),
+            "--tb=short".into(),
+        ]);
         Ok(TestCommand {
-            program: "python3".into(),
-            args: vec![
-                "-m".into(),
-                "pytest".into(),
-                "-k".into(),
-                test_name.into(),
-                "--json-report".into(),
-                "--json-report-file=-".into(),
-                "--tb=short".into(),
-            ],
+            program: if uv { "uv".into() } else { "python3".into() },
+            args,
             env: HashMap::new(),
         })
     }
@@ -358,6 +367,68 @@ mod tests {
         assert_eq!(result.summary.failed, 1);
         assert_eq!(result.failures.len(), 1);
         assert!(result.failures[0].name.contains("intentional_failure"));
+    }
+
+    #[test]
+    fn test_suite_command_uses_uv_when_uv_lock_exists() {
+        let adapter = PytestAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("uv.lock"), "").unwrap();
+
+        let cmd = adapter.suite_command(dir.path(), None, &HashMap::new()).unwrap();
+        assert_eq!(cmd.program, "uv");
+        assert_eq!(cmd.args[0], "run");
+        assert_eq!(cmd.args[1], "pytest");
+        assert!(cmd.args.contains(&"--json-report".to_string()));
+    }
+
+    #[test]
+    fn test_suite_command_uses_python3_without_uv_lock() {
+        let adapter = PytestAdapter;
+        let dir = tempfile::tempdir().unwrap();
+
+        let cmd = adapter.suite_command(dir.path(), None, &HashMap::new()).unwrap();
+        assert_eq!(cmd.program, "python3");
+        assert_eq!(cmd.args[0], "-m");
+        assert_eq!(cmd.args[1], "pytest");
+    }
+
+    #[test]
+    fn test_single_test_command_uses_uv_when_uv_lock_exists() {
+        let adapter = PytestAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("uv.lock"), "").unwrap();
+
+        let cmd = adapter.single_test_command(dir.path(), "test_foo").unwrap();
+        assert_eq!(cmd.program, "uv");
+        assert_eq!(cmd.args[0], "run");
+        assert_eq!(cmd.args[1], "pytest");
+        assert!(cmd.args.contains(&"-k".to_string()));
+        assert!(cmd.args.contains(&"test_foo".to_string()));
+    }
+
+    #[test]
+    fn test_single_test_command_uses_python3_without_uv_lock() {
+        let adapter = PytestAdapter;
+        let dir = tempfile::tempdir().unwrap();
+
+        let cmd = adapter.single_test_command(dir.path(), "test_foo").unwrap();
+        assert_eq!(cmd.program, "python3");
+        assert_eq!(cmd.args[0], "-m");
+    }
+
+    #[test]
+    fn test_suite_command_uv_with_level() {
+        let adapter = PytestAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("uv.lock"), "").unwrap();
+
+        let cmd = adapter.suite_command(dir.path(), Some(TestLevel::Unit), &HashMap::new()).unwrap();
+        assert_eq!(cmd.program, "uv");
+        assert_eq!(cmd.args[0], "run");
+        assert_eq!(cmd.args[1], "pytest");
+        assert!(cmd.args.contains(&"-m".to_string()));
+        assert!(cmd.args.contains(&"not integration and not e2e".to_string()));
     }
 
     #[test]

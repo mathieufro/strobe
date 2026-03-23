@@ -1,0 +1,42 @@
+{
+  "id": "b7f1b93f-c548-4e72-9e4a-6e7f9f844537",
+  "prompt": "I'd like to add support for uv run pytest tests/  for our tests please",
+  "workspacePath": "/Users/alex/strobe",
+  "status": "idle",
+  "currentStage": "classify",
+  "type": "feature",
+  "fromPipelineId": null,
+  "fromStage": null,
+  "model": {
+    "providerID": "anthropic",
+    "modelID": "default"
+  },
+  "variant": "medium",
+  "createdAt": 1774306490071,
+  "updatedAt": 1774307031692,
+  "completedAt": null,
+  "error": "Aborted by user",
+  "pipelineDir": ".atelier/pipelines/2026-03-23-uv-pytest-test-adapter-b7f1",
+  "title": "uv pytest test adapter",
+  "stepCounter": 1,
+  "stages": [
+    {
+      "id": "3980d671-61ac-4a54-90ad-193350257261",
+      "stage": "classify",
+      "sessionId": "a0407569-3da0-4453-ad81-e04adec8baf6",
+      "status": "idle",
+      "compiledPromptPath": null,
+      "assignedOutputPath": ".atelier/pipelines/2026-03-23-uv-pytest-test-adapter-b7f1/01-uv-pytest-test-adapter-classification.md",
+      "outputPath": null,
+      "interrupted": true,
+      "error": null,
+      "startedAt": 1774306493642,
+      "completedAt": null
+    }
+  ],
+  "gitBranch": null,
+  "gitBaseBranch": null,
+  "gitBaseCommit": null,
+  "worktreePath": null,
+  "worktreeChoice": null
+}

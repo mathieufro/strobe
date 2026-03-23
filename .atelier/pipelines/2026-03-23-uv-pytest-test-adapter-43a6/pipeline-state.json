@@ -1,0 +1,42 @@
+{
+  "id": "43a6ada6-694d-486f-a1a9-2740b78cce66",
+  "prompt": "I'd like to add support for uv run pytest tests/  for our tests please",
+  "workspacePath": "/Users/alex/strobe",
+  "status": "idle",
+  "currentStage": "classify",
+  "type": "feature",
+  "fromPipelineId": null,
+  "fromStage": null,
+  "model": {
+    "providerID": "anthropic",
+    "modelID": "default"
+  },
+  "variant": "medium",
+  "createdAt": 1774306094259,
+  "updatedAt": 1774306382495,
+  "completedAt": null,
+  "error": null,
+  "pipelineDir": ".atelier/pipelines/2026-03-23-uv-pytest-test-adapter-43a6",
+  "title": "uv pytest test adapter",
+  "stepCounter": 1,
+  "stages": [
+    {
+      "id": "5f8dd63f-e65c-4b97-8f57-e7320acc8fad",
+      "stage": "classify",
+      "sessionId": "c0522ec9-c749-4a3b-8617-7627970e391a",
+      "status": "idle",
+      "compiledPromptPath": null,
+      "assignedOutputPath": ".atelier/pipelines/2026-03-23-uv-pytest-test-adapter-43a6/01-uv-pytest-test-adapter-classification.md",
+      "outputPath": "/Users/alex/strobe/.atelier/pipelines/2026-03-23-uv-pytest-test-adapter-43a6/01-uv-pytest-test-adapter-classification.md",
+      "interrupted": false,
+      "error": "Classification file is malformed — missing or invalid pipeline type or worktree choice",
+      "startedAt": 1774306097122,
+      "completedAt": 1774306271299
+    }
+  ],
+  "gitBranch": null,
+  "gitBaseBranch": null,
+  "gitBaseCommit": null,
+  "worktreePath": null,
+  "worktreeChoice": null
+}
