@@ -2020,6 +2020,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
     async fn tool_debug_test_status(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let req: crate::mcp::DebugTestStatusRequest = serde_json::from_value(args.clone())?;
+        let test_run_id = req.test_run_id;
 
         // Block for up to 15 seconds, returning immediately if the test completes.
         // This throttles LLM polling while still providing timely completion results.
@@ -2029,8 +2030,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         loop {
             let runs = self.test_runs.read().await;
-            let test_run = runs.get(&req.test_run_id)
-                .ok_or_else(|| crate::Error::TestRunNotFound(req.test_run_id.clone()))?;
+            let test_run = runs.get(&test_run_id)
+                .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
 
             match &test_run.state {
                 crate::test::TestRunState::Running { .. } => {
@@ -2044,9 +2045,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             }
         }
 
-        let mut runs = self.test_runs.write().await;
-        let test_run = runs.get_mut(&req.test_run_id)
-            .ok_or_else(|| crate::Error::TestRunNotFound(req.test_run_id.clone()))?;
+        // Use read lock for building the response — avoids blocking the background
+        // task from writing completion state while we do SQLite baseline queries.
+        let runs = self.test_runs.read().await;
+        let test_run = runs.get(&test_run_id)
+            .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
 
         let response = match &test_run.state {
             crate::test::TestRunState::Running { progress, .. } => {
@@ -2100,7 +2103,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 });
 
                 crate::mcp::DebugTestStatusResponse {
-                    test_run_id: req.test_run_id,
+                    test_run_id: test_run_id.clone(),
                     status: "running".to_string(),
                     progress: Some(crate::mcp::TestProgressSnapshot {
                         elapsed_ms: p.elapsed_ms(),
@@ -2122,11 +2125,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 }
             }
             crate::test::TestRunState::Completed { response, .. } => {
-                test_run.fetched = true;
                 // Surface hint at the top level so the agent sees it immediately
                 let hint = response.get("hint").and_then(|h| h.as_str()).map(|s| s.to_string());
                 crate::mcp::DebugTestStatusResponse {
-                    test_run_id: req.test_run_id,
+                    test_run_id: test_run_id.clone(),
                     status: "completed".to_string(),
                     progress: None,
                     result: Some(response.clone()),
@@ -2135,9 +2137,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 }
             }
             crate::test::TestRunState::Failed { error, .. } => {
-                test_run.fetched = true;
                 crate::mcp::DebugTestStatusResponse {
-                    test_run_id: req.test_run_id,
+                    test_run_id: test_run_id.clone(),
                     status: "failed".to_string(),
                     progress: None,
                     result: None,
@@ -2146,6 +2147,18 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 }
             }
         };
+        // Drop read lock before taking write lock
+        let needs_fetched = matches!(&test_run.state,
+            crate::test::TestRunState::Completed { .. } | crate::test::TestRunState::Failed { .. });
+        drop(runs);
+
+        // Brief write lock only to mark as fetched (Completed/Failed states)
+        if needs_fetched {
+            let mut runs = self.test_runs.write().await;
+            if let Some(test_run) = runs.get_mut(&test_run_id) {
+                test_run.fetched = true;
+            }
+        }
 
         Ok(serde_json::to_value(response)?)
     }

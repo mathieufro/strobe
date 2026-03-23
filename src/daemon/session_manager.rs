@@ -839,9 +839,14 @@ impl SessionManager {
             }
         });
 
-        // Spawn process (lazily initialize FridaSpawner)
-        let mut guard = self.frida_spawner.write().await;
-        let spawner = guard.get_or_insert_with(FridaSpawner::new);
+        // Ensure FridaSpawner exists (brief write lock for lazy init only)
+        {
+            let mut guard = self.frida_spawner.write().await;
+            guard.get_or_insert_with(FridaSpawner::new);
+        }
+        // Use read lock for the actual spawn — allows concurrent Frida operations
+        let guard = self.frida_spawner.read().await;
+        let spawner = guard.as_ref().unwrap();
         spawner.spawn(
             session_id,
             command,
@@ -881,8 +886,8 @@ impl SessionManager {
             resolvers.get(session_id).cloned()
         };
 
-        let mut guard = self.frida_spawner.write().await;
-        let spawner = match guard.as_mut() {
+        let guard = self.frida_spawner.read().await;
+        let spawner = match guard.as_ref() {
             Some(s) => s,
             None => return Ok(HookResult { installed: 0, matched: 0, warnings: vec![] }),
         };
@@ -906,8 +911,8 @@ impl SessionManager {
         watches: Vec<crate::frida_collector::WatchTarget>,
         expr_watches: Vec<crate::frida_collector::ExprWatchTarget>,
     ) -> Result<()> {
-        let mut guard = self.frida_spawner.write().await;
-        let spawner = match guard.as_mut() {
+        let guard = self.frida_spawner.read().await;
+        let spawner = match guard.as_ref() {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -1342,8 +1347,8 @@ impl SessionManager {
 
     /// Stop Frida session
     pub async fn stop_frida(&self, session_id: &str) -> Result<()> {
-        let mut guard = self.frida_spawner.write().await;
-        match guard.as_mut() {
+        let guard = self.frida_spawner.read().await;
+        match guard.as_ref() {
             Some(spawner) => spawner.stop(session_id).await,
             None => Ok(()), // No spawner — nothing to stop
         }
@@ -1517,8 +1522,8 @@ impl SessionManager {
         let runtime_address = address;
 
         // Send setBreakpoint message to agent
-        let mut spawner_guard = self.frida_spawner.write().await;
-        let spawner = spawner_guard.as_mut()
+        let spawner_guard = self.frida_spawner.read().await;
+        let spawner = spawner_guard.as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let message = serde_json::json!({
@@ -1613,8 +1618,8 @@ impl SessionManager {
         let func_name = function.clone();
 
         // Send setBreakpoint to agent with file+line (no address/imageBase)
-        let mut spawner_guard = self.frida_spawner.write().await;
-        let spawner = spawner_guard.as_mut()
+        let spawner_guard = self.frida_spawner.read().await;
+        let spawner = spawner_guard.as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let message = serde_json::json!({
@@ -1682,8 +1687,8 @@ impl SessionManager {
                     format!("Stepping ('{}') is not supported for Python — use 'continue'", action)
                 ));
             }
-            let mut spawner_guard = self.frida_spawner.write().await;
-            let spawner = spawner_guard.as_mut()
+            let spawner_guard = self.frida_spawner.read().await;
+            let spawner = spawner_guard.as_ref()
                 .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
             spawner.send_hook_message(session_id, serde_json::json!({"type": "resume_python_bp"})).await?;
             for (thread_id, _) in &paused {
@@ -1699,8 +1704,8 @@ impl SessionManager {
         }
 
         if lang == Language::JavaScript {
-            let mut spawner_guard = self.frida_spawner.write().await;
-            let spawner = spawner_guard.as_mut()
+            let spawner_guard = self.frida_spawner.read().await;
+            let spawner = spawner_guard.as_ref()
                 .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
             spawner.send_hook_message(session_id, serde_json::json!({
                 "type": "resume_v8_bp",
@@ -1827,8 +1832,8 @@ impl SessionManager {
         };
 
         // Send resume message to each paused thread
-        let mut spawner_guard = self.frida_spawner.write().await;
-        let spawner = spawner_guard.as_mut()
+        let spawner_guard = self.frida_spawner.read().await;
+        let spawner = spawner_guard.as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         for (thread_id, pause_info) in paused {
@@ -1908,8 +1913,8 @@ impl SessionManager {
         let runtime_address = address;
 
         // Send setLogpoint message to agent
-        let mut spawner_guard = self.frida_spawner.write().await;
-        let spawner = spawner_guard.as_mut()
+        let spawner_guard = self.frida_spawner.read().await;
+        let spawner = spawner_guard.as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let msg = serde_json::json!({
@@ -2002,8 +2007,8 @@ impl SessionManager {
         let logpoint_id = id.unwrap_or_else(|| format!("lp-{}", uuid::Uuid::new_v4()));
         let func_name = function.clone();
 
-        let mut spawner_guard = self.frida_spawner.write().await;
-        let spawner = spawner_guard.as_mut()
+        let spawner_guard = self.frida_spawner.read().await;
+        let spawner = spawner_guard.as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let msg = serde_json::json!({
@@ -2063,7 +2068,7 @@ impl SessionManager {
 
     pub async fn remove_breakpoint(&self, session_id: &str, breakpoint_id: &str) {
         let paused = self.get_all_paused_threads(session_id);
-        let mut spawner_guard = self.frida_spawner.write().await;
+        let spawner_guard = self.frida_spawner.read().await;
 
         // IMPORTANT: Detach the listener BEFORE resuming paused threads.
         // Frida's event loop processes removeBreakpoint even while threads are
@@ -2071,7 +2076,7 @@ impl SessionManager {
         // can loop back and re-hit the still-attached interceptor before the
         // removal message is processed — causing a spurious re-pause with no
         // one to continue it.
-        let send_result = if let Some(spawner) = spawner_guard.as_mut() {
+        let send_result = if let Some(spawner) = spawner_guard.as_ref() {
             spawner.remove_breakpoint(session_id, breakpoint_id).await
         } else {
             Ok(())
@@ -2085,7 +2090,7 @@ impl SessionManager {
         // The listener is already detached, so they won't re-trigger.
         for (thread_id, info) in &paused {
             if info.breakpoint_id == breakpoint_id {
-                if let Some(spawner) = spawner_guard.as_mut() {
+                if let Some(spawner) = spawner_guard.as_ref() {
                     if let Err(e) = spawner.resume_thread(session_id, *thread_id).await {
                         tracing::warn!("Failed to resume thread {} paused on breakpoint {}: {}", thread_id, breakpoint_id, e);
                     }
@@ -2281,8 +2286,8 @@ impl SessionManager {
     pub async fn remove_logpoint(&self, session_id: &str, logpoint_id: &str) {
         // Send removal to agent via spawner pipeline (best-effort)
         let send_result = async {
-            let mut spawner_guard = self.frida_spawner.write().await;
-            if let Some(spawner) = spawner_guard.as_mut() {
+            let spawner_guard = self.frida_spawner.read().await;
+            if let Some(spawner) = spawner_guard.as_ref() {
                 spawner.remove_logpoint(session_id, logpoint_id).await
             } else {
                 Ok(())

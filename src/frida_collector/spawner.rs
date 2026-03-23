@@ -2445,17 +2445,21 @@ pub struct FridaSession {
 
 /// Spawner that communicates with the coordinator and per-session worker threads
 pub struct FridaSpawner {
-    sessions: HashMap<String, FridaSession>,
+    /// Per-session Frida state (DWARF handle, hook manager, image base).
+    /// Uses internal RwLock so spawner methods can take &self, enabling
+    /// concurrent operations on different sessions without a global write lock.
+    sessions: std::sync::RwLock<HashMap<String, FridaSession>>,
     coordinator_tx: std::sync::mpsc::Sender<CoordinatorCommand>,
-    session_workers: HashMap<String, std::sync::mpsc::Sender<SessionCommand>>,
+    /// Per-session worker channels. Internal RwLock for concurrent access.
+    session_workers: std::sync::RwLock<HashMap<String, std::sync::mpsc::Sender<SessionCommand>>>,
     /// JoinHandles for session worker threads — needed to synchronize shutdown.
     /// Without this, stop() races: coordinator unrefs the session while the worker
     /// is still unloading/unreffing the script → use-after-free SIGSEGV.
-    session_worker_handles: HashMap<String, thread::JoinHandle<()>>,
+    session_worker_handles: std::sync::Mutex<HashMap<String, thread::JoinHandle<()>>>,
     /// JoinHandle for the coordinator thread — joined on Drop to ensure Frida's
     /// global state (DeviceManager, Device, GLib) is fully cleaned up before
     /// any new FridaSpawner is created.
-    coordinator_handle: Option<thread::JoinHandle<()>>,
+    coordinator_handle: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl FridaSpawner {
@@ -2467,16 +2471,16 @@ impl FridaSpawner {
         });
 
         Self {
-            sessions: HashMap::new(),
+            sessions: std::sync::RwLock::new(HashMap::new()),
             coordinator_tx: cmd_tx,
-            session_workers: HashMap::new(),
-            session_worker_handles: HashMap::new(),
-            coordinator_handle: Some(coordinator_handle),
+            session_workers: std::sync::RwLock::new(HashMap::new()),
+            session_worker_handles: std::sync::Mutex::new(HashMap::new()),
+            coordinator_handle: std::sync::Mutex::new(Some(coordinator_handle)),
         }
     }
 
     pub async fn spawn(
-        &mut self,
+        &self,
         session_id: &str,
         command: &str,
         args: &[String],
@@ -2505,6 +2509,7 @@ impl FridaSpawner {
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
 
+        // No lock held during coordinator round-trip (the expensive part)
         let spawn_result = response_rx.await
             .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))??;
 
@@ -2516,8 +2521,10 @@ impl FridaSpawner {
         let handle = thread::spawn(move || {
             session_worker(sid, spawn_result.script_ptr, spawn_result.hooks_ready, spawn_result.read_response, spawn_result.write_response, pid, session_rx);
         });
-        self.session_workers.insert(session_id.to_string(), session_tx);
-        self.session_worker_handles.insert(session_id.to_string(), handle);
+
+        // Brief internal locks for map insertions
+        self.session_workers.write().unwrap().insert(session_id.to_string(), session_tx);
+        self.session_worker_handles.lock().unwrap().insert(session_id.to_string(), handle);
 
         let session = FridaSession {
             project_root: project_root.to_string(),
@@ -2526,7 +2533,7 @@ impl FridaSpawner {
             image_base,
         };
 
-        self.sessions.insert(session_id.to_string(), session);
+        self.sessions.write().unwrap().insert(session_id.to_string(), session);
 
         Ok(pid)
     }
@@ -2543,13 +2550,17 @@ impl FridaSpawner {
             .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?
     }
 
-    pub async fn add_patterns(&mut self, session_id: &str, patterns: &[String], serialization_depth: Option<u32>, resolver: Option<&dyn crate::symbols::SymbolResolver>) -> Result<HookResult> {
-        let session = self.sessions.get_mut(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+    pub async fn add_patterns(&self, session_id: &str, patterns: &[String], serialization_depth: Option<u32>, resolver: Option<&dyn crate::symbols::SymbolResolver>) -> Result<HookResult> {
+        // Brief write lock: update hook_manager state and extract session data
+        let (mut dwarf_handle, image_base, project_root) = {
+            let mut sessions = self.sessions.write().unwrap();
+            let session = sessions.get_mut(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            session.hook_manager.add_patterns(patterns);
+            (session.dwarf_handle.clone(), session.image_base, session.project_root.clone())
+        };
 
-        session.hook_manager.add_patterns(patterns);
-
-        // Group functions by mode
+        // Group functions by mode — no lock held during expensive DWARF/resolver work
         let mut full_funcs: Vec<FunctionTarget> = Vec::new();
         let mut light_funcs: Vec<FunctionTarget> = Vec::new();
 
@@ -2557,7 +2568,7 @@ impl FridaSpawner {
         if let Some(resolver) = resolver {
             use std::path::Path;
             for pattern in patterns {
-                let targets = resolver.resolve_pattern(pattern, Path::new(&session.project_root))?;
+                let targets = resolver.resolve_pattern(pattern, Path::new(&project_root))?;
                 let mode = HookManager::classify_with_count(pattern, targets.len());
                 tracing::info!("Pattern '{}' -> {:?} mode ({} targets, resolver)", pattern, mode, targets.len());
 
@@ -2593,9 +2604,9 @@ impl FridaSpawner {
             }
         } else {
             // For native binaries (C++/Rust) - use DWARF
-            let dwarf = session.dwarf_handle.clone().get().await?;
+            let dwarf = dwarf_handle.get().await?;
             for pattern in patterns {
-                let matches: Vec<&FunctionInfo> = resolve_pattern(&dwarf, pattern, &session.project_root);
+                let matches: Vec<&FunctionInfo> = resolve_pattern(&dwarf, pattern, &project_root);
                 let mode = HookManager::classify_with_count(pattern, matches.len());
                 tracing::info!("Pattern '{}' -> {:?} mode ({} functions, DWARF)", pattern, mode, matches.len());
 
@@ -2631,7 +2642,7 @@ impl FridaSpawner {
             tracing::warn!("Hook cap: {} matched, {} capped to {}", matched, total, MAX_HOOKS_PER_CALL);
         }
 
-        let image_base = session.image_base;
+        // image_base already extracted above from sessions lock
         let mut total_hooks = 0u32;
 
         // Send chunks for both modes (serialization_depth only on the first chunk overall)
@@ -2668,24 +2679,31 @@ impl FridaSpawner {
     ) -> Result<u32> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::AddPatterns {
-            functions,
-            image_base,
-            mode,
-            serialization_depth,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::AddPatterns {
+                functions,
+                image_base,
+                mode,
+                serialization_depth,
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn remove_patterns(&mut self, session_id: &str, patterns: &[String], resolver: Option<&dyn crate::symbols::SymbolResolver>) -> Result<u32> {
-        let session = self.sessions.get_mut(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+    pub async fn remove_patterns(&self, session_id: &str, patterns: &[String], resolver: Option<&dyn crate::symbols::SymbolResolver>) -> Result<u32> {
+        // Brief lock to extract session data needed for resolution
+        let (mut dwarf_handle, project_root) = {
+            let sessions = self.sessions.read().unwrap();
+            let session = sessions.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            (session.dwarf_handle.clone(), session.project_root.clone())
+        };
 
         let mut functions: Vec<FunctionTarget> = Vec::new();
 
@@ -2693,7 +2711,7 @@ impl FridaSpawner {
             // For interpreted languages (Python, etc.) — use SymbolResolver
             use std::path::Path;
             for pattern in patterns {
-                let targets = resolver.resolve_pattern(pattern, Path::new(&session.project_root))?;
+                let targets = resolver.resolve_pattern(pattern, Path::new(&project_root))?;
                 for target in targets {
                     match target {
                         crate::symbols::ResolvedTarget::SourceLocation { file, line, name } => {
@@ -2719,25 +2737,33 @@ impl FridaSpawner {
             }
         } else {
             // For native binaries — use DWARF
-            let dwarf = session.dwarf_handle.clone().get().await?;
+            let dwarf = dwarf_handle.get().await?;
             for pattern in patterns {
-                for func in resolve_pattern(&dwarf, pattern, &session.project_root) {
+                for func in resolve_pattern(&dwarf, pattern, &project_root) {
                     functions.push(FunctionTarget::from(func));
                 }
             }
         }
 
-        session.hook_manager.remove_patterns(patterns);
+        // Brief write lock to update hook_manager
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.hook_manager.remove_patterns(patterns);
+            }
+        }
 
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::RemovePatterns {
-            functions,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::RemovePatterns {
+                functions,
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
@@ -2746,13 +2772,15 @@ impl FridaSpawner {
     pub async fn read_memory(&self, session_id: &str, recipes_json: String) -> Result<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::ReadMemory {
-            recipes_json,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::ReadMemory {
+                recipes_json,
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
@@ -2761,29 +2789,31 @@ impl FridaSpawner {
     pub async fn write_memory(&self, session_id: &str, recipes_json: String) -> Result<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::WriteMemory {
-            recipes_json,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::WriteMemory {
+                recipes_json,
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn stop(&mut self, session_id: &str) -> Result<()> {
-        self.sessions.remove(session_id);
+    pub async fn stop(&self, session_id: &str) -> Result<()> {
+        self.sessions.write().unwrap().remove(session_id);
 
         // Phase 1: Shut down session worker (unloads + unrefs script).
         // CRITICAL: We must wait for the worker thread to finish before Phase 2,
         // because the coordinator unrefs the Frida *session* GObject. If the worker
         // is still unreffing the *script* (child of session), that's a use-after-free.
-        if let Some(worker_tx) = self.session_workers.remove(session_id) {
+        if let Some(worker_tx) = self.session_workers.write().unwrap().remove(session_id) {
             let _ = worker_tx.send(SessionCommand::Shutdown);
         }
-        if let Some(handle) = self.session_worker_handles.remove(session_id) {
+        if let Some(handle) = self.session_worker_handles.lock().unwrap().remove(session_id) {
             // join() blocks until the worker thread exits (script fully cleaned up)
             let _ = handle.join();
         }
@@ -2801,21 +2831,23 @@ impl FridaSpawner {
     }
 
     pub async fn set_watches(
-        &mut self,
+        &self,
         session_id: &str,
         watches: Vec<WatchTarget>,
         expr_watches: Vec<ExprWatchTarget>,
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::SetWatches {
-            watches,
-            expr_watches,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::SetWatches {
+                watches,
+                expr_watches,
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
@@ -2823,6 +2855,7 @@ impl FridaSpawner {
 
     pub fn get_patterns(&self, session_id: &str) -> Vec<String> {
         self.sessions
+            .read().unwrap()
             .get(session_id)
             .map(|s| s.hook_manager.active_patterns())
             .unwrap_or_default()
@@ -2833,26 +2866,28 @@ impl FridaSpawner {
     /// Both use the same SessionCommand since the message type field
     /// distinguishes them at the agent level.
     pub async fn send_hook_message(
-        &mut self,
+        &self,
         session_id: &str,
         message: serde_json::Value,
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::SetBreakpoint {
-            message,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::SetBreakpoint {
+                message,
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
     pub async fn set_breakpoint(
-        &mut self,
+        &self,
         session_id: &str,
         message: serde_json::Value,
     ) -> Result<()> {
@@ -2860,7 +2895,7 @@ impl FridaSpawner {
     }
 
     pub async fn set_logpoint(
-        &mut self,
+        &self,
         session_id: &str,
         message: serde_json::Value,
     ) -> Result<()> {
@@ -2868,45 +2903,49 @@ impl FridaSpawner {
     }
 
     pub async fn remove_breakpoint(
-        &mut self,
+        &self,
         session_id: &str,
         breakpoint_id: &str,
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::RemoveBreakpoint {
-            breakpoint_id: breakpoint_id.to_string(),
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::RemoveBreakpoint {
+                breakpoint_id: breakpoint_id.to_string(),
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
     pub async fn remove_logpoint(
-        &mut self,
+        &self,
         session_id: &str,
         logpoint_id: &str,
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::RemoveLogpoint {
-            logpoint_id: logpoint_id.to_string(),
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::RemoveLogpoint {
+                logpoint_id: logpoint_id.to_string(),
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
     pub async fn resume_thread(
-        &mut self,
+        &self,
         session_id: &str,
         thread_id: u64,
     ) -> Result<()> {
@@ -2915,7 +2954,7 @@ impl FridaSpawner {
 
     /// Resume thread with optional one-shot breakpoints for stepping
     pub async fn resume_thread_with_step(
-        &mut self,
+        &self,
         session_id: &str,
         thread_id: u64,
         one_shot_addresses: Vec<(u64, bool)>,
@@ -2924,16 +2963,18 @@ impl FridaSpawner {
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let worker_tx = self.session_workers.get(session_id)
-            .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-
-        worker_tx.send(SessionCommand::ResumeThread {
-            thread_id,
-            one_shot_addresses,
-            image_base,
-            return_address,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        {
+            let workers = self.session_workers.read().unwrap();
+            let worker_tx = workers.get(session_id)
+                .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
+            worker_tx.send(SessionCommand::ResumeThread {
+                thread_id,
+                one_shot_addresses,
+                image_base,
+                return_address,
+                response: response_tx,
+            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+        }
 
         response_rx.await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
@@ -2943,16 +2984,17 @@ impl FridaSpawner {
 impl Drop for FridaSpawner {
     fn drop(&mut self) {
         // Send Shutdown to any remaining session workers and join them
-        for (_, tx) in self.session_workers.drain() {
+        // get_mut() avoids locking since we have exclusive &mut self in Drop
+        for (_, tx) in self.session_workers.get_mut().unwrap().drain() {
             let _ = tx.send(SessionCommand::Shutdown);
         }
-        for (_, handle) in self.session_worker_handles.drain() {
+        for (_, handle) in self.session_worker_handles.get_mut().unwrap().drain() {
             let _ = handle.join();
         }
         // Drop coordinator_tx to close the channel, causing coordinator_worker to exit
         // (self.coordinator_tx drops naturally after this block)
         // But we need to drop it *before* joining, so swap it out
-        let coord_handle = self.coordinator_handle.take();
+        let coord_handle = self.coordinator_handle.get_mut().unwrap().take();
         // coordinator_tx is dropped when self drops — but we need it dropped NOW
         // so the coordinator thread sees the channel close and exits.
         // We can't explicitly drop a field, but once we take() the handle,
