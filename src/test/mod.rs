@@ -558,18 +558,97 @@ impl TestRunner {
 /// Resolve a program name to an absolute path via PATH lookup.
 /// Frida's Device.spawn() doesn't do PATH resolution like a shell.
 fn resolve_program(program: &str) -> String {
-    if program.contains('/') {
-        return program.to_string();
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
+    let resolved = if program.contains('/') {
+        program.to_string()
+    } else if let Ok(path_var) = std::env::var("PATH") {
+        let mut found = None;
         for dir in path_var.split(':') {
             let full = format!("{}/{}", dir, program);
             if Path::new(&full).exists() {
-                return full;
+                found = Some(full);
+                break;
             }
         }
+        found.unwrap_or_else(|| program.to_string())
+    } else {
+        program.to_string()
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        return prepare_debuggable_bun(&resolved).unwrap_or(resolved);
     }
-    program.to_string()
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        resolved
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_debuggable_bun(program: &str) -> Option<String> {
+    let path = Path::new(program);
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if !name.contains("bun") || name == "strobe-bun-debug" {
+        return None;
+    }
+
+    let debug_path = std::env::temp_dir().join("strobe-bun-debug");
+    let ent_path = std::env::temp_dir().join("strobe-bun-debug.entitlements");
+
+    let needs_refresh = match (std::fs::metadata(path), std::fs::metadata(&debug_path)) {
+        (Ok(src), Ok(dst)) => {
+            let src_mtime = src.modified().ok();
+            let dst_mtime = dst.modified().ok();
+            src_mtime.zip(dst_mtime).map(|(src, dst)| src > dst).unwrap_or(true)
+        }
+        (Ok(_), Err(_)) => true,
+        _ => return None,
+    };
+
+    if !needs_refresh {
+        return Some(debug_path.to_string_lossy().into_owned());
+    }
+
+    let entitlements = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.security.get-task-allow</key><true/>
+</dict></plist>"#;
+
+    if let Err(err) = std::fs::write(&ent_path, entitlements) {
+        tracing::warn!("Failed to write Bun entitlements file: {}", err);
+        return None;
+    }
+    if let Err(err) = std::fs::copy(path, &debug_path) {
+        tracing::warn!("Failed to copy Bun binary for debug_test: {}", err);
+        return None;
+    }
+
+    match std::process::Command::new("codesign")
+        .args([
+            "-f",
+            "-s",
+            "-",
+            "--entitlements",
+            ent_path.to_string_lossy().as_ref(),
+            debug_path.to_string_lossy().as_ref(),
+        ])
+        .status()
+    {
+        Ok(status) if status.success() => Some(debug_path.to_string_lossy().into_owned()),
+        Ok(status) => {
+            tracing::warn!(
+                "codesign returned {} while preparing Bun for Frida; falling back to original binary",
+                status
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!("Failed to run codesign for Bun debug_test: {}", err);
+            None
+        }
+    }
 }
 
 /// Collect all output events of a given type from the database into a single string.
