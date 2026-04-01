@@ -892,14 +892,20 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
     }
 
     async fn handle_disconnect(&self, connection_id: &str) {
-        // Clean up pending patterns for this connection
+        // Collect all needed state in a single lock pass, following the global
+        // lock order: connection_sessions → pending_patterns → test_runs.
+        // This prevents ABBA deadlocks with tool_debug_launch which uses the
+        // same order.
+        let session_ids = {
+            let mut sessions = self.connection_sessions.write().await;
+            sessions.remove(connection_id).unwrap_or_default()
+        };
+
         {
             let mut pending = self.pending_patterns.write().await;
             pending.remove(connection_id);
         }
 
-        // Collect test session IDs so we can retain their DB data
-        // (the spawned task may still need events for final output)
         let test_session_ids: HashSet<String> = {
             let runs = self.test_runs.read().await;
             runs.values()
@@ -908,26 +914,32 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 .collect()
         };
 
-        // Stop any sessions owned by this connection
-        let session_ids = {
-            let mut sessions = self.connection_sessions.write().await;
-            sessions.remove(connection_id).unwrap_or_default()
-        };
-
+        // Stop sessions concurrently instead of sequentially to prevent
+        // cascading hangs (each stop can take up to 5s with the new timeout).
+        let mut join_set = tokio::task::JoinSet::new();
         for session_id in session_ids {
             if let Ok(Some(session)) = self.session_manager.get_session(&session_id) {
                 if session.status == crate::db::SessionStatus::Running {
-                    tracing::info!("Cleaning up session {} after client disconnect", session_id);
-                    let _ = self.session_manager.stop_frida(&session_id).await;
-                    if test_session_ids.contains(&session_id) {
-                        // Retain DB data — spawned task needs events for final output
-                        let _ = self.session_manager.stop_session_retain(&session_id).await;
-                    } else {
-                        let _ = self.session_manager.stop_session(&session_id).await;
-                    }
+                    let sm = Arc::clone(&self.session_manager);
+                    let is_test = test_session_ids.contains(&session_id);
+                    join_set.spawn(async move {
+                        tracing::info!("Cleaning up session {} after client disconnect", session_id);
+                        let _ = sm.stop_frida(&session_id).await;
+                        if is_test {
+                            let _ = sm.stop_session_retain(&session_id).await;
+                        } else {
+                            let _ = sm.stop_session(&session_id).await;
+                        }
+                    });
                 }
             }
         }
+
+        // Wait for all session stops with a global timeout
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            async { while join_set.join_next().await.is_some() {} },
+        ).await;
 
         // Transition running test runs from this connection to Failed
         {

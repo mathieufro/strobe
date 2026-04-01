@@ -410,62 +410,39 @@ impl SessionManager {
     }
 
     pub async fn stop_session(&self, id: &str) -> Result<u64> {
-        // Phase 1: Signal database writer task to flush and exit
-        if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
-            let _ = cancel_tx.send(true);
-        }
-
-        // Phase 2: Wait for writer task to complete (ensures all events flushed)
-        if let Some(handle) = self.writer_handles.write().await.remove(id) {
-            let _ = handle.await; // Wait for writer to finish flushing
-        }
-
-        // Phase 3: Count events AFTER flush so the count is accurate
+        self.flush_writer(id).await;
         let count = self.db.count_session_events(id)?;
-
-        // Phase 4: Now safe to delete session (all events flushed, no FK violations)
         self.db.delete_session(id)?;
-
-        // Clean up in-memory state
-        write_lock(&self.patterns).remove(id);
-        write_lock(&self.hook_counts).remove(id);
-        write_lock(&self.watches).remove(id);
-        write_lock(&self.event_limits).remove(id);
-        write_lock(&self.child_pids).remove(id);
-        write_lock(&self.breakpoints).remove(id);
-        write_lock(&self.logpoints).remove(id);
-        write_lock(&self.paused_threads).remove(id);
-        write_lock(&self.languages).remove(id);
-        write_lock(&self.resolvers).remove(id);
-
-        // Clean up temp ESM hook script
-        if let Some(path) = write_lock(&self.esm_hook_paths).remove(id) {
-            let _ = std::fs::remove_file(&path);
-        }
-
+        self.cleanup_session_state(id);
         Ok(count)
     }
 
     /// Stop a session but retain its DB rows for later inspection.
     /// Cleans up in-memory state and flushes the writer, but does NOT delete from DB.
     pub async fn stop_session_retain(&self, id: &str) -> Result<u64> {
-        // Phase 1: Signal database writer task to flush and exit
+        self.flush_writer(id).await;
+        let count = self.db.count_session_events(id)?;
+        self.db.mark_session_stopped(id)?;
+        self.cleanup_session_state(id);
+        Ok(count)
+    }
+
+    /// Signal the database writer task to flush and wait for it with a timeout.
+    async fn flush_writer(&self, id: &str) {
         if let Some(cancel_tx) = write_lock(&self.writer_cancel_tokens).remove(id) {
             let _ = cancel_tx.send(true);
         }
-
-        // Phase 2: Wait for writer task to complete (ensures all events flushed)
         if let Some(handle) = self.writer_handles.write().await.remove(id) {
-            let _ = handle.await; // Wait for writer to finish flushing
+            // Timeout prevents hanging if the writer is stuck on a DB operation
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(_) => {} // Writer flushed and exited
+                Err(_) => tracing::warn!("Timed out waiting for event writer to flush for session {} (5s)", id),
+            }
         }
+    }
 
-        // Phase 3: Count events AFTER flush so the count is accurate
-        let count = self.db.count_session_events(id)?;
-
-        // Phase 4: Mark session as stopped (but keep it in the DB)
-        self.db.mark_session_stopped(id)?;
-
-        // Clean up in-memory state
+    /// Clean up all in-memory state for a session.
+    fn cleanup_session_state(&self, id: &str) {
         write_lock(&self.patterns).remove(id);
         write_lock(&self.hook_counts).remove(id);
         write_lock(&self.watches).remove(id);
@@ -476,13 +453,9 @@ impl SessionManager {
         write_lock(&self.paused_threads).remove(id);
         write_lock(&self.languages).remove(id);
         write_lock(&self.resolvers).remove(id);
-
-        // Clean up temp ESM hook script
         if let Some(path) = write_lock(&self.esm_hook_paths).remove(id) {
             let _ = std::fs::remove_file(&path);
         }
-
-        Ok(count)
     }
 
     pub fn add_child_pid(&self, session_id: &str, pid: u32) {

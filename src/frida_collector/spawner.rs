@@ -2813,9 +2813,19 @@ impl FridaSpawner {
         if let Some(worker_tx) = self.session_workers.write().unwrap().remove(session_id) {
             let _ = worker_tx.send(SessionCommand::Shutdown);
         }
-        if let Some(handle) = self.session_worker_handles.lock().unwrap().remove(session_id) {
-            // join() blocks until the worker thread exits (script fully cleaned up)
-            let _ = handle.join();
+        let maybe_handle = self.session_worker_handles.lock().unwrap().remove(session_id);
+        if let Some(handle) = maybe_handle {
+            // Use spawn_blocking + timeout to avoid blocking the async runtime
+            // indefinitely if the worker is stuck on a recv_timeout (up to 45s).
+            let join_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || handle.join()),
+            ).await;
+            match join_result {
+                Ok(Ok(_)) => {} // Worker exited cleanly
+                Ok(Err(_)) => tracing::warn!("spawn_blocking panicked joining session worker for {}", session_id),
+                Err(_) => tracing::warn!("Timed out waiting for session worker {} to exit (5s) — proceeding with cleanup", session_id),
+            }
         }
 
         // Phase 2: Kill processes via coordinator (device.kill)
@@ -2826,8 +2836,14 @@ impl FridaSpawner {
             response: response_tx,
         }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
 
-        response_rx.await
-            .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?
+        // Timeout prevents hanging if coordinator is blocked on device.kill()
+        match tokio::time::timeout(std::time::Duration::from_secs(10), response_rx).await {
+            Ok(result) => result.map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?,
+            Err(_) => {
+                tracing::warn!("Timed out waiting for coordinator to stop session {} (10s)", session_id);
+                Ok(())
+            }
+        }
     }
 
     pub async fn set_watches(
