@@ -29,17 +29,45 @@ impl TestAdapter for BunAdapter {
 
     fn suite_command(
         &self,
-        _project_root: &Path,
-        _level: Option<TestLevel>,
+        project_root: &Path,
+        level: Option<TestLevel>,
         _env: &HashMap<String, String>,
     ) -> crate::Result<TestCommand> {
+        let mut args = vec![
+            "test".to_string(),
+            "--reporter=junit".to_string(),
+            "--reporter-outfile=/dev/stdout".to_string(),
+        ];
+
+        // If a level is specified, check package.json for a matching "test:<level>" script
+        // and extract its directory arguments. E.g. "test:e2e": "bun test src/tests/e2e"
+        // → append "src/tests/e2e" to narrow the test scope.
+        if let Some(level) = level {
+            let level_key = match level {
+                TestLevel::Unit => "test:unit",
+                TestLevel::Integration => "test:integration",
+                TestLevel::E2e => "test:e2e",
+            };
+            if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
+                // Look for "test:<level>": "bun test <paths...>"
+                if let Some(script) = extract_script_value(&pkg, level_key) {
+                    let parts: Vec<&str> = script.split_whitespace().collect();
+                    // Skip "bun test" prefix, take remaining as path args
+                    if parts.len() >= 2 && parts[0] == "bun" && parts[1] == "test" {
+                        for part in &parts[2..] {
+                            // Skip flags (--reporter, etc.)
+                            if !part.starts_with('-') {
+                                args.push(part.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(TestCommand {
             program: "bun".to_string(),
-            args: vec![
-                "test".to_string(),
-                "--reporter=junit".to_string(),
-                "--reporter-outfile=/dev/stdout".to_string(),
-            ],
+            args,
             env: HashMap::new(),
         })
     }
@@ -246,6 +274,21 @@ pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
     }
 }
 
+/// Extract a script value from package.json by key name.
+/// Looks for `"<key>": "<value>"` in the raw JSON string.
+fn extract_script_value(pkg_json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let idx = pkg_json.find(&pattern)?;
+    let after_key = &pkg_json[idx + pattern.len()..];
+    // Skip whitespace and colon
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let after_ws = after_colon.trim_start();
+    // Extract quoted value
+    let after_quote = after_ws.strip_prefix('"')?;
+    let end = after_quote.find('"')?;
+    Some(after_quote[..end].to_string())
+}
+
 /// Extract an attribute value from an XML element.
 fn get_attr(e: &quick_xml::events::BytesStart, name: &str) -> String {
     e.attributes()
@@ -349,5 +392,23 @@ AssertionError: Expected 6, got 5
         assert_eq!(cmd.program, "bun");
         assert!(cmd.args.iter().any(|a| a.contains("junit")));
         assert!(cmd.args.iter().any(|a| a.contains("reporter-outfile")));
+    }
+
+    #[test]
+    fn test_suite_command_with_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"),
+            r#"{"scripts": {"test": "bun test", "test:e2e": "bun test src/tests/e2e"}}"#).unwrap();
+        let cmd = BunAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
+        assert!(cmd.args.contains(&"src/tests/e2e".to_string()),
+            "E2E level should add paths from package.json script, got: {:?}", cmd.args);
+    }
+
+    #[test]
+    fn test_extract_script_value() {
+        let pkg = r#"{"scripts": {"test:e2e": "bun test src/tests/e2e", "test": "bun test"}}"#;
+        assert_eq!(extract_script_value(pkg, "test:e2e"), Some("bun test src/tests/e2e".to_string()));
+        assert_eq!(extract_script_value(pkg, "test"), Some("bun test".to_string()));
+        assert_eq!(extract_script_value(pkg, "test:missing"), None);
     }
 }

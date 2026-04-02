@@ -10,6 +10,7 @@ pub mod deno_adapter;
 pub mod go_adapter;
 pub mod gtest_adapter;
 pub mod mocha_adapter;
+pub mod playwright_adapter;
 pub mod stacks;
 pub mod stuck_detector;
 pub mod output;
@@ -32,6 +33,7 @@ use deno_adapter::DenoAdapter;
 use go_adapter::GoTestAdapter;
 use gtest_adapter::GTestAdapter;
 use mocha_adapter::MochaAdapter;
+use playwright_adapter::PlaywrightAdapter;
 use stuck_detector::StuckDetector;
 
 /// Phase of a test run lifecycle.
@@ -173,6 +175,7 @@ impl TestRunner {
                 Box::new(GoTestAdapter),
                 Box::new(GTestAdapter),
                 Box::new(MochaAdapter),
+                Box::new(PlaywrightAdapter),
             ],
         }
     }
@@ -193,7 +196,7 @@ impl TestRunner {
                 }
             }
             return Err(crate::Error::ValidationError(
-                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2', 'pytest', 'unittest', 'vitest', 'jest', 'bun', 'deno', 'go', 'mocha', 'gtest'", name)
+                format!("Unknown framework '{}'. Supported: 'cargo', 'catch2', 'pytest', 'unittest', 'vitest', 'jest', 'bun', 'deno', 'go', 'mocha', 'gtest', 'playwright'", name)
             ));
         }
 
@@ -326,6 +329,13 @@ impl TestRunner {
             "mocha" => Some(mocha_adapter::update_progress),
             "pytest" => Some(pytest_adapter::update_progress),
             "unittest" => Some(unittest_adapter::update_progress),
+            "playwright" => {
+                playwright_adapter::reset_progress();
+                // Playwright: use the DB event loop callback to poll the progress file.
+                // The callback is invoked every 500ms (even with no DB events thanks to
+                // the empty-string fallback path). Inside, it reads the progress file.
+                Some(playwright_adapter::update_progress as fn(&str, &Arc<Mutex<TestProgress>>))
+            }
             "vitest" | "jest" | "bun" => Some(vitest_adapter::update_progress),
             _ => None,
         };
@@ -359,20 +369,24 @@ impl TestRunner {
         let start = std::time::Instant::now();
         let mut reaped_status: Option<i32> = None;
 
+        // For Playwright: the spawned bun process exec's into node (playwright runner)
+        // and exits immediately. We need to detect when the REAL test runner finishes,
+        // not when the bun wrapper exits. Use a child process group check.
+        let is_playwright = framework_name == "playwright";
+
         loop {
-            if !stacks::is_process_alive(pid) {
-                break;
-            }
+            let process_alive = stacks::is_process_alive(pid);
 
             // Try to reap zombie — kill(pid, 0) returns true for zombies but
             // waitpid detects actual exit. Without this, the loop runs until
             // hard_timeout for every normal test completion.
+            let mut reaped = false;
             {
                 let mut status: i32 = 0;
                 let wp = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
                 if wp > 0 {
                     reaped_status = Some(status);
-                    break;
+                    reaped = true;
                 }
             }
 
@@ -391,9 +405,6 @@ impl TestRunner {
             }
 
             // Poll DB for new text events (stdout + stderr) and update progress.
-            // Use timestamp-based filtering: only fetch events newer than last seen.
-            // (Offset-based pagination is broken with DESC ordering — new events
-            // arrive at the "top" but offset skips from the top, missing them.)
             if let Some(update_fn) = progress_fn {
                 let mut new_events = session_manager.db().query_events(session_id, |q| {
                     let mut q = q.text_output().limit(500);
@@ -403,25 +414,27 @@ impl TestRunner {
                     q
                 }).unwrap_or_default();
 
-                // DB returns newest-first; reverse to chronological so "test started"
-                // is processed before "test ok".
                 new_events.reverse();
 
-                for event in &new_events {
-                    if event.timestamp_ns > last_seen_timestamp_ns {
-                        last_seen_timestamp_ns = event.timestamp_ns;
-                    }
-                    if let Some(text) = &event.text {
-                        update_fn(text, &progress);
+                if new_events.is_empty() {
+                    // No DB events — still call update_fn with empty string so
+                    // file-polling adapters (Playwright) can check their progress file.
+                    update_fn("", &progress);
+                } else {
+                    for event in &new_events {
+                        if event.timestamp_ns > last_seen_timestamp_ns {
+                            last_seen_timestamp_ns = event.timestamp_ns;
+                        }
+                        if let Some(text) = &event.text {
+                            update_fn(text, &progress);
+                        }
                     }
                 }
             }
 
-            // For JS frameworks with buffered reporters (vitest/jest/bun), force transition
-            // from Compiling to Running after 3s IF the custom reporter hasn't already
-            // triggered the transition. Other frameworks (cargo, catch2, go, etc.) manage
-            // their own phase transitions via structured output parsing.
-            if matches!(framework_name.as_str(), "vitest" | "jest" | "bun") {
+            // For JS frameworks with buffered reporters, force transition
+            // from Compiling to Running after 3s.
+            if matches!(framework_name.as_str(), "vitest" | "jest" | "bun" | "playwright") {
                 if let Ok(mut p) = progress.lock() {
                     if p.phase == TestPhase::Compiling && !p.has_custom_reporter && start.elapsed().as_secs() >= 3 {
                         p.phase = TestPhase::Running;
@@ -429,11 +442,54 @@ impl TestRunner {
                 }
             }
 
+            // Process exit check — AFTER the progress poll so we don't miss the last events.
+            if !process_alive || reaped {
+                if is_playwright {
+                    // Playwright: the bun wrapper exits early but tests continue in a child
+                    // node process. Keep polling the progress file until it stops growing
+                    // or all tests have reported results, up to hard_timeout.
+                    let last_file_size = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
+                        .map(|m| m.len()).unwrap_or(0);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let new_file_size = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
+                        .map(|m| m.len()).unwrap_or(0);
+                    if new_file_size > last_file_size {
+                        // File still growing — tests are still running, keep looping
+                        continue;
+                    }
+                    // File stopped growing — drain remaining events
+                    if let Some(update_fn) = progress_fn {
+                        update_fn("", &progress);
+                    }
+                }
+                break;
+            }
+
             tokio::time::sleep(poll_interval).await;
         }
 
         // Abort detector
         detector_handle.abort();
+
+        // Playwright: the spawned process exits before tests finish (exec-replacement).
+        // Wait for the progress file to stop growing, polling + updating progress as we go.
+        if is_playwright {
+            if let Some(update_fn) = progress_fn {
+                let poll_wait = std::time::Duration::from_secs(3);
+                for _ in 0..60 { // max 3 minutes wait
+                    update_fn("", &progress);
+                    let size_before = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
+                        .map(|m| m.len()).unwrap_or(0);
+                    tokio::time::sleep(poll_wait).await;
+                    update_fn("", &progress);
+                    let size_after = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
+                        .map(|m| m.len()).unwrap_or(0);
+                    if size_after == size_before && size_after > 0 {
+                        break; // File stopped growing — tests done
+                    }
+                }
+            }
+        }
 
         // Mark suites finished in progress
         {
@@ -614,6 +670,7 @@ fn prepare_debuggable_bun(program: &str) -> Option<String> {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>com.apple.security.get-task-allow</key><true/>
+<key>com.apple.security.cs.disable-library-validation</key><true/>
 </dict></plist>"#;
 
     if let Err(err) = std::fs::write(&ent_path, entitlements) {
