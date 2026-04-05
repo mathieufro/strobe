@@ -68,6 +68,8 @@ impl TestAdapter for JestAdapter {
                 "--no-coverage".to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -81,6 +83,8 @@ impl TestAdapter for JestAdapter {
                 "-t".to_string(), test_name.to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 

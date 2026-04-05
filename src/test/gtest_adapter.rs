@@ -199,6 +199,8 @@ impl GTestAdapter {
             program: cmd.to_string(),
             args: vec!["--gtest_output=json:/dev/stdout".to_string()],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         }
     }
 
@@ -211,6 +213,8 @@ impl GTestAdapter {
                 format!("--gtest_filter={}", test_name),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         }
     }
 }

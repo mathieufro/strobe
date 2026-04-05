@@ -39,6 +39,8 @@ impl TestAdapter for DenoAdapter {
                 "--reporter=junit".to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -55,6 +57,8 @@ impl TestAdapter for DenoAdapter {
                 format!("--filter={}", test_name),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 

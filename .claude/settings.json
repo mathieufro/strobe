@@ -2,8 +2,13 @@
   "skills": [
     {
       "name": "strobe-tdd",
-      "path": "skills/strobe-tdd.md",
-      "description": "Guide TDD workflow using Strobe's debug_test tool"
+      "path": "skills/strobe-debugging.md",
+      "description": "Investigate bugs using Strobe's dynamic instrumentation — run first, trace fast, fix with evidence"
+    },
+    {
+      "name": "strobe-test-setup",
+      "path": "skills/strobe-test-setup.md",
+      "description": "Set up and run tests with Strobe's debug_test — framework detection, monorepo support, level filtering, and per-language guidance"
     }
   ],
   "attribution": {

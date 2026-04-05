@@ -51,6 +51,8 @@ impl TestAdapter for CargoTestAdapter {
             program: "cargo".to_string(),
             args,
             env: HashMap::from([("RUSTC_BOOTSTRAP".to_string(), "1".to_string())]),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -89,6 +91,8 @@ impl TestAdapter for CargoTestAdapter {
             program: "cargo".to_string(),
             args,
             env: HashMap::from([("RUSTC_BOOTSTRAP".to_string(), "1".to_string())]),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 

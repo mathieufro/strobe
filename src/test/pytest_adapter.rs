@@ -74,6 +74,8 @@ impl TestAdapter for PytestAdapter {
             program: if uv { "uv".into() } else { "python3".into() },
             args,
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -95,6 +97,8 @@ impl TestAdapter for PytestAdapter {
             program: if uv { "uv".into() } else { "python3".into() },
             args,
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 

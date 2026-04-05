@@ -15,6 +15,10 @@ pub struct TestCommand {
     pub program: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    /// Override working directory. None = use project_root.
+    pub cwd: Option<String>,
+    /// Env vars to remove from the inherited environment.
+    pub remove_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

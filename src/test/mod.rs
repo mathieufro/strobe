@@ -274,6 +274,9 @@ impl TestRunner {
         // Inherit parent environment, then overlay test-specific and user-provided vars.
         // envp() replaces the environment entirely, so we must include everything.
         let mut combined_env: HashMap<String, String> = std::env::vars().collect();
+        for key in &test_cmd.remove_env {
+            combined_env.remove(key);
+        }
         combined_env.extend(test_cmd.env.clone());
         combined_env.extend(env.clone());
 
@@ -288,11 +291,13 @@ impl TestRunner {
 
         // Spawn via Frida — defer resume if we need to install hooks first
         let has_trace_patterns = !trace_patterns.is_empty();
+        let spawn_cwd = test_cmd.cwd.as_deref()
+            .unwrap_or(project_root.to_str().unwrap_or("."));
         let pid = session_manager.spawn_with_frida(
             session_id,
             &program,
             &test_cmd.args,
-            Some(project_root.to_str().unwrap_or(".")),
+            Some(spawn_cwd),
             project_root.to_str().unwrap_or("."),
             Some(&combined_env),
             has_trace_patterns, // defer_resume: install hooks before running
@@ -336,7 +341,8 @@ impl TestRunner {
                 // the empty-string fallback path). Inside, it reads the progress file.
                 Some(playwright_adapter::update_progress as fn(&str, &Arc<Mutex<TestProgress>>))
             }
-            "vitest" | "jest" | "bun" => Some(vitest_adapter::update_progress),
+            "vitest" | "jest" => Some(vitest_adapter::update_progress),
+            "bun" => Some(bun_adapter::update_progress),
             _ => None,
         };
 

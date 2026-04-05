@@ -94,6 +94,8 @@ impl TestAdapter for VitestAdapter {
                 "--no-coverage".to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -110,6 +112,8 @@ impl TestAdapter for VitestAdapter {
                 "-t".to_string(), test_name.to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -219,6 +223,8 @@ fn build_custom_command(cmd: &str, test_name: Option<&str>) -> crate::Result<Tes
             program,
             args,
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     } else {
         // Direct vitest/npx command — inject reporter flags
@@ -244,6 +250,8 @@ fn build_custom_command(cmd: &str, test_name: Option<&str>) -> crate::Result<Tes
             program,
             args,
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 }

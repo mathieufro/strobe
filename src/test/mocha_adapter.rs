@@ -116,6 +116,8 @@ impl TestAdapter for MochaAdapter {
                 "json".to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -134,6 +136,8 @@ impl TestAdapter for MochaAdapter {
                 test_name.to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 

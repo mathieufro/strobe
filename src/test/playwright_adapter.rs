@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::adapter::*;
+use super::bun_adapter::find_workspace_dirs;
 
 /// Custom Playwright reporter that streams per-test events to stderr.
 /// Written to a temp file and passed via `--reporter=<path>`.
@@ -24,31 +25,26 @@ pub struct PlaywrightAdapter;
 
 impl TestAdapter for PlaywrightAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
-        let has_config = ["playwright.config.ts", "playwright.config.js", "playwright.config.mts"]
-            .iter()
-            .any(|cfg| project_root.join(cfg).exists());
-
-        if !has_config {
-            return 0;
+        // Direct config in project root
+        if has_playwright_config(project_root) {
+            return if has_competing_framework(project_root) { 80 } else { 95 };
         }
 
-        // If vitest or jest is also present, lower confidence — the user likely wants
-        // the faster test runner by default and should explicitly request playwright.
-        if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
-            if pkg.contains("\"vitest\"") || pkg.contains("\"jest\"") {
-                return 80; // Below vitest (95) — explicit `framework: "playwright"` required
-            }
+        // Monorepo: check if any workspace has a playwright config
+        if find_playwright_workspace(project_root).is_some() {
+            // Always return 80 in monorepos — bun:test or vitest likely handles unit/integration,
+            // so Playwright should only be used when explicitly requested.
+            return 80;
         }
 
-        // Pure Playwright project (no competing framework) — auto-detect
-        95
+        0
     }
 
     fn name(&self) -> &str { "playwright" }
 
     fn suite_command(
         &self,
-        _project_root: &Path,
+        project_root: &Path,
         level: Option<TestLevel>,
         _env: &HashMap<String, String>,
     ) -> crate::Result<TestCommand> {
@@ -65,6 +61,9 @@ impl TestAdapter for PlaywrightAdapter {
         env.insert("STROBE_REPORTER".to_string(), reporter_path.clone());
         env.insert("STROBE_PROGRESS_FILE".to_string(), progress_file);
 
+        // Resolve workspace cwd — Playwright's node_modules and config live in the workspace dir.
+        let cwd = resolve_playwright_cwd(project_root);
+
         // Invoke Playwright CLI directly via bun (not bunx) to avoid exec-replacement
         // that confuses Frida's process tracking. No --reporter on CLI — playwright.config.ts
         // detects the Strobe reporter file on disk and uses both JUnit + progress reporter.
@@ -75,18 +74,22 @@ impl TestAdapter for PlaywrightAdapter {
                 "test".to_string(),
             ],
             env,
+            cwd,
+            remove_env: vec![],
         })
     }
 
     fn single_test_command(
         &self,
-        _project_root: &Path,
+        project_root: &Path,
         test_name: &str,
     ) -> crate::Result<TestCommand> {
         let reporter_path = ensure_reporter_file();
         let progress_file = progress_file_path();
         let mut env = HashMap::new();
         env.insert("STROBE_PROGRESS_FILE".to_string(), progress_file);
+
+        let cwd = resolve_playwright_cwd(project_root);
 
         Ok(TestCommand {
             program: "bun".to_string(),
@@ -97,18 +100,12 @@ impl TestAdapter for PlaywrightAdapter {
                 test_name.to_string(),
             ],
             env,
+            cwd,
+            remove_env: vec![],
         })
     }
 
     fn parse_output(&self, stdout: &str, _stderr: &str, _exit_code: i32) -> TestResult {
-        // DEBUG: write diagnostic info to a file so we can see what parse_output receives
-        let _ = std::fs::write("/tmp/.strobe-pw-parse-debug", format!(
-            "stdout_len={}\nfile_exists={}\nfile_len={}\n",
-            stdout.len(),
-            std::path::Path::new(PROGRESS_FILE).exists(),
-            std::fs::metadata(PROGRESS_FILE).map(|m| m.len()).unwrap_or(0),
-        ));
-
         // Primary: try JUnit XML from stdout (works when Frida captures stdout correctly)
         let blocks: Vec<&str> = stdout
             .split("<?xml")
@@ -158,15 +155,19 @@ impl TestAdapter for PlaywrightAdapter {
                                 });
                             }
                             "fail" => {
+                                let file = v.get("f").and_then(|f| f.as_str()).map(|s| s.to_string());
+                                let line = v.get("l").and_then(|l| l.as_u64()).map(|l| l as u32);
+                                let msg = v.get("m").and_then(|m| m.as_str())
+                                    .unwrap_or("Test failed").to_string();
                                 total.summary.failed += 1;
                                 total.failures.push(TestFailure {
-                                    name: name.clone(), file: None, line: None,
-                                    message: "Test failed".to_string(),
+                                    name: name.clone(), file: file.clone(), line,
+                                    message: msg.clone(),
                                     rerun: None, suggested_traces: vec![],
                                 });
                                 total.all_tests.push(TestDetail {
                                     name, status: TestStatus::Fail, duration_ms: dur,
-                                    stdout: None, stderr: None, message: Some("Test failed".to_string()),
+                                    stdout: None, stderr: None, message: Some(msg),
                                 });
                             }
                             "skip" => {
@@ -201,6 +202,47 @@ impl TestAdapter for PlaywrightAdapter {
     fn default_timeout(&self, _level: Option<TestLevel>) -> u64 {
         300_000 // 5 minutes — browser startup, fixtures, network calls
     }
+}
+
+const PLAYWRIGHT_CONFIGS: &[&str] = &[
+    "playwright.config.ts",
+    "playwright.config.js",
+    "playwright.config.mts",
+];
+
+/// Check if a directory contains a playwright config file.
+fn has_playwright_config(dir: &Path) -> bool {
+    PLAYWRIGHT_CONFIGS.iter().any(|cfg| dir.join(cfg).exists())
+}
+
+/// Check if project has vitest or jest (competing framework).
+fn has_competing_framework(project_root: &Path) -> bool {
+    if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
+        return pkg.contains("\"vitest\"") || pkg.contains("\"jest\"");
+    }
+    false
+}
+
+/// Find the workspace directory containing a playwright config in a monorepo.
+/// Returns the absolute path to the workspace dir, or None.
+pub(crate) fn find_playwright_workspace(project_root: &Path) -> Option<std::path::PathBuf> {
+    let pkg = std::fs::read_to_string(project_root.join("package.json")).ok()?;
+    if !pkg.contains("\"workspaces\"") { return None; }
+    let dirs = find_workspace_dirs(project_root, &pkg);
+    dirs.into_iter().find(|ws| has_playwright_config(ws))
+}
+
+/// Resolve the cwd for Playwright commands.
+/// In monorepos, Playwright's config and node_modules live in a workspace dir.
+/// Returns None if config is in project_root (no cwd override needed).
+fn resolve_playwright_cwd(project_root: &Path) -> Option<String> {
+    // Config at project root — no cwd needed
+    if has_playwright_config(project_root) {
+        return None;
+    }
+    // Monorepo: find workspace with config
+    find_playwright_workspace(project_root)
+        .map(|ws| ws.to_string_lossy().into_owned())
 }
 
 use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
@@ -294,8 +336,8 @@ mod tests {
     fn test_suite_command_e2e() {
         let dir = tempfile::tempdir().unwrap();
         let cmd = PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
-        assert_eq!(cmd.program, "bunx");
-        assert!(cmd.args.contains(&"playwright".to_string()));
+        assert_eq!(cmd.program, "bun");
+        assert!(cmd.args.contains(&"test".to_string()));
         // No --reporter on CLI — config handles reporters via STROBE_REPORTER env
         assert!(cmd.env.contains_key("STROBE_REPORTER"));
         assert!(cmd.env.contains_key("STROBE_PROGRESS_FILE"));
@@ -314,6 +356,48 @@ mod tests {
         let cmd = PlaywrightAdapter.single_test_command(dir.path(), "login page").unwrap();
         assert!(cmd.args.contains(&"--grep".to_string()));
         assert!(cmd.args.contains(&"login page".to_string()));
+    }
+
+    #[test]
+    fn test_detect_monorepo_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root has workspaces but no playwright config
+        std::fs::write(dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"]}"#).unwrap();
+        // Web workspace has playwright config
+        let web = dir.path().join("apps/web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("playwright.config.ts"), "export default {}").unwrap();
+
+        let adapter = PlaywrightAdapter;
+        let conf = adapter.detect(dir.path(), None);
+        assert_eq!(conf, 80, "monorepo with playwright workspace should detect at 80");
+    }
+
+    #[test]
+    fn test_suite_command_monorepo_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root with workspaces, no playwright config at root
+        std::fs::write(dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"]}"#).unwrap();
+        // Web workspace with playwright config
+        let web = dir.path().join("apps/web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("playwright.config.ts"), "export default {}").unwrap();
+
+        let cmd = PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
+        assert!(cmd.cwd.is_some(), "should set cwd for monorepo");
+        assert!(cmd.cwd.as_ref().unwrap().ends_with("apps/web"),
+            "cwd should point to web workspace, got: {:?}", cmd.cwd);
+    }
+
+    #[test]
+    fn test_suite_command_no_cwd_when_config_at_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("playwright.config.ts"), "export default {}").unwrap();
+
+        let cmd = PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
+        assert!(cmd.cwd.is_none(), "should not set cwd when config is at project root");
     }
 
     #[test]

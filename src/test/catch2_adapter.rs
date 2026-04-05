@@ -188,6 +188,8 @@ impl TestAdapter for Catch2Adapter {
             program: cmd.to_string(),
             args,
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -209,6 +211,8 @@ impl TestAdapter for Catch2Adapter {
                 filter,
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 }

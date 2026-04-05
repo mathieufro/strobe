@@ -47,6 +47,8 @@ impl TestAdapter for UnittestAdapter {
                 ".".into(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -56,6 +58,8 @@ impl TestAdapter for UnittestAdapter {
             program: "python3".into(),
             args: vec!["-m".into(), "unittest".into(), test_name.into(), "-v".into()],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 

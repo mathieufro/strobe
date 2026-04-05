@@ -54,6 +54,8 @@ impl TestAdapter for GoTestAdapter {
                 "./...".to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
@@ -75,6 +77,8 @@ impl TestAdapter for GoTestAdapter {
                 "./...".to_string(),
             ],
             env: HashMap::new(),
+            cwd: None,
+            remove_env: vec![],
         })
     }
 
