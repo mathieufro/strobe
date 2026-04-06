@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use walkdir::WalkDir;
+
 use super::adapter::*;
 use super::TestProgress;
 
@@ -119,6 +121,7 @@ impl TestAdapter for BunAdapter {
     }
 
     fn single_test_command(&self, project_root: &Path, test_name: &str) -> crate::Result<TestCommand> {
+        // Explicit file path — has extension or path separator
         let is_file_path = test_name.contains('/')
             || test_name.ends_with(".ts") || test_name.ends_with(".tsx")
             || test_name.ends_with(".js") || test_name.ends_with(".jsx")
@@ -127,30 +130,47 @@ impl TestAdapter for BunAdapter {
         if is_file_path {
             let (cwd, relative_path) = resolve_workspace_path(project_root, test_name);
             let remove_env = bun_remove_env(&cwd, project_root);
-            Ok(TestCommand {
+            return Ok(TestCommand {
                 program: "bun".to_string(),
                 args: vec!["test".to_string(), relative_path],
                 env: HashMap::new(),
                 cwd,
                 remove_env,
-            })
-        } else {
-            // Name pattern — need workspace cwd for bunfig.toml discovery
-            let cwd = find_bun_workspace(project_root)
-                .map(|ws| ws.to_string_lossy().into_owned());
+            });
+        }
+
+        // Fuzzy file resolution: try to find test files matching the stem.
+        // This lets LLMs pass just a file stem like "session-lifecycle" instead
+        // of the full path "src/__tests__/session-lifecycle.test.ts".
+        if let Some((cwd, files)) = find_test_files_by_stem(project_root, test_name) {
             let remove_env = bun_remove_env(&cwd, project_root);
-            Ok(TestCommand {
+            let mut args = vec!["test".to_string()];
+            args.extend(files);
+            return Ok(TestCommand {
                 program: "bun".to_string(),
-                args: vec![
-                    "test".to_string(),
-                    "--test-name-pattern".to_string(),
-                    test_name.to_string(),
-                ],
+                args,
                 env: HashMap::new(),
                 cwd,
                 remove_env,
-            })
+            });
         }
+
+        // Name pattern — need workspace cwd for bunfig.toml discovery.
+        // Escape regex metacharacters so the pattern is a literal substring match.
+        let cwd = find_bun_workspace(project_root)
+            .map(|ws| ws.to_string_lossy().into_owned());
+        let remove_env = bun_remove_env(&cwd, project_root);
+        Ok(TestCommand {
+            program: "bun".to_string(),
+            args: vec![
+                "test".to_string(),
+                "--test-name-pattern".to_string(),
+                escape_regex(test_name),
+            ],
+            env: HashMap::new(),
+            cwd,
+            remove_env,
+        })
     }
 
     fn parse_output(&self, stdout: &str, stderr: &str, _exit_code: i32) -> TestResult {
@@ -696,6 +716,82 @@ fn bun_remove_env(cwd: &Option<String>, project_root: &Path) -> Vec<String> {
     }
 }
 
+/// Escape regex metacharacters so `--test-name-pattern` treats the input as a
+/// literal substring. Bun uses JS regex — unescaped parens/brackets in test
+/// names like `"handles (edge case)"` would otherwise cause match failures.
+fn escape_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if matches!(c, '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Try to find test files whose stem matches `query`.
+/// e.g. query="session-lifecycle" finds "src/__tests__/session-lifecycle.test.ts".
+///
+/// Returns `(cwd, relative_paths)` on match. Prefers exact stem matches over
+/// partial contains matches (only used when unambiguous — single result).
+fn find_test_files_by_stem(project_root: &Path, query: &str) -> Option<(Option<String>, Vec<String>)> {
+    let (search_root, cwd) = if let Some(ws) = find_bun_workspace(project_root) {
+        let cwd_str = ws.to_string_lossy().into_owned();
+        (ws, Some(cwd_str))
+    } else {
+        (project_root.to_path_buf(), None)
+    };
+
+    let mut exact = Vec::new();
+    let mut partial = Vec::new();
+
+    for entry in WalkDir::new(&search_root)
+        .max_depth(10)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 { return true; }
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.') && name != "node_modules" && name != "dist" && name != "build"
+        })
+        .flatten()
+    {
+        if !entry.file_type().is_file() { continue; }
+
+        let file_name = entry.file_name().to_string_lossy();
+
+        // Extract test stem: "auth.test.ts" -> "auth", "auth.spec.tsx" -> "auth"
+        let stem = if let Some(pos) = file_name.find(".test.") {
+            &file_name[..pos]
+        } else if let Some(pos) = file_name.find(".spec.") {
+            &file_name[..pos]
+        } else {
+            continue;
+        };
+
+        let relative = entry.path()
+            .strip_prefix(&search_root)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .into_owned();
+
+        if stem == query {
+            exact.push(relative);
+        } else if stem.contains(query) {
+            partial.push(relative);
+        }
+    }
+
+    if !exact.is_empty() {
+        Some((cwd, exact))
+    } else if partial.len() == 1 {
+        // Only use partial match when unambiguous
+        Some((cwd, partial))
+    } else {
+        None
+    }
+}
+
 /// Resolve a test file path to a workspace-relative path + cwd.
 /// If the path starts with a known workspace prefix, strips it and sets cwd.
 fn resolve_workspace_path(project_root: &Path, test_path: &str) -> (Option<String>, String) {
@@ -1185,6 +1281,117 @@ src/services/todo.test.ts:
             dir.path(), "src/middleware/auth.test.ts"
         ).unwrap();
         assert!(cmd.args.contains(&"src/middleware/auth.test.ts".to_string()));
+    }
+
+    // --- Fuzzy file stem matching tests ---
+
+    #[test]
+    fn test_single_test_fuzzy_stem_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a test file nested in the project
+        let test_dir = dir.path().join("src/__tests__");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(test_dir.join("session-lifecycle.test.ts"), "").unwrap();
+
+        let cmd = BunAdapter.single_test_command(dir.path(), "session-lifecycle").unwrap();
+        assert!(!cmd.args.contains(&"--test-name-pattern".to_string()),
+            "fuzzy stem match should not use --test-name-pattern");
+        assert!(cmd.args.iter().any(|a| a.ends_with("session-lifecycle.test.ts")),
+            "should find test file by stem, got: {:?}", cmd.args);
+    }
+
+    #[test]
+    fn test_single_test_fuzzy_stem_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        // Set up monorepo with a test file in the workspace
+        let api = dir.path().join("apps/api");
+        let test_dir = api.join("src/__tests__");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(api.join("bunfig.toml"), "[test]").unwrap();
+        std::fs::write(dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"]}"#).unwrap();
+        std::fs::write(test_dir.join("auth-service.test.ts"), "").unwrap();
+
+        let cmd = BunAdapter.single_test_command(dir.path(), "auth-service").unwrap();
+        assert!(cmd.args.iter().any(|a| a.contains("auth-service.test.ts")),
+            "should find test file in workspace by stem, got: {:?}", cmd.args);
+        assert!(cmd.cwd.as_ref().unwrap().ends_with("apps/api"),
+            "should set cwd to workspace dir");
+    }
+
+    #[test]
+    fn test_single_test_fuzzy_stem_no_match_falls_to_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        // No test files exist — should fall through to --test-name-pattern
+        let cmd = BunAdapter.single_test_command(dir.path(), "nonexistent").unwrap();
+        assert!(cmd.args.contains(&"--test-name-pattern".to_string()),
+            "no matching file should fall through to name pattern");
+    }
+
+    #[test]
+    fn test_single_test_fuzzy_stem_ambiguous_falls_to_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create two files that partially match — ambiguous, should fall through
+        let test_dir = dir.path().join("src");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(test_dir.join("auth-login.test.ts"), "").unwrap();
+        std::fs::write(test_dir.join("auth-signup.test.ts"), "").unwrap();
+
+        // "auth" partially matches both stems but neither is exact
+        let cmd = BunAdapter.single_test_command(dir.path(), "auth").unwrap();
+        assert!(cmd.args.contains(&"--test-name-pattern".to_string()),
+            "ambiguous partial match should fall through to name pattern, got: {:?}", cmd.args);
+    }
+
+    #[test]
+    fn test_single_test_fuzzy_stem_unique_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_dir = dir.path().join("src");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(test_dir.join("auth-login.test.ts"), "").unwrap();
+        std::fs::write(test_dir.join("todo-crud.test.ts"), "").unwrap();
+
+        // "auth" partially matches only one stem — unambiguous
+        let cmd = BunAdapter.single_test_command(dir.path(), "auth").unwrap();
+        assert!(!cmd.args.contains(&"--test-name-pattern".to_string()),
+            "unique partial match should resolve to file, got: {:?}", cmd.args);
+        assert!(cmd.args.iter().any(|a| a.contains("auth-login.test.ts")),
+            "should find the matching file");
+    }
+
+    #[test]
+    fn test_single_test_fuzzy_spec_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_dir = dir.path().join("tests");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(test_dir.join("utils.spec.ts"), "").unwrap();
+
+        let cmd = BunAdapter.single_test_command(dir.path(), "utils").unwrap();
+        assert!(cmd.args.iter().any(|a| a.contains("utils.spec.ts")),
+            "should find .spec. files too, got: {:?}", cmd.args);
+    }
+
+    // --- Regex escaping tests ---
+
+    #[test]
+    fn test_single_test_name_pattern_escapes_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = BunAdapter.single_test_command(dir.path(), "handles (edge case)").unwrap();
+        assert!(cmd.args.contains(&"--test-name-pattern".to_string()));
+        assert!(cmd.args.contains(&r"handles \(edge case\)".to_string()),
+            "should escape regex metacharacters, got: {:?}", cmd.args);
+    }
+
+    #[test]
+    fn test_escape_regex() {
+        assert_eq!(escape_regex("plain text"), "plain text");
+        assert_eq!(escape_regex("a.b"), r"a\.b");
+        assert_eq!(escape_regex("foo(bar)"), r"foo\(bar\)");
+        assert_eq!(escape_regex("[test]"), r"\[test\]");
+        assert_eq!(escape_regex("a*b+c?"), r"a\*b\+c\?");
+        assert_eq!(escape_regex("^start$"), r"\^start\$");
+        assert_eq!(escape_regex("a|b"), r"a\|b");
+        assert_eq!(escape_regex("a{1,2}"), r"a\{1,2\}");
     }
 
     // --- Orchestrator tests ---
