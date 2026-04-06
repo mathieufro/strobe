@@ -193,4 +193,16 @@ pub trait TestAdapter: Send + Sync {
     fn default_timeout(&self, _level: Option<TestLevel>) -> u64 {
         600_000 // 10 minutes
     }
+
+    /// Detect and return a pretest setup command from package.json scripts.
+    /// Checks for `pretest:<level>` first, then `pretest`. The returned command
+    /// is run synchronously (outside Frida) before the test process spawns.
+    /// Default: no pretest command.
+    fn pretest_command(
+        &self,
+        _project_root: &Path,
+        _level: Option<TestLevel>,
+    ) -> Option<TestCommand> {
+        None
+    }
 }

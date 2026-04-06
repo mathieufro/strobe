@@ -567,6 +567,9 @@ pub struct DebugTestRequest {
     pub framework: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<crate::test::adapter::TestLevel>,
+    /// Hard timeout in milliseconds. Overrides adapter default and settings.json.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

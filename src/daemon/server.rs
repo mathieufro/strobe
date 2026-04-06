@@ -758,7 +758,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results. Only one test run at a time per project. Use this instead of running test commands via bash.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results. Only one test run at a time per project. Use this instead of running test commands via bash.\n\nPretest scripts (e.g. `pretest:e2e` in package.json) are automatically detected and run before spawning tests. Configure timeout via .strobe/settings.json `test.timeoutMs` or the `timeout` parameter.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -778,7 +778,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                                 "remove": { "type": "array", "items": { "type": "string" } }
                             }
                         },
-                        "env": { "type": "object", "description": "Additional environment variables" }
+                        "env": { "type": "object", "description": "Additional environment variables" },
+                        "timeout": { "type": "integer", "description": "Hard timeout in milliseconds. Overrides adapter default and settings.json. Falls back to: settings.json test.timeoutMs → adapter default (e.g. 600s Playwright, 60-300s bun)." }
                     }
                 }),
             },
@@ -1907,7 +1908,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 req_clone.test.as_deref(),
                 req_clone.command.as_deref(),
                 &env,
-                None,  // timeout — uses adapter defaults, configurable via settings
+                req_clone.timeout,  // explicit timeout overrides adapter default + settings.json
                 &session_manager,
                 &trace_patterns,
                 req_clone.watches.as_ref(),
@@ -1915,6 +1916,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 &session_id_clone,
                 progress_clone,
             ).await;
+
+            // Clean up Frida session — test process is dead, release resources.
+            // Without this, the output_registry and session state from the old run
+            // can interfere with subsequent test runs on the same connection.
+            let _ = session_manager.stop_frida(&session_id_clone).await;
 
             // Record baselines for completed tests
             if let Ok(ref run_result) = run_result {
@@ -1950,7 +1956,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     let hint = if is_compile_failure {
                         Some("COMPILATION FAILED — 0 tests ran. Check 'details' file for compiler errors in rawStderr.".to_string())
                     } else if run_result.result.all_tests.is_empty() && run_result.result.failures.is_empty() {
-                        Some("No tests found. Check framework detection, test filter, or project path.".to_string())
+                        Some("No tests found. Possible causes: (1) framework or test filter mismatch, \
+                              (2) test process crashed during setup — check rawStderr in the details file, \
+                              (3) stale session from previous run — try again.".to_string())
                     } else {
                         None
                     };
@@ -2200,8 +2208,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             });
         }
 
-        // Clean up retained DB sessions outside the lock
+        // Clean up retained Frida state + DB sessions outside the lock
         for sid in sessions_to_delete {
+            let _ = self.session_manager.stop_frida(&sid).await;
             let _ = self.session_manager.db().delete_session(&sid);
         }
     }

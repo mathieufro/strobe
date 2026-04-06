@@ -8,6 +8,10 @@ pub const MAX_EVENT_LIMIT: usize = 10_000_000;
 pub struct StrobeSettings {
     pub events_max_per_session: usize,
     pub test_status_retry_ms: u64,
+    /// Override the adapter's default hard timeout for test runs (milliseconds).
+    /// None = use the adapter default (e.g. 600s for Playwright, 60-300s for bun).
+    /// Configurable via .strobe/settings.json "test.timeoutMs".
+    pub test_timeout_ms: Option<u64>,
     pub vision_enabled: bool,
     pub vision_confidence_threshold: f32,
     pub vision_iou_merge_threshold: f32,
@@ -19,6 +23,7 @@ impl Default for StrobeSettings {
         Self {
             events_max_per_session: 200_000,
             test_status_retry_ms: 5_000,
+            test_timeout_ms: None,
             vision_enabled: false,
             vision_confidence_threshold: 0.3,
             vision_iou_merge_threshold: 0.5,
@@ -34,6 +39,9 @@ struct SettingsFile {
     events_max_per_session: Option<usize>,
     #[serde(rename = "test.statusRetryMs")]
     test_status_retry_ms: Option<u64>,
+    /// Override adapter default timeout for test runs (30s–3600s).
+    #[serde(rename = "test.timeoutMs")]
+    test_timeout_ms: Option<u64>,
     #[serde(rename = "vision.enabled")]
     vision_enabled: Option<bool>,
     #[serde(rename = "vision.confidenceThreshold")]
@@ -95,6 +103,16 @@ fn apply_file(settings: &mut StrobeSettings, path: &Path) {
         } else {
             tracing::warn!(
                 "test.statusRetryMs ({}) out of range (500..60000), using default",
+                v
+            );
+        }
+    }
+    if let Some(v) = file.test_timeout_ms {
+        if v >= 30_000 && v <= 3_600_000 {
+            settings.test_timeout_ms = Some(v);
+        } else {
+            tracing::warn!(
+                "test.timeoutMs ({}) out of range (30000..3600000), using adapter default",
                 v
             );
         }
@@ -238,6 +256,32 @@ mod tests {
         let settings = resolve_with_paths(Some(&file), None);
         assert_eq!(settings.test_status_retry_ms, 2_000);
         assert_eq!(settings.events_max_per_session, 200_000); // unchanged
+    }
+
+    #[test]
+    fn test_timeout_ms_config() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+
+        // Valid value
+        std::fs::write(&file, r#"{"test.timeoutMs": 120000}"#).unwrap();
+        let settings = resolve_with_paths(Some(&file), None);
+        assert_eq!(settings.test_timeout_ms, Some(120_000));
+
+        // Default (not set)
+        std::fs::write(&file, r#"{}"#).unwrap();
+        let settings = resolve_with_paths(Some(&file), None);
+        assert_eq!(settings.test_timeout_ms, None);
+
+        // Below minimum (30s) — rejected
+        std::fs::write(&file, r#"{"test.timeoutMs": 1000}"#).unwrap();
+        let settings = resolve_with_paths(Some(&file), None);
+        assert_eq!(settings.test_timeout_ms, None);
+
+        // Above maximum (1h) — rejected
+        std::fs::write(&file, r#"{"test.timeoutMs": 9999999}"#).unwrap();
+        let settings = resolve_with_paths(Some(&file), None);
+        assert_eq!(settings.test_timeout_ms, None);
     }
 
     #[test]

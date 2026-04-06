@@ -266,7 +266,46 @@ impl TestRunner {
             adapter.suite_command(project_root, level, env)?
         };
 
-        let hard_timeout = timeout.unwrap_or_else(|| adapter.default_timeout(level));
+        // Timeout priority: explicit param > settings.json > adapter default
+        let settings = crate::config::resolve(Some(project_root));
+        let hard_timeout = timeout
+            .or(settings.test_timeout_ms)
+            .unwrap_or_else(|| adapter.default_timeout(level));
+
+        // Run pretest script if one exists (e.g. pretest:e2e for DB setup).
+        // Executed outside Frida — these are setup commands, not test code.
+        if let Some(pretest) = adapter.pretest_command(project_root, level) {
+            let pretest_cwd = pretest.cwd.as_deref()
+                .unwrap_or(project_root.to_str().unwrap_or("."));
+            tracing::info!(
+                cmd = %pretest.program,
+                args = ?pretest.args,
+                cwd = %pretest_cwd,
+                "Running pretest script"
+            );
+            let status = std::process::Command::new(&pretest.program)
+                .args(&pretest.args)
+                .current_dir(pretest_cwd)
+                .envs(&pretest.env)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .status();
+            match status {
+                Ok(s) if !s.success() => {
+                    let code = s.code().unwrap_or(-1);
+                    return Err(crate::Error::ValidationError(format!(
+                        "Pretest script '{}' failed (exit code {}). \
+                         Fix the script or remove it from package.json scripts.",
+                        pretest.args.last().unwrap_or(&pretest.program),
+                        code
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "Pretest script failed to execute, continuing anyway");
+                }
+                _ => {}
+            }
+        }
 
         // Resolve program to absolute path (Frida's Device.spawn doesn't do PATH lookup)
         let program = resolve_program(&test_cmd.program);

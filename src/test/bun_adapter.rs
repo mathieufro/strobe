@@ -111,6 +111,12 @@ impl TestAdapter for BunAdapter {
         }
 
         let remove_env = bun_remove_env(&cwd, project_root);
+        tracing::info!(
+            args = ?args,
+            cwd = ?cwd,
+            has_orchestrator = orchestrator.is_some(),
+            "bun suite_command"
+        );
         Ok(TestCommand {
             program: "bun".to_string(),
             args,
@@ -203,6 +209,54 @@ impl TestAdapter for BunAdapter {
             Some(TestLevel::E2e) => 300_000,
             None => 120_000,
         }
+    }
+
+    /// Detect pretest scripts from package.json. Checks the project root first
+    /// (monorepo scripts live at root), then the workspace package.json.
+    /// Looks for `pretest:<level>` → `pretest` in that order.
+    fn pretest_command(
+        &self,
+        project_root: &Path,
+        level: Option<TestLevel>,
+    ) -> Option<TestCommand> {
+        let level_key = match level {
+            Some(TestLevel::Unit) => Some("pretest:unit"),
+            Some(TestLevel::Integration) => Some("pretest:integration"),
+            Some(TestLevel::E2e) => Some("pretest:e2e"),
+            None => None,
+        };
+
+        // Search root package.json first, then workspace
+        let candidates = [
+            project_root.join("package.json"),
+            find_bun_workspace(project_root)
+                .map(|ws| ws.join("package.json"))
+                .unwrap_or_default(),
+        ];
+
+        for pkg_path in &candidates {
+            let pkg = match std::fs::read_to_string(pkg_path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Try level-specific pretest first, then generic pretest
+            let script_keys: Vec<&str> = level_key.into_iter().chain(std::iter::once("pretest")).collect();
+            for key in script_keys {
+                if extract_script_value(&pkg, key).is_some() {
+                    let cwd = pkg_path.parent()
+                        .map(|p| p.to_string_lossy().into_owned());
+                    return Some(TestCommand {
+                        program: "bun".to_string(),
+                        args: vec!["run".to_string(), key.to_string()],
+                        env: HashMap::new(),
+                        cwd,
+                        remove_env: vec![],
+                    });
+                }
+            }
+        }
+        None
     }
 }
 
@@ -840,6 +894,7 @@ pub(crate) struct OrchestratorSuite {
 
 /// Parse suite configs from a test orchestrator TypeScript file.
 /// Looks for a SUITES-like object mapping suite names to {cmd, cwd} entries.
+/// Handles both single-line and multi-line `cmd` array literals.
 pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, OrchestratorSuite>> {
     let mut suites = HashMap::new();
     let mut current_name: Option<String> = None;
@@ -847,6 +902,10 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
     let mut current_cwd: Option<String> = None;
     let mut brace_depth = 0i32;
     let mut in_suites_block = false;
+
+    // State for accumulating multi-line cmd arrays (e.g. cmd: [\n"bun",\n"test",\n...])
+    let mut in_cmd_array = false;
+    let mut cmd_accumulator = String::new();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -858,6 +917,27 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
             {
                 in_suites_block = true;
                 brace_depth = 1;
+            }
+            continue;
+        }
+
+        // Accumulate multi-line cmd array until closing bracket
+        if in_cmd_array {
+            cmd_accumulator.push(' ');
+            cmd_accumulator.push_str(trimmed);
+            if trimmed.contains(']') {
+                in_cmd_array = false;
+                let all_strings = extract_quoted_strings(&cmd_accumulator);
+                let is_bun_test = all_strings.first().map(|s| s == "bun").unwrap_or(false)
+                    && all_strings.get(1).map(|s| s == "test").unwrap_or(false);
+                current_dirs = if is_bun_test {
+                    all_strings.into_iter()
+                        .filter(|s| s != "bun" && s != "test" && !s.starts_with("--"))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                cmd_accumulator.clear();
             }
             continue;
         }
@@ -894,19 +974,25 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
             continue;
         }
 
-        // cmd array: `cmd: ["bun", "test", "src/services", ...]`
+        // cmd array — single-line or start of multi-line
         if trimmed.starts_with("cmd:") || trimmed.starts_with("cmd :") {
-            let all_strings = extract_quoted_strings(trimmed);
-            // "bun run <script>" commands are custom runners, not `bun test` — no dirs to extract
-            let is_bun_test = all_strings.first().map(|s| s == "bun").unwrap_or(false)
-                && all_strings.get(1).map(|s| s == "test").unwrap_or(false);
-            current_dirs = if is_bun_test {
-                all_strings.into_iter()
-                    .filter(|s| s != "bun" && s != "test" && !s.starts_with("--"))
-                    .collect()
-            } else {
-                vec![]
-            };
+            if trimmed.contains('[') && trimmed.contains(']') {
+                // Single-line: cmd: ["bun", "test", "src/services", ...]
+                let all_strings = extract_quoted_strings(trimmed);
+                let is_bun_test = all_strings.first().map(|s| s == "bun").unwrap_or(false)
+                    && all_strings.get(1).map(|s| s == "test").unwrap_or(false);
+                current_dirs = if is_bun_test {
+                    all_strings.into_iter()
+                        .filter(|s| s != "bun" && s != "test" && !s.starts_with("--"))
+                        .collect()
+                } else {
+                    vec![]
+                };
+            } else if trimmed.contains('[') {
+                // Multi-line: cmd: [\n  "bun",\n  "test",\n  ...  ]
+                in_cmd_array = true;
+                cmd_accumulator = trimmed.to_string();
+            }
             continue;
         }
 
@@ -1442,6 +1528,133 @@ const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
         let all = &suites["all"];
         assert!(all.dirs.is_empty(), "all suite should have no dirs (runs everything)");
         assert_eq!(all.cwd, "apps/api");
+    }
+
+    #[test]
+    fn test_parse_orchestrator_multiline_cmd() {
+        // Exact pattern from a real orchestrator: comments between suite name and cmd,
+        // multi-line cmd array, mix of single-line and multi-line suites.
+        let content = r#"
+const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
+  unit: {
+    cmd: ["bun", "test", "src/modules", "src/lib"],
+    cwd: path.join(ROOT, "apps/api"),
+  },
+  integration: {
+    // Runs all cross-module integration tests in src/tests/ (excluding e2e/).
+    // auth-service.test.ts requires exclusive DB state — serialized naturally.
+    cmd: [
+      "bun",
+      "test",
+      "src/tests/auth-service.test.ts",
+      "src/tests/auth-login-error.test.ts",
+      "src/tests/event-bus.test.ts",
+    ],
+    cwd: path.join(ROOT, "apps/api"),
+  },
+  e2e: {
+    cmd: ["bun", "test", "src/tests/e2e"],
+    cwd: path.join(ROOT, "apps/api"),
+  },
+};
+"#;
+        let suites = parse_suites_from_ts(content).unwrap();
+        assert_eq!(suites.len(), 3);
+
+        // Multi-line cmd correctly parsed (with comments before cmd:)
+        let integration = &suites["integration"];
+        assert_eq!(integration.dirs, vec![
+            "src/tests/auth-service.test.ts",
+            "src/tests/auth-login-error.test.ts",
+            "src/tests/event-bus.test.ts",
+        ]);
+        assert_eq!(integration.cwd, "apps/api");
+
+        // Single-line still works
+        let unit = &suites["unit"];
+        assert_eq!(unit.dirs, vec!["src/modules", "src/lib"]);
+    }
+
+    #[test]
+    fn test_parse_orchestrator_real_world_full() {
+        // Full real-world orchestrator with all edge cases:
+        // - Comments between suite name and cmd
+        // - Multi-line cmd arrays
+        // - Single-line cmd arrays
+        // - Custom runner suites (bun run, not bun test)
+        // - Back-compat aliases
+        let content = r#"
+const ROOT = path.resolve(import.meta.dir, "..")
+const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
+  all: {
+    cmd: ["bun", "test"],
+    cwd: path.join(ROOT, "apps/api"),
+  },
+  unit: {
+    cmd: ["bun", "test", "src/modules", "src/infra", "src/middleware", "src/lib", "src/db"],
+    cwd: path.join(ROOT, "apps/api"),
+  },
+  integration: {
+    // Runs all cross-module integration tests in src/tests/ (excluding e2e/).
+    // auth-service.test.ts requires exclusive DB state (bootstrapRegister needs
+    // zero orgs) — serialized naturally since bun test runs sequentially within a dir.
+    cmd: [
+      "bun",
+      "test",
+      "src/tests/auth-service.test.ts",
+      "src/tests/auth-login-error.test.ts",
+      "src/tests/app-contract.test.ts",
+      "src/tests/contacts.test.ts",
+      "src/tests/db-import-enforcement.test.ts",
+      "src/tests/event-bus.test.ts",
+      "src/tests/event-subscribers.test.ts",
+      "src/tests/full-integration.test.ts",
+      "src/tests/jobs-integration.test.ts",
+    ],
+    cwd: path.join(ROOT, "apps/api"),
+  },
+  e2e: {
+    cmd: ["bun", "test", "src/tests/e2e"],
+    cwd: path.join(ROOT, "apps/api"),
+  },
+  "e2e-parallel": {
+    cmd: ["bun", "run", "scripts/test-e2e-parallel.ts", "--workers=4"],
+    cwd: ROOT,
+  },
+  playwright: {
+    cmd: ["bunx", "--bun", "playwright", "test"],
+    cwd: path.join(ROOT, "apps/web"),
+  },
+  "e2e-web": {
+    cmd: ["bunx", "--bun", "playwright", "test"],
+    cwd: path.join(ROOT, "apps/web"),
+  },
+};
+"#;
+        let suites = parse_suites_from_ts(content).unwrap();
+
+        // integration: multi-line cmd with comments before it
+        let integration = &suites["integration"];
+        assert_eq!(integration.dirs.len(), 9, "integration should have 9 specific files, got: {:?}", integration.dirs);
+        assert!(integration.dirs.contains(&"src/tests/auth-service.test.ts".to_string()));
+        assert!(integration.dirs.contains(&"src/tests/jobs-integration.test.ts".to_string()));
+        assert_eq!(integration.cwd, "apps/api");
+
+        // unit: single-line cmd
+        let unit = &suites["unit"];
+        assert_eq!(unit.dirs, vec!["src/modules", "src/infra", "src/middleware", "src/lib", "src/db"]);
+
+        // e2e: single-line cmd
+        let e2e = &suites["e2e"];
+        assert_eq!(e2e.dirs, vec!["src/tests/e2e"]);
+
+        // e2e-parallel: custom runner (not bun test) → empty dirs
+        let parallel = &suites["e2e-parallel"];
+        assert!(parallel.dirs.is_empty(), "custom runner should have no dirs");
+
+        // all: bun test with no dirs
+        let all = &suites["all"];
+        assert!(all.dirs.is_empty());
     }
 
     #[test]
