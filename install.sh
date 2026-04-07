@@ -70,6 +70,22 @@ install_files() {
     cp "$SRC_DIR/target/release/strobe" "$BIN_DIR/strobe"
     chmod +x "$BIN_DIR/strobe"
 
+    # macOS: sign with entitlements required for Frida's task_for_pid (SIP blocks without this)
+    if [ "$(uname)" = "Darwin" ]; then
+        local ent_file
+        ent_file="$(mktemp)"
+        cat > "$ent_file" <<'ENTEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.security.get-task-allow</key><true/>
+<key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>
+ENTEOF
+        codesign -f -s - --entitlements "$ent_file" "$BIN_DIR/strobe" 2>/dev/null && ok "Signed with Frida entitlements" || warn "codesign failed — Frida may not attach on SIP-enabled macOS"
+        rm -f "$ent_file"
+    fi
+
     # Vision sidecar source (not venv or models)
     if [ -d "$SRC_DIR/vision-sidecar" ]; then
         rm -rf "$INSTALL_DIR/vision-sidecar"

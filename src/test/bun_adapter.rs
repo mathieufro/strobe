@@ -72,7 +72,24 @@ impl TestAdapter for BunAdapter {
             if let Some(suite) = suites.get(suite_key) {
                 args.extend(suite.dirs.iter().cloned());
                 if !suite.cwd.is_empty() {
-                    cwd = Some(project_root.join(&suite.cwd).to_string_lossy().into_owned());
+                    let joined = project_root.join(&suite.cwd);
+                    // If project_root already ends with the suite cwd (e.g. both are
+                    // "apps/api"), avoid doubling the path. The orchestrator script
+                    // specifies cwd relative to the monorepo root, but project_root
+                    // may already BE that subdirectory.
+                    cwd = Some(if joined.exists() {
+                        joined
+                    } else if project_root.ends_with(&suite.cwd) {
+                        project_root.to_path_buf()
+                    } else {
+                        // Try resolving from monorepo root (parent dirs)
+                        let mut ancestor = project_root.to_path_buf();
+                        loop {
+                            if !ancestor.pop() { break joined; }
+                            let candidate = ancestor.join(&suite.cwd);
+                            if candidate.exists() { break candidate; }
+                        }
+                    }.to_string_lossy().into_owned());
                 }
             }
         }

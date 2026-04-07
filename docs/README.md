@@ -252,32 +252,51 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for technical details.
 
 ### macOS
 
-Strobe uses Frida for dynamic instrumentation, which requires `task_for_pid` permissions. On macOS, you need to enable Developer Mode:
+Strobe uses Frida for dynamic instrumentation, which requires `task_for_pid` permissions. On macOS with SIP enabled, **both the strobe binary and target binaries** need proper entitlements.
+
+#### 1. Enable Developer Mode (one-time)
 
 ```bash
 sudo DevToolsSecurity -enable
 ```
 
-This is a one-time setup that allows debugging tools to attach to processes. You'll be prompted for your password.
+#### 2. Strobe binary entitlements (required)
 
-Additionally, binaries must be signed with the `get-task-allow` entitlement to be debugged. Debug builds typically have this, but if you encounter issues, you can sign manually:
+The strobe daemon itself needs `get-task-allow` and `disable-library-validation` entitlements to use Frida's `task_for_pid`. The installer (`install.sh`) handles this automatically. If you build manually or the daemon fails with `FRIDA_ATTACH_FAILED`, re-sign:
 
 ```bash
-# Create entitlements file
-cat > debug.entitlements << 'EOF'
+cat > /tmp/strobe-entitlements.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.get-task-allow</key>
-    <true/>
-</dict>
-</plist>
+<plist version="1.0"><dict>
+<key>com.apple.security.get-task-allow</key><true/>
+<key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>
 EOF
 
-# Sign your binary
-codesign -f -s - --entitlements debug.entitlements /path/to/your/binary
+codesign -f -s - --entitlements /tmp/strobe-entitlements.plist ~/.strobe/bin/strobe
 ```
+
+**After re-signing, restart Claude Code** (or kill all `strobe` processes) so the daemon reloads with the new signature.
+
+#### 3. Target binary entitlements (automatic)
+
+Strobe automatically re-signs target binaries (e.g., Bun) with `get-task-allow` before spawning. This is handled by `prepare_debuggable_bun()` — no manual action needed.
+
+If you still encounter issues with a custom binary:
+
+```bash
+codesign -f -s - --entitlements /tmp/strobe-entitlements.plist /path/to/your/binary
+```
+
+#### Troubleshooting macOS
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `FRIDA_ATTACH_FAILED: Failed to attach` | Strobe binary not signed | Re-sign `~/.strobe/bin/strobe` (see above) |
+| `Spawn gating requires additional privileges` | Strobe binary not signed | Re-sign `~/.strobe/bin/strobe` (see above) |
+| `No such file or directory` on spawn | Stale daemon using unsigned binary | Restart Claude Code after re-signing |
+| Attach works on one machine but not another | SIP enabled on failing machine | Sign strobe binary with entitlements |
 
 ### Linux
 
