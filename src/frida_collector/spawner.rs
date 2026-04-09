@@ -1145,6 +1145,27 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     std::mem::forget(frida_session);
                     session_ptrs.insert(pid, raw_session);
 
+                    // Helper: clean up session pointer + output registry on failure
+                    // after we've already inserted into session_ptrs. Without this,
+                    // orphaned Frida session GObjects accumulate and exhaust device
+                    // state, causing all subsequent attach() calls to fail permanently.
+                    let cleanup_session_on_error = |
+                        session_ptrs: &mut HashMap<u32, *mut frida_sys::_FridaSession>,
+                        output_registry: &OutputRegistry,
+                        pid: u32,
+                        device: &mut frida::Device<'_>,
+                    | {
+                        if let Some(ptr) = session_ptrs.remove(&pid) {
+                            unsafe { frida_sys::frida_unref(ptr as *mut c_void) };
+                        }
+                        if let Ok(mut reg) = output_registry.lock() {
+                            reg.remove(&pid);
+                        }
+                        // Kill the spawned process so it doesn't linger
+                        let _ = device.kill(pid);
+                        tracing::warn!("Cleaned up leaked Frida session for PID {} after spawn failure", pid);
+                    };
+
                     // -------------------------------------------------------
                     // Step 3: Create and load agent script (common path)
                     // -------------------------------------------------------
@@ -1154,9 +1175,14 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         .and_then(|n| n.to_str())
                         .unwrap_or("");
                     let is_bun = cmd_basename.contains("bun");
-                    let script_ptr = unsafe {
+                    let script_ptr = match unsafe {
                         create_script_raw_with_options(raw_session, AGENT_CODE, language, is_bun)
-                            .map_err(|e| crate::Error::FridaAttachFailed(format!("Script creation failed: {}", e)))?
+                    } {
+                        Ok(ptr) => ptr,
+                        Err(e) => {
+                            cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
+                            return Err(crate::Error::FridaAttachFailed(format!("Script creation failed: {}", e)));
+                        }
                     };
                     tracing::debug!("PERF: create_script took {:?}", t.elapsed());
 
@@ -1186,23 +1212,30 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     let load_result = unsafe { load_script_raw(script_ptr) };
                     if let Err(e) = load_result {
                         unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
+                        cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
                         return Err(crate::Error::FridaAttachFailed(format!("Script load failed: {}", e)));
                     }
                     tracing::debug!("PERF: script load + handler setup took {:?}", t.elapsed());
 
                     // Initialize agent
                     let init_msg = serde_json::json!({ "type": "initialize", "sessionId": session_id });
-                    unsafe {
+                    if let Err(e) = unsafe {
                         post_message_raw(script_ptr, &serde_json::to_string(&init_msg).unwrap())
-                            .map_err(|e| crate::Error::FridaAttachFailed(format!("Init message failed: {}", e)))?;
+                    } {
+                        unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
+                        cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
+                        return Err(crate::Error::FridaAttachFailed(format!("Init message failed: {}", e)));
                     }
 
                     // Resume the process (interpreted processes are already running)
                     if !is_interpreted {
                         if !defer_resume {
                             let t = std::time::Instant::now();
-                            device.resume(pid)
-                                .map_err(|e| crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)))?;
+                            if let Err(e) = device.resume(pid) {
+                                unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
+                                cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
+                                return Err(crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)));
+                            }
                             tracing::debug!("PERF: device.resume() took {:?}", t.elapsed());
                         } else {
                             tracing::info!("Process {} spawned with deferred resume", pid);
@@ -1877,11 +1910,14 @@ fn handle_child_spawn(
                 return;
             }
         };
-        // Look up by parent PID first, fall back to any session for single-session case
+        // Look up by parent PID first. Only fall back to "any session" when
+        // there is exactly one active session — with multiple sessions, the
+        // fallback would assign the child to an arbitrary (wrong) session,
+        // causing cross-session event pollution and orphaned session pointers.
         let ppid = get_ppid(child_pid);
         let ctx = ppid
             .and_then(|pp| reg.get(&pp))
-            .or_else(|| reg.values().next());
+            .or_else(|| if reg.len() == 1 { reg.values().next() } else { None });
         ctx.map(|c| (c.session_id.clone(), c.event_tx.clone(), c.start_ns))
     };
 

@@ -1059,10 +1059,13 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 pid
             }
             Err(e) => {
-                // Clean up the pre-created session on spawn failure
-                let _ = self.session_manager.db().update_session_status(
-                    &session_id, crate::db::SessionStatus::Stopped
-                );
+                // Clean up fully: stop any Frida state the coordinator may
+                // have allocated (session pointers, output registry entries),
+                // then clean up in-memory session maps and mark DB as stopped.
+                // Without this, failed spawns leak Frida session GObjects that
+                // accumulate and eventually break all subsequent attach() calls.
+                let _ = self.session_manager.stop_frida(&session_id).await;
+                let _ = self.session_manager.stop_session(&session_id).await;
                 return Err(e);
             }
         };
