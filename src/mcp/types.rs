@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-fn default_empty_string() -> String { String::new() }
+fn default_empty_string() -> String {
+    String::new()
+}
 
 // ============ Runtime capabilities ============
 
@@ -68,12 +70,12 @@ impl DebugLaunchRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.command.is_empty() {
             return Err(crate::Error::ValidationError(
-                "command must not be empty".to_string()
+                "command must not be empty".to_string(),
             ));
         }
         if self.project_root.is_empty() {
             return Err(crate::Error::ValidationError(
-                "projectRoot must not be empty".to_string()
+                "projectRoot must not be empty".to_string(),
             ));
         }
         Ok(())
@@ -195,17 +197,19 @@ pub const MAX_LOGPOINT_MESSAGE_LENGTH: usize = 2048;
 /// Validate a watch field (expression or variable name) against length and depth limits.
 fn validate_watch_field(value: &str, field_name: &str) -> crate::Result<()> {
     if value.len() > MAX_WATCH_EXPRESSION_LENGTH {
-        return Err(crate::Error::ValidationError(
-            format!("Watch {} length ({} bytes) exceeds maximum of {} bytes",
-                field_name, value.len(), MAX_WATCH_EXPRESSION_LENGTH)
-        ));
+        return Err(crate::Error::ValidationError(format!(
+            "Watch {} length ({} bytes) exceeds maximum of {} bytes",
+            field_name,
+            value.len(),
+            MAX_WATCH_EXPRESSION_LENGTH
+        )));
     }
     let depth = value.matches("->").count() + value.matches('.').count();
     if depth > MAX_WATCH_EXPRESSION_DEPTH {
-        return Err(crate::Error::ValidationError(
-            format!("Watch {} depth ({}) exceeds maximum of {}",
-                field_name, depth, MAX_WATCH_EXPRESSION_DEPTH)
-        ));
+        return Err(crate::Error::ValidationError(format!(
+            "Watch {} depth ({}) exceeds maximum of {}",
+            field_name, depth, MAX_WATCH_EXPRESSION_DEPTH
+        )));
     }
     Ok(())
 }
@@ -216,7 +220,7 @@ impl DebugTraceRequest {
         if let Some(depth) = self.serialization_depth {
             if depth < 1 || depth > 10 {
                 return Err(crate::Error::ValidationError(
-                    "serialization_depth must be between 1 and 10".to_string()
+                    "serialization_depth must be between 1 and 10".to_string(),
                 ));
             }
         }
@@ -224,9 +228,11 @@ impl DebugTraceRequest {
         if let Some(ref watch_update) = self.watches {
             if let Some(ref add_watches) = watch_update.add {
                 if add_watches.len() > MAX_WATCHES_PER_SESSION {
-                    return Err(crate::Error::ValidationError(
-                        format!("Cannot add {} watches (max {})", add_watches.len(), MAX_WATCHES_PER_SESSION)
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "Cannot add {} watches (max {})",
+                        add_watches.len(),
+                        MAX_WATCHES_PER_SESSION
+                    )));
                 }
 
                 for watch in add_watches {
@@ -412,65 +418,72 @@ pub const MIN_POLL_DURATION_MS: u32 = 100;
 pub const MAX_POLL_DURATION_MS: u32 = 30000;
 pub const MAX_RAW_READ_SIZE: u32 = 65536;
 const VALID_TYPE_HINTS: &[&str] = &[
-    "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
-    "f32", "f64", "pointer", "bytes",
+    "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "pointer", "bytes",
 ];
 
 impl DebugReadRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.targets.is_empty() {
             return Err(crate::Error::ValidationError(
-                "targets must not be empty".to_string()
+                "targets must not be empty".to_string(),
             ));
         }
         if self.targets.len() > MAX_READ_TARGETS {
-            return Err(crate::Error::ValidationError(
-                format!("Too many targets ({}, max {})", self.targets.len(), MAX_READ_TARGETS)
-            ));
+            return Err(crate::Error::ValidationError(format!(
+                "Too many targets ({}, max {})",
+                self.targets.len(),
+                MAX_READ_TARGETS
+            )));
         }
         if let Some(depth) = self.depth {
             if depth < 1 || depth > MAX_READ_DEPTH {
-                return Err(crate::Error::ValidationError(
-                    format!("depth must be between 1 and {}", MAX_READ_DEPTH)
-                ));
+                return Err(crate::Error::ValidationError(format!(
+                    "depth must be between 1 and {}",
+                    MAX_READ_DEPTH
+                )));
             }
         }
         if let Some(ref poll) = self.poll {
             if poll.interval_ms < MIN_POLL_INTERVAL_MS || poll.interval_ms > MAX_POLL_INTERVAL_MS {
-                return Err(crate::Error::ValidationError(
-                    format!("poll.intervalMs must be between {} and {}", MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS)
-                ));
+                return Err(crate::Error::ValidationError(format!(
+                    "poll.intervalMs must be between {} and {}",
+                    MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS
+                )));
             }
             if poll.duration_ms < MIN_POLL_DURATION_MS || poll.duration_ms > MAX_POLL_DURATION_MS {
-                return Err(crate::Error::ValidationError(
-                    format!("poll.durationMs must be between {} and {}", MIN_POLL_DURATION_MS, MAX_POLL_DURATION_MS)
-                ));
+                return Err(crate::Error::ValidationError(format!(
+                    "poll.durationMs must be between {} and {}",
+                    MIN_POLL_DURATION_MS, MAX_POLL_DURATION_MS
+                )));
             }
         }
         for target in &self.targets {
             if target.variable.is_none() && target.address.is_none() {
                 return Err(crate::Error::ValidationError(
-                    "Each target must have either 'variable' or 'address'".to_string()
+                    "Each target must have either 'variable' or 'address'".to_string(),
                 ));
             }
             if target.address.is_some() {
                 if target.size.is_none() || target.type_hint.is_none() {
                     return Err(crate::Error::ValidationError(
-                        "Raw address targets require 'size' and 'type'".to_string()
+                        "Raw address targets require 'size' and 'type'".to_string(),
                     ));
                 }
                 if let Some(size) = target.size {
                     if size == 0 || size > MAX_RAW_READ_SIZE {
-                        return Err(crate::Error::ValidationError(
-                            format!("size must be between 1 and {}", MAX_RAW_READ_SIZE)
-                        ));
+                        return Err(crate::Error::ValidationError(format!(
+                            "size must be between 1 and {}",
+                            MAX_RAW_READ_SIZE
+                        )));
                     }
                 }
                 if let Some(ref type_hint) = target.type_hint {
                     if !VALID_TYPE_HINTS.contains(&type_hint.as_str()) {
-                        return Err(crate::Error::ValidationError(
-                            format!("Invalid type '{}'. Valid: {}", type_hint, VALID_TYPE_HINTS.join(", "))
-                        ));
+                        return Err(crate::Error::ValidationError(format!(
+                            "Invalid type '{}'. Valid: {}",
+                            type_hint,
+                            VALID_TYPE_HINTS.join(", ")
+                        )));
                     }
                 }
             }
@@ -799,43 +812,46 @@ pub struct DebugWriteRequest {
 }
 
 const VALID_WRITE_TYPE_HINTS: &[&str] = &[
-    "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
-    "f32", "f64", "pointer",
+    "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "pointer",
 ];
 
 impl DebugWriteRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.session_id.is_empty() {
             return Err(crate::Error::ValidationError(
-                "sessionId must not be empty".to_string()
+                "sessionId must not be empty".to_string(),
             ));
         }
         if self.targets.is_empty() {
             return Err(crate::Error::ValidationError(
-                "targets must not be empty".to_string()
+                "targets must not be empty".to_string(),
             ));
         }
         if self.targets.len() > MAX_READ_TARGETS {
-            return Err(crate::Error::ValidationError(
-                format!("Too many targets ({}, max {})", self.targets.len(), MAX_READ_TARGETS)
-            ));
+            return Err(crate::Error::ValidationError(format!(
+                "Too many targets ({}, max {})",
+                self.targets.len(),
+                MAX_READ_TARGETS
+            )));
         }
         for target in &self.targets {
             if target.variable.is_none() && target.address.is_none() {
                 return Err(crate::Error::ValidationError(
-                    "Each target must have either 'variable' or 'address'".to_string()
+                    "Each target must have either 'variable' or 'address'".to_string(),
                 ));
             }
             if target.address.is_some() && target.type_hint.is_none() {
                 return Err(crate::Error::ValidationError(
-                    "Raw address targets require 'type'".to_string()
+                    "Raw address targets require 'type'".to_string(),
                 ));
             }
             if let Some(ref type_hint) = target.type_hint {
                 if !VALID_WRITE_TYPE_HINTS.contains(&type_hint.as_str()) {
-                    return Err(crate::Error::ValidationError(
-                        format!("Invalid type '{}'. Valid: {}", type_hint, VALID_WRITE_TYPE_HINTS.join(", "))
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "Invalid type '{}'. Valid: {}",
+                        type_hint,
+                        VALID_WRITE_TYPE_HINTS.join(", ")
+                    )));
                 }
             }
             if let Some(ref var) = target.variable {
@@ -900,15 +916,17 @@ impl DebugBreakpointRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.session_id.is_empty() {
             return Err(crate::Error::ValidationError(
-                "sessionId must not be empty".to_string()
+                "sessionId must not be empty".to_string(),
             ));
         }
 
         if let Some(targets) = &self.add {
             if targets.len() > MAX_BREAKPOINTS_PER_SESSION {
-                return Err(crate::Error::ValidationError(
-                    format!("Too many breakpoints: {} (max {})", targets.len(), MAX_BREAKPOINTS_PER_SESSION)
-                ));
+                return Err(crate::Error::ValidationError(format!(
+                    "Too many breakpoints: {} (max {})",
+                    targets.len(),
+                    MAX_BREAKPOINTS_PER_SESSION
+                )));
             }
 
             for target in targets {
@@ -918,36 +936,40 @@ impl DebugBreakpointRequest {
 
                 if !has_function && !has_file_line {
                     return Err(crate::Error::ValidationError(
-                        "Breakpoint target must specify either 'function' or 'file'+'line'".to_string()
+                        "Breakpoint target must specify either 'function' or 'file'+'line'"
+                            .to_string(),
                     ));
                 }
 
                 if has_function && has_file_line {
                     return Err(crate::Error::ValidationError(
-                        "Breakpoint target cannot specify both 'function' and 'file'+'line'".to_string()
+                        "Breakpoint target cannot specify both 'function' and 'file'+'line'"
+                            .to_string(),
                     ));
                 }
 
                 if target.file.is_some() && target.line.is_none() {
                     return Err(crate::Error::ValidationError(
-                        "Breakpoint with 'file' must also specify 'line'".to_string()
+                        "Breakpoint with 'file' must also specify 'line'".to_string(),
                     ));
                 }
 
                 if let Some(line) = target.line {
                     if line > MAX_LINE_NUMBER {
-                        return Err(crate::Error::ValidationError(
-                            format!("Line number {} exceeds maximum ({})", line, MAX_LINE_NUMBER)
-                        ));
+                        return Err(crate::Error::ValidationError(format!(
+                            "Line number {} exceeds maximum ({})",
+                            line, MAX_LINE_NUMBER
+                        )));
                     }
                 }
 
                 if let Some(ref condition) = target.condition {
                     if condition.len() > MAX_CONDITION_LENGTH {
-                        return Err(crate::Error::ValidationError(
-                            format!("Condition length ({} bytes) exceeds maximum of {} bytes",
-                                condition.len(), MAX_CONDITION_LENGTH)
-                        ));
+                        return Err(crate::Error::ValidationError(format!(
+                            "Condition length ({} bytes) exceeds maximum of {} bytes",
+                            condition.len(),
+                            MAX_CONDITION_LENGTH
+                        )));
                     }
                 }
 
@@ -955,18 +977,20 @@ impl DebugBreakpointRequest {
                 if let Some(ref message) = target.message {
                     if message.is_empty() {
                         return Err(crate::Error::ValidationError(
-                            "Logpoint message must not be empty".to_string()
+                            "Logpoint message must not be empty".to_string(),
                         ));
                     }
                     if message.len() > MAX_LOGPOINT_MESSAGE_LENGTH {
-                        return Err(crate::Error::ValidationError(
-                            format!("Logpoint message length ({} bytes) exceeds maximum of {} bytes",
-                                message.len(), MAX_LOGPOINT_MESSAGE_LENGTH)
-                        ));
+                        return Err(crate::Error::ValidationError(format!(
+                            "Logpoint message length ({} bytes) exceeds maximum of {} bytes",
+                            message.len(),
+                            MAX_LOGPOINT_MESSAGE_LENGTH
+                        )));
                     }
                     if target.hit_count.is_some() {
                         return Err(crate::Error::ValidationError(
-                            "hit_count is not valid for logpoints (entries with 'message')".to_string()
+                            "hit_count is not valid for logpoints (entries with 'message')"
+                                .to_string(),
                         ));
                     }
                 }
@@ -1012,7 +1036,7 @@ impl DebugContinueRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.session_id.is_empty() {
             return Err(crate::Error::ValidationError(
-                "sessionId must not be empty".to_string()
+                "sessionId must not be empty".to_string(),
             ));
         }
 
@@ -1020,9 +1044,10 @@ impl DebugContinueRequest {
             match action.as_str() {
                 "continue" | "step-over" | "step-into" | "step-out" => {}
                 _ => {
-                    return Err(crate::Error::ValidationError(
-                        format!("Invalid action '{}'. Must be: continue, step-over, step-into, step-out", action)
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "Invalid action '{}'. Must be: continue, step-over, step-into, step-out",
+                        action
+                    )));
                 }
             }
         }
@@ -1076,15 +1101,17 @@ impl DebugLogpointRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.session_id.is_empty() {
             return Err(crate::Error::ValidationError(
-                "sessionId must not be empty".to_string()
+                "sessionId must not be empty".to_string(),
             ));
         }
 
         if let Some(targets) = &self.add {
             if targets.len() > MAX_LOGPOINTS_PER_SESSION {
-                return Err(crate::Error::ValidationError(
-                    format!("Too many logpoints: {} (max {})", targets.len(), MAX_LOGPOINTS_PER_SESSION)
-                ));
+                return Err(crate::Error::ValidationError(format!(
+                    "Too many logpoints: {} (max {})",
+                    targets.len(),
+                    MAX_LOGPOINTS_PER_SESSION
+                )));
             }
 
             for target in targets {
@@ -1093,37 +1120,41 @@ impl DebugLogpointRequest {
 
                 if !has_function && !has_file_line {
                     return Err(crate::Error::ValidationError(
-                        "Logpoint target must specify either 'function' or 'file'+'line'".to_string()
+                        "Logpoint target must specify either 'function' or 'file'+'line'"
+                            .to_string(),
                     ));
                 }
 
                 if target.message.is_empty() {
                     return Err(crate::Error::ValidationError(
-                        "Logpoint message must not be empty".to_string()
+                        "Logpoint message must not be empty".to_string(),
                     ));
                 }
 
                 if target.message.len() > MAX_LOGPOINT_MESSAGE_LENGTH {
-                    return Err(crate::Error::ValidationError(
-                        format!("Logpoint message length ({} bytes) exceeds maximum of {} bytes",
-                            target.message.len(), MAX_LOGPOINT_MESSAGE_LENGTH)
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "Logpoint message length ({} bytes) exceeds maximum of {} bytes",
+                        target.message.len(),
+                        MAX_LOGPOINT_MESSAGE_LENGTH
+                    )));
                 }
 
                 if let Some(ref condition) = target.condition {
                     if condition.len() > MAX_CONDITION_LENGTH {
-                        return Err(crate::Error::ValidationError(
-                            format!("Condition length ({} bytes) exceeds maximum of {} bytes",
-                                condition.len(), MAX_CONDITION_LENGTH)
-                        ));
+                        return Err(crate::Error::ValidationError(format!(
+                            "Condition length ({} bytes) exceeds maximum of {} bytes",
+                            condition.len(),
+                            MAX_CONDITION_LENGTH
+                        )));
                     }
                 }
 
                 if let Some(line) = target.line {
                     if line > MAX_LINE_NUMBER {
-                        return Err(crate::Error::ValidationError(
-                            format!("Line number {} exceeds maximum ({})", line, MAX_LINE_NUMBER)
-                        ));
+                        return Err(crate::Error::ValidationError(format!(
+                            "Line number {} exceeds maximum ({})",
+                            line, MAX_LINE_NUMBER
+                        )));
                     }
                 }
             }
@@ -1163,7 +1194,9 @@ pub enum MemoryAction {
 }
 
 impl Default for MemoryAction {
-    fn default() -> Self { Self::Read }
+    fn default() -> Self {
+        Self::Read
+    }
 }
 
 /// Unified target for debug_memory — works for both read and write.
@@ -1202,12 +1235,12 @@ impl DebugMemoryRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.session_id.is_empty() {
             return Err(crate::Error::ValidationError(
-                "sessionId must not be empty".to_string()
+                "sessionId must not be empty".to_string(),
             ));
         }
         if self.targets.is_empty() {
             return Err(crate::Error::ValidationError(
-                "targets must not be empty".to_string()
+                "targets must not be empty".to_string(),
             ));
         }
         match self.action {
@@ -1215,12 +1248,16 @@ impl DebugMemoryRequest {
                 // Delegate validation to DebugReadRequest
                 let read_req = DebugReadRequest {
                     session_id: self.session_id.clone(),
-                    targets: self.targets.iter().map(|t| ReadTarget {
-                        variable: t.variable.clone(),
-                        address: t.address.clone(),
-                        size: t.size,
-                        type_hint: t.type_hint.clone(),
-                    }).collect(),
+                    targets: self
+                        .targets
+                        .iter()
+                        .map(|t| ReadTarget {
+                            variable: t.variable.clone(),
+                            address: t.address.clone(),
+                            size: t.size,
+                            type_hint: t.type_hint.clone(),
+                        })
+                        .collect(),
                     depth: self.depth,
                     poll: self.poll.clone(),
                 };
@@ -1238,12 +1275,16 @@ impl DebugMemoryRequest {
                 // Delegate validation to DebugWriteRequest
                 let write_req = DebugWriteRequest {
                     session_id: self.session_id.clone(),
-                    targets: self.targets.iter().map(|t| WriteTarget {
-                        variable: t.variable.clone(),
-                        address: t.address.clone(),
-                        value: t.value.clone().unwrap_or(serde_json::Value::Null),
-                        type_hint: t.type_hint.clone(),
-                    }).collect(),
+                    targets: self
+                        .targets
+                        .iter()
+                        .map(|t| WriteTarget {
+                            variable: t.variable.clone(),
+                            address: t.address.clone(),
+                            value: t.value.clone().unwrap_or(serde_json::Value::Null),
+                            type_hint: t.type_hint.clone(),
+                        })
+                        .collect(),
                 };
                 write_req.validate()
             }
@@ -1277,9 +1318,10 @@ impl DebugSessionRequest {
         match self.action {
             SessionAction::Status | SessionAction::Stop | SessionAction::Delete => {
                 if self.session_id.as_ref().map_or(true, |s| s.is_empty()) {
-                    return Err(crate::Error::ValidationError(
-                        format!("sessionId is required for action: {:?}", self.action)
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "sessionId is required for action: {:?}",
+                        self.action
+                    )));
                 }
             }
             SessionAction::List => {} // no sessionId needed
@@ -1331,7 +1373,7 @@ pub struct PausedThreadInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatusResponse {
-    pub status: String,             // "running" | "paused" | "exited" | "crashed"
+    pub status: String, // "running" | "paused" | "exited" | "crashed"
     pub pid: u32,
     pub event_count: u64,
     pub hooked_functions: u32,
@@ -1372,7 +1414,9 @@ pub enum UiMode {
 }
 
 impl Default for UiMode {
-    fn default() -> Self { Self::Tree }
+    fn default() -> Self {
+        Self::Tree
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1393,7 +1437,7 @@ impl DebugUiRequest {
     pub fn validate(&self) -> crate::Result<()> {
         if self.session_id.is_empty() {
             return Err(crate::Error::ValidationError(
-                "sessionId must not be empty".to_string()
+                "sessionId must not be empty".to_string(),
             ));
         }
         Ok(())
@@ -1624,7 +1668,8 @@ mod write_tests {
 
     #[test]
     fn test_debug_ui_request_serde() {
-        let req: DebugUiRequest = serde_json::from_str(r#"{"sessionId": "s1", "mode": "tree"}"#).unwrap();
+        let req: DebugUiRequest =
+            serde_json::from_str(r#"{"sessionId": "s1", "mode": "tree"}"#).unwrap();
         assert_eq!(req.session_id, "s1");
         assert_eq!(req.mode, UiMode::Tree);
         assert!(req.vision.is_none());
@@ -1646,7 +1691,12 @@ mod write_tests {
     fn test_debug_ui_response_serde() {
         let resp = DebugUiResponse {
             tree: Some("[window \"Test\" id=w1]".to_string()),
-            stats: Some(UiStats { ax_nodes: 5, vision_nodes: 0, merged_nodes: 0, latency_ms: 12 }),
+            stats: Some(UiStats {
+                ax_nodes: 5,
+                vision_nodes: 0,
+                merged_nodes: 0,
+                latency_ms: 12,
+            }),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("tree").is_some());
@@ -1682,8 +1732,14 @@ mod ui_action_tests {
             session_id: "".to_string(),
             action: UiActionType::Click,
             id: Some("btn_a1b2".to_string()),
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         assert!(req.validate().is_err());
     }
@@ -1694,8 +1750,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::Click,
             id: None,
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         let err = req.validate().unwrap_err();
         assert!(err.to_string().contains("id"));
@@ -1707,10 +1769,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::Key,
             id: None,
-            value: None, text: None,
+            value: None,
+            text: None,
             key: Some("s".to_string()),
             modifiers: Some(vec!["cmd".to_string()]),
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         assert!(req.validate().is_ok());
     }
@@ -1721,8 +1787,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::Key,
             id: None,
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         let err = req.validate().unwrap_err();
         assert!(err.to_string().contains("key"));
@@ -1734,8 +1806,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::Type,
             id: Some("txt_1234".to_string()),
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         let err = req.validate().unwrap_err();
         assert!(err.to_string().contains("text"));
@@ -1747,8 +1825,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::Drag,
             id: Some("el_1234".to_string()),
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         let err = req.validate().unwrap_err();
         assert!(err.to_string().contains("toId"));
@@ -1760,8 +1844,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::Scroll,
             id: Some("lst_1234".to_string()),
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         let err = req.validate().unwrap_err();
         assert!(err.to_string().contains("direction"));
@@ -1773,8 +1863,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::SetValue,
             id: Some("sld_1234".to_string()),
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: None,
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: None,
         };
         let err = req.validate().unwrap_err();
         assert!(err.to_string().contains("value"));
@@ -1786,8 +1882,14 @@ mod ui_action_tests {
             session_id: "s1".to_string(),
             action: UiActionType::Click,
             id: Some("btn_a1b2".to_string()),
-            value: None, text: None, key: None, modifiers: None,
-            direction: None, amount: None, to_id: None, settle_ms: Some(100),
+            value: None,
+            text: None,
+            key: None,
+            modifiers: None,
+            direction: None,
+            amount: None,
+            to_id: None,
+            settle_ms: Some(100),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("sessionId").is_some());
@@ -2002,12 +2104,14 @@ mod read_tests {
 
     #[test]
     fn test_debug_read_request_validation_too_many_targets() {
-        let targets: Vec<ReadTarget> = (0..17).map(|i| ReadTarget {
-            variable: Some(format!("var{}", i)),
-            address: None,
-            size: None,
-            type_hint: None,
-        }).collect();
+        let targets: Vec<ReadTarget> = (0..17)
+            .map(|i| ReadTarget {
+                variable: Some(format!("var{}", i)),
+                address: None,
+                size: None,
+                type_hint: None,
+            })
+            .collect();
         let req = DebugReadRequest {
             session_id: "s1".to_string(),
             targets,
@@ -2045,7 +2149,7 @@ mod read_tests {
             }],
             depth: None,
             poll: Some(PollConfig {
-                interval_ms: 10,  // below min 50
+                interval_ms: 10, // below min 50
                 duration_ms: 2000,
             }),
         };
@@ -2062,7 +2166,7 @@ mod read_tests {
                 size: None,
                 type_hint: None,
             }],
-            depth: Some(10),  // above max 5
+            depth: Some(10), // above max 5
             poll: None,
         };
         assert!(req.validate().is_err());
@@ -2075,8 +2179,8 @@ mod read_tests {
             targets: vec![ReadTarget {
                 variable: None,
                 address: Some("0x7ff800".to_string()),
-                size: None,  // missing
-                type_hint: None,  // missing
+                size: None,      // missing
+                type_hint: None, // missing
             }],
             depth: None,
             poll: None,
@@ -2090,7 +2194,9 @@ mod read_tests {
             session_id: "s1".to_string(),
             targets: vec![ReadTarget {
                 variable: Some("gTempo".to_string()),
-                address: None, size: None, type_hint: None,
+                address: None,
+                size: None,
+                type_hint: None,
             }],
             depth: Some(0),
             poll: None,
@@ -2104,11 +2210,13 @@ mod read_tests {
             session_id: "s1".to_string(),
             targets: vec![ReadTarget {
                 variable: Some("gTempo".to_string()),
-                address: None, size: None, type_hint: None,
+                address: None,
+                size: None,
+                type_hint: None,
             }],
             depth: None,
             poll: Some(PollConfig {
-                interval_ms: 6000,  // above max 5000
+                interval_ms: 6000, // above max 5000
                 duration_ms: 10000,
             }),
         };
@@ -2121,12 +2229,14 @@ mod read_tests {
             session_id: "s1".to_string(),
             targets: vec![ReadTarget {
                 variable: Some("gTempo".to_string()),
-                address: None, size: None, type_hint: None,
+                address: None,
+                size: None,
+                type_hint: None,
             }],
             depth: None,
             poll: Some(PollConfig {
                 interval_ms: 100,
-                duration_ms: 50,  // below min 100
+                duration_ms: 50, // below min 100
             }),
         };
         assert!(req.validate().is_err());
@@ -2138,12 +2248,14 @@ mod read_tests {
             session_id: "s1".to_string(),
             targets: vec![ReadTarget {
                 variable: Some("gTempo".to_string()),
-                address: None, size: None, type_hint: None,
+                address: None,
+                size: None,
+                type_hint: None,
             }],
             depth: None,
             poll: Some(PollConfig {
                 interval_ms: 100,
-                duration_ms: 40000,  // above max 30000
+                duration_ms: 40000, // above max 30000
             }),
         };
         assert!(req.validate().is_err());
@@ -2157,7 +2269,7 @@ mod read_tests {
                 variable: None,
                 address: Some("0x1000".to_string()),
                 size: Some(4),
-                type_hint: Some("int64".to_string()),  // invalid — should be "i64"
+                type_hint: Some("int64".to_string()), // invalid — should be "i64"
             }],
             depth: None,
             poll: None,
@@ -2172,7 +2284,7 @@ mod read_tests {
             targets: vec![ReadTarget {
                 variable: None,
                 address: Some("0x1000".to_string()),
-                size: Some(0),  // invalid
+                size: Some(0), // invalid
                 type_hint: Some("u32".to_string()),
             }],
             depth: None,
@@ -2188,7 +2300,7 @@ mod read_tests {
             targets: vec![ReadTarget {
                 variable: None,
                 address: Some("0x1000".to_string()),
-                size: Some(100000),  // above max 65536
+                size: Some(100000), // above max 65536
                 type_hint: Some("bytes".to_string()),
             }],
             depth: None,
@@ -2235,7 +2347,9 @@ mod read_tests {
             session_id: "s1".to_string(),
             targets: vec![ReadTarget {
                 variable: Some("gTempo".to_string()),
-                address: None, size: None, type_hint: None,
+                address: None,
+                size: None,
+                type_hint: None,
             }],
             depth: Some(1),
             poll: Some(PollConfig {
@@ -2248,8 +2362,9 @@ mod read_tests {
 
     #[test]
     fn test_debug_read_request_validation_all_valid_type_hints() {
-        let valid_types = ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
-                           "f32", "f64", "pointer", "bytes"];
+        let valid_types = [
+            "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "pointer", "bytes",
+        ];
         for type_hint in valid_types {
             let req = DebugReadRequest {
                 session_id: "s1".to_string(),
@@ -2262,7 +2377,11 @@ mod read_tests {
                 depth: None,
                 poll: None,
             };
-            assert!(req.validate().is_ok(), "type '{}' should be valid", type_hint);
+            assert!(
+                req.validate().is_ok(),
+                "type '{}' should be valid",
+                type_hint
+            );
         }
     }
 }

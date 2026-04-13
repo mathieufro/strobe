@@ -1,10 +1,10 @@
-mod types;
 mod protocol;
 mod proxy;
+mod types;
 
-pub use types::*;
 pub use protocol::*;
 pub use proxy::stdio_proxy;
+pub use types::*;
 
 #[cfg(test)]
 mod tests {
@@ -95,7 +95,9 @@ mod tests {
         let response = McpInitializeResponse {
             protocol_version: "2024-11-05".to_string(),
             capabilities: McpServerCapabilities {
-                tools: McpToolsCapability { list_changed: false },
+                tools: McpToolsCapability {
+                    list_changed: false,
+                },
             },
             server_info: McpServerInfo {
                 name: "strobe".to_string(),
@@ -111,7 +113,9 @@ mod tests {
         let response_no = McpInitializeResponse {
             protocol_version: "2024-11-05".to_string(),
             capabilities: McpServerCapabilities {
-                tools: McpToolsCapability { list_changed: false },
+                tools: McpToolsCapability {
+                    list_changed: false,
+                },
             },
             server_info: McpServerInfo {
                 name: "strobe".to_string(),
@@ -161,15 +165,24 @@ mod tests {
         let watches: Vec<WatchTarget> = (0..33)
             .map(|i| WatchTarget {
                 variable: Some(format!("var{}", i)),
-                address: None, type_hint: None, label: None, expr: None, on: None,
+                address: None,
+                type_hint: None,
+                label: None,
+                expr: None,
+                on: None,
             })
             .collect();
 
         let req = DebugTraceRequest {
             session_id: Some("test".to_string()),
-            add: None, remove: None,
-            watches: Some(WatchUpdate { add: Some(watches), remove: None }),
-            project_root: None, serialization_depth: None,
+            add: None,
+            remove: None,
+            watches: Some(WatchUpdate {
+                add: Some(watches),
+                remove: None,
+            }),
+            project_root: None,
+            serialization_depth: None,
         };
 
         let result = req.validate();
@@ -183,16 +196,21 @@ mod tests {
 
         let req = DebugTraceRequest {
             session_id: Some("test".to_string()),
-            add: None, remove: None,
+            add: None,
+            remove: None,
             watches: Some(WatchUpdate {
                 add: Some(vec![WatchTarget {
-                    variable: None, address: None, type_hint: None,
+                    variable: None,
+                    address: None,
+                    type_hint: None,
                     label: Some("test".to_string()),
-                    expr: Some(long_expr), on: None,
+                    expr: Some(long_expr),
+                    on: None,
                 }]),
                 remove: None,
             }),
-            project_root: None, serialization_depth: None,
+            project_root: None,
+            serialization_depth: None,
         };
 
         let result = req.validate();
@@ -206,16 +224,21 @@ mod tests {
 
         let req = DebugTraceRequest {
             session_id: Some("test".to_string()),
-            add: None, remove: None,
+            add: None,
+            remove: None,
             watches: Some(WatchUpdate {
                 add: Some(vec![WatchTarget {
-                    variable: None, address: None, type_hint: None,
+                    variable: None,
+                    address: None,
+                    type_hint: None,
                     label: Some("test".to_string()),
-                    expr: Some(deep_expr.to_string()), on: None,
+                    expr: Some(deep_expr.to_string()),
+                    on: None,
                 }]),
                 remove: None,
             }),
-            project_root: None, serialization_depth: None,
+            project_root: None,
+            serialization_depth: None,
         };
 
         let result = req.validate();
@@ -232,13 +255,16 @@ mod tests {
             watches: Some(WatchUpdate {
                 add: Some(vec![WatchTarget {
                     variable: Some("gCounter".to_string()),
-                    address: None, type_hint: None,
+                    address: None,
+                    type_hint: None,
                     label: Some("counter".to_string()),
-                    expr: None, on: Some(vec!["process::*".to_string()]),
+                    expr: None,
+                    on: Some(vec!["process::*".to_string()]),
                 }]),
                 remove: None,
             }),
-            project_root: None, serialization_depth: None,
+            project_root: None,
+            serialization_depth: None,
         };
         assert!(req.validate().is_ok());
     }
@@ -248,16 +274,22 @@ mod tests {
         // Zero rejected
         let req = DebugTraceRequest {
             session_id: Some("test".to_string()),
-            add: None, remove: None, watches: None,
-            project_root: None, serialization_depth: Some(0),
+            add: None,
+            remove: None,
+            watches: None,
+            project_root: None,
+            serialization_depth: Some(0),
         };
         assert!(req.validate().is_err());
 
         // 11 rejected
         let req = DebugTraceRequest {
             session_id: Some("test".to_string()),
-            add: None, remove: None, watches: None,
-            project_root: None, serialization_depth: Some(11),
+            add: None,
+            remove: None,
+            watches: None,
+            project_root: None,
+            serialization_depth: Some(11),
         };
         assert!(req.validate().is_err());
 
@@ -266,8 +298,10 @@ mod tests {
             let req = DebugTraceRequest {
                 session_id: Some("test".to_string()),
                 add: Some(vec!["foo::*".to_string()]),
-                remove: None, watches: None,
-                project_root: None, serialization_depth: Some(depth),
+                remove: None,
+                watches: None,
+                project_root: None,
+                serialization_depth: Some(depth),
             };
             assert!(req.validate().is_ok(), "depth={} should be valid", depth);
         }
@@ -275,8 +309,11 @@ mod tests {
         // None is valid
         let req = DebugTraceRequest {
             session_id: Some("test".to_string()),
-            add: None, remove: None, watches: None,
-            project_root: None, serialization_depth: None,
+            add: None,
+            remove: None,
+            watches: None,
+            project_root: None,
+            serialization_depth: None,
         };
         assert!(req.validate().is_ok());
 
@@ -284,10 +321,17 @@ mod tests {
         for depth in [100, 255, 1000, u32::MAX] {
             let req = DebugTraceRequest {
                 session_id: Some("test".to_string()),
-                add: None, remove: None, watches: None,
-                project_root: None, serialization_depth: Some(depth),
+                add: None,
+                remove: None,
+                watches: None,
+                project_root: None,
+                serialization_depth: Some(depth),
             };
-            assert!(req.validate().is_err(), "depth={} should be rejected", depth);
+            assert!(
+                req.validate().is_err(),
+                "depth={} should be rejected",
+                depth
+            );
         }
     }
 
@@ -296,8 +340,10 @@ mod tests {
         let req = DebugTraceRequest {
             session_id: Some("test-123".to_string()),
             add: Some(vec!["audio::*".to_string()]),
-            remove: None, watches: None,
-            project_root: None, serialization_depth: Some(5),
+            remove: None,
+            watches: None,
+            project_root: None,
+            serialization_depth: Some(5),
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -309,8 +355,11 @@ mod tests {
         // None should be omitted
         let req_none = DebugTraceRequest {
             session_id: Some("test".to_string()),
-            add: None, remove: None, watches: None,
-            project_root: None, serialization_depth: None,
+            add: None,
+            remove: None,
+            watches: None,
+            project_root: None,
+            serialization_depth: None,
         };
         let json = serde_json::to_string(&req_none).unwrap();
         assert!(!json.contains("serializationDepth"));

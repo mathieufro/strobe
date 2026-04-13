@@ -34,10 +34,7 @@ impl TestAdapter for DenoAdapter {
     ) -> crate::Result<TestCommand> {
         Ok(TestCommand {
             program: "deno".to_string(),
-            args: vec![
-                "test".to_string(),
-                "--reporter=junit".to_string(),
-            ],
+            args: vec!["test".to_string(), "--reporter=junit".to_string()],
             env: HashMap::new(),
             cwd: None,
             remove_env: vec![],
@@ -93,7 +90,10 @@ impl TestAdapter for DenoAdapter {
                     name: "Deno test run".to_string(),
                     file: None,
                     line: None,
-                    message: format!("Could not parse Deno test output (no JUnit XML found).\nstderr: {}", preview),
+                    message: format!(
+                        "Could not parse Deno test output (no JUnit XML found).\nstderr: {}",
+                        preview
+                    ),
                     rerun: None,
                     suggested_traces: vec![],
                 }]
@@ -229,7 +229,10 @@ AssertionError: Expected 6, got 5
         assert_eq!(adapter.detect(dir.path(), None), 0);
 
         std::fs::write(dir.path().join("deno.json"), "{}").unwrap();
-        assert!(adapter.detect(dir.path(), None) >= 90, "deno.json should yield high confidence");
+        assert!(
+            adapter.detect(dir.path(), None) >= 90,
+            "deno.json should yield high confidence"
+        );
     }
 
     #[test]
@@ -238,7 +241,10 @@ AssertionError: Expected 6, got 5
         let adapter = DenoAdapter;
 
         std::fs::write(dir.path().join("deno.jsonc"), "{}").unwrap();
-        assert!(adapter.detect(dir.path(), None) >= 90, "deno.jsonc should yield high confidence");
+        assert!(
+            adapter.detect(dir.path(), None) >= 90,
+            "deno.jsonc should yield high confidence"
+        );
     }
 
     #[test]
@@ -294,7 +300,9 @@ AssertionError: Expected 6, got 5
     #[test]
     fn test_suite_command() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = DenoAdapter.suite_command(dir.path(), None, &Default::default()).unwrap();
+        let cmd = DenoAdapter
+            .suite_command(dir.path(), None, &Default::default())
+            .unwrap();
         assert_eq!(cmd.program, "deno");
         assert!(cmd.args.iter().any(|a| a.contains("junit")));
     }
@@ -302,7 +310,9 @@ AssertionError: Expected 6, got 5
     #[test]
     fn test_single_test_command_filter() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = DenoAdapter.single_test_command(dir.path(), "adds two numbers").unwrap();
+        let cmd = DenoAdapter
+            .single_test_command(dir.path(), "adds two numbers")
+            .unwrap();
         assert_eq!(cmd.program, "deno");
         assert!(cmd.args.iter().any(|a| a.contains("filter")));
         assert!(cmd.args.iter().any(|a| a.contains("adds two numbers")));
@@ -327,7 +337,10 @@ AssertionError: Expected 6, got 5
     fn test_default_timeouts() {
         let adapter = DenoAdapter;
         assert_eq!(adapter.default_timeout(Some(TestLevel::Unit)), 60_000);
-        assert_eq!(adapter.default_timeout(Some(TestLevel::Integration)), 180_000);
+        assert_eq!(
+            adapter.default_timeout(Some(TestLevel::Integration)),
+            180_000
+        );
         assert_eq!(adapter.default_timeout(Some(TestLevel::E2e)), 300_000);
         assert_eq!(adapter.default_timeout(None), 120_000);
     }
@@ -335,10 +348,16 @@ AssertionError: Expected 6, got 5
     #[test]
     fn test_update_progress_running_transition() {
         let progress = Arc::new(Mutex::new(TestProgress::new()));
-        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Compiling);
+        assert_eq!(
+            progress.lock().unwrap().phase,
+            super::super::TestPhase::Compiling
+        );
 
         update_progress("running 3 tests from ./math_test.ts", &progress);
-        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Running);
+        assert_eq!(
+            progress.lock().unwrap().phase,
+            super::super::TestPhase::Running
+        );
     }
 
     #[test]
@@ -399,6 +418,10 @@ AssertionError: Expected 6, got 5
 
         std::fs::write(dir.path().join("deno.lock"), "{}").unwrap();
         let confidence = adapter.detect(dir.path(), None);
-        assert!(confidence >= 85, "deno.lock should yield confidence >= 85, got {}", confidence);
+        assert!(
+            confidence >= 85,
+            "deno.lock should yield confidence >= 85, got {}",
+            confidence
+        );
     }
 }

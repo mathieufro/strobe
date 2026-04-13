@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -149,12 +149,7 @@ pub trait TestAdapter: Send + Sync {
     ) -> crate::Result<TestCommand>;
 
     /// Parse raw stdout + stderr into structured results.
-    fn parse_output(
-        &self,
-        stdout: &str,
-        stderr: &str,
-        exit_code: i32,
-    ) -> TestResult;
+    fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult;
 
     /// Given a failure, suggest trace patterns for instrumented rerun.
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String>;
@@ -172,20 +167,18 @@ pub trait TestAdapter: Send + Sync {
         _cmd: &str,
         _level: Option<TestLevel>,
     ) -> crate::Result<TestCommand> {
-        Err(crate::Error::ValidationError(
-            format!("{} does not support direct binary execution", self.name())
-        ))
+        Err(crate::Error::ValidationError(format!(
+            "{} does not support direct binary execution",
+            self.name()
+        )))
     }
 
     /// Build command for running a single test on a user-provided binary.
-    fn single_test_for_binary(
-        &self,
-        _cmd: &str,
-        _test_name: &str,
-    ) -> crate::Result<TestCommand> {
-        Err(crate::Error::ValidationError(
-            format!("{} does not support direct binary execution", self.name())
-        ))
+    fn single_test_for_binary(&self, _cmd: &str, _test_name: &str) -> crate::Result<TestCommand> {
+        Err(crate::Error::ValidationError(format!(
+            "{} does not support direct binary execution",
+            self.name()
+        )))
     }
 
     /// Safety-net timeout — per-test tracking via stuck detector is the primary mechanism.

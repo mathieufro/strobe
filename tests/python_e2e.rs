@@ -73,7 +73,8 @@ async fn scenario_python_output_capture(
     let python3 = get_python3_path().expect("python3 should be available");
 
     // Create session BEFORE spawning — writer task starts immediately and needs FK
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     // Use globals mode — stays alive ~20s (self-spawn + attach needs ~300ms)
     let _pid = sm
@@ -134,7 +135,8 @@ async fn scenario_python_tracing(
     let session_id = "py-tracing";
     let python3 = get_python3_path().expect("python3 should be available");
 
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     let _pid = sm
         .spawn_with_frida(
@@ -193,7 +195,8 @@ async fn scenario_python_pattern_matching(
     let session_id = "py-patterns";
     let python3 = get_python3_path().expect("python3 should be available");
 
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     let _pid = sm
         .spawn_with_frida(
@@ -238,7 +241,8 @@ async fn scenario_python_decorated_tracing(
     let session_id = "py-decorated";
     let python3 = get_python3_path().expect("python3 should be available");
 
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     // Launch fixture in "decorators" mode — loops calling decorated_process()
     let _pid = sm
@@ -284,9 +288,7 @@ async fn scenario_python_decorated_tracing(
     );
 
     // Verify the traced function name matches
-    let names: Vec<&str> = events.iter()
-        .map(|e| e.function_name.as_str())
-        .collect();
+    let names: Vec<&str> = events.iter().map(|e| e.function_name.as_str()).collect();
     assert!(
         names.iter().any(|n| n.contains("decorated_process")),
         "Expected 'decorated_process' in traced function names, got: {:?}",
@@ -306,9 +308,7 @@ async fn test_pytest_adapter_detection() {
     let runner = strobe::test::TestRunner::new();
 
     // Should detect pytest in our fixture (has pyproject.toml with [tool.pytest])
-    let adapter = runner
-        .detect_adapter(&python_project, None, None)
-        .unwrap();
+    let adapter = runner.detect_adapter(&python_project, None, None).unwrap();
     assert_eq!(adapter.name(), "pytest", "Should detect pytest adapter");
     eprintln!("✓ Pytest adapter detection works");
 }
@@ -317,9 +317,7 @@ async fn test_pytest_adapter_detection() {
 async fn test_pytest_suite_command() {
     let python_project = python_fixture_project();
     let runner = strobe::test::TestRunner::new();
-    let adapter = runner
-        .detect_adapter(&python_project, None, None)
-        .unwrap();
+    let adapter = runner.detect_adapter(&python_project, None, None).unwrap();
 
     let cmd = adapter
         .suite_command(&python_project, None, &std::collections::HashMap::new())

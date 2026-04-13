@@ -13,9 +13,19 @@ async fn test_breakpoint_suite() {
     // --- Test 1: Function entry breakpoint ---
     {
         let session_id = "bp-test-func";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
+            .spawn_with_frida(
+                session_id,
+                binary.to_str().unwrap(),
+                &[],
+                None,
+                project_root,
+                None,
+                false,
+                None,
+            )
             .await
             .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
@@ -25,7 +35,10 @@ async fn test_breakpoint_suite() {
                 session_id,
                 Some("bp-1".to_string()),
                 Some("audio::process_buffer".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
 
@@ -49,9 +62,19 @@ async fn test_breakpoint_suite() {
     // --- Test 2: Line-level breakpoint ---
     {
         let session_id = "bp-test-line";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
+            .spawn_with_frida(
+                session_id,
+                binary.to_str().unwrap(),
+                &[],
+                None,
+                project_root,
+                None,
+                false,
+                None,
+            )
             .await
             .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
@@ -59,10 +82,12 @@ async fn test_breakpoint_suite() {
         let bp_result = sm
             .set_breakpoint_async(
                 session_id,
-                None, None,
+                None,
+                None,
                 Some("main.cpp".to_string()),
                 Some(10),
-                None, None,
+                None,
+                None,
             )
             .await;
 
@@ -70,7 +95,11 @@ async fn test_breakpoint_suite() {
             Ok(bp_info) => {
                 assert!(bp_info.id.starts_with("bp-"));
                 assert!(bp_info.line.is_some());
-                println!("✓ Line breakpoint set at {}:{}", bp_info.file.unwrap(), bp_info.line.unwrap());
+                println!(
+                    "✓ Line breakpoint set at {}:{}",
+                    bp_info.file.unwrap(),
+                    bp_info.line.unwrap()
+                );
             }
             Err(e) => println!("Note: {}", e),
         }
@@ -82,9 +111,19 @@ async fn test_breakpoint_suite() {
     // --- Test 3: Conditional breakpoint ---
     {
         let session_id = "bp-test-cond";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
+            .spawn_with_frida(
+                session_id,
+                binary.to_str().unwrap(),
+                &[],
+                None,
+                project_root,
+                None,
+                false,
+                None,
+            )
             .await
             .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
@@ -94,7 +133,8 @@ async fn test_breakpoint_suite() {
                 session_id,
                 None,
                 Some("audio::process_buffer".to_string()),
-                None, None,
+                None,
+                None,
                 Some("args[0] > 5".to_string()),
                 None,
             )
@@ -114,9 +154,19 @@ async fn test_breakpoint_suite() {
     // --- Test 4: Breakpoint removal ---
     {
         let session_id = "bp-test-remove";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
+            .spawn_with_frida(
+                session_id,
+                binary.to_str().unwrap(),
+                &[],
+                None,
+                project_root,
+                None,
+                false,
+                None,
+            )
             .await
             .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
@@ -126,7 +176,10 @@ async fn test_breakpoint_suite() {
                 session_id,
                 Some("bp-to-remove".to_string()),
                 Some("main".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
 
@@ -148,9 +201,19 @@ async fn test_breakpoint_suite() {
     // --- Test 5: Validation errors ---
     {
         let session_id = "bp-test-validation";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
-            .spawn_with_frida(session_id, binary.to_str().unwrap(), &[], None, project_root, None, false, None)
+            .spawn_with_frida(
+                session_id,
+                binary.to_str().unwrap(),
+                &[],
+                None,
+                project_root,
+                None,
+                false,
+                None,
+            )
             .await
             .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
@@ -161,7 +224,10 @@ async fn test_breakpoint_suite() {
                 session_id,
                 None,
                 Some("thisDoesNotExist123".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
         assert!(result.is_err(), "Should fail for non-existent function");
@@ -171,10 +237,12 @@ async fn test_breakpoint_suite() {
         let result = sm
             .set_breakpoint_async(
                 session_id,
-                None, None,
+                None,
+                None,
                 Some("main.cpp".to_string()),
                 Some(1),
-                None, None,
+                None,
+                None,
             )
             .await;
         if result.is_err() {

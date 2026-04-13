@@ -9,7 +9,6 @@
 ///
 /// All tests share a single SessionManager because Frida's GLib state is
 /// process-global and cannot be safely torn down and recreated.
-
 use std::time::Duration;
 
 mod common;
@@ -42,23 +41,35 @@ async fn test_stepping_behavioral_suite() {
     println!("\n=== Test 1: Step-over advances to next line ===");
     {
         let session_id = "step-over-adv";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Set breakpoint to establish initial pause point
-        let bp = sm.set_breakpoint_async(
-            session_id, Some("bp-step".to_string()),
-            Some("audio::process_buffer".to_string()),
-            None, None, None, None,
-        ).await;
+        let bp = sm
+            .set_breakpoint_async(
+                session_id,
+                Some("bp-step".to_string()),
+                Some("audio::process_buffer".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
         assert!(bp.is_ok(), "Failed to set breakpoint: {:?}", bp.err());
 
         sm.resume_process(pid).await.unwrap();
@@ -72,7 +83,11 @@ async fn test_stepping_behavioral_suite() {
         let step_result = sm
             .debug_continue_async(session_id, Some("step-over".to_string()))
             .await;
-        assert!(step_result.is_ok(), "Step-over failed: {:?}", step_result.err());
+        assert!(
+            step_result.is_ok(),
+            "Step-over failed: {:?}",
+            step_result.err()
+        );
 
         // Wait for step to complete (should pause at next line via one-shot hook)
         let paused2 = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
@@ -97,25 +112,33 @@ async fn test_stepping_behavioral_suite() {
 
         // Verify Pause events in DB — should have at least 2 (initial + step)
         let pause_events = poll_events_typed(
-            &sm, session_id, Duration::from_secs(2),
-            strobe::db::EventType::Pause, |events| events.len() >= 2,
-        ).await;
+            &sm,
+            session_id,
+            Duration::from_secs(2),
+            strobe::db::EventType::Pause,
+            |events| events.len() >= 2,
+        )
+        .await;
         assert!(
             pause_events.len() >= 2,
             "Should have at least 2 Pause events (initial + step), got {}",
             pause_events.len()
         );
         // Verify the two pause events have different breakpoint IDs
-        let bp_ids: Vec<_> = pause_events.iter()
+        let bp_ids: Vec<_> = pause_events
+            .iter()
             .filter_map(|e| e.breakpoint_id.as_deref())
             .collect();
         assert!(
             bp_ids.len() >= 2 && bp_ids[0] != bp_ids[1],
-            "Pause events should have different breakpoint IDs: {:?}", bp_ids
+            "Pause events should have different breakpoint IDs: {:?}",
+            bp_ids
         );
 
         sm.remove_breakpoint(session_id, "bp-step").await;
-        let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
+        let _ = sm
+            .debug_continue_async(session_id, Some("continue".to_string()))
+            .await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).await.unwrap();
         println!("  PASSED");
@@ -125,23 +148,35 @@ async fn test_stepping_behavioral_suite() {
     println!("\n=== Test 2: Step-into enters callee ===");
     {
         let session_id = "step-into-callee";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["step-target".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Set breakpoint on audio::generate_sine
-        let bp = sm.set_breakpoint_async(
-            session_id, Some("bp-sine".to_string()),
-            Some("audio::generate_sine".to_string()),
-            None, None, None, None,
-        ).await;
+        let bp = sm
+            .set_breakpoint_async(
+                session_id,
+                Some("bp-sine".to_string()),
+                Some("audio::generate_sine".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
         assert!(bp.is_ok(), "Failed to set breakpoint: {:?}", bp.err());
 
         sm.resume_process(pid).await.unwrap();
@@ -155,7 +190,11 @@ async fn test_stepping_behavioral_suite() {
         let step_result = sm
             .debug_continue_async(session_id, Some("step-into".to_string()))
             .await;
-        assert!(step_result.is_ok(), "Step-into failed: {:?}", step_result.err());
+        assert!(
+            step_result.is_ok(),
+            "Step-into failed: {:?}",
+            step_result.err()
+        );
 
         // Wait for step completion
         let paused2 = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
@@ -168,7 +207,9 @@ async fn test_stepping_behavioral_suite() {
         }
 
         sm.remove_breakpoint(session_id, "bp-sine").await;
-        let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
+        let _ = sm
+            .debug_continue_async(session_id, Some("continue".to_string()))
+            .await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).await.unwrap();
         println!("  PASSED");
@@ -178,23 +219,35 @@ async fn test_stepping_behavioral_suite() {
     println!("\n=== Test 3: Step-out returns to caller ===");
     {
         let session_id = "step-out-caller";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Set breakpoint inside process_buffer
-        let bp = sm.set_breakpoint_async(
-            session_id, Some("bp-inner".to_string()),
-            Some("audio::process_buffer".to_string()),
-            None, None, None, None,
-        ).await;
+        let bp = sm
+            .set_breakpoint_async(
+                session_id,
+                Some("bp-inner".to_string()),
+                Some("audio::process_buffer".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
         assert!(bp.is_ok());
 
         sm.resume_process(pid).await.unwrap();
@@ -252,7 +305,9 @@ async fn test_stepping_behavioral_suite() {
         }
 
         sm.remove_breakpoint(session_id, "bp-inner").await;
-        let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
+        let _ = sm
+            .debug_continue_async(session_id, Some("continue".to_string()))
+            .await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).await.unwrap();
         println!("  PASSED");
@@ -262,22 +317,34 @@ async fn test_stepping_behavioral_suite() {
     println!("\n=== Test 4: Multiple sequential steps ===");
     {
         let session_id = "step-seq";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
-        let bp = sm.set_breakpoint_async(
-            session_id, Some("bp-seq".to_string()),
-            Some("audio::process_buffer".to_string()),
-            None, None, None, None,
-        ).await;
+        let bp = sm
+            .set_breakpoint_async(
+                session_id,
+                Some("bp-seq".to_string()),
+                Some("audio::process_buffer".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
         assert!(bp.is_ok());
 
         sm.resume_process(pid).await.unwrap();
@@ -301,13 +368,18 @@ async fn test_stepping_behavioral_suite() {
 
             let paused_step = wait_for_pause(&sm, session_id, 1, Duration::from_secs(5)).await;
             if paused_step.is_empty() {
-                println!("  Step {} didn't produce a pause (may have reached end of function)", i);
+                println!(
+                    "  Step {} didn't produce a pause (may have reached end of function)",
+                    i
+                );
                 break;
             }
             let step_id = paused_step[0].1.breakpoint_id.clone();
             assert!(
                 step_id.starts_with("step-"),
-                "Step {} should have step-* ID, got: {}", i, step_id
+                "Step {} should have step-* ID, got: {}",
+                i,
+                step_id
             );
             step_ids.push(step_id.clone());
             step_count += 1;
@@ -322,13 +394,17 @@ async fn test_stepping_behavioral_suite() {
         // Verify each step produced a distinct ID (different address each time)
         for i in 1..step_ids.len() {
             assert_ne!(
-                step_ids[i], step_ids[i - 1],
-                "Sequential steps should produce different IDs: {:?}", step_ids
+                step_ids[i],
+                step_ids[i - 1],
+                "Sequential steps should produce different IDs: {:?}",
+                step_ids
             );
         }
 
         sm.remove_breakpoint(session_id, "bp-seq").await;
-        let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
+        let _ = sm
+            .debug_continue_async(session_id, Some("continue".to_string()))
+            .await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).await.unwrap();
         println!("  PASSED");
@@ -338,22 +414,34 @@ async fn test_stepping_behavioral_suite() {
     println!("\n=== Test 5: Invalid step action rejected ===");
     {
         let session_id = "step-invalid";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
-        let bp = sm.set_breakpoint_async(
-            session_id, Some("bp-val".to_string()),
-            Some("audio::process_buffer".to_string()),
-            None, None, None, None,
-        ).await;
+        let bp = sm
+            .set_breakpoint_async(
+                session_id,
+                Some("bp-val".to_string()),
+                Some("audio::process_buffer".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
         assert!(bp.is_ok());
 
         sm.resume_process(pid).await.unwrap();
@@ -368,13 +456,17 @@ async fn test_stepping_behavioral_suite() {
         assert!(result.is_err(), "Invalid action should be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Invalid") || err_msg.contains("invalid") || err_msg.contains("Unknown"),
+            err_msg.contains("Invalid")
+                || err_msg.contains("invalid")
+                || err_msg.contains("Unknown"),
             "Error should mention invalid/unknown action: {}",
             err_msg
         );
 
         sm.remove_breakpoint(session_id, "bp-val").await;
-        let _ = sm.debug_continue_async(session_id, Some("continue".to_string())).await;
+        let _ = sm
+            .debug_continue_async(session_id, Some("continue".to_string()))
+            .await;
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).await.unwrap();
         println!("  PASSED");
@@ -384,15 +476,21 @@ async fn test_stepping_behavioral_suite() {
     println!("\n=== Test 6: Continue with no paused threads ===");
     {
         let session_id = "step-nopause";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["hello".to_string()],
-                None, project_root, None, false,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // No breakpoints set, no threads paused

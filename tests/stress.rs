@@ -77,9 +77,7 @@ fn test_limit(max_events: usize) {
         .collect();
 
     let start = Instant::now();
-    let stats = db
-        .insert_events_with_limit(&new_batch, max_events)
-        .unwrap();
+    let stats = db.insert_events_with_limit(&new_batch, max_events).unwrap();
     let cleanup_time = start.elapsed();
     println!(
         "    Insert 1000 + cleanup: {:.2}ms (deleted: {})",

@@ -1,14 +1,14 @@
-mod spawner;
 mod hooks;
+mod spawner;
 
-pub use spawner::FridaSpawner;
-pub use spawner::HookResult;
-pub use spawner::WatchTarget;
-pub use spawner::ExprWatchTarget;
-pub use spawner::PauseNotification;
-pub use spawner::PauseNotifyTx;
 pub use hooks::HookManager;
 pub use hooks::HookMode;
+pub use spawner::ExprWatchTarget;
+pub use spawner::FridaSpawner;
+pub use spawner::HookResult;
+pub use spawner::PauseNotification;
+pub use spawner::PauseNotifyTx;
+pub use spawner::WatchTarget;
 
 #[cfg(test)]
 mod tests {
@@ -30,9 +30,21 @@ mod tests {
     #[test]
     fn test_hook_count_accuracy() {
         let chunks = vec![
-            HookResult { installed: 50, matched: 50, warnings: vec![] },
-            HookResult { installed: 30, matched: 30, warnings: vec![] },
-            HookResult { installed: 20, matched: 20, warnings: vec![] },
+            HookResult {
+                installed: 50,
+                matched: 50,
+                warnings: vec![],
+            },
+            HookResult {
+                installed: 30,
+                matched: 30,
+                warnings: vec![],
+            },
+            HookResult {
+                installed: 20,
+                matched: 20,
+                warnings: vec![],
+            },
         ];
 
         let total_installed: u32 = chunks.iter().map(|r| r.installed).sum();

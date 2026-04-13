@@ -6,13 +6,13 @@
 use crate::ui::tree::{generate_id, NodeSource, Rect, UiNode};
 use crate::Result;
 use accessibility_sys::*;
+use core_foundation::array::CFArray;
 use core_foundation::base::{CFRelease, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::string::CFString;
-use core_foundation::array::CFArray;
-use core_foundation_sys::base::{CFTypeRef, CFGetTypeID};
-use core_foundation_sys::string::CFStringRef;
+use core_foundation_sys::base::{CFGetTypeID, CFTypeRef};
 use core_foundation_sys::number::CFNumberRef;
+use core_foundation_sys::string::CFStringRef;
 use std::ffi::c_void;
 
 /// Check if this process has accessibility permissions.
@@ -61,25 +61,28 @@ pub fn query_ax_tree(pid: u32) -> Result<Vec<UiNode>> {
         );
 
         if ret <= 0 {
-            return Err(crate::Error::UiQueryFailed(
-                format!("Process {} not found or not accessible", pid)
-            ));
+            return Err(crate::Error::UiQueryFailed(format!(
+                "Process {} not found or not accessible",
+                pid
+            )));
         }
 
         // Check if the process is owned by the current user
         if proc_info.pbi_uid != current_uid && current_uid != 0 {
-            return Err(crate::Error::UiQueryFailed(
-                format!("Permission denied: process {} is owned by another user", pid)
-            ));
+            return Err(crate::Error::UiQueryFailed(format!(
+                "Permission denied: process {} is owned by another user",
+                pid
+            )));
         }
     }
 
     unsafe {
         let app_ref = AXUIElementCreateApplication(pid as i32);
         if app_ref.is_null() {
-            return Err(crate::Error::UiQueryFailed(
-                format!("Failed to create AXUIElement for PID {}", pid)
-            ));
+            return Err(crate::Error::UiQueryFailed(format!(
+                "Failed to create AXUIElement for PID {}",
+                pid
+            )));
         }
 
         // Get all children of application (windows, menu bars, etc.)
@@ -239,7 +242,8 @@ unsafe fn get_ax_bounds(element: AXUIElementRef) -> Option<Rect> {
     // Position
     let pos_attr = CFString::new(kAXPositionAttribute);
     let mut pos_value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, pos_attr.as_concrete_TypeRef(), &mut pos_value);
+    let err =
+        AXUIElementCopyAttributeValue(element, pos_attr.as_concrete_TypeRef(), &mut pos_value);
     if err != 0 || pos_value.is_null() {
         return None;
     }
@@ -258,7 +262,8 @@ unsafe fn get_ax_bounds(element: AXUIElementRef) -> Option<Rect> {
     // Size
     let size_attr = CFString::new(kAXSizeAttribute);
     let mut size_value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, size_attr.as_concrete_TypeRef(), &mut size_value);
+    let err =
+        AXUIElementCopyAttributeValue(element, size_attr.as_concrete_TypeRef(), &mut size_value);
     if err != 0 || size_value.is_null() {
         return None;
     }
@@ -366,7 +371,9 @@ unsafe fn find_element_recursive(
             let role = get_ax_string(*child, kAXRoleAttribute);
             let is_menu_bar = role.as_deref().map_or(false, |r| r.contains("MenuBar"));
             if !is_menu_bar {
-                if let Some(found) = find_element_recursive(*child, target_id, window_index, depth + 1) {
+                if let Some(found) =
+                    find_element_recursive(*child, target_id, window_index, depth + 1)
+                {
                     for c in &children {
                         CFRelease(*c as *const c_void);
                     }

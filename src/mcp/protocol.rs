@@ -43,7 +43,11 @@ impl JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id,
             result: None,
-            error: Some(JsonRpcError { code, message, data }),
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data,
+            }),
         }
     }
 }

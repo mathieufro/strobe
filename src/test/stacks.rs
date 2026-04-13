@@ -38,7 +38,9 @@ pub fn kill_process_tree(pid: u32) {
     if !descendants.is_empty() {
         tracing::info!(
             "Killing process tree: root PID {} + {} descendants {:?}",
-            pid, descendants.len(), descendants
+            pid,
+            descendants.len(),
+            descendants
         );
     }
 
@@ -151,7 +153,10 @@ fn parse_sample_output(text: &str) -> Vec<ThreadStack> {
 
     if let Some(name) = current_thread {
         if !current_stack.is_empty() {
-            threads.push(ThreadStack { name, stack: current_stack });
+            threads.push(ThreadStack {
+                name,
+                stack: current_stack,
+            });
         }
     }
 
@@ -168,7 +173,8 @@ fn capture_stacks_linux(pid: u32) -> Vec<ThreadStack> {
             let tid = entry.file_name().to_string_lossy().to_string();
             let stack_path = format!("{}/{}/stack", task_dir, tid);
             if let Ok(stack) = std::fs::read_to_string(&stack_path) {
-                let frames: Vec<String> = stack.lines()
+                let frames: Vec<String> = stack
+                    .lines()
                     .map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty())
                     .collect();

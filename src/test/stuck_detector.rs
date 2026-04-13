@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::TestProgress;
 use super::adapter::ThreadStack;
+use super::TestProgress;
 
 /// Tracks the suspicion state for stuck detection. The triplet of fields
 /// (since, zero_delta_count, constant_high_count) is reset together
@@ -64,7 +64,12 @@ pub struct StuckDetector {
 
 impl StuckDetector {
     pub fn new(pid: u32, hard_timeout_ms: u64, progress: Arc<Mutex<TestProgress>>) -> Self {
-        Self { pid, hard_timeout_ms, progress, has_paused_threads: None }
+        Self {
+            pid,
+            hard_timeout_ms,
+            progress,
+            has_paused_threads: None,
+        }
     }
 
     pub fn with_pause_check(mut self, check: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
@@ -238,7 +243,9 @@ impl StuckDetector {
                     let test_started = self.current_test_started_at();
                     if let Some(started) = test_started {
                         let test_elapsed = started.elapsed();
-                        if test_elapsed > PER_TEST_STALL_THRESHOLD && delta < sample_interval_ns / 10 {
+                        if test_elapsed > PER_TEST_STALL_THRESHOLD
+                            && delta < sample_interval_ns / 10
+                        {
                             let test_name = self.current_test().unwrap_or_default();
                             let elapsed_s = test_elapsed.as_secs();
                             let cpu_pct = (delta as f64 / sample_interval_ns as f64) * 100.0;
@@ -267,10 +274,12 @@ impl StuckDetector {
 
         let stacks1 = tokio::time::timeout(
             Duration::from_secs(8),
-            tokio::task::spawn_blocking(move || {
-                super::stacks::capture_native_stacks(pid)
-            })
-        ).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+            tokio::task::spawn_blocking(move || super::stacks::capture_native_stacks(pid)),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -284,16 +293,20 @@ impl StuckDetector {
 
         let stacks2 = tokio::time::timeout(
             Duration::from_secs(8),
-            tokio::task::spawn_blocking(move || {
-                super::stacks::capture_native_stacks(pid)
-            })
-        ).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+            tokio::task::spawn_blocking(move || super::stacks::capture_native_stacks(pid)),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
 
         if stacks_match(&stacks1, &stacks2) {
             let diagnosis = match diagnosis_type {
                 "deadlock" => "Deadlock: 0% CPU, stacks unchanged across samples",
                 "infinite_loop" => "Infinite loop: 100% CPU, stacks unchanged across samples",
-                "stall" => "Stall: low CPU (<10%), stacks unchanged — possible Frida hang or I/O timeout",
+                "stall" => {
+                    "Stall: low CPU (<10%), stacks unchanged — possible Frida hang or I/O timeout"
+                }
                 _ => "Process appears stuck: stacks unchanged across samples",
             };
             Some(diagnosis.to_string())
@@ -313,7 +326,8 @@ fn stacks_match(a: &[ThreadStack], b: &[ThreadStack]) -> bool {
 
     // Compare top 5 frames of each thread by name
     let top_frames = |stacks: &[ThreadStack]| -> Vec<Vec<String>> {
-        let mut result: Vec<Vec<String>> = stacks.iter()
+        let mut result: Vec<Vec<String>> = stacks
+            .iter()
             .map(|t| t.stack.iter().take(5).cloned().collect())
             .collect();
         result.sort();
@@ -367,18 +381,18 @@ fn get_child_pids_macos(pid: u32) -> Vec<u32> {
 
         let mut pids = vec![0i32; count as usize];
         let buf_size = (count as usize * std::mem::size_of::<i32>()) as i32;
-        let actual = proc_listchildpids(
-            pid as i32,
-            pids.as_mut_ptr() as *mut libc::c_void,
-            buf_size,
-        );
+        let actual =
+            proc_listchildpids(pid as i32, pids.as_mut_ptr() as *mut libc::c_void, buf_size);
         if actual <= 0 {
             return vec![];
         }
 
         let n = actual as usize / std::mem::size_of::<i32>();
         pids.truncate(n);
-        pids.into_iter().filter(|&p| p > 0).map(|p| p as u32).collect()
+        pids.into_iter()
+            .filter(|&p| p > 0)
+            .map(|p| p as u32)
+            .collect()
     }
 }
 
@@ -517,9 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stuck_detector_returns_for_fast_exit() {
-        let mut child = tokio::process::Command::new("true")
-            .spawn()
-            .unwrap();
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
         let pid = child.id().unwrap();
         let _ = child.wait().await;
         let progress = Arc::new(Mutex::new(super::super::TestProgress::new()));
@@ -562,8 +574,8 @@ mod tests {
     #[test]
     fn test_stuck_detector_with_pause_check() {
         let progress = Arc::new(Mutex::new(super::super::TestProgress::new()));
-        let detector = StuckDetector::new(1, 5000, Arc::clone(&progress))
-            .with_pause_check(Arc::new(|| true));
+        let detector =
+            StuckDetector::new(1, 5000, Arc::clone(&progress)).with_pause_check(Arc::new(|| true));
         assert!(detector.has_paused_threads.is_some());
         assert!(detector.has_paused_threads.as_ref().unwrap()());
     }
@@ -595,9 +607,12 @@ mod tests {
     #[test]
     fn test_stacks_match_empty() {
         assert!(!stacks_match(&[], &[]));
-        assert!(!stacks_match(&[super::super::adapter::ThreadStack {
-            name: "thread-1".to_string(),
-            stack: vec!["frame1".to_string()],
-        }], &[]));
+        assert!(!stacks_match(
+            &[super::super::adapter::ThreadStack {
+                name: "thread-1".to_string(),
+                stack: vec!["frame1".to_string()],
+            }],
+            &[]
+        ));
     }
 }

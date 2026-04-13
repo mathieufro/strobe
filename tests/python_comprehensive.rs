@@ -80,16 +80,13 @@ fn get_python3_path() -> Option<String> {
 
 // ─── Test 1: Output Capture ──────────────────────────────────────────
 
-async fn test_python_output(
-    sm: &strobe::daemon::SessionManager,
-    script: &str,
-    project_root: &str,
-) {
+async fn test_python_output(sm: &strobe::daemon::SessionManager, script: &str, project_root: &str) {
     let session_id = "py-output";
     let python3 = get_python3_path().expect("python3 should be available");
 
     // Create session BEFORE spawning — writer task starts immediately and needs FK
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     // Use globals mode — stays alive long enough for self-spawn + attach
     let pid = sm
@@ -157,7 +154,8 @@ async fn test_python_tracing(
     let session_id = "py-tracing";
     let python3 = get_python3_path().expect("python3 should be available");
 
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     let _pid = sm
         .spawn_with_frida(
@@ -206,7 +204,10 @@ async fn test_python_tracing(
         !events.is_empty(),
         "Expected function enter events from Python tracing, got none"
     );
-    eprintln!("✓ Python function tracing working ({} events)", events.len());
+    eprintln!(
+        "✓ Python function tracing working ({} events)",
+        events.len()
+    );
 
     let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id).await;
@@ -222,7 +223,8 @@ async fn test_python_crashes(
     let session_id = "py-crash";
     let python3 = get_python3_path().expect("python3 should be available");
 
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     let spawn_result = sm
         .spawn_with_frida(
@@ -279,7 +281,8 @@ async fn test_python_threads(
     let session_id = "py-threads";
     let python3 = get_python3_path().expect("python3 should be available");
 
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     let _pid = sm
         .spawn_with_frida(
@@ -445,7 +448,8 @@ async fn test_python_pattern_updates(
     let session_id = "py-patterns";
     let python3 = get_python3_path().expect("python3 should be available");
 
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
 
     let _pid = sm
         .spawn_with_frida(

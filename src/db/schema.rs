@@ -1,11 +1,19 @@
-use rusqlite::{Connection, params};
+use crate::Result;
+use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use crate::Result;
 
 /// Add a column to a table, ignoring "duplicate column" errors (idempotent migration).
-fn add_column_if_not_exists(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
-    match conn.execute(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type), []) {
+fn add_column_if_not_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    col_type: &str,
+) -> Result<()> {
+    match conn.execute(
+        &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type),
+        [],
+    ) {
         Ok(_) => Ok(()),
         Err(e) if e.to_string().contains("duplicate column") => Ok(()),
         Err(e) => Err(e.into()),
@@ -23,7 +31,9 @@ impl Database {
         // Enable WAL mode for concurrent access
         // Use query_row to handle PRAGMA that returns a value
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(
+            "PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )?;
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),

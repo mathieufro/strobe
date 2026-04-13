@@ -1,6 +1,6 @@
-use std::path::Path;
 use super::resolver::*;
 use crate::dwarf::DwarfHandle;
+use std::path::Path;
 
 /// Wraps the existing DwarfParser behind the SymbolResolver trait.
 pub struct DwarfResolver {
@@ -19,10 +19,16 @@ impl DwarfResolver {
 }
 
 impl SymbolResolver for DwarfResolver {
-    fn resolve_pattern(&self, pattern: &str, _project_root: &Path) -> crate::Result<Vec<ResolvedTarget>> {
+    fn resolve_pattern(
+        &self,
+        pattern: &str,
+        _project_root: &Path,
+    ) -> crate::Result<Vec<ResolvedTarget>> {
         // Access the DwarfHandle synchronously via borrow() — assumes parse is complete.
         // In practice, the session manager won't create a DwarfResolver until parse finishes.
-        let parser_result = self.dwarf.try_borrow_parser()
+        let parser_result = self
+            .dwarf
+            .try_borrow_parser()
             .ok_or_else(|| crate::Error::Internal("DWARF parse not yet complete".to_string()))?
             .map_err(|e| crate::Error::Internal(format!("DWARF parse failed: {}", e)))?;
 
@@ -33,17 +39,22 @@ impl SymbolResolver for DwarfResolver {
             parser_result.find_by_pattern(pattern)
         };
 
-        Ok(functions.iter().map(|f| ResolvedTarget::Address {
-            address: f.low_pc,
-            name: f.name.clone(),
-            name_raw: f.name_raw.clone(),
-            file: f.source_file.clone(),
-            line: f.line_number,
-        }).collect())
+        Ok(functions
+            .iter()
+            .map(|f| ResolvedTarget::Address {
+                address: f.low_pc,
+                name: f.name.clone(),
+                name_raw: f.name_raw.clone(),
+                file: f.source_file.clone(),
+                line: f.line_number,
+            })
+            .collect())
     }
 
     fn resolve_line(&self, file: &str, line: u32) -> crate::Result<Option<ResolvedTarget>> {
-        let parser_result = self.dwarf.try_borrow_parser()
+        let parser_result = self
+            .dwarf
+            .try_borrow_parser()
             .ok_or_else(|| crate::Error::Internal("DWARF parse not yet complete".to_string()))?
             .map_err(|e| crate::Error::Internal(format!("DWARF parse failed: {}", e)))?;
 
@@ -65,7 +76,7 @@ impl SymbolResolver for DwarfResolver {
         // For now, return an error — the existing flow bypasses this trait
         let _ = name;
         Err(crate::Error::Internal(
-            "DwarfResolver::resolve_variable not yet wired — use existing DWARF flow".to_string()
+            "DwarfResolver::resolve_variable not yet wired — use existing DWARF flow".to_string(),
         ))
     }
 

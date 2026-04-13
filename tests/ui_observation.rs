@@ -3,7 +3,6 @@
 
 mod common;
 
-
 #[cfg(target_os = "macos")]
 mod macos_tests {
     use super::common::*;
@@ -67,11 +66,10 @@ mod macos_tests {
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG header
             0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
             0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1 image
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
-            0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
-            0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00,
-            0x18, 0xDD, 0x8D, 0xB4,
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49,
+            0x44, 0x41, 0x54, // IDAT chunk
+            0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD,
+            0x8D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
             0xAE, 0x42, 0x60, 0x82,
         ];
         use base64::Engine;
@@ -81,7 +79,10 @@ mod macos_tests {
         match sidecar.detect(&b64, 0.3, 0.5) {
             Ok(elements) => {
                 // If it works, verify it returns something reasonable
-                println!("Vision detection succeeded, found {} elements", elements.len());
+                println!(
+                    "Vision detection succeeded, found {} elements",
+                    elements.len()
+                );
             }
             Err(e) => {
                 println!("Vision sidecar unavailable (expected in CI): {}", e);
@@ -104,15 +105,11 @@ mod macos_tests {
 
         // After check_idle_timeout, any detect() call should restart the sidecar
         let png_bytes = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
-            0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54,
-            0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00,
-            0x18, 0xDD, 0x8D, 0xB4,
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
-            0xAE, 0x42, 0x60, 0x82,
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
@@ -125,48 +122,57 @@ mod macos_tests {
 
     #[test]
     fn test_merge_algorithm_with_real_data() {
-        use strobe::ui::tree::{UiNode, Rect, NodeSource};
-        use strobe::ui::vision::{VisionElement, VisionBounds};
         use strobe::ui::merge::merge_vision_into_tree;
+        use strobe::ui::tree::{NodeSource, Rect, UiNode};
+        use strobe::ui::vision::{VisionBounds, VisionElement};
 
         // Create a simple AX tree: Window -> Button
-        let mut ax_tree = vec![
-            UiNode {
-                id: "window-1".to_string(),
-                role: "window".to_string(),
-                title: Some("Test Window".to_string()),
+        let mut ax_tree = vec![UiNode {
+            id: "window-1".to_string(),
+            role: "window".to_string(),
+            title: Some("Test Window".to_string()),
+            value: None,
+            enabled: true,
+            focused: false,
+            bounds: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+            }),
+            actions: vec![],
+            source: NodeSource::Ax,
+            children: vec![UiNode {
+                id: "button-1".to_string(),
+                role: "button".to_string(),
+                title: Some("Click Me".to_string()),
                 value: None,
                 enabled: true,
                 focused: false,
-                bounds: Some(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }),
+                bounds: Some(Rect {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 120.0,
+                    h: 40.0,
+                }),
                 actions: vec![],
                 source: NodeSource::Ax,
-                children: vec![
-                    UiNode {
-                        id: "button-1".to_string(),
-                        role: "button".to_string(),
-                        title: Some("Click Me".to_string()),
-                        value: None,
-                        enabled: true,
-                        focused: false,
-                        bounds: Some(Rect { x: 100.0, y: 100.0, w: 120.0, h: 40.0 }),
-                        actions: vec![],
-                        source: NodeSource::Ax,
-                        children: vec![],
-                    }
-                ],
-            }
-        ];
+                children: vec![],
+            }],
+        }];
 
         // Vision detected an icon inside the button bounds
-        let vision_elements = vec![
-            VisionElement {
-                label: "icon".to_string(),
-                description: "play icon".to_string(),
-                confidence: 0.9,
-                bounds: VisionBounds { x: 105, y: 110, w: 20, h: 20 },
-            }
-        ];
+        let vision_elements = vec![VisionElement {
+            label: "icon".to_string(),
+            description: "play icon".to_string(),
+            confidence: 0.9,
+            bounds: VisionBounds {
+                x: 105,
+                y: 110,
+                w: 20,
+                h: 20,
+            },
+        }];
 
         // Merge with IoU threshold 0.5
         merge_vision_into_tree(&mut ax_tree, &vision_elements, 0.5);
@@ -174,7 +180,10 @@ mod macos_tests {
         // Verify the icon was added to the button's children
         let button = &ax_tree[0].children[0];
         assert_eq!(button.children.len(), 1, "Button should have vision child");
-        assert_eq!(button.children[0].role, "icon", "Role should match vision label");
+        assert_eq!(
+            button.children[0].role, "icon",
+            "Role should match vision label"
+        );
         assert_eq!(button.children[0].title.as_deref(), Some("play icon"));
 
         // Verify it's marked as vision source
@@ -193,17 +202,25 @@ mod macos_tests {
         use strobe::config::StrobeSettings;
 
         let settings = StrobeSettings::default();
-        assert_eq!(settings.vision_enabled, false, "Vision should be disabled by default");
+        assert_eq!(
+            settings.vision_enabled, false,
+            "Vision should be disabled by default"
+        );
 
         // The actual error check happens in tool_debug_ui, but we verify config here
     }
 
     #[test]
     fn test_vision_bounds_to_rect_conversion() {
-        use strobe::ui::vision::VisionBounds;
         use strobe::ui::tree::Rect;
+        use strobe::ui::vision::VisionBounds;
 
-        let vb = VisionBounds { x: 10, y: 20, w: 100, h: 50 };
+        let vb = VisionBounds {
+            x: 10,
+            y: 20,
+            w: 100,
+            h: 50,
+        };
 
         // Test conversion (implicit in merge algorithm)
         let rect = Rect {
@@ -221,8 +238,8 @@ mod macos_tests {
 
     #[test]
     fn test_merge_empty_vision() {
-        use strobe::ui::tree::{UiNode, Rect, NodeSource};
         use strobe::ui::merge::merge_vision_into_tree;
+        use strobe::ui::tree::{NodeSource, Rect, UiNode};
 
         let mut tree = vec![UiNode {
             id: "w".to_string(),
@@ -231,7 +248,12 @@ mod macos_tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }),
+            bounds: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+            }),
             actions: vec![],
             source: NodeSource::Ax,
             children: vec![],
@@ -246,15 +268,20 @@ mod macos_tests {
 
     #[test]
     fn test_merge_empty_tree() {
-        use strobe::ui::vision::{VisionElement, VisionBounds};
         use strobe::ui::merge::merge_vision_into_tree;
+        use strobe::ui::vision::{VisionBounds, VisionElement};
 
         let mut tree = vec![];
         let vision = vec![VisionElement {
             label: "button".to_string(),
             description: "Orphan".to_string(),
             confidence: 0.9,
-            bounds: VisionBounds { x: 10, y: 10, w: 50, h: 30 },
+            bounds: VisionBounds {
+                x: 10,
+                y: 10,
+                w: 50,
+                h: 30,
+            },
         }];
 
         // Vision elements with empty tree should be added at root
@@ -272,19 +299,30 @@ mod macos_tests {
         let err = strobe::Error::UiQueryFailed("test error".to_string());
         let mcp_err: McpError = err.into();
         let code_str = serde_json::to_string(&mcp_err.code).unwrap();
-        assert!(code_str.contains("UI_QUERY_FAILED"), "UiQueryFailed should map to UI_QUERY_FAILED, got: {}", code_str);
+        assert!(
+            code_str.contains("UI_QUERY_FAILED"),
+            "UiQueryFailed should map to UI_QUERY_FAILED, got: {}",
+            code_str
+        );
 
         // UiNotAvailable should map to its own error code (not UiQueryFailed)
         let err = strobe::Error::UiNotAvailable("not available".to_string());
         let mcp_err: McpError = err.into();
         let code_str = serde_json::to_string(&mcp_err.code).unwrap();
-        assert!(code_str.contains("UI_NOT_AVAILABLE"), "UiNotAvailable should map to UI_NOT_AVAILABLE, got: {}", code_str);
+        assert!(
+            code_str.contains("UI_NOT_AVAILABLE"),
+            "UiNotAvailable should map to UI_NOT_AVAILABLE, got: {}",
+            code_str
+        );
     }
 
     // ---- Helpers for integration suite ----
 
     /// Helper: find first node with matching role in tree (recursive)
-    fn find_node_by_role_recursive(nodes: &[strobe::ui::tree::UiNode], role: &str) -> Option<String> {
+    fn find_node_by_role_recursive(
+        nodes: &[strobe::ui::tree::UiNode],
+        role: &str,
+    ) -> Option<String> {
         for node in nodes {
             if node.role == role {
                 return Some(node.id.clone());
@@ -298,7 +336,8 @@ mod macos_tests {
 
     /// Helper: find first node with matching title in tree (recursive)
     fn find_node_by_title_recursive(
-        nodes: &[strobe::ui::tree::UiNode], title: &str,
+        nodes: &[strobe::ui::tree::UiNode],
+        title: &str,
     ) -> Option<String> {
         for node in nodes {
             if node.title.as_deref() == Some(title) {
@@ -333,12 +372,21 @@ mod macos_tests {
         let (sm, _temp_dir) = create_session_manager();
 
         let session_id = "ui-suite";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
-        let pid = sm.spawn_with_frida(
-            session_id,
-            binary.to_str().unwrap(),
-            &[], None, project_root, None, false, None,
-        ).await.unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
+        let pid = sm
+            .spawn_with_frida(
+                session_id,
+                binary.to_str().unwrap(),
+                &[],
+                None,
+                project_root,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Give the app time to render its window and fully initialize AX tree
@@ -352,8 +400,11 @@ mod macos_tests {
 
             // Verify we got a window
             let window = &nodes[0];
-            assert!(window.role.contains("Window") || window.role == "window",
-                "First node should be a window, got: {}", window.role);
+            assert!(
+                window.role.contains("Window") || window.role == "window",
+                "First node should be a window, got: {}",
+                window.role
+            );
 
             // Verify tree has children
             let total = strobe::ui::tree::count_nodes(&nodes);
@@ -368,15 +419,25 @@ mod macos_tests {
             let text2 = strobe::ui::tree::format_compact(&nodes2);
 
             // Check that the main window ID is stable
-            assert!(text.contains("w_7cdd"), "First query should contain window ID");
-            assert!(text2.contains("w_7cdd"), "Second query should contain same window ID");
+            assert!(
+                text.contains("w_7cdd"),
+                "First query should contain window ID"
+            );
+            assert!(
+                text2.contains("w_7cdd"),
+                "Second query should contain same window ID"
+            );
 
             // Check >90% tree similarity
             let lines1: Vec<&str> = text.lines().collect();
             let lines2: Vec<&str> = text2.lines().collect();
             let common_lines = lines1.iter().filter(|l| lines2.contains(l)).count();
             let similarity = (common_lines as f64) / (lines1.len().max(lines2.len()) as f64);
-            assert!(similarity > 0.9, "Tree structure should be mostly stable (got {:.1}% similar)", similarity * 100.0);
+            assert!(
+                similarity > 0.9,
+                "Tree structure should be mostly stable (got {:.1}% similar)",
+                similarity * 100.0
+            );
         }
 
         // ==== Part 2: AX query latency ====
@@ -390,7 +451,11 @@ mod macos_tests {
             let _nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
             let elapsed = start.elapsed();
 
-            assert!(elapsed.as_millis() < 600, "Subsequent AX query should be <600ms, took {}ms", elapsed.as_millis());
+            assert!(
+                elapsed.as_millis() < 600,
+                "Subsequent AX query should be <600ms, took {}ms",
+                elapsed.as_millis()
+            );
         }
 
         // ==== Part 3: Screenshot capture ====
@@ -398,14 +463,27 @@ mod macos_tests {
         {
             match strobe::ui::capture::capture_window_screenshot(pid) {
                 Ok(png_bytes) => {
-                    assert!(png_bytes.len() > 100, "PNG should be non-trivial, got {} bytes", png_bytes.len());
+                    assert!(
+                        png_bytes.len() > 100,
+                        "PNG should be non-trivial, got {} bytes",
+                        png_bytes.len()
+                    );
                     // Verify PNG header
-                    assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47], "Should be valid PNG");
+                    assert_eq!(
+                        &png_bytes[..4],
+                        &[0x89, 0x50, 0x4E, 0x47],
+                        "Should be valid PNG"
+                    );
                 }
                 Err(e) => {
                     let err_msg = format!("{:?}", e);
-                    if err_msg.contains("Failed to capture screenshot") || err_msg.contains("No visible window") {
-                        eprintln!("Warning: Screenshot capture failed (likely permissions). Error: {}", err_msg);
+                    if err_msg.contains("Failed to capture screenshot")
+                        || err_msg.contains("No visible window")
+                    {
+                        eprintln!(
+                            "Warning: Screenshot capture failed (likely permissions). Error: {}",
+                            err_msg
+                        );
                     } else {
                         panic!("Unexpected screenshot error: {}", err_msg);
                     }
@@ -424,13 +502,20 @@ mod macos_tests {
                     assert!(!b64.is_empty(), "Base64 screenshot should be non-empty");
                     assert!(b64.len() > 100, "Base64 screenshot should be substantial");
 
-                    let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&b64)
+                        .unwrap();
                     assert_eq!(decoded, png_bytes, "Base64 roundtrip should match");
                 }
                 Err(e) => {
                     let err_msg = format!("{:?}", e);
-                    if err_msg.contains("Failed to capture screenshot") || err_msg.contains("No visible window") {
-                        eprintln!("Warning: Screenshot capture failed (likely permissions). Error: {}", err_msg);
+                    if err_msg.contains("Failed to capture screenshot")
+                        || err_msg.contains("No visible window")
+                    {
+                        eprintln!(
+                            "Warning: Screenshot capture failed (likely permissions). Error: {}",
+                            err_msg
+                        );
                     } else {
                         panic!("Unexpected screenshot error: {}", err_msg);
                     }
@@ -446,7 +531,10 @@ mod macos_tests {
             let button_id = find_node_by_role_recursive(&nodes, "AXButton")
                 .expect("Should find a button in the test app");
             let ax_ref = strobe::ui::accessibility::find_ax_element(pid, &button_id).unwrap();
-            assert!(ax_ref.is_some(), "find_ax_element should locate button by ID");
+            assert!(
+                ax_ref.is_some(),
+                "find_ax_element should locate button by ID"
+            );
             unsafe { core_foundation::base::CFRelease(ax_ref.unwrap() as *const std::ffi::c_void) };
 
             // 1. Click (AX action path)
@@ -454,10 +542,18 @@ mod macos_tests {
                 session_id: session_id.to_string(),
                 action: strobe::mcp::UiActionType::Click,
                 id: Some(button_id.clone()),
-                value: None, text: None, key: None, modifiers: None,
-                direction: None, amount: None, to_id: None, settle_ms: None,
+                value: None,
+                text: None,
+                key: None,
+                modifiers: None,
+                direction: None,
+                amount: None,
+                to_id: None,
+                settle_ms: None,
             };
-            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            let result = strobe::ui::input::execute_ui_action(pid, &req)
+                .await
+                .unwrap();
             assert!(result.success, "Click should succeed");
             assert!(result.method.is_some(), "Should report method used");
             assert!(result.node_after.is_some(), "Should return node_after");
@@ -472,14 +568,23 @@ mod macos_tests {
                 action: strobe::mcp::UiActionType::SetValue,
                 id: Some(slider_id),
                 value: Some(serde_json::json!(0.8)),
-                text: None, key: None, modifiers: None,
-                direction: None, amount: None, to_id: None, settle_ms: Some(200),
+                text: None,
+                key: None,
+                modifiers: None,
+                direction: None,
+                amount: None,
+                to_id: None,
+                settle_ms: Some(200),
             };
-            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            let result = strobe::ui::input::execute_ui_action(pid, &req)
+                .await
+                .unwrap();
             if result.success {
                 assert_eq!(result.method.as_deref(), Some("ax"));
             } else {
-                eprintln!("Note: set_value on slider not supported in this SwiftUI version (expected)");
+                eprintln!(
+                    "Note: set_value on slider not supported in this SwiftUI version (expected)"
+                );
             }
 
             // 3. Scroll
@@ -494,17 +599,26 @@ mod macos_tests {
                     id: Some(list_id),
                     direction: Some(strobe::mcp::ScrollDirection::Down),
                     amount: Some(3),
-                    value: None, text: None, key: None, modifiers: None,
-                    to_id: None, settle_ms: Some(200),
+                    value: None,
+                    text: None,
+                    key: None,
+                    modifiers: None,
+                    to_id: None,
+                    settle_ms: Some(200),
                 };
-                let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+                let result = strobe::ui::input::execute_ui_action(pid, &req)
+                    .await
+                    .unwrap();
                 assert!(result.success, "scroll should succeed: {:?}", result.error);
                 assert_eq!(result.method.as_deref(), Some("cgevent"));
             } else {
                 eprintln!("Note: no scrollable element found in tree");
             }
 
-            assert!(process_alive(pid), "Process should still be alive after scroll");
+            assert!(
+                process_alive(pid),
+                "Process should still be alive after scroll"
+            );
 
             // 4. Drag (best-effort — CGEvent drag unreliable in SwiftUI)
             let nodes = strobe::ui::accessibility::query_ax_tree(pid).unwrap();
@@ -517,10 +631,17 @@ mod macos_tests {
                     action: strobe::mcp::UiActionType::Drag,
                     id: Some(src_id),
                     to_id: Some(dst_id),
-                    value: None, text: None, key: None, modifiers: None,
-                    direction: None, amount: None, settle_ms: Some(300),
+                    value: None,
+                    text: None,
+                    key: None,
+                    modifiers: None,
+                    direction: None,
+                    amount: None,
+                    settle_ms: Some(300),
                 };
-                let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+                let result = strobe::ui::input::execute_ui_action(pid, &req)
+                    .await
+                    .unwrap();
                 assert!(result.success, "drag should succeed: {:?}", result.error);
                 assert_eq!(result.method.as_deref(), Some("cgevent"));
                 assert!(result.node_before.is_some(), "drag should have node_before");
@@ -535,10 +656,17 @@ mod macos_tests {
                 action: strobe::mcp::UiActionType::SetValue,
                 id: Some(text_id.clone()),
                 value: Some(serde_json::json!("programmatic")),
-                text: None, key: None, modifiers: None,
-                direction: None, amount: None, to_id: None, settle_ms: Some(200),
+                text: None,
+                key: None,
+                modifiers: None,
+                direction: None,
+                amount: None,
+                to_id: None,
+                settle_ms: Some(200),
             };
-            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            let result = strobe::ui::input::execute_ui_action(pid, &req)
+                .await
+                .unwrap();
             if result.success {
                 assert_eq!(result.method.as_deref(), Some("ax"));
             }
@@ -549,10 +677,17 @@ mod macos_tests {
                 action: strobe::mcp::UiActionType::Type,
                 id: Some(text_id),
                 text: Some("hello".to_string()),
-                value: None, key: None, modifiers: None,
-                direction: None, amount: None, to_id: None, settle_ms: Some(200),
+                value: None,
+                key: None,
+                modifiers: None,
+                direction: None,
+                amount: None,
+                to_id: None,
+                settle_ms: Some(200),
             };
-            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            let result = strobe::ui::input::execute_ui_action(pid, &req)
+                .await
+                .unwrap();
             assert!(result.success, "type should succeed: {:?}", result.error);
             assert!(result.node_after.is_some());
 
@@ -563,10 +698,16 @@ mod macos_tests {
                 id: None,
                 key: Some("tab".to_string()),
                 modifiers: None,
-                value: None, text: None,
-                direction: None, amount: None, to_id: None, settle_ms: Some(100),
+                value: None,
+                text: None,
+                direction: None,
+                amount: None,
+                to_id: None,
+                settle_ms: Some(100),
             };
-            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            let result = strobe::ui::input::execute_ui_action(pid, &req)
+                .await
+                .unwrap();
             assert!(result.success, "key should succeed: {:?}", result.error);
             assert_eq!(result.method.as_deref(), Some("cgevent"));
             assert!(result.node_before.is_none());
@@ -577,10 +718,18 @@ mod macos_tests {
                 session_id: session_id.to_string(),
                 action: strobe::mcp::UiActionType::Click,
                 id: Some("btn_0000".to_string()), // bogus ID
-                value: None, text: None, key: None, modifiers: None,
-                direction: None, amount: None, to_id: None, settle_ms: None,
+                value: None,
+                text: None,
+                key: None,
+                modifiers: None,
+                direction: None,
+                amount: None,
+                to_id: None,
+                settle_ms: None,
             };
-            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            let result = strobe::ui::input::execute_ui_action(pid, &req)
+                .await
+                .unwrap();
             assert!(!result.success);
             assert!(result.error.as_deref().unwrap().contains("not found"));
 
@@ -591,10 +740,16 @@ mod macos_tests {
                 id: None,
                 key: Some("pagedown".to_string()), // not in keycode table
                 modifiers: None,
-                value: None, text: None,
-                direction: None, amount: None, to_id: None, settle_ms: None,
+                value: None,
+                text: None,
+                direction: None,
+                amount: None,
+                to_id: None,
+                settle_ms: None,
             };
-            let result = strobe::ui::input::execute_ui_action(pid, &req).await.unwrap();
+            let result = strobe::ui::input::execute_ui_action(pid, &req)
+                .await
+                .unwrap();
             assert!(!result.success, "Unknown key should fail");
             assert!(result.error.as_deref().unwrap().contains("unknown key"));
         }

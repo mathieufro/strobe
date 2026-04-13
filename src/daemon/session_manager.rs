@@ -1,21 +1,25 @@
+use crate::db::{Database, Event, Session, SessionStatus};
+use crate::dwarf::{DwarfHandle, DwarfParser};
+use crate::frida_collector::{FridaSpawner, HookResult};
+use crate::symbols::{DwarfResolver, JsResolver, Language, PythonResolver, SymbolResolver};
+use crate::Result;
+use chrono::{Timelike, Utc};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Instant;
-use chrono::{Utc, Timelike};
 use tokio::sync::mpsc;
-use crate::db::{Database, Session, SessionStatus, Event};
-use crate::dwarf::{DwarfParser, DwarfHandle};
-use crate::frida_collector::{FridaSpawner, HookResult};
-use crate::symbols::{Language, SymbolResolver, DwarfResolver, PythonResolver, JsResolver};
-use crate::Result;
 
 /// Map TypeKind to the string the agent expects.
 fn type_kind_to_agent_str(tk: &crate::dwarf::TypeKind) -> &'static str {
     match tk {
         crate::dwarf::TypeKind::Integer { signed } => {
-            if *signed { "int" } else { "uint" }
+            if *signed {
+                "int"
+            } else {
+                "uint"
+            }
         }
         crate::dwarf::TypeKind::Float => "float",
         crate::dwarf::TypeKind::Pointer => "pointer",
@@ -25,7 +29,10 @@ fn type_kind_to_agent_str(tk: &crate::dwarf::TypeKind) -> &'static str {
 
 fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
-        return Err(format!("Hex string must have even length, got {}", hex.len()));
+        return Err(format!(
+            "Hex string must have even length, got {}",
+            hex.len()
+        ));
     }
     (0..hex.len())
         .step_by(2)
@@ -54,21 +61,27 @@ pub fn detect_language(command: &str, project_root: &Path) -> Language {
     if cmd_lower.contains("python") || command.ends_with(".py") {
         return Language::Python;
     }
-    if cmd_lower.contains("node") || cmd_lower.contains("bun")
-       || command.ends_with(".js") || command.ends_with(".ts")
-       || cmd_lower.contains("npx") || cmd_lower.contains("tsx") {
+    if cmd_lower.contains("node")
+        || cmd_lower.contains("bun")
+        || command.ends_with(".js")
+        || command.ends_with(".ts")
+        || cmd_lower.contains("npx")
+        || cmd_lower.contains("tsx")
+    {
         return Language::JavaScript;
     }
 
     // Check project root signals
     if project_root.join("pyproject.toml").exists()
-       || project_root.join("requirements.txt").exists()
-       || project_root.join("setup.py").exists() {
+        || project_root.join("requirements.txt").exists()
+        || project_root.join("setup.py").exists()
+    {
         return Language::Python;
     }
     if project_root.join("package.json").exists()
-       || project_root.join("bun.lockb").exists()
-       || project_root.join("deno.json").exists() {
+        || project_root.join("bun.lockb").exists()
+        || project_root.join("deno.json").exists()
+    {
         return Language::JavaScript;
     }
 
@@ -110,7 +123,12 @@ fn generate_esm_hook_script(session_id: &str) -> std::io::Result<(String, String
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let script_path = format!("/tmp/strobe-esm-hooks-{}-{:x}-{}.mjs", session_id, unique, std::process::id());
+    let script_path = format!(
+        "/tmp/strobe-esm-hooks-{}-{:x}-{}.mjs",
+        session_id,
+        unique,
+        std::process::id()
+    );
     let script_content = r#"
 // Strobe ESM hook registration script — injected via NODE_OPTIONS=--import
 // Intercepts ESM module loads and wraps exported functions with __strobe_trace calls.
@@ -238,12 +256,10 @@ fn kill_orphans_by_name(name: &str, killed: &mut std::collections::HashSet<i32>)
         .output();
 
     let pids: Vec<i32> = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .filter_map(|s| s.parse::<i32>().ok())
-                .collect()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse::<i32>().ok())
+            .collect(),
         _ => return,
     };
 
@@ -262,18 +278,20 @@ fn kill_orphans_by_cmdline(pattern: &str, killed: &mut std::collections::HashSet
         .output();
 
     let pids: Vec<i32> = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .filter_map(|s| s.parse::<i32>().ok())
-                .collect()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse::<i32>().ok())
+            .collect(),
         _ => return,
     };
 
     for pid in pids {
         if killed.insert(pid) {
-            tracing::warn!("Reaping orphaned process {} (cmdline match: {})", pid, pattern);
+            tracing::warn!(
+                "Reaping orphaned process {} (cmdline match: {})",
+                pid,
+                pattern
+            );
             crate::test::stacks::kill_process_tree(pid as u32);
         }
     }
@@ -377,8 +395,13 @@ impl SessionManager {
             if existing.status == SessionStatus::Running {
                 let pid_alive = is_process_alive(existing.pid);
                 if !pid_alive {
-                    tracing::warn!("Session {} has dead PID {}, marking as stopped", existing.id, existing.pid);
-                    self.db.update_session_status(&existing.id, SessionStatus::Stopped)?;
+                    tracing::warn!(
+                        "Session {} has dead PID {}, marking as stopped",
+                        existing.id,
+                        existing.pid
+                    );
+                    self.db
+                        .update_session_status(&existing.id, SessionStatus::Stopped)?;
                 }
                 // Multiple concurrent sessions on the same binary are allowed
                 // (e.g. parallel agents debugging the same project)
@@ -436,7 +459,10 @@ impl SessionManager {
             // Timeout prevents hanging if the writer is stuck on a DB operation
             match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
                 Ok(_) => {} // Writer flushed and exited
-                Err(_) => tracing::warn!("Timed out waiting for event writer to flush for session {} (5s)", id),
+                Err(_) => tracing::warn!(
+                    "Timed out waiting for event writer to flush for session {} (5s)",
+                    id
+                ),
             }
         }
     }
@@ -478,9 +504,7 @@ impl SessionManager {
 
     pub fn add_patterns(&self, session_id: &str, patterns: &[String]) -> Result<()> {
         let mut all_patterns = write_lock(&self.patterns);
-        let session_patterns = all_patterns
-            .entry(session_id.to_string())
-            .or_default();
+        let session_patterns = all_patterns.entry(session_id.to_string()).or_default();
 
         for pattern in patterns {
             if !session_patterns.contains(pattern) {
@@ -507,8 +531,7 @@ impl SessionManager {
     }
 
     pub fn set_hook_count(&self, session_id: &str, count: u32) {
-        write_lock(&self.hook_counts)
-            .insert(session_id.to_string(), count);
+        write_lock(&self.hook_counts).insert(session_id.to_string(), count);
     }
 
     pub fn get_hook_count(&self, session_id: &str) -> u32 {
@@ -548,18 +571,40 @@ impl SessionManager {
     /// Get or start a background DWARF parse. Returns a handle immediately.
     /// If the binary was already parsed (or is being parsed), returns the cached handle.
     /// Failed parses are evicted from cache so that retries (e.g. after dsymutil) work.
-    pub fn get_or_start_dwarf_parse(&self, binary_path: &str, search_root: Option<&str>) -> DwarfHandle {
+    pub fn get_or_start_dwarf_parse(
+        &self,
+        binary_path: &str,
+        search_root: Option<&str>,
+    ) -> DwarfHandle {
         self.get_or_start_dwarf_parse_with_symbols(binary_path, search_root, None)
     }
 
-    pub fn get_or_start_dwarf_parse_with_symbols(&self, binary_path: &str, search_root: Option<&str>, symbols_path: Option<&str>) -> DwarfHandle {
+    pub fn get_or_start_dwarf_parse_with_symbols(
+        &self,
+        binary_path: &str,
+        search_root: Option<&str>,
+        symbols_path: Option<&str>,
+    ) -> DwarfHandle {
         // Include mtime and symbols_path in cache key so rebuilds and symbol overrides invalidate correctly
         let mtime = std::fs::metadata(binary_path)
             .and_then(|m| m.modified())
             .ok();
         let cache_key = match (mtime, symbols_path) {
-            (Some(t), Some(sp)) => format!("{}@{}@sym:{}", binary_path, t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(), sp),
-            (Some(t), None) => format!("{}@{}", binary_path, t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+            (Some(t), Some(sp)) => format!(
+                "{}@{}@sym:{}",
+                binary_path,
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sp
+            ),
+            (Some(t), None) => format!(
+                "{}@{}",
+                binary_path,
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            ),
             (None, Some(sp)) => format!("{}@sym:{}", binary_path, sp),
             (None, None) => binary_path.to_string(),
         };
@@ -611,7 +656,11 @@ impl SessionManager {
         // Detect language from command and project signals
         let language = detect_language(command, Path::new(project_root));
         write_lock(&self.languages).insert(session_id.to_string(), language);
-        tracing::info!("Detected language for session {}: {:?}", session_id, language);
+        tracing::info!(
+            "Detected language for session {}: {:?}",
+            session_id,
+            language
+        );
 
         // Derive baseline runtime capabilities (enriched later by agent)
         let caps = crate::capabilities::derive_capabilities(language, command);
@@ -621,7 +670,8 @@ impl SessionManager {
         let image_base = DwarfParser::extract_image_base(Path::new(command)).unwrap_or(0);
 
         // Start background DWARF parse (or get cached handle)
-        let dwarf_handle = self.get_or_start_dwarf_parse_with_symbols(command, Some(project_root), symbols_path);
+        let dwarf_handle =
+            self.get_or_start_dwarf_parse_with_symbols(command, Some(project_root), symbols_path);
 
         // For native binaries, instantiate DwarfResolver once parse completes
         if language == Language::Native {
@@ -633,7 +683,8 @@ impl SessionManager {
                 match dwarf_clone.get().await {
                     Ok(_) => {
                         let resolver = Arc::new(DwarfResolver::new(dwarf_clone, image_base));
-                        write_lock(&resolvers).insert(sid.clone(), resolver as Arc<dyn SymbolResolver>);
+                        write_lock(&resolvers)
+                            .insert(sid.clone(), resolver as Arc<dyn SymbolResolver>);
                         tracing::debug!("DwarfResolver instantiated for session {}", sid);
                     }
                     Err(e) => {
@@ -647,14 +698,18 @@ impl SessionManager {
             let resolvers = Arc::clone(&self.resolvers);
             let sid = session_id.to_string();
             let project_root_path = Path::new(project_root).to_path_buf();
-            match tokio::task::spawn_blocking(move || {
-                PythonResolver::parse(&project_root_path)
-            }).await {
+            match tokio::task::spawn_blocking(move || PythonResolver::parse(&project_root_path))
+                .await
+            {
                 Ok(Ok(resolver)) => {
                     let count = resolver.function_count();
                     let resolver = Arc::new(resolver);
                     write_lock(&resolvers).insert(sid.clone(), resolver as Arc<dyn SymbolResolver>);
-                    tracing::info!("PythonResolver instantiated for session {} ({} functions)", sid, count);
+                    tracing::info!(
+                        "PythonResolver instantiated for session {} ({} functions)",
+                        sid,
+                        count
+                    );
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Python resolver parse failed for session {}: {}", sid, e);
@@ -667,16 +722,18 @@ impl SessionManager {
             let resolvers = Arc::clone(&self.resolvers);
             let sid = session_id.to_string();
             let project_root_path = Path::new(project_root).to_path_buf();
-            match tokio::task::spawn_blocking(move || {
-                JsResolver::from_project(&project_root_path)
-            }).await {
+            match tokio::task::spawn_blocking(move || JsResolver::from_project(&project_root_path))
+                .await
+            {
                 Ok(Ok(resolver)) => {
                     let count = resolver.function_count();
-                    write_lock(&resolvers).insert(
-                        sid.clone(),
-                        Arc::new(resolver) as Arc<dyn SymbolResolver>,
+                    write_lock(&resolvers)
+                        .insert(sid.clone(), Arc::new(resolver) as Arc<dyn SymbolResolver>);
+                    tracing::info!(
+                        "JsResolver instantiated for session {} ({} functions)",
+                        sid,
+                        count
                     );
-                    tracing::info!("JsResolver instantiated for session {} ({} functions)", sid, count);
                 }
                 Ok(Err(e)) => tracing::warn!("JS resolver parse failed for {}: {}", sid, e),
                 Err(e) => tracing::warn!("JS resolver task panicked for {}: {}", sid, e),
@@ -691,8 +748,10 @@ impl SessionManager {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            let is_node = cmd_basename.contains("node") || cmd_basename == "npx"
-                || cmd_basename == "tsx" || cmd_basename == "ts-node";
+            let is_node = cmd_basename.contains("node")
+                || cmd_basename == "npx"
+                || cmd_basename == "tsx"
+                || cmd_basename == "ts-node";
             if is_node {
                 if let Ok((hook_path, hook_url)) = generate_esm_hook_script(session_id) {
                     write_lock(&self.esm_hook_paths).insert(session_id.to_string(), hook_path);
@@ -727,8 +786,12 @@ impl SessionManager {
             let mut cached_limit = crate::config::StrobeSettings::default().events_max_per_session;
             let mut batches_since_refresh = 0u32;
 
-            let flush_batch = |batch: &mut Vec<Event>, cached_limit: &mut usize, batches_since_refresh: &mut u32| {
-                if batch.is_empty() { return; }
+            let flush_batch = |batch: &mut Vec<Event>,
+                               cached_limit: &mut usize,
+                               batches_since_refresh: &mut u32| {
+                if batch.is_empty() {
+                    return;
+                }
                 if *batches_since_refresh >= 10 {
                     let session_id = &batch[0].session_id;
                     *cached_limit = read_lock(&event_limits)
@@ -774,10 +837,14 @@ impl SessionManager {
         });
 
         // Store writer handle so we can await completion during stop
-        self.writer_handles.write().await.insert(session_id.to_string(), writer_handle);
+        self.writer_handles
+            .write()
+            .await
+            .insert(session_id.to_string(), writer_handle);
 
         // Create pause notification channel for breakpoint support
-        let (pause_tx, mut pause_rx) = mpsc::channel::<crate::frida_collector::PauseNotification>(100);
+        let (pause_tx, mut pause_rx) =
+            mpsc::channel::<crate::frida_collector::PauseNotification>(100);
         let paused_threads = Arc::clone(&self.paused_threads);
         let breakpoints_for_hits = Arc::clone(&self.breakpoints);
         let sid = session_id.to_string();
@@ -820,20 +887,22 @@ impl SessionManager {
         // Use read lock for the actual spawn — allows concurrent Frida operations
         let guard = self.frida_spawner.read().await;
         let spawner = guard.as_ref().unwrap();
-        spawner.spawn(
-            session_id,
-            command,
-            args,
-            cwd,
-            project_root,
-            effective_env,
-            dwarf_handle,
-            image_base,
-            tx,
-            defer_resume,
-            Some(pause_tx),
-            language,
-        ).await
+        spawner
+            .spawn(
+                session_id,
+                command,
+                args,
+                cwd,
+                project_root,
+                effective_env,
+                dwarf_handle,
+                image_base,
+                tx,
+                defer_resume,
+                Some(pause_tx),
+                language,
+            )
+            .await
     }
 
     /// Resume a process that was spawned with defer_resume=true.
@@ -841,7 +910,9 @@ impl SessionManager {
         let guard = self.frida_spawner.read().await;
         match guard.as_ref() {
             Some(spawner) => spawner.resume(pid).await,
-            None => Err(crate::Error::Frida("No Frida spawner initialized".to_string())),
+            None => Err(crate::Error::Frida(
+                "No Frida spawner initialized".to_string(),
+            )),
         }
     }
 
@@ -862,19 +933,42 @@ impl SessionManager {
         let guard = self.frida_spawner.read().await;
         let spawner = match guard.as_ref() {
             Some(s) => s,
-            None => return Ok(HookResult { installed: 0, matched: 0, warnings: vec![] }),
+            None => {
+                return Ok(HookResult {
+                    installed: 0,
+                    matched: 0,
+                    warnings: vec![],
+                })
+            }
         };
 
         if let Some(patterns) = add {
-            return spawner.add_patterns(session_id, patterns, serialization_depth, resolver.as_ref().map(|v| &**v)).await;
+            return spawner
+                .add_patterns(
+                    session_id,
+                    patterns,
+                    serialization_depth,
+                    resolver.as_ref().map(|v| &**v),
+                )
+                .await;
         }
 
         if let Some(patterns) = remove {
-            let remaining = spawner.remove_patterns(session_id, patterns, resolver.as_ref().map(|v| &**v)).await?;
-            return Ok(HookResult { installed: remaining, matched: 0, warnings: vec![] });
+            let remaining = spawner
+                .remove_patterns(session_id, patterns, resolver.as_ref().map(|v| &**v))
+                .await?;
+            return Ok(HookResult {
+                installed: remaining,
+                matched: 0,
+                warnings: vec![],
+            });
         }
 
-        Ok(HookResult { installed: 0, matched: 0, warnings: vec![] })
+        Ok(HookResult {
+            installed: 0,
+            matched: 0,
+            warnings: vec![],
+        })
     }
 
     /// Update Frida watches
@@ -900,7 +994,8 @@ impl SessionManager {
         recipes_json: String,
     ) -> Result<serde_json::Value> {
         let guard = self.frida_spawner.read().await;
-        let spawner = guard.as_ref()
+        let spawner = guard
+            .as_ref()
             .ok_or_else(|| crate::Error::Frida("No Frida spawner available".to_string()))?;
 
         spawner.read_memory(session_id, recipes_json).await
@@ -908,28 +1003,29 @@ impl SessionManager {
 
     /// Execute a debug_read request end-to-end: validate, resolve DWARF, build recipes,
     /// send to agent, format response. This is the full pipeline used by the MCP tool.
-    pub async fn execute_debug_read(
-        &self,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    pub async fn execute_debug_read(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         use crate::mcp::*;
 
         let req: DebugReadRequest = serde_json::from_value(args.clone())?;
         req.validate()?;
 
         // Verify session exists and is running
-        let session = self.get_session(&req.session_id)?
+        let session = self
+            .get_session(&req.session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
         if session.status != crate::db::SessionStatus::Running {
             return Err(crate::Error::ReadFailed(
-                "Process exited — session still queryable but reads unavailable".to_string()
+                "Process exited — session still queryable but reads unavailable".to_string(),
             ));
         }
 
         let depth = req.depth.unwrap_or(1);
 
         // For interpreted languages (Python/JS), use eval_variable via agent
-        let lang = read_lock(&self.languages).get(&req.session_id).copied().unwrap_or(Language::Native);
+        let lang = read_lock(&self.languages)
+            .get(&req.session_id)
+            .copied()
+            .unwrap_or(Language::Native);
         if lang == Language::Python || lang == Language::JavaScript {
             return self.execute_interpreted_read(&req).await;
         }
@@ -970,16 +1066,19 @@ impl SessionManager {
 
                         if let Some(fields) = struct_fields {
                             recipe_json["struct"] = serde_json::json!(true);
-                            let fields_json: Vec<serde_json::Value> = fields.iter().map(|f| {
-                                serde_json::json!({
-                                    "name": f.name,
-                                    "offset": f.offset,
-                                    "size": f.size,
-                                    "typeKind": type_kind_to_agent_str(&f.type_kind),
-                                    "typeName": f.type_name,
-                                    "isTruncatedStruct": f.is_truncated_struct,
+                            let fields_json: Vec<serde_json::Value> = fields
+                                .iter()
+                                .map(|f| {
+                                    serde_json::json!({
+                                        "name": f.name,
+                                        "offset": f.offset,
+                                        "size": f.size,
+                                        "typeKind": type_kind_to_agent_str(&f.type_kind),
+                                        "typeName": f.type_name,
+                                        "isTruncatedStruct": f.is_truncated_struct,
+                                    })
                                 })
-                            }).collect();
+                                .collect();
                             recipe_json["fields"] = serde_json::json!(fields_json);
                         }
 
@@ -995,7 +1094,10 @@ impl SessionManager {
                 }
             } else if let Some(ref addr) = target.address {
                 let size = target.size.unwrap_or(4);
-                let type_hint = target.type_hint.clone().unwrap_or_else(|| "bytes".to_string());
+                let type_hint = target
+                    .type_hint
+                    .clone()
+                    .unwrap_or_else(|| "bytes".to_string());
 
                 recipes.push(serde_json::json!({
                     "label": addr,
@@ -1047,7 +1149,8 @@ impl SessionManager {
                 duration_ms: poll.duration_ms,
                 expected_samples: expected,
                 event_type: "variable_snapshot".to_string(),
-                hint: "Use debug_query({ eventType: 'variable_snapshot' }) to see results".to_string(),
+                hint: "Use debug_query({ eventType: 'variable_snapshot' }) to see results"
+                    .to_string(),
             };
             return Ok(serde_json::to_value(response)?);
         }
@@ -1066,26 +1169,40 @@ impl SessionManager {
                 } else if let Some(fields) = result.get("fields") {
                     read_result.fields = Some(fields.clone());
                 } else if let Some(value) = result.get("value") {
-                    if result.get("isBytes").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if result
+                        .get("isBytes")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         if let Some(hex) = value.as_str() {
                             match hex_to_bytes(hex) {
                                 Ok(bytes) => {
                                     let dir = "/tmp/strobe/reads";
                                     let _ = std::fs::create_dir_all(dir);
-                                    let filename = format!("{}-{}.bin", req.session_id, chrono::Utc::now().timestamp());
+                                    let filename = format!(
+                                        "{}-{}.bin",
+                                        req.session_id,
+                                        chrono::Utc::now().timestamp()
+                                    );
                                     let filepath = format!("{}/{}", dir, filename);
                                     if let Err(e) = std::fs::write(&filepath, &bytes) {
-                                        read_result.error = Some(format!("Failed to write bytes file: {}", e));
+                                        read_result.error =
+                                            Some(format!("Failed to write bytes file: {}", e));
                                     } else {
                                         read_result.file = Some(filepath);
                                         let preview_bytes = &bytes[..bytes.len().min(32)];
                                         read_result.preview = Some(
-                                            preview_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+                                            preview_bytes
+                                                .iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<Vec<_>>()
+                                                .join(" "),
                                         );
                                     }
                                 }
                                 Err(e) => {
-                                    read_result.error = Some(format!("Failed to decode bytes: {}", e));
+                                    read_result.error =
+                                        Some(format!("Failed to decode bytes: {}", e));
                                 }
                             }
                         }
@@ -1109,7 +1226,8 @@ impl SessionManager {
         recipes_json: String,
     ) -> Result<serde_json::Value> {
         let guard = self.frida_spawner.read().await;
-        let spawner = guard.as_ref()
+        let spawner = guard
+            .as_ref()
             .ok_or_else(|| crate::Error::Frida("No Frida spawner available".to_string()))?;
 
         spawner.write_memory(session_id, recipes_json).await
@@ -1125,7 +1243,9 @@ impl SessionManager {
         let mut results: Vec<ReadResult> = Vec::new();
 
         for target in &req.targets {
-            let expr = target.variable.as_deref()
+            let expr = target
+                .variable
+                .as_deref()
                 .or(target.address.as_deref())
                 .unwrap_or("None");
 
@@ -1147,7 +1267,10 @@ impl SessionManager {
                             ..Default::default()
                         });
                     } else {
-                        let value = resp.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                        let value = resp
+                            .get("value")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                         results.push(ReadResult {
                             target: expr.to_string(),
                             value: Some(value),
@@ -1170,21 +1293,19 @@ impl SessionManager {
 
     /// Execute a debug_write request end-to-end: validate, resolve DWARF, build recipes,
     /// send to agent, format response.
-    pub async fn execute_debug_write(
-        &self,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    pub async fn execute_debug_write(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         use crate::mcp::*;
 
         let req: DebugWriteRequest = serde_json::from_value(args.clone())?;
         req.validate()?;
 
         // Verify session exists and is running
-        let session = self.get_session(&req.session_id)?
+        let session = self
+            .get_session(&req.session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(req.session_id.clone()))?;
         if session.status != crate::db::SessionStatus::Running {
             return Err(crate::Error::WriteFailed(
-                "Process exited — session still queryable but writes unavailable".to_string()
+                "Process exited — session still queryable but writes unavailable".to_string(),
             ));
         }
 
@@ -1213,10 +1334,14 @@ impl SessionManager {
                     Ok((recipe, _struct_fields)) => {
                         let type_kind_str = type_kind_to_agent_str(&recipe.type_kind);
                         let numeric_value = match &target.value {
-                            serde_json::Value::Number(n) => {
-                                n.as_f64().unwrap_or(0.0)
+                            serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                            serde_json::Value::Bool(b) => {
+                                if *b {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
                             }
-                            serde_json::Value::Bool(b) => if *b { 1.0 } else { 0.0 },
                             _ => {
                                 response_results.push(WriteResult {
                                     variable: Some(var_name.clone()),
@@ -1248,11 +1373,20 @@ impl SessionManager {
                     }
                 }
             } else if let Some(ref addr) = target.address {
-                let type_hint = target.type_hint.clone().unwrap_or_else(|| "u32".to_string());
+                let type_hint = target
+                    .type_hint
+                    .clone()
+                    .unwrap_or_else(|| "u32".to_string());
                 let (size, type_kind) = crate::daemon::server::parse_type_hint(&type_hint);
                 let numeric_value = match &target.value {
                     serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                    serde_json::Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                    serde_json::Value::Bool(b) => {
+                        if *b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
                     _ => {
                         response_results.push(WriteResult {
                             variable: None,
@@ -1298,10 +1432,21 @@ impl SessionManager {
             for result in results {
                 let label = result.get("label").and_then(|v| v.as_str()).unwrap_or("?");
                 let mut write_result = WriteResult {
-                    variable: if label.starts_with("0x") { None } else { Some(label.to_string()) },
-                    address: result.get("address").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                    variable: if label.starts_with("0x") {
+                        None
+                    } else {
+                        Some(label.to_string())
+                    },
+                    address: result
+                        .get("address")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
                     previous_value: result.get("previousValue").cloned(),
-                    new_value: result.get("newValue").cloned().unwrap_or(serde_json::Value::Null),
+                    new_value: result
+                        .get("newValue")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
                     error: None,
                 };
 
@@ -1361,7 +1506,8 @@ impl SessionManager {
             None => return Ok(None),
         };
 
-        let mut handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
+        let mut handle =
+            self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
         match handle.get().await {
             Ok(parser) => Ok(Some(parser)),
             Err(e) => Err(e),
@@ -1386,27 +1532,41 @@ impl SessionManager {
         };
 
         // Get crash PC from backtrace (first frame) or fault address
-        let crash_pc_str = event.backtrace.as_ref()
+        let crash_pc_str = event
+            .backtrace
+            .as_ref()
             .and_then(|bt| bt.as_array())
             .and_then(|frames| frames.first())
             .and_then(|f| f.get("address"))
             .and_then(|a| a.as_str())
             .or(event.fault_address.as_deref());
 
-        let crash_pc = crash_pc_str
-            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+        let crash_pc =
+            crash_pc_str.and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
         if let Some(pc) = crash_pc {
             if let Ok(locals_info) = dwarf.parse_locals_at_pc(pc) {
-                let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+                let arch = if cfg!(target_arch = "aarch64") {
+                    "arm64"
+                } else {
+                    "x64"
+                };
 
                 // Extract frame_memory and frame_base from the crash event's text field
                 // (stored by parse_event as JSON with frameMemory/frameBase keys)
-                let (frame_memory, frame_base) = event.text.as_ref()
+                let (frame_memory, frame_base) = event
+                    .text
+                    .as_ref()
                     .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
                     .map(|v| {
-                        let fm = v.get("frameMemory").and_then(|f| f.as_str()).map(|s| s.to_string());
-                        let fb = v.get("frameBase").and_then(|f| f.as_str()).map(|s| s.to_string());
+                        let fm = v
+                            .get("frameMemory")
+                            .and_then(|f| f.as_str())
+                            .map(|s| s.to_string());
+                        let fb = v
+                            .get("frameBase")
+                            .and_then(|f| f.as_str())
+                            .map(|s| s.to_string());
                         (fm, fb)
                     })
                     .unwrap_or((None, None));
@@ -1419,7 +1579,8 @@ impl SessionManager {
                     arch,
                 );
                 if !locals.is_empty() {
-                    self.db.update_event_locals(event_id, &serde_json::Value::Array(locals))?;
+                    self.db
+                        .update_event_locals(event_id, &serde_json::Value::Array(locals))?;
                 }
             }
         }
@@ -1440,44 +1601,56 @@ impl SessionManager {
         hit_count: Option<u32>,
     ) -> Result<crate::mcp::BreakpointInfo> {
         // Validate session exists
-        let session = self.db.get_session(session_id)?
+        let session = self
+            .db
+            .get_session(session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
         // For interpreted languages, use file+line directly (no DWARF)
-        let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Native);
+        let lang = read_lock(&self.languages)
+            .get(session_id)
+            .copied()
+            .unwrap_or(Language::Native);
         if lang == Language::Python || lang == Language::JavaScript {
-            return self.set_interpreted_breakpoint(session_id, id, function, file, line, condition, hit_count).await;
+            return self
+                .set_interpreted_breakpoint(
+                    session_id, id, function, file, line, condition, hit_count,
+                )
+                .await;
         }
 
         // Get DWARF parser for address resolution
-        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
+        let mut dwarf_handle =
+            self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
         let dwarf = dwarf_handle.get().await?;
 
-        let breakpoint_id = id.unwrap_or_else(|| format!("bp-{}", uuid::Uuid::new_v4().to_string()));
+        let breakpoint_id =
+            id.unwrap_or_else(|| format!("bp-{}", uuid::Uuid::new_v4().to_string()));
 
         // Save function name for later use (before it's moved into the match)
         let function_name_for_target = function.clone();
 
         // Resolve target to address
-        let (address, resolved_function, resolved_file, resolved_line) = if let Some(func_pattern) = function {
-            // Function breakpoint: resolve via DWARF function table
-            let matches = dwarf.find_by_pattern(&func_pattern);
-            if matches.is_empty() {
-                return Err(crate::Error::ValidationError(
-                    format!("No function matching pattern '{}'", func_pattern)
-                ));
-            }
-            let func = &matches[0];
-            (
-                func.low_pc,
-                Some(func.name.clone()),
-                func.source_file.clone(),
-                func.line_number.map(|l| l as u32),
-            )
-        } else if let (Some(file_path), Some(line_num)) = (file, line) {
-            // Line breakpoint: resolve via DWARF line table
-            let result = dwarf.resolve_line(&file_path, line_num)
-                .ok_or_else(|| {
+        let (address, resolved_function, resolved_file, resolved_line) =
+            if let Some(func_pattern) = function {
+                // Function breakpoint: resolve via DWARF function table
+                let matches = dwarf.find_by_pattern(&func_pattern);
+                if matches.is_empty() {
+                    return Err(crate::Error::ValidationError(format!(
+                        "No function matching pattern '{}'",
+                        func_pattern
+                    )));
+                }
+                let func = &matches[0];
+                (
+                    func.low_pc,
+                    Some(func.name.clone()),
+                    func.source_file.clone(),
+                    func.line_number.map(|l| l as u32),
+                )
+            } else if let (Some(file_path), Some(line_num)) = (file, line) {
+                // Line breakpoint: resolve via DWARF line table
+                let result = dwarf.resolve_line(&file_path, line_num).ok_or_else(|| {
                     let nearest = dwarf.find_nearest_lines(&file_path, line_num, 5);
                     crate::Error::NoCodeAtLine {
                         file: file_path.clone(),
@@ -1485,18 +1658,19 @@ impl SessionManager {
                         nearest_lines: nearest,
                     }
                 })?;
-            (result.0, None, Some(file_path), Some(result.1))
-        } else {
-            return Err(crate::Error::ValidationError(
-                "Breakpoint must specify either function or file+line".to_string()
-            ));
-        };
+                (result.0, None, Some(file_path), Some(result.1))
+            } else {
+                return Err(crate::Error::ValidationError(
+                    "Breakpoint must specify either function or file+line".to_string(),
+                ));
+            };
 
         let runtime_address = address;
 
         // Send setBreakpoint message to agent
         let spawner_guard = self.frida_spawner.read().await;
-        let spawner = spawner_guard.as_ref()
+        let spawner = spawner_guard
+            .as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let message = serde_json::json!({
@@ -1556,34 +1730,43 @@ impl SessionManager {
             (f, l)
         } else if let Some(func_pattern) = function.as_deref() {
             // Try to resolve function name via PythonResolver
-            let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Python);
+            let lang = read_lock(&self.languages)
+                .get(session_id)
+                .copied()
+                .unwrap_or(Language::Python);
             let resolvers = read_lock(&self.resolvers);
             if let Some(resolver) = resolvers.get(session_id) {
-                let session = self.db.get_session(session_id)?
+                let session = self
+                    .db
+                    .get_session(session_id)?
                     .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
                 let project_root = std::path::Path::new(&session.project_root);
-                let symbols = resolver.resolve_breakpoint_pattern(func_pattern, project_root)
+                let symbols = resolver
+                    .resolve_breakpoint_pattern(func_pattern, project_root)
                     .unwrap_or_default();
                 if let Some(sym) = symbols.first() {
                     match sym {
-                        crate::symbols::ResolvedTarget::SourceLocation { file, line, .. } => (file.clone(), *line),
+                        crate::symbols::ResolvedTarget::SourceLocation { file, line, .. } => {
+                            (file.clone(), *line)
+                        }
                         crate::symbols::ResolvedTarget::Address { file, line, .. } => {
                             (file.clone().unwrap_or_default(), line.unwrap_or(0))
                         }
                     }
                 } else {
-                    return Err(crate::Error::ValidationError(
-                        format!("No {} function matching '{}' found", lang, func_pattern)
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "No {} function matching '{}' found",
+                        lang, func_pattern
+                    )));
                 }
             } else {
                 return Err(crate::Error::ValidationError(
-                    "No symbol resolver for this session — specify file+line directly".to_string()
+                    "No symbol resolver for this session — specify file+line directly".to_string(),
                 ));
             }
         } else {
             return Err(crate::Error::ValidationError(
-                "Breakpoint must specify either function or file+line".to_string()
+                "Breakpoint must specify either function or file+line".to_string(),
             ));
         };
 
@@ -1592,7 +1775,8 @@ impl SessionManager {
 
         // Send setBreakpoint to agent with file+line (no address/imageBase)
         let spawner_guard = self.frida_spawner.read().await;
-        let spawner = spawner_guard.as_ref()
+        let spawner = spawner_guard
+            .as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let message = serde_json::json!({
@@ -1646,24 +1830,31 @@ impl SessionManager {
 
         if paused.is_empty() {
             return Err(crate::Error::ValidationError(
-                "No paused threads in this session".to_string()
+                "No paused threads in this session".to_string(),
             ));
         }
 
         let action = action.unwrap_or_else(|| "continue".to_string());
 
         // For interpreted languages, send resume message via Frida
-        let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Native);
+        let lang = read_lock(&self.languages)
+            .get(session_id)
+            .copied()
+            .unwrap_or(Language::Native);
         if lang == Language::Python {
             if action != "continue" {
-                return Err(crate::Error::ValidationError(
-                    format!("Stepping ('{}') is not supported for Python — use 'continue'", action)
-                ));
+                return Err(crate::Error::ValidationError(format!(
+                    "Stepping ('{}') is not supported for Python — use 'continue'",
+                    action
+                )));
             }
             let spawner_guard = self.frida_spawner.read().await;
-            let spawner = spawner_guard.as_ref()
-                .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
-            spawner.send_hook_message(session_id, serde_json::json!({"type": "resume_python_bp"})).await?;
+            let spawner = spawner_guard.as_ref().ok_or_else(|| {
+                crate::Error::Internal("Frida spawner not initialized".to_string())
+            })?;
+            spawner
+                .send_hook_message(session_id, serde_json::json!({"type": "resume_python_bp"}))
+                .await?;
             for (thread_id, _) in &paused {
                 self.remove_paused_thread(session_id, *thread_id);
             }
@@ -1678,12 +1869,18 @@ impl SessionManager {
 
         if lang == Language::JavaScript {
             let spawner_guard = self.frida_spawner.read().await;
-            let spawner = spawner_guard.as_ref()
-                .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
-            spawner.send_hook_message(session_id, serde_json::json!({
-                "type": "resume_v8_bp",
-                "action": action,
-            })).await?;
+            let spawner = spawner_guard.as_ref().ok_or_else(|| {
+                crate::Error::Internal("Frida spawner not initialized".to_string())
+            })?;
+            spawner
+                .send_hook_message(
+                    session_id,
+                    serde_json::json!({
+                        "type": "resume_v8_bp",
+                        "action": action,
+                    }),
+                )
+                .await?;
             for (thread_id, _) in &paused {
                 self.remove_paused_thread(session_id, *thread_id);
             }
@@ -1697,18 +1894,23 @@ impl SessionManager {
         }
 
         // Get session info for DWARF access
-        let session = self.db.get_session(session_id)?
+        let session = self
+            .db
+            .get_session(session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
         // For stepping actions, we need DWARF info
         // Each address is (addr, no_slide): no_slide=true for runtime addresses (e.g., return address)
         let (one_shot_addresses, image_base) = if action != "continue" {
-            let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
+            let mut dwarf_handle =
+                self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
             let dwarf = dwarf_handle.get().await?;
             let ib = dwarf.image_base;
 
             // Get the first paused thread (stepping is single-threaded)
-            let (_thread_id, pause_info) = paused.iter().next()
+            let (_thread_id, pause_info) = paused
+                .iter()
+                .next()
                 .ok_or_else(|| crate::Error::ValidationError("No paused thread".to_string()))?;
 
             // Get the current DWARF-static address.
@@ -1719,7 +1921,10 @@ impl SessionManager {
             let current_address = if let Some(ref bp) = bp {
                 bp.address
             } else if let Some(addr) = pause_info.address {
-                tracing::debug!("Using step BP DWARF-static address 0x{:x} for next_line lookup", addr);
+                tracing::debug!(
+                    "Using step BP DWARF-static address 0x{:x} for next_line lookup",
+                    addr
+                );
                 addr
             } else {
                 0
@@ -1738,7 +1943,9 @@ impl SessionManager {
                     let mut addresses: Vec<(u64, bool)> = Vec::new();
 
                     // Find next line in same function (DWARF-static → needs slide)
-                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address, min_offset) {
+                    if let Some((next_addr, _file, _line)) =
+                        dwarf.next_line_in_function(current_address, min_offset)
+                    {
                         addresses.push((next_addr, false));
                         tracing::debug!("step-over: next line at 0x{:x}", next_addr);
                     } else {
@@ -1749,7 +1956,10 @@ impl SessionManager {
                     if let Some(ret_addr) = pause_info.return_address {
                         if !addresses.iter().any(|(a, _)| *a == ret_addr) {
                             addresses.push((ret_addr, true));
-                            tracing::debug!("step-over: return address fallback at 0x{:x}", ret_addr);
+                            tracing::debug!(
+                                "step-over: return address fallback at 0x{:x}",
+                                ret_addr
+                            );
                         }
                     }
 
@@ -1763,7 +1973,9 @@ impl SessionManager {
                     let mut addresses: Vec<(u64, bool)> = Vec::new();
 
                     // Next line in same function (DWARF-static → needs slide)
-                    if let Some((next_addr, _file, _line)) = dwarf.next_line_in_function(current_address, min_offset) {
+                    if let Some((next_addr, _file, _line)) =
+                        dwarf.next_line_in_function(current_address, min_offset)
+                    {
                         addresses.push((next_addr, false));
                         tracing::debug!("step-into: next line at 0x{:x}", next_addr);
                     }
@@ -1794,9 +2006,10 @@ impl SessionManager {
                     }
                 }
                 _ => {
-                    return Err(crate::Error::ValidationError(
-                        format!("Unknown action: '{}'. Valid: continue, step-over, step-into, step-out", action)
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "Unknown action: '{}'. Valid: continue, step-over, step-into, step-out",
+                        action
+                    )));
                 }
             };
             (addrs, ib)
@@ -1806,14 +2019,23 @@ impl SessionManager {
 
         // Send resume message to each paused thread
         let spawner_guard = self.frida_spawner.read().await;
-        let spawner = spawner_guard.as_ref()
+        let spawner = spawner_guard
+            .as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         for (thread_id, pause_info) in paused {
             // Carry forward the return address during stepping — step hooks can't
             // reliably capture it (Frida trampoline is on the stack after recv().wait()).
             let carry_ret_addr = pause_info.return_address;
-            spawner.resume_thread_with_step(session_id, thread_id, one_shot_addresses.clone(), image_base, carry_ret_addr).await?;
+            spawner
+                .resume_thread_with_step(
+                    session_id,
+                    thread_id,
+                    one_shot_addresses.clone(),
+                    image_base,
+                    carry_ret_addr,
+                )
+                .await?;
             self.remove_paused_thread(session_id, thread_id);
         }
 
@@ -1837,38 +2059,47 @@ impl SessionManager {
         message: String,
         condition: Option<String>,
     ) -> Result<crate::mcp::LogpointInfo> {
-        let session = self.db.get_session(session_id)?
+        let session = self
+            .db
+            .get_session(session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
         // For interpreted languages, use file+line directly (no DWARF)
-        let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Native);
+        let lang = read_lock(&self.languages)
+            .get(session_id)
+            .copied()
+            .unwrap_or(Language::Native);
         if lang == Language::Python || lang == Language::JavaScript {
-            return self.set_interpreted_logpoint(session_id, id, function, file, line, message, condition).await;
+            return self
+                .set_interpreted_logpoint(session_id, id, function, file, line, message, condition)
+                .await;
         }
 
-        let mut dwarf_handle = self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
+        let mut dwarf_handle =
+            self.get_or_start_dwarf_parse(&session.binary_path, Some(&session.project_root));
         let dwarf = dwarf_handle.get().await?;
 
         let logpoint_id = id.unwrap_or_else(|| format!("lp-{}", uuid::Uuid::new_v4().to_string()));
         let function_name_for_target = function.clone();
 
-        let (address, resolved_function, resolved_file, resolved_line) = if let Some(func_pattern) = function {
-            let matches = dwarf.find_by_pattern(&func_pattern);
-            if matches.is_empty() {
-                return Err(crate::Error::ValidationError(
-                    format!("No function matching pattern '{}'", func_pattern)
-                ));
-            }
-            let func = &matches[0];
-            (
-                func.low_pc,
-                Some(func.name.clone()),
-                func.source_file.clone(),
-                func.line_number.map(|l| l as u32),
-            )
-        } else if let (Some(file_path), Some(line_num)) = (file, line) {
-            let result = dwarf.resolve_line(&file_path, line_num)
-                .ok_or_else(|| {
+        let (address, resolved_function, resolved_file, resolved_line) =
+            if let Some(func_pattern) = function {
+                let matches = dwarf.find_by_pattern(&func_pattern);
+                if matches.is_empty() {
+                    return Err(crate::Error::ValidationError(format!(
+                        "No function matching pattern '{}'",
+                        func_pattern
+                    )));
+                }
+                let func = &matches[0];
+                (
+                    func.low_pc,
+                    Some(func.name.clone()),
+                    func.source_file.clone(),
+                    func.line_number.map(|l| l as u32),
+                )
+            } else if let (Some(file_path), Some(line_num)) = (file, line) {
+                let result = dwarf.resolve_line(&file_path, line_num).ok_or_else(|| {
                     let nearest = dwarf.find_nearest_lines(&file_path, line_num, 5);
                     crate::Error::NoCodeAtLine {
                         file: file_path.clone(),
@@ -1876,18 +2107,19 @@ impl SessionManager {
                         nearest_lines: nearest,
                     }
                 })?;
-            (result.0, None, Some(file_path), Some(result.1))
-        } else {
-            return Err(crate::Error::ValidationError(
-                "Logpoint must specify either function or file+line".to_string()
-            ));
-        };
+                (result.0, None, Some(file_path), Some(result.1))
+            } else {
+                return Err(crate::Error::ValidationError(
+                    "Logpoint must specify either function or file+line".to_string(),
+                ));
+            };
 
         let runtime_address = address;
 
         // Send setLogpoint message to agent
         let spawner_guard = self.frida_spawner.read().await;
-        let spawner = spawner_guard.as_ref()
+        let spawner = spawner_guard
+            .as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let msg = serde_json::json!({
@@ -1946,34 +2178,43 @@ impl SessionManager {
         let (resolved_file, resolved_line) = if let (Some(f), Some(l)) = (file.clone(), line) {
             (f, l)
         } else if let Some(func_pattern) = function.as_deref() {
-            let lang = read_lock(&self.languages).get(session_id).copied().unwrap_or(Language::Python);
+            let lang = read_lock(&self.languages)
+                .get(session_id)
+                .copied()
+                .unwrap_or(Language::Python);
             let resolvers = read_lock(&self.resolvers);
             if let Some(resolver) = resolvers.get(session_id) {
-                let session = self.db.get_session(session_id)?
+                let session = self
+                    .db
+                    .get_session(session_id)?
                     .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
                 let project_root = std::path::Path::new(&session.project_root);
-                let symbols = resolver.resolve_breakpoint_pattern(func_pattern, project_root)
+                let symbols = resolver
+                    .resolve_breakpoint_pattern(func_pattern, project_root)
                     .unwrap_or_default();
                 if let Some(sym) = symbols.first() {
                     match sym {
-                        crate::symbols::ResolvedTarget::SourceLocation { file, line, .. } => (file.clone(), *line),
+                        crate::symbols::ResolvedTarget::SourceLocation { file, line, .. } => {
+                            (file.clone(), *line)
+                        }
                         crate::symbols::ResolvedTarget::Address { file, line, .. } => {
                             (file.clone().unwrap_or_default(), line.unwrap_or(0))
                         }
                     }
                 } else {
-                    return Err(crate::Error::ValidationError(
-                        format!("No {} function matching '{}' found", lang, func_pattern)
-                    ));
+                    return Err(crate::Error::ValidationError(format!(
+                        "No {} function matching '{}' found",
+                        lang, func_pattern
+                    )));
                 }
             } else {
                 return Err(crate::Error::ValidationError(
-                    "No symbol resolver for this session — specify file+line directly".to_string()
+                    "No symbol resolver for this session — specify file+line directly".to_string(),
                 ));
             }
         } else {
             return Err(crate::Error::ValidationError(
-                "Logpoint must specify either function or file+line".to_string()
+                "Logpoint must specify either function or file+line".to_string(),
             ));
         };
 
@@ -1981,7 +2222,8 @@ impl SessionManager {
         let func_name = function.clone();
 
         let spawner_guard = self.frida_spawner.read().await;
-        let spawner = spawner_guard.as_ref()
+        let spawner = spawner_guard
+            .as_ref()
             .ok_or_else(|| crate::Error::Internal("Frida spawner not initialized".to_string()))?;
 
         let msg = serde_json::json!({
@@ -2027,13 +2269,15 @@ impl SessionManager {
 
     pub fn add_breakpoint(&self, session_id: &str, breakpoint: Breakpoint) -> Result<()> {
         let mut guard = write_lock(&self.breakpoints);
-        let session_bps = guard.entry(session_id.to_string())
+        let session_bps = guard
+            .entry(session_id.to_string())
             .or_insert_with(HashMap::new);
         if session_bps.len() >= crate::mcp::MAX_BREAKPOINTS_PER_SESSION {
-            return Err(crate::Error::ValidationError(
-                format!("Session has {} breakpoints (max {})",
-                    session_bps.len(), crate::mcp::MAX_BREAKPOINTS_PER_SESSION)
-            ));
+            return Err(crate::Error::ValidationError(format!(
+                "Session has {} breakpoints (max {})",
+                session_bps.len(),
+                crate::mcp::MAX_BREAKPOINTS_PER_SESSION
+            )));
         }
         session_bps.insert(breakpoint.id.clone(), breakpoint);
         Ok(())
@@ -2056,7 +2300,10 @@ impl SessionManager {
         };
 
         if let Err(e) = send_result {
-            tracing::warn!("Failed to send breakpoint removal to agent: {} (cleaning up state anyway)", e);
+            tracing::warn!(
+                "Failed to send breakpoint removal to agent: {} (cleaning up state anyway)",
+                e
+            );
         }
 
         // Now resume any threads that were paused on this breakpoint.
@@ -2065,15 +2312,22 @@ impl SessionManager {
             if info.breakpoint_id == breakpoint_id {
                 if let Some(spawner) = spawner_guard.as_ref() {
                     if let Err(e) = spawner.resume_thread(session_id, *thread_id).await {
-                        tracing::warn!("Failed to resume thread {} paused on breakpoint {}: {}", thread_id, breakpoint_id, e);
+                        tracing::warn!(
+                            "Failed to resume thread {} paused on breakpoint {}: {}",
+                            thread_id,
+                            breakpoint_id,
+                            e
+                        );
                     }
                 }
                 // Only clear paused state if the thread is still paused at THIS breakpoint.
                 // Between the agent removal (which unblocks the thread) and here, the thread
                 // may have already hit a different breakpoint and been re-paused — clearing
                 // unconditionally would lose that new pause state.
-                if self.get_pause_info(session_id, *thread_id)
-                    .map_or(true, |current| current.breakpoint_id == breakpoint_id) {
+                if self
+                    .get_pause_info(session_id, *thread_id)
+                    .map_or(true, |current| current.breakpoint_id == breakpoint_id)
+                {
                     self.remove_paused_thread(session_id, *thread_id);
                 }
             }
@@ -2089,7 +2343,8 @@ impl SessionManager {
 
     /// Build a full status snapshot for a session.
     pub fn session_status(&self, session_id: &str) -> Result<crate::mcp::SessionStatusResponse> {
-        let session = self.get_session(session_id)?
+        let session = self
+            .get_session(session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
 
         let event_count = self.db.count_session_events(session_id)?;
@@ -2097,7 +2352,8 @@ impl SessionManager {
         let trace_patterns = self.get_patterns(session_id);
 
         // Convert breakpoints
-        let breakpoints: Vec<crate::mcp::BreakpointInfo> = self.get_breakpoints(session_id)
+        let breakpoints: Vec<crate::mcp::BreakpointInfo> = self
+            .get_breakpoints(session_id)
             .into_iter()
             .map(|bp| crate::mcp::BreakpointInfo {
                 id: bp.id,
@@ -2118,7 +2374,8 @@ impl SessionManager {
             .collect();
 
         // Convert logpoints
-        let logpoints: Vec<crate::mcp::LogpointInfo> = self.get_logpoints(session_id)
+        let logpoints: Vec<crate::mcp::LogpointInfo> = self
+            .get_logpoints(session_id)
             .into_iter()
             .map(|lp| crate::mcp::LogpointInfo {
                 id: lp.id,
@@ -2140,11 +2397,16 @@ impl SessionManager {
             .collect();
 
         // Convert watches
-        let watches: Vec<crate::mcp::ActiveWatch> = self.get_watches(session_id)
+        let watches: Vec<crate::mcp::ActiveWatch> = self
+            .get_watches(session_id)
             .into_iter()
             .map(|w| crate::mcp::ActiveWatch {
                 label: w.label,
-                address: if w.is_expr { "expr".to_string() } else { format!("0x{:x}", w.address) },
+                address: if w.is_expr {
+                    "expr".to_string()
+                } else {
+                    format!("0x{:x}", w.address)
+                },
                 size: w.size,
                 type_name: w.type_name,
                 on: w.on_patterns,
@@ -2174,25 +2436,34 @@ impl SessionManager {
             ("running".to_string(), None)
         } else {
             // Check if the process crashed
-            let crash_events = self.db().query_events(session_id, |q| {
-                q.event_type(crate::db::EventType::Crash).limit(1)
-            }).unwrap_or_default();
+            let crash_events = self
+                .db()
+                .query_events(session_id, |q| {
+                    q.event_type(crate::db::EventType::Crash).limit(1)
+                })
+                .unwrap_or_default();
 
             if let Some(crash) = crash_events.first() {
-                let top_frame = crash.backtrace.as_ref()
+                let top_frame = crash
+                    .backtrace
+                    .as_ref()
                     .and_then(|bt| bt.as_array())
                     .and_then(|frames| frames.first())
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .map(|s| s.to_string());
 
-                let throw_top_frame = crash.throw_backtrace.as_ref()
+                let throw_top_frame = crash
+                    .throw_backtrace
+                    .as_ref()
                     .and_then(|bt| bt.as_array())
-                    .and_then(|frames| frames.iter().find(|f| {
-                        // Skip __cxa_throw and internal frames to find the actual throw site
-                        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                        !name.contains("__cxa_throw") && !name.contains("__cxa_allocate")
-                    }))
+                    .and_then(|frames| {
+                        frames.iter().find(|f| {
+                            // Skip __cxa_throw and internal frames to find the actual throw site
+                            let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            !name.contains("__cxa_throw") && !name.contains("__cxa_allocate")
+                        })
+                    })
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .map(|s| s.to_string());
@@ -2229,14 +2500,16 @@ impl SessionManager {
 
     pub fn get_breakpoints(&self, session_id: &str) -> Vec<Breakpoint> {
         let guard = read_lock(&self.breakpoints);
-        guard.get(session_id)
+        guard
+            .get(session_id)
             .map(|bps| bps.values().cloned().collect())
             .unwrap_or_default()
     }
 
     pub fn get_breakpoint(&self, session_id: &str, breakpoint_id: &str) -> Option<Breakpoint> {
         let guard = read_lock(&self.breakpoints);
-        guard.get(session_id)
+        guard
+            .get(session_id)
             .and_then(|bps| bps.get(breakpoint_id))
             .cloned()
     }
@@ -2244,13 +2517,15 @@ impl SessionManager {
     // Logpoint management
     pub fn add_logpoint(&self, session_id: &str, logpoint: Logpoint) -> Result<()> {
         let mut guard = write_lock(&self.logpoints);
-        let session_lps = guard.entry(session_id.to_string())
+        let session_lps = guard
+            .entry(session_id.to_string())
             .or_insert_with(HashMap::new);
         if session_lps.len() >= crate::mcp::MAX_LOGPOINTS_PER_SESSION {
-            return Err(crate::Error::ValidationError(
-                format!("Session has {} logpoints (max {})",
-                    session_lps.len(), crate::mcp::MAX_LOGPOINTS_PER_SESSION)
-            ));
+            return Err(crate::Error::ValidationError(format!(
+                "Session has {} logpoints (max {})",
+                session_lps.len(),
+                crate::mcp::MAX_LOGPOINTS_PER_SESSION
+            )));
         }
         session_lps.insert(logpoint.id.clone(), logpoint);
         Ok(())
@@ -2265,10 +2540,14 @@ impl SessionManager {
             } else {
                 Ok(())
             }
-        }.await;
+        }
+        .await;
 
         if let Err(e) = send_result {
-            tracing::warn!("Failed to send logpoint removal to agent: {} (cleaning up state anyway)", e);
+            tracing::warn!(
+                "Failed to send logpoint removal to agent: {} (cleaning up state anyway)",
+                e
+            );
         }
 
         let mut guard = write_lock(&self.logpoints);
@@ -2279,7 +2558,8 @@ impl SessionManager {
 
     pub fn get_logpoints(&self, session_id: &str) -> Vec<Logpoint> {
         let guard = read_lock(&self.logpoints);
-        guard.get(session_id)
+        guard
+            .get(session_id)
             .map(|lps| lps.values().cloned().collect())
             .unwrap_or_default()
     }
@@ -2287,7 +2567,8 @@ impl SessionManager {
     // Pause state management
     pub fn add_paused_thread(&self, session_id: &str, thread_id: u64, info: PauseInfo) {
         let mut guard = write_lock(&self.paused_threads);
-        guard.entry(session_id.to_string())
+        guard
+            .entry(session_id.to_string())
             .or_insert_with(HashMap::new)
             .insert(thread_id, info);
     }
@@ -2301,23 +2582,23 @@ impl SessionManager {
 
     pub fn is_thread_paused(&self, session_id: &str, thread_id: u64) -> bool {
         let guard = read_lock(&self.paused_threads);
-        guard.get(session_id)
+        guard
+            .get(session_id)
             .and_then(|threads| threads.get(&thread_id))
             .is_some()
     }
 
     pub fn get_pause_info(&self, session_id: &str, thread_id: u64) -> Option<PauseInfo> {
         let guard = read_lock(&self.paused_threads);
-        guard.get(session_id)
+        guard
+            .get(session_id)
             .and_then(|threads| threads.get(&thread_id))
             .cloned()
     }
 
     pub fn get_all_paused_threads(&self, session_id: &str) -> HashMap<u64, PauseInfo> {
         let guard = read_lock(&self.paused_threads);
-        guard.get(session_id)
-            .cloned()
-            .unwrap_or_default()
+        guard.get(session_id).cloned().unwrap_or_default()
     }
 
     /// Get a reference to the paused_threads map for external use (e.g., stuck detector).
@@ -2519,8 +2800,14 @@ mod tests {
     #[test]
     fn test_detect_language_python_command() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(detect_language("python script.py", temp.path()), Language::Python);
-        assert_eq!(detect_language("/usr/bin/python3", temp.path()), Language::Python);
+        assert_eq!(
+            detect_language("python script.py", temp.path()),
+            Language::Python
+        );
+        assert_eq!(
+            detect_language("/usr/bin/python3", temp.path()),
+            Language::Python
+        );
         assert_eq!(detect_language("script.py", temp.path()), Language::Python);
         assert_eq!(detect_language("python3.11", temp.path()), Language::Python);
     }
@@ -2528,11 +2815,26 @@ mod tests {
     #[test]
     fn test_detect_language_javascript_command() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(detect_language("node index.js", temp.path()), Language::JavaScript);
-        assert_eq!(detect_language("bun test.ts", temp.path()), Language::JavaScript);
-        assert_eq!(detect_language("npx tsx script.ts", temp.path()), Language::JavaScript);
-        assert_eq!(detect_language("test.js", temp.path()), Language::JavaScript);
-        assert_eq!(detect_language("test.ts", temp.path()), Language::JavaScript);
+        assert_eq!(
+            detect_language("node index.js", temp.path()),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect_language("bun test.ts", temp.path()),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect_language("npx tsx script.ts", temp.path()),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect_language("test.js", temp.path()),
+            Language::JavaScript
+        );
+        assert_eq!(
+            detect_language("test.ts", temp.path()),
+            Language::JavaScript
+        );
     }
 
     #[test]
@@ -2556,22 +2858,37 @@ mod tests {
 
         // JavaScript project
         fs::write(temp.path().join("package.json"), "{}").unwrap();
-        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
+        assert_eq!(
+            detect_language("./binary", temp.path()),
+            Language::JavaScript
+        );
         fs::remove_file(temp.path().join("package.json")).unwrap();
 
         fs::write(temp.path().join("bun.lockb"), "").unwrap();
-        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
+        assert_eq!(
+            detect_language("./binary", temp.path()),
+            Language::JavaScript
+        );
         fs::remove_file(temp.path().join("bun.lockb")).unwrap();
 
         fs::write(temp.path().join("deno.json"), "{}").unwrap();
-        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
+        assert_eq!(
+            detect_language("./binary", temp.path()),
+            Language::JavaScript
+        );
     }
 
     #[test]
     fn test_detect_language_native_fallback() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(detect_language("./my_binary", temp.path()), Language::Native);
-        assert_eq!(detect_language("/usr/bin/ls", temp.path()), Language::Native);
+        assert_eq!(
+            detect_language("./my_binary", temp.path()),
+            Language::Native
+        );
+        assert_eq!(
+            detect_language("/usr/bin/ls", temp.path()),
+            Language::Native
+        );
         assert_eq!(detect_language("cargo test", temp.path()), Language::Native);
     }
 
@@ -2584,9 +2901,15 @@ mod tests {
         fs::write(temp.path().join("package.json"), "{}").unwrap();
 
         // Python command overrides JS project markers
-        assert_eq!(detect_language("python test.py", temp.path()), Language::Python);
+        assert_eq!(
+            detect_language("python test.py", temp.path()),
+            Language::Python
+        );
 
         // But a generic binary name falls back to project detection
-        assert_eq!(detect_language("./binary", temp.path()), Language::JavaScript);
+        assert_eq!(
+            detect_language("./binary", temp.path()),
+            Language::JavaScript
+        );
     }
 }

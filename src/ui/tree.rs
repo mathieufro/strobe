@@ -99,8 +99,10 @@ fn format_node(out: &mut String, node: &UiNode, depth: usize) {
     out.push_str(&format!(" id={}", node.id));
 
     if let Some(ref bounds) = node.bounds {
-        out.push_str(&format!(" bounds={},{},{},{}",
-            bounds.x as i64, bounds.y as i64, bounds.w as i64, bounds.h as i64));
+        out.push_str(&format!(
+            " bounds={},{},{},{}",
+            bounds.x as i64, bounds.y as i64, bounds.w as i64, bounds.h as i64
+        ));
     }
 
     if let Some(ref value) = node.value {
@@ -174,7 +176,12 @@ mod tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }),
+            bounds: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+            }),
             actions: vec![],
             source: NodeSource::Ax,
             children: vec![
@@ -185,7 +192,12 @@ mod tests {
                     value: None,
                     enabled: true,
                     focused: true,
-                    bounds: Some(Rect { x: 10.0, y: 5.0, w: 80.0, h: 30.0 }),
+                    bounds: Some(Rect {
+                        x: 10.0,
+                        y: 5.0,
+                        w: 80.0,
+                        h: 30.0,
+                    }),
                     actions: vec!["AXPress".to_string()],
                     source: NodeSource::Ax,
                     children: vec![],
@@ -197,7 +209,12 @@ mod tests {
                     value: Some("0.6".to_string()),
                     enabled: true,
                     focused: false,
-                    bounds: Some(Rect { x: 100.0, y: 50.0, w: 60.0, h: 60.0 }),
+                    bounds: Some(Rect {
+                        x: 100.0,
+                        y: 50.0,
+                        w: 60.0,
+                        h: 60.0,
+                    }),
                     actions: vec![],
                     source: NodeSource::Vision { confidence: 0.87 },
                     children: vec![],
@@ -263,7 +280,12 @@ mod tests {
             value: Some("0.5".to_string()),
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 10.0, y: 20.0, w: 200.0, h: 30.0 }),
+            bounds: Some(Rect {
+                x: 10.0,
+                y: 20.0,
+                w: 200.0,
+                h: 30.0,
+            }),
             actions: vec!["AXIncrement".to_string()],
             source: NodeSource::Ax,
             children: vec![],
@@ -282,7 +304,12 @@ mod tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 10.0, y: 5.0, w: 80.0, h: 30.0 }),
+            bounds: Some(Rect {
+                x: 10.0,
+                y: 5.0,
+                w: 80.0,
+                h: 30.0,
+            }),
             actions: vec!["AXPress".to_string()],
             source: NodeSource::Ax,
             children: vec![],

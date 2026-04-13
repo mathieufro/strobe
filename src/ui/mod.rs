@@ -19,8 +19,8 @@ pub mod capture_linux;
 #[cfg(target_os = "linux")]
 pub use capture_linux as capture;
 
-pub mod vision;
 pub mod merge;
+pub mod vision;
 
 pub mod input;
 

@@ -132,8 +132,7 @@ mod tests {
 
     #[test]
     fn test_modifier_flags() {
-        let flags =
-            modifier_string_to_flags(&["cmd".to_string(), "shift".to_string()]);
+        let flags = modifier_string_to_flags(&["cmd".to_string(), "shift".to_string()]);
         assert!(flags & MOD_COMMAND != 0);
         assert!(flags & MOD_SHIFT != 0);
         assert!(flags & MOD_CONTROL == 0);

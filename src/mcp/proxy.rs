@@ -1,9 +1,9 @@
+use crate::Result;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use crate::Result;
 
 /// Max reconnection attempts within the reset window before giving up.
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
@@ -66,19 +66,22 @@ pub async fn stdio_proxy() -> Result<()> {
             }
 
             // Send initialize to new daemon
-            let init_msg = format!("{}\n", serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "_proxy_reinit_0",
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "strobe-proxy-reconnect",
-                        "version": env!("CARGO_PKG_VERSION")
+            let init_msg = format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "_proxy_reinit_0",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "strobe-proxy-reconnect",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
                     }
-                }
-            }));
+                })
+            );
             writer.write_all(init_msg.as_bytes()).await?;
             writer.flush().await?;
             // Read and discard the initialize response
@@ -86,11 +89,14 @@ pub async fn stdio_proxy() -> Result<()> {
             daemon_reader.read_line(&mut daemon_line).await?;
 
             // Send initialized notification
-            let initialized_msg = format!("{}\n", serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            }));
+            let initialized_msg = format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                })
+            );
             writer.write_all(initialized_msg.as_bytes()).await?;
             writer.flush().await?;
 
@@ -146,10 +152,9 @@ pub async fn stdio_proxy() -> Result<()> {
 /// Try to connect to an existing daemon, or spawn one and connect.
 async fn ensure_daemon_and_connect(strobe_dir: &Path, socket_path: &Path) -> Result<UnixStream> {
     // Fast path: daemon may already be running
-    if let Ok(Ok(stream)) = tokio::time::timeout(
-        Duration::from_millis(500),
-        UnixStream::connect(socket_path),
-    ).await {
+    if let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(socket_path)).await
+    {
         return Ok(stream);
     }
 
@@ -160,10 +165,9 @@ async fn ensure_daemon_and_connect(strobe_dir: &Path, socket_path: &Path) -> Res
     // Wait for daemon to become connectable (50 attempts x 100ms = 5s)
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Ok(Ok(stream)) = tokio::time::timeout(
-            Duration::from_millis(100),
-            UnixStream::connect(socket_path),
-        ).await {
+        if let Ok(Ok(stream)) =
+            tokio::time::timeout(Duration::from_millis(100), UnixStream::connect(socket_path)).await
+        {
             return Ok(stream);
         }
     }
@@ -201,7 +205,10 @@ fn start_daemon(strobe_dir: &Path) -> Result<()> {
 
     std::process::Command::new(exe)
         .arg("daemon")
-        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file))

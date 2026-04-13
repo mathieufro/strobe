@@ -1,7 +1,7 @@
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use regex::Regex;
 
 use super::adapter::*;
 use super::TestProgress;
@@ -11,9 +11,7 @@ pub struct UnittestAdapter;
 impl TestAdapter for UnittestAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
         // Lower priority than pytest — only detect if no pytest config found
-        if project_root.join("pytest.ini").exists()
-            || project_root.join("conftest.py").exists()
-        {
+        if project_root.join("pytest.ini").exists() || project_root.join("conftest.py").exists() {
             return 0; // pytest takes priority
         }
 
@@ -56,7 +54,12 @@ impl TestAdapter for UnittestAdapter {
         // test_name format: "test_module.TestClass.test_method"
         Ok(TestCommand {
             program: "python3".into(),
-            args: vec!["-m".into(), "unittest".into(), test_name.into(), "-v".into()],
+            args: vec![
+                "-m".into(),
+                "unittest".into(),
+                test_name.into(),
+                "-v".into(),
+            ],
             env: HashMap::new(),
             cwd: None,
             remove_env: vec![],
@@ -162,7 +165,8 @@ fn parse_unittest_output(stdout: &str, stderr: &str) -> TestResult {
     let mut all_tests = Vec::new();
 
     // Parse test result lines
-    let test_line_re = Regex::new(r"^(\w+)\s+\(([^)]+)\)\s+\.\.\.\s+(ok|FAIL|ERROR|skipped)").unwrap();
+    let test_line_re =
+        Regex::new(r"^(\w+)\s+\(([^)]+)\)\s+\.\.\.\s+(ok|FAIL|ERROR|skipped)").unwrap();
 
     for line in combined.lines() {
         if let Some(caps) = test_line_re.captures(line) {
@@ -212,10 +216,9 @@ fn parse_unittest_output(stdout: &str, stderr: &str) -> TestResult {
     }
 
     // Parse failure details
-    let fail_block_re = Regex::new(
-        r"(?s)(?:FAIL|ERROR):\s+(\w+)\s+\(([^)]+)\)\s*\n-+\n(.*?)(?:\n-+|\n=+|$)",
-    )
-    .unwrap();
+    let fail_block_re =
+        Regex::new(r"(?s)(?:FAIL|ERROR):\s+(\w+)\s+\(([^)]+)\)\s*\n-+\n(.*?)(?:\n-+|\n=+|$)")
+            .unwrap();
 
     for caps in fail_block_re.captures_iter(&combined) {
         let test_method = caps.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -229,8 +232,7 @@ fn parse_unittest_output(stdout: &str, stderr: &str) -> TestResult {
         let (file, line) = if let Some(caps) = file_line_re.captures(message_block) {
             (
                 caps.get(1).map(|m| m.as_str().to_string()),
-                caps.get(2)
-                    .and_then(|m| m.as_str().parse::<u32>().ok()),
+                caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()),
             )
         } else {
             (None, None)
@@ -326,9 +328,18 @@ pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
                 p.phase = super::TestPhase::Running;
             }
             match outcome {
-                "ok" => { p.passed += 1; p.finish_test(&test_name); }
-                "FAIL" | "ERROR" => { p.failed += 1; p.finish_test(&test_name); }
-                "skipped" => { p.skipped += 1; p.finish_test(&test_name); }
+                "ok" => {
+                    p.passed += 1;
+                    p.finish_test(&test_name);
+                }
+                "FAIL" | "ERROR" => {
+                    p.failed += 1;
+                    p.finish_test(&test_name);
+                }
+                "skipped" => {
+                    p.skipped += 1;
+                    p.finish_test(&test_name);
+                }
                 _ => {}
             }
         }

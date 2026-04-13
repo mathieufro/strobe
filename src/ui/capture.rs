@@ -1,12 +1,12 @@
 //! Screenshot capture via macOS CGWindowListCreateImage.
 
 use crate::Result;
-use core_graphics::display::*;
-use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+use core_foundation::array::CFArray;
 use core_foundation::base::TCFType;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use core_foundation::array::CFArray;
+use core_graphics::display::*;
+use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_graphics::image::CGImage;
 
 /// Window info: ID and screen-space bounds in points.
@@ -30,21 +30,32 @@ pub fn capture_window_screenshot(pid: u32) -> Result<Vec<u8>> {
 
 /// Capture a screenshot cropped to a specific element's bounds.
 /// `element_bounds` is in screen-space points (from AX tree).
-pub fn capture_element_screenshot(pid: u32, element_bounds: &crate::ui::tree::Rect) -> Result<Vec<u8>> {
+pub fn capture_element_screenshot(
+    pid: u32,
+    element_bounds: &crate::ui::tree::Rect,
+) -> Result<Vec<u8>> {
     unsafe {
         let win = find_main_window(pid)?;
         let image = capture_window_image(pid, &win)?;
 
         // Compute scale factor: pixel dimensions / point dimensions
-        let scale_x = if win.w > 0.0 { image.width() as f64 / win.w } else { 1.0 };
-        let scale_y = if win.h > 0.0 { image.height() as f64 / win.h } else { 1.0 };
+        let scale_x = if win.w > 0.0 {
+            image.width() as f64 / win.w
+        } else {
+            1.0
+        };
+        let scale_y = if win.h > 0.0 {
+            image.height() as f64 / win.h
+        } else {
+            1.0
+        };
 
         // Convert element screen-space bounds to window-relative pixel coords
         let crop_x_f = (element_bounds.x - win.x) * scale_x;
         let crop_y_f = (element_bounds.y - win.y) * scale_y;
         if crop_x_f < 0.0 || crop_y_f < 0.0 {
             return Err(crate::Error::UiQueryFailed(
-                "Element is outside the visible window area".to_string()
+                "Element is outside the visible window area".to_string(),
             ));
         }
 
@@ -57,7 +68,7 @@ pub fn capture_element_screenshot(pid: u32, element_bounds: &crate::ui::tree::Re
 
         if crop_w == 0 || crop_h == 0 {
             return Err(crate::Error::UiQueryFailed(
-                "Element has zero-size bounds after cropping".to_string()
+                "Element has zero-size bounds after cropping".to_string(),
             ));
         }
 
@@ -73,9 +84,12 @@ unsafe fn capture_window_image(pid: u32, win: &WindowInfo) -> Result<CGImage> {
         win.id,
         kCGWindowImageBoundsIgnoreFraming,
     )
-    .ok_or_else(|| crate::Error::UiQueryFailed(
-        format!("Failed to capture screenshot for PID {} (window {})", pid, win.id)
-    ))
+    .ok_or_else(|| {
+        crate::Error::UiQueryFailed(format!(
+            "Failed to capture screenshot for PID {} (window {})",
+            pid, win.id
+        ))
+    })
 }
 
 /// Find the main (largest, on-screen) window for a PID.
@@ -87,7 +101,7 @@ unsafe fn find_main_window(pid: u32) -> Result<WindowInfo> {
 
     if windows.is_null() {
         return Err(crate::Error::UiQueryFailed(
-            "Failed to list windows".to_string()
+            "Failed to list windows".to_string(),
         ));
     }
 
@@ -105,8 +119,11 @@ unsafe fn find_main_window(pid: u32) -> Result<WindowInfo> {
             // Check PID
             let mut pid_val: *const std::ffi::c_void = std::ptr::null();
             if core_foundation_sys::dictionary::CFDictionaryGetValueIfPresent(
-                dict_ref, pid_key.as_concrete_TypeRef() as _, &mut pid_val
-            ) == 0 {
+                dict_ref,
+                pid_key.as_concrete_TypeRef() as _,
+                &mut pid_val,
+            ) == 0
+            {
                 continue;
             }
             let window_pid = CFNumber::wrap_under_get_rule(pid_val as _);
@@ -117,18 +134,25 @@ unsafe fn find_main_window(pid: u32) -> Result<WindowInfo> {
             // Get window ID
             let mut id_val: *const std::ffi::c_void = std::ptr::null();
             if core_foundation_sys::dictionary::CFDictionaryGetValueIfPresent(
-                dict_ref, id_key.as_concrete_TypeRef() as _, &mut id_val
-            ) == 0 {
+                dict_ref,
+                id_key.as_concrete_TypeRef() as _,
+                &mut id_val,
+            ) == 0
+            {
                 continue;
             }
             let window_id = CFNumber::wrap_under_get_rule(id_val as _)
-                .to_i64().unwrap_or(0) as CGWindowID;
+                .to_i64()
+                .unwrap_or(0) as CGWindowID;
 
             // Get bounds
             let mut bounds_val: *const std::ffi::c_void = std::ptr::null();
             if core_foundation_sys::dictionary::CFDictionaryGetValueIfPresent(
-                dict_ref, bounds_key.as_concrete_TypeRef() as _, &mut bounds_val
-            ) == 0 {
+                dict_ref,
+                bounds_key.as_concrete_TypeRef() as _,
+                &mut bounds_val,
+            ) == 0
+            {
                 continue;
             }
 
@@ -140,16 +164,23 @@ unsafe fn find_main_window(pid: u32) -> Result<WindowInfo> {
             let area = w * h;
 
             if best.is_none() || area > best.as_ref().unwrap().1 {
-                best = Some((WindowInfo { id: window_id, x, y, w, h }, area));
+                best = Some((
+                    WindowInfo {
+                        id: window_id,
+                        x,
+                        y,
+                        w,
+                        h,
+                    },
+                    area,
+                ));
             }
         }
     }
 
-    best
-        .map(|(info, _)| info)
-        .ok_or_else(|| crate::Error::UiQueryFailed(
-            format!("No visible window found for PID {}", pid)
-        ))
+    best.map(|(info, _)| info).ok_or_else(|| {
+        crate::Error::UiQueryFailed(format!("No visible window found for PID {}", pid))
+    })
 }
 
 /// Read an f64 from a CFDictionary by string key.
@@ -157,9 +188,14 @@ unsafe fn cf_dict_f64(dict: core_foundation_sys::dictionary::CFDictionaryRef, ke
     let cf_key = CFString::new(key);
     let mut val: *const std::ffi::c_void = std::ptr::null();
     if core_foundation_sys::dictionary::CFDictionaryGetValueIfPresent(
-        dict, cf_key.as_concrete_TypeRef() as _, &mut val
-    ) != 0 {
-        CFNumber::wrap_under_get_rule(val as _).to_f64().unwrap_or(0.0)
+        dict,
+        cf_key.as_concrete_TypeRef() as _,
+        &mut val,
+    ) != 0
+    {
+        CFNumber::wrap_under_get_rule(val as _)
+            .to_f64()
+            .unwrap_or(0.0)
     } else {
         0.0
     }
@@ -180,11 +216,14 @@ fn crop_cg_image_to_png(
 ) -> Result<Vec<u8>> {
     // SEC-3: Validate image size to prevent memory exhaustion
     const MAX_PIXELS: usize = 3840 * 2160; // 4K resolution limit
-    if crop_w.checked_mul(crop_h).map_or(true, |pixels| pixels > MAX_PIXELS) {
-        return Err(crate::Error::UiQueryFailed(
-            format!("Screenshot too large: {}x{} exceeds 4K limit ({}x{})",
-                crop_w, crop_h, 3840, 2160)
-        ));
+    if crop_w
+        .checked_mul(crop_h)
+        .map_or(true, |pixels| pixels > MAX_PIXELS)
+    {
+        return Err(crate::Error::UiQueryFailed(format!(
+            "Screenshot too large: {}x{} exceeds 4K limit ({}x{})",
+            crop_w, crop_h, 3840, 2160
+        )));
     }
 
     let bytes_per_row = image.bytes_per_row();
@@ -196,14 +235,17 @@ fn crop_cg_image_to_png(
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
 
-    let mut writer = encoder.write_header()
+    let mut writer = encoder
+        .write_header()
         .map_err(|e| crate::Error::UiQueryFailed(format!("PNG encode error: {}", e)))?;
 
     // CGImage is BGRA, PNG expects RGBA — swap channels
     // SEC-4: Use checked multiplication to prevent integer overflow
-    let pixel_count = crop_w.checked_mul(crop_h)
+    let pixel_count = crop_w
+        .checked_mul(crop_h)
         .ok_or_else(|| crate::Error::UiQueryFailed("Image dimensions overflow".to_string()))?;
-    let byte_count = pixel_count.checked_mul(4)
+    let byte_count = pixel_count
+        .checked_mul(4)
         .ok_or_else(|| crate::Error::UiQueryFailed("Image size overflow".to_string()))?;
     let mut rgba = Vec::with_capacity(byte_count);
     for y in crop_y..(crop_y + crop_h) {
@@ -213,13 +255,14 @@ fn crop_cg_image_to_png(
             if offset + 3 < bytes.len() {
                 rgba.push(bytes[offset + 2]); // R (from B)
                 rgba.push(bytes[offset + 1]); // G
-                rgba.push(bytes[offset]);     // B (from R)
+                rgba.push(bytes[offset]); // B (from R)
                 rgba.push(bytes[offset + 3]); // A
             }
         }
     }
 
-    writer.write_image_data(&rgba)
+    writer
+        .write_image_data(&rgba)
         .map_err(|e| crate::Error::UiQueryFailed(format!("PNG write error: {}", e)))?;
 
     drop(writer);

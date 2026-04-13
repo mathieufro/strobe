@@ -1,6 +1,6 @@
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
-use serde::Deserialize;
 
 use super::adapter::*;
 
@@ -57,7 +57,12 @@ impl TestAdapter for PytestAdapter {
         } else {
             vec!["-m".into(), "pytest".into()]
         };
-        args.extend(["--tb=short".into(), "-q".into(), "--json-report".into(), "--json-report-file=-".into()]);
+        args.extend([
+            "--tb=short".into(),
+            "-q".into(),
+            "--json-report".into(),
+            "--json-report-file=-".into(),
+        ]);
         match level {
             Some(TestLevel::Unit) => {
                 args.extend(["-m".into(), "not integration and not e2e".into()]);
@@ -249,11 +254,7 @@ fn parse_pytest_json_report(stdout: &str, _stderr: &str, _exit_code: i32) -> Tes
 
         if test.outcome == "failed" {
             // Extract file name from nodeid: "tests/test_audio.py::test_function"
-            let file = test
-                .nodeid
-                .split("::")
-                .next()
-                .map(|s| s.to_string());
+            let file = test.nodeid.split("::").next().map(|s| s.to_string());
 
             let message = test
                 .call
@@ -266,7 +267,13 @@ fn parse_pytest_json_report(stdout: &str, _stderr: &str, _exit_code: i32) -> Tes
                 file,
                 line: test.lineno,
                 message,
-                rerun: Some(test.nodeid.split("::").last().unwrap_or(&test.nodeid).to_string()),
+                rerun: Some(
+                    test.nodeid
+                        .split("::")
+                        .last()
+                        .unwrap_or(&test.nodeid)
+                        .to_string(),
+                ),
                 suggested_traces: vec![],
             });
         }
@@ -351,8 +358,7 @@ mod tests {
     #[test]
     fn test_detect_pytest_config() {
         let adapter = PytestAdapter;
-        let fixture_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python");
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python");
         if fixture_dir.exists() {
             let confidence = adapter.detect(&fixture_dir, None);
             assert!(
@@ -379,7 +385,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("uv.lock"), "").unwrap();
 
-        let cmd = adapter.suite_command(dir.path(), None, &HashMap::new()).unwrap();
+        let cmd = adapter
+            .suite_command(dir.path(), None, &HashMap::new())
+            .unwrap();
         assert_eq!(cmd.program, "uv");
         assert_eq!(cmd.args[0], "run");
         assert_eq!(cmd.args[1], "pytest");
@@ -391,7 +399,9 @@ mod tests {
         let adapter = PytestAdapter;
         let dir = tempfile::tempdir().unwrap();
 
-        let cmd = adapter.suite_command(dir.path(), None, &HashMap::new()).unwrap();
+        let cmd = adapter
+            .suite_command(dir.path(), None, &HashMap::new())
+            .unwrap();
         assert_eq!(cmd.program, "python3");
         assert_eq!(cmd.args[0], "-m");
         assert_eq!(cmd.args[1], "pytest");
@@ -427,12 +437,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("uv.lock"), "").unwrap();
 
-        let cmd = adapter.suite_command(dir.path(), Some(TestLevel::Unit), &HashMap::new()).unwrap();
+        let cmd = adapter
+            .suite_command(dir.path(), Some(TestLevel::Unit), &HashMap::new())
+            .unwrap();
         assert_eq!(cmd.program, "uv");
         assert_eq!(cmd.args[0], "run");
         assert_eq!(cmd.args[1], "pytest");
         assert!(cmd.args.contains(&"-m".to_string()));
-        assert!(cmd.args.contains(&"not integration and not e2e".to_string()));
+        assert!(cmd
+            .args
+            .contains(&"not integration and not e2e".to_string()));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use crate::Result;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 enum AgentSystem {
@@ -14,7 +14,9 @@ fn detect_agent() -> Option<AgentSystem> {
     let claude_dir = home.join(".claude");
     let claude_json = home.join(".claude.json");
     if claude_dir.exists() || claude_json.exists() {
-        return Some(AgentSystem::ClaudeCode { config_dir: claude_dir });
+        return Some(AgentSystem::ClaudeCode {
+            config_dir: claude_dir,
+        });
     }
 
     None
@@ -56,7 +58,8 @@ fn install_claude_code(config_dir: &Path) -> Result<()> {
     let binary = strobe_binary_path()?;
 
     // Write/update MCP config in ~/.claude.json (local scope for current project)
-    let claude_json_path = config_dir.parent()
+    let claude_json_path = config_dir
+        .parent()
         .unwrap_or(config_dir)
         .join(".claude.json");
 

@@ -9,9 +9,7 @@ impl TestAdapter for Catch2Adapter {
     fn detect(&self, _project_root: &Path, command: Option<&str>) -> u8 {
         if let Some(cmd) = command {
             if Path::new(cmd).exists() {
-                let output = std::process::Command::new(cmd)
-                    .arg("--list-tests")
-                    .output();
+                let output = std::process::Command::new(cmd).arg("--list-tests").output();
                 match output {
                     Ok(o) if o.status.success() => return 85,
                     _ => return 0,
@@ -32,7 +30,7 @@ impl TestAdapter for Catch2Adapter {
         _env: &HashMap<String, String>,
     ) -> crate::Result<TestCommand> {
         Err(crate::Error::Frida(
-            "Catch2 adapter requires a test binary path via the 'command' parameter".to_string()
+            "Catch2 adapter requires a test binary path via the 'command' parameter".to_string(),
         ))
     }
 
@@ -42,16 +40,11 @@ impl TestAdapter for Catch2Adapter {
         _test_name: &str,
     ) -> crate::Result<TestCommand> {
         Err(crate::Error::Frida(
-            "Catch2 adapter requires a test binary path via the 'command' parameter".to_string()
+            "Catch2 adapter requires a test binary path via the 'command' parameter".to_string(),
         ))
     }
 
-    fn parse_output(
-        &self,
-        stdout: &str,
-        stderr: &str,
-        exit_code: i32,
-    ) -> TestResult {
+    fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
         let mut result = parse_catch2_xml(stdout);
 
         // Detect crash: signal death (exit > 128) or sanitizer output in stderr
@@ -65,10 +58,12 @@ impl TestAdapter for Catch2Adapter {
             // Build crash message from sanitizer output or signal
             let message = if has_sanitizer {
                 // Extract the ERROR and SUMMARY lines
-                let error_line = stderr.lines()
+                let error_line = stderr
+                    .lines()
                     .find(|l| l.contains("ERROR:") && l.contains("Sanitizer:"))
                     .unwrap_or("Sanitizer error detected");
-                let summary_line = stderr.lines()
+                let summary_line = stderr
+                    .lines()
                     .find(|l| l.contains("SUMMARY:"))
                     .map(|l| l.split("SUMMARY: ").nth(1).unwrap_or(l).trim())
                     .unwrap_or("");
@@ -88,7 +83,10 @@ impl TestAdapter for Catch2Adapter {
                     4 => "SIGILL",
                     _ => "unknown signal",
                 };
-                format!("Process crashed with {} (exit code {})", sig_name, exit_code)
+                format!(
+                    "Process crashed with {} (exit code {})",
+                    sig_name, exit_code
+                )
             };
 
             // Extract source files from sanitizer backtrace for suggested_traces
@@ -100,7 +98,9 @@ impl TestAdapter for Catch2Adapter {
                         let file_part = &trimmed[file_pos + 1..];
                         if let Some(colon) = file_part.find(':') {
                             let file_path = &file_part[..colon];
-                            if let Some(filename) = Path::new(file_path).file_name().and_then(|n| n.to_str()) {
+                            if let Some(filename) =
+                                Path::new(file_path).file_name().and_then(|n| n.to_str())
+                            {
                                 let trace = format!("@file:{}", filename);
                                 if !trace_files.contains(&trace) {
                                     trace_files.push(trace);
@@ -112,7 +112,10 @@ impl TestAdapter for Catch2Adapter {
             }
 
             // Find the currently running test (last test that wasn't completed)
-            let crash_test_name = result.all_tests.iter().rev()
+            let crash_test_name = result
+                .all_tests
+                .iter()
+                .rev()
                 .find(|t| t.status == TestStatus::Fail)
                 .map(|t| t.name.clone())
                 .or_else(|| {
@@ -123,7 +126,9 @@ impl TestAdapter for Catch2Adapter {
                 .unwrap_or_else(|| "unknown (process crashed)".to_string());
 
             // Only add crash failure if no existing failure covers it
-            let crash_already_reported = result.failures.iter()
+            let crash_already_reported = result
+                .failures
+                .iter()
                 .any(|f| f.message.contains("crashed") || f.message.contains("Sanitizer"));
 
             if !crash_already_reported {
@@ -193,11 +198,7 @@ impl TestAdapter for Catch2Adapter {
         })
     }
 
-    fn single_test_for_binary(
-        &self,
-        cmd: &str,
-        test_name: &str,
-    ) -> crate::Result<TestCommand> {
+    fn single_test_for_binary(&self, cmd: &str, test_name: &str) -> crate::Result<TestCommand> {
         let filter = if test_name.contains('*') {
             test_name.to_string()
         } else {
@@ -205,11 +206,7 @@ impl TestAdapter for Catch2Adapter {
         };
         Ok(TestCommand {
             program: cmd.to_string(),
-            args: vec![
-                "--reporter".to_string(),
-                "xml".to_string(),
-                filter,
-            ],
+            args: vec!["--reporter".to_string(), "xml".to_string(), filter],
             env: HashMap::new(),
             cwd: None,
             remove_env: vec![],
@@ -292,72 +289,73 @@ fn parse_catch2_xml(xml: &str) -> TestResult {
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => {
-                match e.local_name().as_ref() {
-                    b"TestCase" => {
-                        if tc_success {
-                            passed += 1;
-                            all_tests.push(TestDetail {
-                                name: tc_name.clone(),
-                                status: TestStatus::Pass,
-                                duration_ms: tc_duration_ms,
-                                stdout: None,
-                                stderr: None,
-                                message: None,
-                            });
+            Ok(Event::End(ref e)) => match e.local_name().as_ref() {
+                b"TestCase" => {
+                    if tc_success {
+                        passed += 1;
+                        all_tests.push(TestDetail {
+                            name: tc_name.clone(),
+                            status: TestStatus::Pass,
+                            duration_ms: tc_duration_ms,
+                            stdout: None,
+                            stderr: None,
+                            message: None,
+                        });
+                    } else {
+                        failed += 1;
+                        let message = if !expr_expanded.is_empty() {
+                            format!(
+                                "REQUIRE( {} )\nwith expansion:\n  {}",
+                                expr_original, expr_expanded
+                            )
                         } else {
-                            failed += 1;
-                            let message = if !expr_expanded.is_empty() {
-                                format!("REQUIRE( {} )\nwith expansion:\n  {}", expr_original, expr_expanded)
-                            } else {
-                                "Test failed".to_string()
-                            };
+                            "Test failed".to_string()
+                        };
 
-                            let file = if !expr_file.is_empty() {
-                                Some(expr_file.clone())
-                            } else if !tc_file.is_empty() {
-                                Some(tc_file.clone())
-                            } else {
-                                None
-                            };
-                            let line = if expr_line > 0 {
-                                Some(expr_line)
-                            } else if tc_line > 0 {
-                                Some(tc_line)
-                            } else {
-                                None
-                            };
+                        let file = if !expr_file.is_empty() {
+                            Some(expr_file.clone())
+                        } else if !tc_file.is_empty() {
+                            Some(tc_file.clone())
+                        } else {
+                            None
+                        };
+                        let line = if expr_line > 0 {
+                            Some(expr_line)
+                        } else if tc_line > 0 {
+                            Some(tc_line)
+                        } else {
+                            None
+                        };
 
-                            failures.push(TestFailure {
-                                name: tc_name.clone(),
-                                file,
-                                line,
-                                message: message.clone(),
-                                rerun: Some(tc_name.clone()),
-                                suggested_traces: vec![],
-                            });
+                        failures.push(TestFailure {
+                            name: tc_name.clone(),
+                            file,
+                            line,
+                            message: message.clone(),
+                            rerun: Some(tc_name.clone()),
+                            suggested_traces: vec![],
+                        });
 
-                            all_tests.push(TestDetail {
-                                name: tc_name.clone(),
-                                status: TestStatus::Fail,
-                                duration_ms: tc_duration_ms,
-                                stdout: None,
-                                stderr: None,
-                                message: Some(message),
-                            });
-                        }
-                        in_test_case = false;
+                        all_tests.push(TestDetail {
+                            name: tc_name.clone(),
+                            status: TestStatus::Fail,
+                            duration_ms: tc_duration_ms,
+                            stdout: None,
+                            stderr: None,
+                            message: Some(message),
+                        });
                     }
-                    b"Expression" => {}
-                    b"Original" => {
-                        reading_original = false;
-                    }
-                    b"Expanded" => {
-                        reading_expanded = false;
-                    }
-                    _ => {}
+                    in_test_case = false;
                 }
-            }
+                b"Expression" => {}
+                b"Original" => {
+                    reading_original = false;
+                }
+                b"Expanded" => {
+                    reading_expanded = false;
+                }
+                _ => {}
+            },
             Ok(Event::Text(ref e)) => {
                 if reading_original {
                     expr_original = e.unescape().unwrap_or_default().to_string();
@@ -399,7 +397,10 @@ fn get_attr(e: &quick_xml::events::BytesStart, name: &str) -> String {
 
 /// Parse a single line of Catch2 XML output and update progress incrementally.
 /// Heuristic: detects TestCase name and OverallResult success/failure tags.
-pub fn update_progress(line: &str, progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>) {
+pub fn update_progress(
+    line: &str,
+    progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>,
+) {
     let trimmed = line.trim();
     if trimmed.contains("<TestCase") {
         if let Some(start) = trimmed.find("name=\"") {

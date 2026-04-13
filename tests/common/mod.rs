@@ -11,17 +11,11 @@ pub fn cpp_target() -> PathBuf {
     static CACHED: OnceLock<PathBuf> = OnceLock::new();
     CACHED
         .get_or_init(|| {
-            let fixture_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+            let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
             let binary = fixture_dir.join("build/strobe_test_target");
             let cmake = fixture_dir.join("CMakeLists.txt");
 
-            if !binary.exists()
-                || needs_rebuild(
-                    &[&fixture_dir.join("src"), &cmake],
-                    &binary,
-                )
-            {
+            if !binary.exists() || needs_rebuild(&[&fixture_dir.join("src"), &cmake], &binary) {
                 build_cpp_fixtures(&fixture_dir);
             } else {
                 eprintln!("C++ fixtures up-to-date, skipping build");
@@ -42,8 +36,7 @@ pub fn cpp_test_suite() -> PathBuf {
     static CACHED: OnceLock<PathBuf> = OnceLock::new();
     CACHED
         .get_or_init(|| {
-            let fixture_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+            let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
             let binary = fixture_dir.join("build/strobe_test_suite");
             let cmake = fixture_dir.join("CMakeLists.txt");
 
@@ -73,16 +66,11 @@ pub fn rust_target() -> PathBuf {
     static CACHED: OnceLock<PathBuf> = OnceLock::new();
     CACHED
         .get_or_init(|| {
-            let fixture_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust");
+            let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust");
             let binary = fixture_dir.join("target/debug/strobe_test_fixture");
             let cargo_toml = fixture_dir.join("Cargo.toml");
 
-            if !binary.exists()
-                || needs_rebuild(
-                    &[&fixture_dir.join("src"), &cargo_toml],
-                    &binary,
-                )
+            if !binary.exists() || needs_rebuild(&[&fixture_dir.join("src"), &cargo_toml], &binary)
             {
                 build_rust_fixture(&fixture_dir);
             } else {
@@ -125,7 +113,11 @@ pub fn ui_test_app() -> PathBuf {
                 eprintln!("UI test app up-to-date, skipping build");
             }
 
-            assert!(binary.exists(), "UI test app not found after build: {:?}", binary);
+            assert!(
+                binary.exists(),
+                "UI test app not found after build: {:?}",
+                binary
+            );
             binary
         })
         .clone()

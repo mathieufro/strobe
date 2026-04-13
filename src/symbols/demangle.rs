@@ -1,5 +1,5 @@
-use rustc_demangle::demangle as rust_demangle;
 use cpp_demangle::Symbol as CppSymbol;
+use rustc_demangle::demangle as rust_demangle;
 
 /// Demangle a symbol name from any supported format (Rust, C++, or plain C).
 /// Returns the demangled name, or the original if demangling fails.

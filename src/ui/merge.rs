@@ -19,7 +19,11 @@ pub fn iou(a: &Rect, b: &Rect) -> f64 {
     let area_b = b.w * b.h;
     let union = area_a + area_b - intersection;
 
-    if union <= f64::EPSILON { 0.0 } else { intersection / union }
+    if union <= f64::EPSILON {
+        0.0
+    } else {
+        intersection / union
+    }
 }
 
 /// Convert VisionBounds to Rect.
@@ -56,7 +60,9 @@ pub fn merge_vision_into_tree(
             if best_iou >= iou_threshold {
                 // Merge: update existing node
                 if let Some(node) = get_node_mut(ax_nodes, &path) {
-                    node.source = NodeSource::Merged { confidence: ve.confidence };
+                    node.source = NodeSource::Merged {
+                        confidence: ve.confidence,
+                    };
                     if node.value.is_none() {
                         // Use vision-estimated value if AX didn't provide one
                         node.value = Some(ve.description.clone());
@@ -71,13 +77,19 @@ pub fn merge_vision_into_tree(
         let vision_node = UiNode {
             id: generate_id(&ve.label, Some(&ve.description), added_count),
             role: ve.label.clone(),
-            title: if ve.description.is_empty() { None } else { Some(ve.description.clone()) },
+            title: if ve.description.is_empty() {
+                None
+            } else {
+                Some(ve.description.clone())
+            },
             value: None,
             enabled: true,
             focused: false,
             bounds: Some(vr),
             actions: vec![],
-            source: NodeSource::Vision { confidence: ve.confidence },
+            source: NodeSource::Vision {
+                confidence: ve.confidence,
+            },
             children: vec![],
         };
 
@@ -135,8 +147,10 @@ fn insert_into_container(nodes: &mut Vec<UiNode>, node: UiNode, cx: f64, cy: f64
     // Find deepest container whose bounds contain the center point
     for parent in nodes.iter_mut() {
         if let Some(ref bounds) = parent.bounds {
-            if cx >= bounds.x && cx <= bounds.x + bounds.w
-                && cy >= bounds.y && cy <= bounds.y + bounds.h
+            if cx >= bounds.x
+                && cx <= bounds.x + bounds.w
+                && cy >= bounds.y
+                && cy <= bounds.y + bounds.h
             {
                 // Try to insert deeper first
                 if !insert_into_container(&mut parent.children, node.clone(), cx, cy) {
@@ -155,21 +169,46 @@ mod tests {
 
     #[test]
     fn test_iou_identical() {
-        let a = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let a = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
         assert!((iou(&a, &a) - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn test_iou_no_overlap() {
-        let a = Rect { x: 0.0, y: 0.0, w: 50.0, h: 50.0 };
-        let b = Rect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 };
+        let a = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 50.0,
+            h: 50.0,
+        };
+        let b = Rect {
+            x: 100.0,
+            y: 100.0,
+            w: 50.0,
+            h: 50.0,
+        };
         assert_eq!(iou(&a, &b), 0.0);
     }
 
     #[test]
     fn test_iou_partial() {
-        let a = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let b = Rect { x: 50.0, y: 50.0, w: 100.0, h: 100.0 };
+        let a = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let b = Rect {
+            x: 50.0,
+            y: 50.0,
+            w: 100.0,
+            h: 100.0,
+        };
         // Intersection: 50x50 = 2500, Union: 10000 + 10000 - 2500 = 17500
         let expected = 2500.0 / 17500.0;
         assert!((iou(&a, &b) - expected).abs() < 0.001);
@@ -177,8 +216,18 @@ mod tests {
 
     #[test]
     fn test_iou_contained() {
-        let outer = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let inner = Rect { x: 25.0, y: 25.0, w: 50.0, h: 50.0 };
+        let outer = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let inner = Rect {
+            x: 25.0,
+            y: 25.0,
+            w: 50.0,
+            h: 50.0,
+        };
         // Intersection: 50x50 = 2500, Union: 10000 + 2500 - 2500 = 10000
         assert!((iou(&outer, &inner) - 0.25).abs() < 0.001);
     }
@@ -192,7 +241,12 @@ mod tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 10.0, y: 10.0, w: 80.0, h: 30.0 }),
+            bounds: Some(Rect {
+                x: 10.0,
+                y: 10.0,
+                w: 80.0,
+                h: 30.0,
+            }),
             actions: vec![],
             source: NodeSource::Ax,
             children: vec![],
@@ -202,7 +256,12 @@ mod tests {
             label: "button".to_string(),
             description: "Play button".to_string(),
             confidence: 0.9,
-            bounds: VisionBounds { x: 12, y: 8, w: 78, h: 32 }, // High IoU with ax node
+            bounds: VisionBounds {
+                x: 12,
+                y: 8,
+                w: 78,
+                h: 32,
+            }, // High IoU with ax node
         }];
 
         let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
@@ -220,7 +279,12 @@ mod tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }),
+            bounds: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 300.0,
+            }),
             actions: vec![],
             source: NodeSource::Ax,
             children: vec![],
@@ -230,7 +294,12 @@ mod tests {
             label: "knob".to_string(),
             description: "Filter Cutoff".to_string(),
             confidence: 0.85,
-            bounds: VisionBounds { x: 100, y: 100, w: 60, h: 60 }, // No AX match
+            bounds: VisionBounds {
+                x: 100,
+                y: 100,
+                w: 60,
+                h: 60,
+            }, // No AX match
         }];
 
         let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
@@ -238,7 +307,10 @@ mod tests {
         assert_eq!(added, 1);
         // Vision node should be added as child of window (spatial containment)
         assert_eq!(tree[0].children.len(), 1);
-        assert!(matches!(tree[0].children[0].source, NodeSource::Vision { .. }));
+        assert!(matches!(
+            tree[0].children[0].source,
+            NodeSource::Vision { .. }
+        ));
     }
 
     // TEST-3: Edge case tests for merge algorithm
@@ -246,13 +318,32 @@ mod tests {
     #[test]
     fn test_merge_zero_area_bounds() {
         // Test IoU with zero-area rectangles
-        let zero_w = Rect { x: 10.0, y: 10.0, w: 0.0, h: 50.0 };
-        let zero_h = Rect { x: 10.0, y: 10.0, w: 50.0, h: 0.0 };
-        let normal = Rect { x: 10.0, y: 10.0, w: 50.0, h: 50.0 };
+        let zero_w = Rect {
+            x: 10.0,
+            y: 10.0,
+            w: 0.0,
+            h: 50.0,
+        };
+        let zero_h = Rect {
+            x: 10.0,
+            y: 10.0,
+            w: 50.0,
+            h: 0.0,
+        };
+        let normal = Rect {
+            x: 10.0,
+            y: 10.0,
+            w: 50.0,
+            h: 50.0,
+        };
 
         assert_eq!(iou(&zero_w, &normal), 0.0, "Zero width should have 0 IoU");
         assert_eq!(iou(&zero_h, &normal), 0.0, "Zero height should have 0 IoU");
-        assert_eq!(iou(&zero_w, &zero_h), 0.0, "Two zero-area should have 0 IoU");
+        assert_eq!(
+            iou(&zero_w, &zero_h),
+            0.0,
+            "Two zero-area should have 0 IoU"
+        );
 
         // Merge should not crash with zero-area vision elements
         let mut tree = vec![UiNode {
@@ -272,7 +363,12 @@ mod tests {
             label: "button".to_string(),
             description: "Zero width".to_string(),
             confidence: 0.9,
-            bounds: VisionBounds { x: 10, y: 10, w: 0, h: 50 },
+            bounds: VisionBounds {
+                x: 10,
+                y: 10,
+                w: 0,
+                h: 50,
+            },
         }];
 
         let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
@@ -284,12 +380,26 @@ mod tests {
     #[test]
     fn test_merge_negative_coordinates() {
         // Some window systems use negative coords for off-screen windows
-        let neg = Rect { x: -100.0, y: -50.0, w: 200.0, h: 100.0 };
-        let pos = Rect { x: 50.0, y: 25.0, w: 100.0, h: 50.0 };
+        let neg = Rect {
+            x: -100.0,
+            y: -50.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let pos = Rect {
+            x: 50.0,
+            y: 25.0,
+            w: 100.0,
+            h: 50.0,
+        };
 
         // Should have partial overlap
         let score = iou(&neg, &pos);
-        assert!(score > 0.0 && score < 1.0, "Should have partial overlap: {}", score);
+        assert!(
+            score > 0.0 && score < 1.0,
+            "Should have partial overlap: {}",
+            score
+        );
     }
 
     #[test]
@@ -302,7 +412,12 @@ mod tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 100.0, y: 100.0, w: 80.0, h: 40.0 }),
+            bounds: Some(Rect {
+                x: 100.0,
+                y: 100.0,
+                w: 80.0,
+                h: 40.0,
+            }),
             actions: vec![],
             source: NodeSource::Ax,
             children: vec![],
@@ -312,13 +427,20 @@ mod tests {
             label: "button".to_string(),
             description: "Vision Button".to_string(),
             confidence: 0.95,
-            bounds: VisionBounds { x: 100, y: 100, w: 80, h: 40 }, // Exact match
+            bounds: VisionBounds {
+                x: 100,
+                y: 100,
+                w: 80,
+                h: 40,
+            }, // Exact match
         }];
 
         let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
         assert_eq!(merged, 1, "Exact overlap should merge");
         assert_eq!(added, 0);
-        assert!(matches!(tree[0].source, NodeSource::Merged { confidence } if (confidence - 0.95).abs() < 0.01));
+        assert!(
+            matches!(tree[0].source, NodeSource::Merged { confidence } if (confidence - 0.95).abs() < 0.01)
+        );
     }
 
     #[test]
@@ -331,7 +453,12 @@ mod tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }),
+            bounds: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+            }),
             actions: vec![],
             source: NodeSource::Ax,
             children: vec![UiNode {
@@ -341,7 +468,12 @@ mod tests {
                 value: None,
                 enabled: true,
                 focused: false,
-                bounds: Some(Rect { x: 10.0, y: 10.0, w: 780.0, h: 580.0 }),
+                bounds: Some(Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    w: 780.0,
+                    h: 580.0,
+                }),
                 actions: vec![],
                 source: NodeSource::Ax,
                 children: vec![UiNode {
@@ -351,7 +483,12 @@ mod tests {
                     value: None,
                     enabled: true,
                     focused: false,
-                    bounds: Some(Rect { x: 100.0, y: 100.0, w: 200.0, h: 100.0 }),
+                    bounds: Some(Rect {
+                        x: 100.0,
+                        y: 100.0,
+                        w: 200.0,
+                        h: 100.0,
+                    }),
                     actions: vec![],
                     source: NodeSource::Ax,
                     children: vec![UiNode {
@@ -361,7 +498,12 @@ mod tests {
                         value: None,
                         enabled: true,
                         focused: false,
-                        bounds: Some(Rect { x: 120.0, y: 130.0, w: 80.0, h: 30.0 }),
+                        bounds: Some(Rect {
+                            x: 120.0,
+                            y: 130.0,
+                            w: 80.0,
+                            h: 30.0,
+                        }),
                         actions: vec![],
                         source: NodeSource::Ax,
                         children: vec![],
@@ -375,7 +517,12 @@ mod tests {
             label: "button".to_string(),
             description: "Click Me".to_string(),
             confidence: 0.9,
-            bounds: VisionBounds { x: 121, y: 131, w: 78, h: 28 }, // High IoU with nested button
+            bounds: VisionBounds {
+                x: 121,
+                y: 131,
+                w: 78,
+                h: 28,
+            }, // High IoU with nested button
         }];
 
         let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
@@ -397,7 +544,12 @@ mod tests {
             value: None,
             enabled: true,
             focused: false,
-            bounds: Some(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }),
+            bounds: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 300.0,
+            }),
             actions: vec![],
             source: NodeSource::Ax,
             children: vec![],
@@ -407,7 +559,12 @@ mod tests {
             label: "button".to_string(),
             description: "Off Screen".to_string(),
             confidence: 0.8,
-            bounds: VisionBounds { x: 1000, y: 1000, w: 100, h: 50 }, // Way outside
+            bounds: VisionBounds {
+                x: 1000,
+                y: 1000,
+                w: 100,
+                h: 50,
+            }, // Way outside
         }];
 
         let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
@@ -430,7 +587,12 @@ mod tests {
                 value: None,
                 enabled: true,
                 focused: false,
-                bounds: Some(Rect { x: 10.0, y: 10.0, w: 80.0, h: 30.0 }),
+                bounds: Some(Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    w: 80.0,
+                    h: 30.0,
+                }),
                 actions: vec![],
                 source: NodeSource::Ax,
                 children: vec![],
@@ -442,7 +604,12 @@ mod tests {
                 value: None,
                 enabled: true,
                 focused: false,
-                bounds: Some(Rect { x: 10.0, y: 10.0, w: 80.0, h: 30.0 }), // Same bounds
+                bounds: Some(Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    w: 80.0,
+                    h: 30.0,
+                }), // Same bounds
                 actions: vec![],
                 source: NodeSource::Ax,
                 children: vec![],
@@ -453,7 +620,12 @@ mod tests {
             label: "button".to_string(),
             description: "Ambiguous".to_string(),
             confidence: 0.9,
-            bounds: VisionBounds { x: 10, y: 10, w: 80, h: 30 },
+            bounds: VisionBounds {
+                x: 10,
+                y: 10,
+                w: 80,
+                h: 30,
+            },
         }];
 
         let (merged, added) = merge_vision_into_tree(&mut tree, &vision, 0.5);
@@ -463,7 +635,8 @@ mod tests {
         assert_eq!(added, 0);
 
         // Exactly one should be merged
-        let merged_count = tree.iter()
+        let merged_count = tree
+            .iter()
             .filter(|n| matches!(n.source, NodeSource::Merged { .. }))
             .count();
         assert_eq!(merged_count, 1, "Exactly one button should be merged");

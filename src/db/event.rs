@@ -1,7 +1,7 @@
+use super::Database;
+use crate::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use crate::Result;
-use super::Database;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -263,7 +263,10 @@ const INSERT_EVENT_SQL: &str =
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 /// Insert a single event row using a connection or transaction.
-fn insert_event_row(conn: &rusqlite::Connection, event: &Event) -> std::result::Result<(), rusqlite::Error> {
+fn insert_event_row(
+    conn: &rusqlite::Connection,
+    event: &Event,
+) -> std::result::Result<(), rusqlite::Error> {
     conn.execute(
         INSERT_EVENT_SQL,
         params![
@@ -301,7 +304,10 @@ fn insert_event_row(conn: &rusqlite::Connection, event: &Event) -> std::result::
 }
 
 /// Read a JSON column that may be stored as Text, Integer, or Real.
-fn read_json_flexible(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<Option<serde_json::Value>> {
+fn read_json_flexible(
+    row: &rusqlite::Row,
+    idx: usize,
+) -> rusqlite::Result<Option<serde_json::Value>> {
     match row.get_ref(idx)? {
         rusqlite::types::ValueRef::Null => Ok(None),
         rusqlite::types::ValueRef::Text(s) => {
@@ -390,7 +396,7 @@ impl Database {
              arguments, return_value, duration_ns, text, sampled, watch_values, pid,
              signal, fault_address, registers, backtrace, locals, breakpoint_id, logpoint_message,
              exception_type, exception_message, throw_backtrace
-             FROM events WHERE session_id = ?"
+             FROM events WHERE session_id = ?",
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(session_id.to_string())];
@@ -403,7 +409,9 @@ impl Database {
         }
 
         if let Some(ref f) = query.function_equals {
-            sql.push_str(" AND event_type IN ('function_enter', 'function_exit') AND function_name = ?");
+            sql.push_str(
+                " AND event_type IN ('function_enter', 'function_exit') AND function_name = ?",
+            );
             params_vec.push(Box::new(f.clone()));
         }
 
@@ -463,12 +471,15 @@ impl Database {
         params_vec.push(Box::new(query.limit as i64));
         params_vec.push(Box::new(query.offset as i64));
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let events = stmt.query_map(params_refs.as_slice(), event_from_row)?;
 
-        events.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        events
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn get_latest_timestamp(&self, session_id: &str) -> Result<i64> {
@@ -509,7 +520,9 @@ impl Database {
             params_vec.push(Box::new(et.as_str().to_string()));
         }
         if let Some(ref f) = query.function_equals {
-            sql.push_str(" AND event_type IN ('function_enter', 'function_exit') AND function_name = ?");
+            sql.push_str(
+                " AND event_type IN ('function_enter', 'function_exit') AND function_name = ?",
+            );
             params_vec.push(Box::new(f.clone()));
         }
         if let Some(ref f) = query.function_contains {
@@ -557,7 +570,8 @@ impl Database {
             params_vec.push(Box::new(after));
         }
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let count: i64 = conn.query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
         Ok(count as u64)
     }
@@ -602,7 +616,8 @@ impl Database {
         let tx = conn.transaction()?;
 
         let mut stats = EventInsertStats::default();
-        let mut session_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut session_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         // Count ALL current events per session (total determines when limit is exceeded).
         for event in events {
@@ -652,10 +667,8 @@ impl Database {
                      )",
                     EVICTABLE_TYPES
                 );
-                let deleted = tx.execute(
-                    &query,
-                    params![&session_id, &session_id, to_delete as i64],
-                )?;
+                let deleted =
+                    tx.execute(&query, params![&session_id, &session_id, to_delete as i64])?;
 
                 stats.events_deleted += deleted as u64;
                 if deleted > 0 {

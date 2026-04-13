@@ -35,7 +35,9 @@ fn get_debuggable_bun() -> Option<String> {
         .ok()
         .and_then(|out| {
             if out.status.success() {
-                String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(out.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
@@ -109,7 +111,8 @@ async fn scenario_bun_output_capture(
     project_root: &str,
 ) {
     let session_id = "bun-output";
-    sm.create_session(session_id, fixture, project_root, 0).unwrap();
+    sm.create_session(session_id, fixture, project_root, 0)
+        .unwrap();
 
     let spawn_result = sm
         .spawn_with_frida(
@@ -146,7 +149,10 @@ async fn scenario_bun_output_capture(
     )
     .await;
 
-    let stdout_text: String = stdout_events.iter().filter_map(|e| e.text.as_deref()).collect();
+    let stdout_text: String = stdout_events
+        .iter()
+        .filter_map(|e| e.text.as_deref())
+        .collect();
     eprintln!("  Bun stdout: {:?}", stdout_text);
 
     assert!(
@@ -169,7 +175,8 @@ async fn scenario_bun_lifecycle(
     project_root: &str,
 ) {
     let session_id = "bun-lifecycle";
-    sm.create_session(session_id, fixture, project_root, 0).unwrap();
+    sm.create_session(session_id, fixture, project_root, 0)
+        .unwrap();
 
     let spawn_result = sm
         .spawn_with_frida(

@@ -200,9 +200,7 @@ impl TestAdapter for MochaAdapter {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("test");
-            let module = stem
-                .trim_end_matches(".test")
-                .trim_end_matches(".spec");
+            let module = stem.trim_end_matches(".test").trim_end_matches(".spec");
             traces.push(format!("@file:{}", stem));
             traces.push(format!("{}.*", module));
         }
@@ -240,8 +238,7 @@ fn extract_mocha_json(text: &str) -> Option<MochaReport> {
 
 /// Build a TestResult from a successfully parsed MochaReport.
 fn build_result_from_report(report: MochaReport) -> TestResult {
-    let stack_re =
-        regex::Regex::new(r"at\s+\S+\s+\(([^)]+):(\d+):\d+\)").unwrap();
+    let stack_re = regex::Regex::new(r"at\s+\S+\s+\(([^)]+):(\d+):\d+\)").unwrap();
 
     let mut all_tests = Vec::new();
     let mut failures = Vec::new();
@@ -370,13 +367,19 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
     let trimmed = line.trim();
     if trimmed.contains("passing") {
         // e.g. "  2 passing (50ms)"
-        if let Some(count) = trimmed.split_whitespace().next().and_then(|s| s.parse::<u32>().ok())
+        if let Some(count) = trimmed
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
         {
             p.passed = count;
         }
     } else if trimmed.contains("failing") {
         // e.g. "  1 failing"
-        if let Some(count) = trimmed.split_whitespace().next().and_then(|s| s.parse::<u32>().ok())
+        if let Some(count) = trimmed
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
         {
             p.failed = count;
         }
@@ -458,7 +461,10 @@ mod tests {
         assert_eq!(result.summary.failed, 0);
         assert!(result.failures.is_empty());
         assert_eq!(result.all_tests.len(), 2);
-        assert!(result.all_tests.iter().all(|t| t.status == TestStatus::Pass));
+        assert!(result
+            .all_tests
+            .iter()
+            .all(|t| t.status == TestStatus::Pass));
     }
 
     #[test]
@@ -533,7 +539,11 @@ mod tests {
         assert_eq!(result.summary.skipped, 2);
         assert_eq!(result.summary.failed, 0);
         assert_eq!(result.all_tests.len(), 3);
-        let skip_count = result.all_tests.iter().filter(|t| t.status == TestStatus::Skip).count();
+        let skip_count = result
+            .all_tests
+            .iter()
+            .filter(|t| t.status == TestStatus::Skip)
+            .count();
         assert_eq!(skip_count, 2, "expected 2 skipped tests");
     }
 
@@ -548,11 +558,15 @@ mod tests {
 
     #[test]
     fn test_update_progress_passing_failing() {
-        let progress = std::sync::Arc::new(std::sync::Mutex::new(super::super::TestProgress::new()));
+        let progress =
+            std::sync::Arc::new(std::sync::Mutex::new(super::super::TestProgress::new()));
 
         update_progress("  2 passing (50ms)", &progress);
         assert_eq!(progress.lock().unwrap().passed, 2);
-        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Running);
+        assert_eq!(
+            progress.lock().unwrap().phase,
+            super::super::TestPhase::Running
+        );
 
         update_progress("  1 failing", &progress);
         assert_eq!(progress.lock().unwrap().failed, 1);

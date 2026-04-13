@@ -61,7 +61,10 @@ impl TestAdapter for GTestAdapter {
 
         let cmake_path = project_root.join("CMakeLists.txt");
         if let Ok(contents) = std::fs::read_to_string(cmake_path) {
-            if contents.contains("gtest") || contents.contains("gmock") || contents.contains("GTest") {
+            if contents.contains("gtest")
+                || contents.contains("gmock")
+                || contents.contains("GTest")
+            {
                 return 85;
             }
         }
@@ -94,12 +97,7 @@ impl TestAdapter for GTestAdapter {
         ))
     }
 
-    fn parse_output(
-        &self,
-        stdout: &str,
-        stderr: &str,
-        exit_code: i32,
-    ) -> TestResult {
+    fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
         if let Some(result) = parse_gtest_json(stdout) {
             return result;
         }
@@ -183,11 +181,7 @@ impl TestAdapter for GTestAdapter {
         Ok(GTestAdapter::command_for_binary(cmd, level))
     }
 
-    fn single_test_for_binary(
-        &self,
-        cmd: &str,
-        test_name: &str,
-    ) -> crate::Result<TestCommand> {
+    fn single_test_for_binary(&self, cmd: &str, test_name: &str) -> crate::Result<TestCommand> {
         Ok(GTestAdapter::single_test_for_binary(cmd, test_name))
     }
 }
@@ -388,7 +382,11 @@ fn parse_gtest_text_fallback(stdout: &str) -> TestResult {
                 stderr: None,
                 message: None,
             });
-        } else if !in_summary && trimmed.starts_with("[  FAILED  ]") && !trimmed.contains("tests listed below") && !trimmed.contains("test,") {
+        } else if !in_summary
+            && trimmed.starts_with("[  FAILED  ]")
+            && !trimmed.contains("tests listed below")
+            && !trimmed.contains("test,")
+        {
             let name = extract_name_after_bracket(trimmed);
             // Avoid counting the summary line "N FAILED TESTS" or test list footer
             if !name.is_empty() && !name.starts_with(char::is_numeric) {
@@ -447,7 +445,9 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
     // [ RUN      ] SuiteName.TestName
     if trimmed.starts_with("[ RUN      ]") {
         let name = extract_name_after_bracket(trimmed);
-        if name.is_empty() { return; }
+        if name.is_empty() {
+            return;
+        }
         let mut p = progress.lock().unwrap();
         if p.phase == super::TestPhase::Compiling {
             p.phase = super::TestPhase::Running;
@@ -457,7 +457,9 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
     // [       OK ] SuiteName.TestName (N ms)
     else if trimmed.starts_with("[       OK ]") {
         let name = extract_name_after_bracket(trimmed);
-        if name.is_empty() { return; }
+        if name.is_empty() {
+            return;
+        }
         let mut p = progress.lock().unwrap();
         p.passed += 1;
         if let Some(started) = p.running_tests.remove(&name) {
@@ -468,7 +470,9 @@ pub fn update_progress(line: &str, progress: &Arc<Mutex<TestProgress>>) {
     // [  SKIPPED ] SuiteName.TestName (N ms)
     else if trimmed.starts_with("[  SKIPPED ]") {
         let name = extract_name_after_bracket(trimmed);
-        if name.is_empty() { return; }
+        if name.is_empty() {
+            return;
+        }
         let mut p = progress.lock().unwrap();
         p.skipped += 1;
         p.running_tests.remove(&name);
@@ -631,18 +635,19 @@ mod tests {
     fn test_command_for_binary() {
         let cmd = GTestAdapter::command_for_binary("/path/to/test_binary", None);
         assert_eq!(cmd.program, "/path/to/test_binary");
-        assert!(cmd.args.contains(&"--gtest_output=json:/dev/stdout".to_string()));
+        assert!(cmd
+            .args
+            .contains(&"--gtest_output=json:/dev/stdout".to_string()));
         assert!(cmd.env.is_empty());
     }
 
     #[test]
     fn test_single_test_for_binary() {
-        let cmd = GTestAdapter::single_test_for_binary(
-            "/path/to/test_binary",
-            "MathTest.Addition",
-        );
+        let cmd = GTestAdapter::single_test_for_binary("/path/to/test_binary", "MathTest.Addition");
         assert_eq!(cmd.program, "/path/to/test_binary");
-        assert!(cmd.args.contains(&"--gtest_output=json:/dev/stdout".to_string()));
+        assert!(cmd
+            .args
+            .contains(&"--gtest_output=json:/dev/stdout".to_string()));
         assert!(cmd
             .args
             .contains(&"--gtest_filter=MathTest.Addition".to_string()));
@@ -738,17 +743,31 @@ mod tests {
         let progress = Arc::new(Mutex::new(super::super::TestProgress::new()));
 
         // Initial phase is Compiling
-        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Compiling);
+        assert_eq!(
+            progress.lock().unwrap().phase,
+            super::super::TestPhase::Compiling
+        );
 
         // RUN transitions to Running
         update_progress("[ RUN      ] MathTest.Addition", &progress);
-        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::Running);
-        assert!(progress.lock().unwrap().running_tests.contains_key("MathTest.Addition"));
+        assert_eq!(
+            progress.lock().unwrap().phase,
+            super::super::TestPhase::Running
+        );
+        assert!(progress
+            .lock()
+            .unwrap()
+            .running_tests
+            .contains_key("MathTest.Addition"));
 
         // OK increments passed and removes from running
         update_progress("[       OK ] MathTest.Addition (0 ms)", &progress);
         assert_eq!(progress.lock().unwrap().passed, 1);
-        assert!(!progress.lock().unwrap().running_tests.contains_key("MathTest.Addition"));
+        assert!(!progress
+            .lock()
+            .unwrap()
+            .running_tests
+            .contains_key("MathTest.Addition"));
 
         // FAILED increments failed
         update_progress("[ RUN      ] MathTest.Bad", &progress);
@@ -760,8 +779,14 @@ mod tests {
         assert_eq!(progress.lock().unwrap().skipped, 1);
 
         // Summary line triggers SuitesFinished
-        update_progress("[==========] 3 tests from 1 test suite ran. (1 ms total)", &progress);
-        assert_eq!(progress.lock().unwrap().phase, super::super::TestPhase::SuitesFinished);
+        update_progress(
+            "[==========] 3 tests from 1 test suite ran. (1 ms total)",
+            &progress,
+        );
+        assert_eq!(
+            progress.lock().unwrap().phase,
+            super::super::TestPhase::SuitesFinished
+        );
     }
 
     #[test]
@@ -776,8 +801,13 @@ mod tests {
     #[test]
     fn test_trait_single_test_for_binary() {
         let adapter: &dyn TestAdapter = &GTestAdapter;
-        let cmd = adapter.single_test_for_binary("/path/to/test", "Suite.Test").unwrap();
+        let cmd = adapter
+            .single_test_for_binary("/path/to/test", "Suite.Test")
+            .unwrap();
         assert_eq!(cmd.program, "/path/to/test");
-        assert!(cmd.args.iter().any(|a| a.contains("gtest_filter=Suite.Test")));
+        assert!(cmd
+            .args
+            .iter()
+            .any(|a| a.contains("gtest_filter=Suite.Test")));
     }
 }

@@ -1,6 +1,6 @@
 //! Linux accessibility via AT-SPI2 (D-Bus).
 
-use crate::ui::tree::{generate_id, Rect, UiNode, NodeSource};
+use crate::ui::tree::{generate_id, NodeSource, Rect, UiNode};
 use crate::Result;
 use atspi::proxy::accessible::ObjectRefExt;
 use std::time::Duration;
@@ -158,12 +158,15 @@ async fn query_ax_tree_inner(pid: u32) -> Result<Vec<UiNode>> {
     let conn = connection.connection();
 
     // Get registry root and enumerate applications
-    let root = connection.root_accessible_on_registry().await.map_err(|e| {
-        if is_peer_disconnected(&e) {
-            return crate::Error::UiQueryFailed("Process exited during query".into());
-        }
-        crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
-    })?;
+    let root = connection
+        .root_accessible_on_registry()
+        .await
+        .map_err(|e| {
+            if is_peer_disconnected(&e) {
+                return crate::Error::UiQueryFailed("Process exited during query".into());
+            }
+            crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
+        })?;
 
     let app_refs = root.get_children().await.map_err(|e| {
         if is_peer_disconnected(&e) {
@@ -173,9 +176,9 @@ async fn query_ax_tree_inner(pid: u32) -> Result<Vec<UiNode>> {
     })?;
 
     // Create a D-Bus proxy to resolve PIDs from bus names
-    let dbus_proxy = atspi::zbus::fdo::DBusProxy::new(conn).await.map_err(|e| {
-        crate::Error::Internal(format!("D-Bus proxy creation failed: {}", e))
-    })?;
+    let dbus_proxy = atspi::zbus::fdo::DBusProxy::new(conn)
+        .await
+        .map_err(|e| crate::Error::Internal(format!("D-Bus proxy creation failed: {}", e)))?;
 
     // Find the application accessible matching the target PID
     let mut target_proxy = None;
@@ -191,10 +194,7 @@ async fn query_ax_tree_inner(pid: u32) -> Result<Vec<UiNode>> {
         let Ok(bus) = atspi::zbus::names::BusName::try_from(bus_name.as_str()) else {
             continue;
         };
-        match dbus_proxy
-            .get_connection_unix_process_id(bus)
-            .await
-        {
+        match dbus_proxy.get_connection_unix_process_id(bus).await {
             Ok(app_pid) if app_pid == pid => {
                 if let Ok(proxy) = app_ref.as_accessible_proxy(conn).await {
                     target_proxy = Some(proxy);
@@ -229,7 +229,9 @@ async fn query_ax_tree_inner(pid: u32) -> Result<Vec<UiNode>> {
             continue;
         }
         if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
-            if let Some(node) = Box::pin(build_node(conn, &child_proxy, i, 0, &mut node_count)).await {
+            if let Some(node) =
+                Box::pin(build_node(conn, &child_proxy, i, 0, &mut node_count)).await
+            {
                 // Skip MenuBar nodes for consistency with macOS
                 if node.role != "AXMenuBar" {
                     windows.push(node);
@@ -261,7 +263,11 @@ async fn build_node(
     // Get name/title
     let title = match accessible.name().await {
         Ok(n) if !n.is_empty() => Some(n),
-        _ => accessible.description().await.ok().filter(|s| !s.is_empty()),
+        _ => accessible
+            .description()
+            .await
+            .ok()
+            .filter(|s| !s.is_empty()),
     };
 
     // Get interfaces
@@ -290,8 +296,8 @@ async fn build_node(
 
     // Get state for enabled/focused
     let states = accessible.get_state().await.unwrap_or_default();
-    let enabled = states.contains(atspi::State::Enabled)
-        || states.contains(atspi::State::Sensitive);
+    let enabled =
+        states.contains(atspi::State::Enabled) || states.contains(atspi::State::Sensitive);
     let focused = states.contains(atspi::State::Focused);
 
     let id = generate_id(&role, title.as_deref(), sibling_index);
@@ -304,9 +310,9 @@ async fn build_node(
             continue;
         }
         if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
-            if let Some(child_node) = Box::pin(
-                build_node(conn, &child_proxy, i, depth + 1, node_count)
-            ).await {
+            if let Some(child_node) =
+                Box::pin(build_node(conn, &child_proxy, i, depth + 1, node_count)).await
+            {
                 children.push(child_node);
             }
         }
@@ -335,8 +341,10 @@ async fn get_component_bounds(
     let path = accessible.inner().path().to_owned();
 
     let comp = atspi::proxy::component::ComponentProxy::builder(conn)
-        .destination(dest).ok()?
-        .path(path).ok()?
+        .destination(dest)
+        .ok()?
+        .path(path)
+        .ok()?
         .cache_properties(atspi::zbus::proxy::CacheProperties::No)
         .build()
         .await
@@ -364,7 +372,8 @@ async fn get_action_names(
     let path = accessible.inner().path().to_owned();
 
     let action_proxy = match atspi::proxy::action::ActionProxy::builder(conn)
-        .destination(dest).ok()
+        .destination(dest)
+        .ok()
         .and_then(|b| b.path(path).ok())
     {
         Some(b) => match b
@@ -397,14 +406,20 @@ async fn get_value(
     let path = accessible.inner().path().to_owned();
 
     let val_proxy = atspi::proxy::value::ValueProxy::builder(conn)
-        .destination(dest).ok()?
-        .path(path).ok()?
+        .destination(dest)
+        .ok()?
+        .path(path)
+        .ok()?
         .cache_properties(atspi::zbus::proxy::CacheProperties::No)
         .build()
         .await
         .ok()?;
 
-    val_proxy.current_value().await.ok().map(|v| format!("{}", v))
+    val_proxy
+        .current_value()
+        .await
+        .ok()
+        .map(|v| format!("{}", v))
 }
 
 /// Result of finding an element — carries the D-Bus destination and path
@@ -418,10 +433,7 @@ pub struct FindResult {
 
 /// Find an AT-SPI2 accessible by node ID. Returns the accessible's
 /// destination/path and node for action execution. Used by input_linux.rs.
-pub async fn find_element_by_id(
-    pid: u32,
-    target_id: &str,
-) -> Result<Option<FindResult>> {
+pub async fn find_element_by_id(pid: u32, target_id: &str) -> Result<Option<FindResult>> {
     validate_pid_ownership(pid)?;
 
     match tokio::time::timeout(DBUS_TIMEOUT, find_element_by_id_inner(pid, target_id)).await {
@@ -433,19 +445,19 @@ pub async fn find_element_by_id(
     }
 }
 
-async fn find_element_by_id_inner(
-    pid: u32,
-    target_id: &str,
-) -> Result<Option<FindResult>> {
+async fn find_element_by_id_inner(pid: u32, target_id: &str) -> Result<Option<FindResult>> {
     let connection = connect().await?;
     let conn = connection.connection();
 
-    let root = connection.root_accessible_on_registry().await.map_err(|e| {
-        if is_peer_disconnected(&e) {
-            return crate::Error::UiQueryFailed("Process exited during query".into());
-        }
-        crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
-    })?;
+    let root = connection
+        .root_accessible_on_registry()
+        .await
+        .map_err(|e| {
+            if is_peer_disconnected(&e) {
+                return crate::Error::UiQueryFailed("Process exited during query".into());
+            }
+            crate::Error::UiQueryFailed(format!("Failed to get AT-SPI2 registry root: {}", e))
+        })?;
 
     let app_refs = root.get_children().await.map_err(|e| {
         if is_peer_disconnected(&e) {
@@ -454,9 +466,9 @@ async fn find_element_by_id_inner(
         crate::Error::UiQueryFailed(format!("Failed to enumerate apps: {}", e))
     })?;
 
-    let dbus_proxy = atspi::zbus::fdo::DBusProxy::new(conn).await.map_err(|e| {
-        crate::Error::Internal(format!("D-Bus proxy: {}", e))
-    })?;
+    let dbus_proxy = atspi::zbus::fdo::DBusProxy::new(conn)
+        .await
+        .map_err(|e| crate::Error::Internal(format!("D-Bus proxy: {}", e)))?;
 
     for app_ref in &app_refs {
         if app_ref.is_null() {
@@ -470,10 +482,7 @@ async fn find_element_by_id_inner(
         let Ok(bus) = atspi::zbus::names::BusName::try_from(bus_name.as_str()) else {
             continue;
         };
-        if let Ok(app_pid) = dbus_proxy
-            .get_connection_unix_process_id(bus)
-            .await
-        {
+        if let Ok(app_pid) = dbus_proxy.get_connection_unix_process_id(bus).await {
             if app_pid == pid {
                 if let Ok(app_proxy) = app_ref.as_accessible_proxy(conn).await {
                     let child_refs = app_proxy.get_children().await.unwrap_or_default();
@@ -482,9 +491,9 @@ async fn find_element_by_id_inner(
                             continue;
                         }
                         if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
-                            if let Some(result) = Box::pin(
-                                find_in_subtree(conn, &child_proxy, target_id, i, 0)
-                            ).await {
+                            if let Some(result) =
+                                Box::pin(find_in_subtree(conn, &child_proxy, target_id, i, 0)).await
+                            {
                                 return Ok(Some(result));
                             }
                         }
@@ -554,9 +563,9 @@ async fn find_in_subtree(
             continue;
         }
         if let Ok(child_proxy) = child_ref.as_accessible_proxy(conn).await {
-            if let Some(result) = Box::pin(
-                find_in_subtree(conn, &child_proxy, target_id, i, depth + 1)
-            ).await {
+            if let Some(result) =
+                Box::pin(find_in_subtree(conn, &child_proxy, target_id, i, depth + 1)).await
+            {
                 return Some(result);
             }
         }
@@ -580,7 +589,10 @@ mod tests {
     #[test]
     fn test_role_mapping_text_fields() {
         assert_eq!(map_atspi_role(atspi::Role::Entry), "AXTextField");
-        assert_eq!(map_atspi_role(atspi::Role::PasswordText), "AXSecureTextField");
+        assert_eq!(
+            map_atspi_role(atspi::Role::PasswordText),
+            "AXSecureTextField"
+        );
     }
 
     #[test]
@@ -610,7 +622,10 @@ mod tests {
     #[test]
     fn test_role_mapping_misc() {
         assert_eq!(map_atspi_role(atspi::Role::Slider), "AXSlider");
-        assert_eq!(map_atspi_role(atspi::Role::ProgressBar), "AXProgressIndicator");
+        assert_eq!(
+            map_atspi_role(atspi::Role::ProgressBar),
+            "AXProgressIndicator"
+        );
         assert_eq!(map_atspi_role(atspi::Role::Label), "AXStaticText");
         assert_eq!(map_atspi_role(atspi::Role::Link), "AXLink");
         assert_eq!(map_atspi_role(atspi::Role::Image), "AXImage");
@@ -666,7 +681,9 @@ mod tests {
     fn test_is_peer_disconnected_detection() {
         assert!(is_peer_disconnected(&"peer disconnected"));
         assert!(is_peer_disconnected(&"Connection closed by peer"));
-        assert!(is_peer_disconnected(&"org.freedesktop.DBus.Error.ServiceUnknown: name has no owner"));
+        assert!(is_peer_disconnected(
+            &"org.freedesktop.DBus.Error.ServiceUnknown: name has no owner"
+        ));
         assert!(is_peer_disconnected(&"Broken pipe"));
         assert!(!is_peer_disconnected(&"some other error"));
         assert!(!is_peer_disconnected(&"timeout expired"));

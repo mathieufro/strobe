@@ -25,21 +25,21 @@ fn key_name_to_keysym(name: &str) -> Option<u32> {
             Some(s.as_bytes()[0] as u32)
         }
         // Special keys
-        "return" | "enter" => Some(0xff0d),       // XK_Return
-        "tab" => Some(0xff09),                     // XK_Tab
-        "space" => Some(0x0020),                   // XK_space
-        "delete" | "backspace" => Some(0xff08),    // XK_BackSpace
-        "forwarddelete" => Some(0xffff),           // XK_Delete
-        "escape" | "esc" => Some(0xff1b),          // XK_Escape
-        "home" => Some(0xff50),                    // XK_Home
-        "end" => Some(0xff57),                     // XK_End
-        "pageup" => Some(0xff55),                  // XK_Page_Up
-        "pagedown" => Some(0xff56),                // XK_Page_Down
+        "return" | "enter" => Some(0xff0d),     // XK_Return
+        "tab" => Some(0xff09),                  // XK_Tab
+        "space" => Some(0x0020),                // XK_space
+        "delete" | "backspace" => Some(0xff08), // XK_BackSpace
+        "forwarddelete" => Some(0xffff),        // XK_Delete
+        "escape" | "esc" => Some(0xff1b),       // XK_Escape
+        "home" => Some(0xff50),                 // XK_Home
+        "end" => Some(0xff57),                  // XK_End
+        "pageup" => Some(0xff55),               // XK_Page_Up
+        "pagedown" => Some(0xff56),             // XK_Page_Down
         // Arrows
-        "leftarrow" | "left" => Some(0xff51),      // XK_Left
-        "uparrow" | "up" => Some(0xff52),          // XK_Up
-        "rightarrow" | "right" => Some(0xff53),    // XK_Right
-        "downarrow" | "down" => Some(0xff54),      // XK_Down
+        "leftarrow" | "left" => Some(0xff51),   // XK_Left
+        "uparrow" | "up" => Some(0xff52),       // XK_Up
+        "rightarrow" | "right" => Some(0xff53), // XK_Right
+        "downarrow" | "down" => Some(0xff54),   // XK_Down
         // Function keys (XK_F1=0xffbe .. XK_F12=0xffc9)
         s if s.starts_with('f') && s.len() <= 3 => {
             let num: u32 = s[1..].parse().ok()?;
@@ -50,19 +50,16 @@ fn key_name_to_keysym(name: &str) -> Option<u32> {
             }
         }
         // Modifier keys (as standalone keypresses)
-        "shift" => Some(0xffe1),                   // XK_Shift_L
-        "control" | "ctrl" => Some(0xffe3),        // XK_Control_L
-        "alt" | "option" => Some(0xffe9),          // XK_Alt_L
+        "shift" => Some(0xffe1),                              // XK_Shift_L
+        "control" | "ctrl" => Some(0xffe3),                   // XK_Control_L
+        "alt" | "option" => Some(0xffe9),                     // XK_Alt_L
         "super" | "command" | "cmd" | "meta" => Some(0xffeb), // XK_Super_L
         _ => None,
     }
 }
 
 /// Resolve keysym to keycode via the X11 keyboard mapping.
-fn keysym_to_keycode(
-    conn: &impl Connection,
-    keysym: u32,
-) -> Result<u8, String> {
+fn keysym_to_keycode(conn: &impl Connection, keysym: u32) -> Result<u8, String> {
     let setup = conn.setup();
     let min_kc = setup.min_keycode;
     let max_kc = setup.max_keycode;
@@ -87,13 +84,13 @@ fn keysym_to_keycode(
 }
 
 /// Send a fake key press/release via XTest.
-fn xtest_key(
-    conn: &impl Connection,
-    keysym: u32,
-    press: bool,
-) -> Result<(), String> {
+fn xtest_key(conn: &impl Connection, keysym: u32, press: bool) -> Result<(), String> {
     let keycode = keysym_to_keycode(conn, keysym)?;
-    let event_type = if press { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT };
+    let event_type = if press {
+        KEY_PRESS_EVENT
+    } else {
+        KEY_RELEASE_EVENT
+    };
     xtest::fake_input(conn, event_type, keycode, 0, 0, 0, 0, 0)
         .map_err(|e| format!("fake_input: {}", e))?
         .check()
@@ -117,7 +114,11 @@ fn xtest_button(
         .check()
         .map_err(|e| format!("motion check: {}", e))?;
 
-    let event_type = if press { BUTTON_PRESS_EVENT } else { BUTTON_RELEASE_EVENT };
+    let event_type = if press {
+        BUTTON_PRESS_EVENT
+    } else {
+        BUTTON_RELEASE_EVENT
+    };
     xtest::fake_input(conn, event_type, button, 0, root, 0, 0, 0)
         .map_err(|e| format!("button: {}", e))?
         .check()
@@ -127,12 +128,7 @@ fn xtest_button(
 }
 
 /// Move the mouse pointer via XTest.
-fn xtest_motion(
-    conn: &impl Connection,
-    x: i16,
-    y: i16,
-    root: u32,
-) -> Result<(), String> {
+fn xtest_motion(conn: &impl Connection, x: i16, y: i16, root: u32) -> Result<(), String> {
     xtest::fake_input(conn, MOTION_NOTIFY_EVENT, 0, 0, root, x, y, 0)
         .map_err(|e| format!("motion: {}", e))?
         .check()
@@ -207,11 +203,9 @@ pub async fn execute_action(
         let key_name = req.key.as_ref().unwrap().clone();
         let modifiers = req.modifiers.clone().unwrap_or_default();
 
-        return tokio::task::spawn_blocking(move || {
-            execute_key_action(&key_name, &modifiers)
-        })
-        .await
-        .map_err(|e| crate::Error::Internal(format!("Key action task failed: {}", e)))?;
+        return tokio::task::spawn_blocking(move || execute_key_action(&key_name, &modifiers))
+            .await
+            .map_err(|e| crate::Error::Internal(format!("Key action task failed: {}", e)))?;
     }
 
     // Resolve target node
@@ -222,9 +216,9 @@ pub async fn execute_action(
     })?;
 
     // Snapshot before
-    let find_result = find_element_by_id(pid, target_id).await?.ok_or_else(|| {
-        crate::Error::UiQueryFailed(format!("Node not found: {}", target_id))
-    })?;
+    let find_result = find_element_by_id(pid, target_id)
+        .await?
+        .ok_or_else(|| crate::Error::UiQueryFailed(format!("Node not found: {}", target_id)))?;
     let node_before = find_result.node.clone();
 
     // Execute action
@@ -261,9 +255,7 @@ pub async fn execute_action(
     })
 }
 
-async fn execute_click(
-    target: &FindResult,
-) -> (bool, String, Option<String>) {
+async fn execute_click(target: &FindResult) -> (bool, String, Option<String>) {
     // Tier 1: Try AT-SPI2 do_action("click")
     if target.interfaces.contains(atspi::Interface::Action) {
         if let Some(result) = try_atspi_click(target).await {
@@ -278,8 +270,8 @@ async fn execute_click(
         let cy = cy as i16;
 
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let (conn, screen_num) = x11rb::connect(None)
-                .map_err(|e| format!("X11 connect: {}", e))?;
+            let (conn, screen_num) =
+                x11rb::connect(None).map_err(|e| format!("X11 connect: {}", e))?;
             let root = conn.setup().roots[screen_num].root;
             xtest_button(&conn, 1, true, cx, cy, root)?;
             xtest_button(&conn, 1, false, cx, cy, root)?;
@@ -510,13 +502,11 @@ fn execute_key_action(
     key_name: &str,
     modifiers: &[String],
 ) -> crate::Result<DebugUiActionResponse> {
-    let keysym = key_name_to_keysym(key_name).ok_or_else(|| {
-        crate::Error::UiQueryFailed(format!("Unknown key: {}", key_name))
-    })?;
+    let keysym = key_name_to_keysym(key_name)
+        .ok_or_else(|| crate::Error::UiQueryFailed(format!("Unknown key: {}", key_name)))?;
 
-    let (conn, _screen_num) = x11rb::connect(None).map_err(|e| {
-        crate::Error::UiNotAvailable(format!("X11 display not available: {}", e))
-    })?;
+    let (conn, _screen_num) = x11rb::connect(None)
+        .map_err(|e| crate::Error::UiNotAvailable(format!("X11 display not available: {}", e)))?;
 
     // Press modifier keys
     let modifier_keysyms: Vec<u32> = modifiers
@@ -660,7 +650,11 @@ mod tests {
         let result = execute_action(std::process::id(), &req).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+        assert!(
+            err.contains("element ID"),
+            "error should mention element ID: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -671,7 +665,11 @@ mod tests {
         let result = execute_action(std::process::id(), &req).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+        assert!(
+            err.contains("element ID"),
+            "error should mention element ID: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -681,7 +679,11 @@ mod tests {
         let result = execute_action(std::process::id(), &req).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+        assert!(
+            err.contains("element ID"),
+            "error should mention element ID: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -691,7 +693,11 @@ mod tests {
         let result = execute_action(std::process::id(), &req).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("element ID"), "error should mention element ID: {}", err);
+        assert!(
+            err.contains("element ID"),
+            "error should mention element ID: {}",
+            err
+        );
     }
 
     #[tokio::test]

@@ -27,7 +27,11 @@ impl TestAdapter for PlaywrightAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
         // Direct config in project root
         if has_playwright_config(project_root) {
-            return if has_competing_framework(project_root) { 80 } else { 95 };
+            return if has_competing_framework(project_root) {
+                80
+            } else {
+                95
+            };
         }
 
         // Monorepo: check if any workspace has a playwright config
@@ -40,7 +44,9 @@ impl TestAdapter for PlaywrightAdapter {
         0
     }
 
-    fn name(&self) -> &str { "playwright" }
+    fn name(&self) -> &str {
+        "playwright"
+    }
 
     fn suite_command(
         &self,
@@ -114,7 +120,13 @@ impl TestAdapter for PlaywrightAdapter {
             .collect();
 
         let mut total = TestResult {
-            summary: TestSummary { passed: 0, failed: 0, skipped: 0, stuck: None, duration_ms: 0 },
+            summary: TestSummary {
+                passed: 0,
+                failed: 0,
+                skipped: 0,
+                stuck: None,
+                duration_ms: 0,
+            },
             failures: vec![],
             stuck: vec![],
             all_tests: vec![],
@@ -139,42 +151,67 @@ impl TestAdapter for PlaywrightAdapter {
             if let Ok(content) = std::fs::read_to_string(PROGRESS_FILE) {
                 for segment in content.split("STROBE_TEST:") {
                     let json_str = segment.trim();
-                    if json_str.is_empty() || !json_str.starts_with('{') { continue; }
+                    if json_str.is_empty() || !json_str.starts_with('{') {
+                        continue;
+                    }
                     let json_end = json_str.find('\n').unwrap_or(json_str.len());
                     let json = &json_str[..json_end];
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
                         let event = v.get("e").and_then(|e| e.as_str()).unwrap_or("");
-                        let name = v.get("n").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        let name = v
+                            .get("n")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let dur = v.get("d").and_then(|d| d.as_u64()).unwrap_or(0);
                         match event {
                             "pass" => {
                                 total.summary.passed += 1;
                                 total.all_tests.push(TestDetail {
-                                    name, status: TestStatus::Pass, duration_ms: dur,
-                                    stdout: None, stderr: None, message: None,
+                                    name,
+                                    status: TestStatus::Pass,
+                                    duration_ms: dur,
+                                    stdout: None,
+                                    stderr: None,
+                                    message: None,
                                 });
                             }
                             "fail" => {
-                                let file = v.get("f").and_then(|f| f.as_str()).map(|s| s.to_string());
+                                let file =
+                                    v.get("f").and_then(|f| f.as_str()).map(|s| s.to_string());
                                 let line = v.get("l").and_then(|l| l.as_u64()).map(|l| l as u32);
-                                let msg = v.get("m").and_then(|m| m.as_str())
-                                    .unwrap_or("Test failed").to_string();
+                                let msg = v
+                                    .get("m")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("Test failed")
+                                    .to_string();
                                 total.summary.failed += 1;
                                 total.failures.push(TestFailure {
-                                    name: name.clone(), file: file.clone(), line,
+                                    name: name.clone(),
+                                    file: file.clone(),
+                                    line,
                                     message: msg.clone(),
-                                    rerun: None, suggested_traces: vec![],
+                                    rerun: None,
+                                    suggested_traces: vec![],
                                 });
                                 total.all_tests.push(TestDetail {
-                                    name, status: TestStatus::Fail, duration_ms: dur,
-                                    stdout: None, stderr: None, message: Some(msg),
+                                    name,
+                                    status: TestStatus::Fail,
+                                    duration_ms: dur,
+                                    stdout: None,
+                                    stderr: None,
+                                    message: Some(msg),
                                 });
                             }
                             "skip" => {
                                 total.summary.skipped += 1;
                                 total.all_tests.push(TestDetail {
-                                    name, status: TestStatus::Skip, duration_ms: dur,
-                                    stdout: None, stderr: None, message: None,
+                                    name,
+                                    status: TestStatus::Skip,
+                                    duration_ms: dur,
+                                    stdout: None,
+                                    stderr: None,
+                                    message: None,
                                 });
                             }
                             _ => {}
@@ -191,7 +228,8 @@ impl TestAdapter for PlaywrightAdapter {
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String> {
         let mut traces = vec![];
         if let Some(file) = &failure.file {
-            let stem = Path::new(file).file_stem()
+            let stem = Path::new(file)
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("test");
             traces.push(format!("@file:{}", stem));
@@ -229,7 +267,9 @@ fn has_competing_framework(project_root: &Path) -> bool {
 /// Returns the absolute path to the workspace dir, or None.
 pub(crate) fn find_playwright_workspace(project_root: &Path) -> Option<std::path::PathBuf> {
     let pkg = std::fs::read_to_string(project_root.join("package.json")).ok()?;
-    if !pkg.contains("\"workspaces\"") { return None; }
+    if !pkg.contains("\"workspaces\"") {
+        return None;
+    }
     let dirs = find_workspace_dirs(project_root, &pkg);
     dirs.into_iter().find(|ws| has_playwright_config(ws))
 }
@@ -243,12 +283,14 @@ fn resolve_playwright_cwd(project_root: &Path) -> Option<String> {
         return None;
     }
     // Monorepo: find workspace with config
-    find_playwright_workspace(project_root)
-        .map(|ws| ws.to_string_lossy().into_owned())
+    find_playwright_workspace(project_root).map(|ws| ws.to_string_lossy().into_owned())
 }
 
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 use super::TestProgress;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 /// File offset tracker — how far we've read into the progress file.
 static PROGRESS_OFFSET: AtomicUsize = AtomicUsize::new(0);
@@ -283,7 +325,11 @@ pub fn update_progress(_text: &str, progress: &Arc<Mutex<TestProgress>>) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
             p.has_custom_reporter = true;
             let event = v.get("e").and_then(|e| e.as_str()).unwrap_or("");
-            let name = v.get("n").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let name = v
+                .get("n")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
 
             match event {
                 "module_start" => {
@@ -291,10 +337,21 @@ pub fn update_progress(_text: &str, progress: &Arc<Mutex<TestProgress>>) {
                         p.phase = super::TestPhase::Running;
                     }
                 }
-                "start" => { p.start_test(name); }
-                "pass"  => { p.passed += 1; p.finish_test(&name); }
-                "fail"  => { p.failed += 1; p.finish_test(&name); }
-                "skip"  => { p.skipped += 1; p.finish_test(&name); }
+                "start" => {
+                    p.start_test(name);
+                }
+                "pass" => {
+                    p.passed += 1;
+                    p.finish_test(&name);
+                }
+                "fail" => {
+                    p.failed += 1;
+                    p.finish_test(&name);
+                }
+                "skip" => {
+                    p.skipped += 1;
+                    p.finish_test(&name);
+                }
                 _ => {}
             }
         }
@@ -328,7 +385,8 @@ mod tests {
         std::fs::write(
             dir.path().join("package.json"),
             r#"{"devDependencies": {"vitest": "^3"}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let adapter = PlaywrightAdapter;
         // Should return lower confidence when vitest is present
         assert_eq!(adapter.detect(dir.path(), None), 80);
@@ -337,7 +395,9 @@ mod tests {
     #[test]
     fn test_suite_command_e2e() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
+        let cmd = PlaywrightAdapter
+            .suite_command(dir.path(), Some(TestLevel::E2e), &Default::default())
+            .unwrap();
         assert_eq!(cmd.program, "bun");
         assert!(cmd.args.contains(&"test".to_string()));
         // No --reporter on CLI — config handles reporters via STROBE_REPORTER env
@@ -348,14 +408,17 @@ mod tests {
     #[test]
     fn test_suite_command_unit_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::Unit), &Default::default());
+        let result =
+            PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::Unit), &Default::default());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_single_test_command() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = PlaywrightAdapter.single_test_command(dir.path(), "login page").unwrap();
+        let cmd = PlaywrightAdapter
+            .single_test_command(dir.path(), "login page")
+            .unwrap();
         assert!(cmd.args.contains(&"--grep".to_string()));
         assert!(cmd.args.contains(&"login page".to_string()));
     }
@@ -364,8 +427,11 @@ mod tests {
     fn test_detect_monorepo_workspace() {
         let dir = tempfile::tempdir().unwrap();
         // Root has workspaces but no playwright config
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"workspaces": ["apps/*"]}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"]}"#,
+        )
+        .unwrap();
         // Web workspace has playwright config
         let web = dir.path().join("apps/web");
         std::fs::create_dir_all(&web).unwrap();
@@ -373,24 +439,35 @@ mod tests {
 
         let adapter = PlaywrightAdapter;
         let conf = adapter.detect(dir.path(), None);
-        assert_eq!(conf, 80, "monorepo with playwright workspace should detect at 80");
+        assert_eq!(
+            conf, 80,
+            "monorepo with playwright workspace should detect at 80"
+        );
     }
 
     #[test]
     fn test_suite_command_monorepo_cwd() {
         let dir = tempfile::tempdir().unwrap();
         // Root with workspaces, no playwright config at root
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"workspaces": ["apps/*"]}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"]}"#,
+        )
+        .unwrap();
         // Web workspace with playwright config
         let web = dir.path().join("apps/web");
         std::fs::create_dir_all(&web).unwrap();
         std::fs::write(web.join("playwright.config.ts"), "export default {}").unwrap();
 
-        let cmd = PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
+        let cmd = PlaywrightAdapter
+            .suite_command(dir.path(), Some(TestLevel::E2e), &Default::default())
+            .unwrap();
         assert!(cmd.cwd.is_some(), "should set cwd for monorepo");
-        assert!(cmd.cwd.as_ref().unwrap().ends_with("apps/web"),
-            "cwd should point to web workspace, got: {:?}", cmd.cwd);
+        assert!(
+            cmd.cwd.as_ref().unwrap().ends_with("apps/web"),
+            "cwd should point to web workspace, got: {:?}",
+            cmd.cwd
+        );
     }
 
     #[test]
@@ -398,8 +475,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("playwright.config.ts"), "export default {}").unwrap();
 
-        let cmd = PlaywrightAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
-        assert!(cmd.cwd.is_none(), "should not set cwd when config is at project root");
+        let cmd = PlaywrightAdapter
+            .suite_command(dir.path(), Some(TestLevel::E2e), &Default::default())
+            .unwrap();
+        assert!(
+            cmd.cwd.is_none(),
+            "should not set cwd when config is at project root"
+        );
     }
 
     #[test]
@@ -408,13 +490,17 @@ mod tests {
 
         // Reset offset and write a test progress file
         reset_progress();
-        std::fs::write(PROGRESS_FILE, concat!(
-            "STROBE_TEST:{\"e\":\"module_start\",\"n\":\"test.ts\"}\n",
-            "STROBE_TEST:{\"e\":\"start\",\"n\":\"test one\"}\n",
-            "STROBE_TEST:{\"e\":\"pass\",\"n\":\"test one\",\"d\":100}\n",
-            "STROBE_TEST:{\"e\":\"start\",\"n\":\"test two\"}\n",
-            "STROBE_TEST:{\"e\":\"fail\",\"n\":\"test two\",\"d\":50}\n",
-        )).unwrap();
+        std::fs::write(
+            PROGRESS_FILE,
+            concat!(
+                "STROBE_TEST:{\"e\":\"module_start\",\"n\":\"test.ts\"}\n",
+                "STROBE_TEST:{\"e\":\"start\",\"n\":\"test one\"}\n",
+                "STROBE_TEST:{\"e\":\"pass\",\"n\":\"test one\",\"d\":100}\n",
+                "STROBE_TEST:{\"e\":\"start\",\"n\":\"test two\"}\n",
+                "STROBE_TEST:{\"e\":\"fail\",\"n\":\"test two\",\"d\":50}\n",
+            ),
+        )
+        .unwrap();
 
         let progress = Arc::new(Mutex::new(TestProgress::new()));
 
@@ -425,7 +511,11 @@ mod tests {
         assert_eq!(p.passed, 1, "should have 1 passed, got {}", p.passed);
         assert_eq!(p.failed, 1, "should have 1 failed, got {}", p.failed);
         assert!(p.has_custom_reporter, "should set custom reporter flag");
-        assert_eq!(p.phase, super::super::TestPhase::Running, "module_start should transition to Running");
+        assert_eq!(
+            p.phase,
+            super::super::TestPhase::Running,
+            "module_start should transition to Running"
+        );
 
         // Second call with no new data — should be a no-op
         drop(p);
@@ -441,18 +531,30 @@ mod tests {
     #[test]
     fn test_parse_output_falls_back_to_progress_file() {
         // Write progress file with known content
-        std::fs::write(PROGRESS_FILE, concat!(
-            "STROBE_TEST:{\"e\":\"pass\",\"n\":\"test alpha\",\"d\":100}\n",
-            "STROBE_TEST:{\"e\":\"pass\",\"n\":\"test beta\",\"d\":200}\n",
-            "STROBE_TEST:{\"e\":\"fail\",\"n\":\"test gamma\",\"d\":50}\n",
-        )).unwrap();
+        std::fs::write(
+            PROGRESS_FILE,
+            concat!(
+                "STROBE_TEST:{\"e\":\"pass\",\"n\":\"test alpha\",\"d\":100}\n",
+                "STROBE_TEST:{\"e\":\"pass\",\"n\":\"test beta\",\"d\":200}\n",
+                "STROBE_TEST:{\"e\":\"fail\",\"n\":\"test gamma\",\"d\":50}\n",
+            ),
+        )
+        .unwrap();
 
         // Call parse_output with empty stdout — should fall back to file
         let adapter = PlaywrightAdapter;
         let result = adapter.parse_output("", "", 1);
 
-        assert_eq!(result.summary.passed, 2, "should find 2 passed from file, got {}", result.summary.passed);
-        assert_eq!(result.summary.failed, 1, "should find 1 failed from file, got {}", result.summary.failed);
+        assert_eq!(
+            result.summary.passed, 2,
+            "should find 2 passed from file, got {}",
+            result.summary.passed
+        );
+        assert_eq!(
+            result.summary.failed, 1,
+            "should find 1 failed from file, got {}",
+            result.summary.failed
+        );
         assert_eq!(result.all_tests.len(), 3, "should have 3 tests total");
         assert_eq!(result.failures.len(), 1, "should have 1 failure");
 

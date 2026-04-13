@@ -9,9 +9,7 @@ use core_foundation::base::{CFRelease, TCFType};
 use core_foundation::string::CFString;
 use core_foundation_sys::base::CFTypeRef;
 use core_foundation_sys::number::{kCFNumberFloat64Type, CFNumberCreate};
-use core_graphics::event::{
-    CGEvent, CGEventType, CGMouseButton, ScrollEventUnit,
-};
+use core_graphics::event::{CGEvent, CGEventType, CGMouseButton, ScrollEventUnit};
 use core_graphics::event_source::CGEventSource;
 use core_graphics::event_source::CGEventSourceStateID;
 use core_graphics::geometry::CGPoint;
@@ -32,11 +30,10 @@ pub async fn execute_action(
     if req.action == UiActionType::Key {
         let key_str = req.key.as_ref().unwrap().clone(); // validated by caller
         let modifiers = req.modifiers.clone().unwrap_or_default();
-        let send_result = tokio::task::spawn_blocking(move || {
-            send_key_event(pid, &key_str, &modifiers)
-        })
-        .await
-        .map_err(|e| crate::Error::Internal(format!("Key event task failed: {}", e)))?;
+        let send_result =
+            tokio::task::spawn_blocking(move || send_key_event(pid, &key_str, &modifiers))
+                .await
+                .map_err(|e| crate::Error::Internal(format!("Key event task failed: {}", e)))?;
 
         return match send_result {
             Ok(()) => Ok(DebugUiActionResponse {
@@ -215,17 +212,14 @@ fn execute_set_value(
     let value = req.value.as_ref().unwrap();
 
     unsafe {
-        let ax_ref = find_ax_element(pid, target_id)?
-            .ok_or_else(|| {
-                crate::Error::UiQueryFailed("node not found during set_value".to_string())
-            })?;
+        let ax_ref = find_ax_element(pid, target_id)?.ok_or_else(|| {
+            crate::Error::UiQueryFailed("node not found during set_value".to_string())
+        })?;
 
         let result = if let Some(num) = value.as_f64() {
             // Check if this is a text field — convert to string
             let role = get_ax_role(ax_ref);
-            if role.as_deref() == Some("AXTextField")
-                || role.as_deref() == Some("AXTextArea")
-            {
+            if role.as_deref() == Some("AXTextField") || role.as_deref() == Some("AXTextArea") {
                 set_ax_string_value(ax_ref, &num.to_string())
             } else {
                 // Try CFNumber first, fall back to string (SwiftUI sliders use string values)
@@ -403,13 +397,8 @@ fn cg_click(pid: u32, x: f64, y: f64) -> crate::Result<()> {
         CGMouseButton::Left,
     )
     .map_err(|_| crate::Error::Internal("Failed to create mouse down".to_string()))?;
-    let up = CGEvent::new_mouse_event(
-        source,
-        CGEventType::LeftMouseUp,
-        point,
-        CGMouseButton::Left,
-    )
-    .map_err(|_| crate::Error::Internal("Failed to create mouse up".to_string()))?;
+    let up = CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, point, CGMouseButton::Left)
+        .map_err(|_| crate::Error::Internal("Failed to create mouse up".to_string()))?;
     down.post_to_pid(pid as i32);
     up.post_to_pid(pid as i32);
     Ok(())
@@ -522,10 +511,9 @@ fn key_name_to_keycode(key: &str) -> crate::Result<u16> {
 
 fn perform_ax_action(pid: u32, target_id: &str, action_name: &str) -> crate::Result<()> {
     unsafe {
-        let ax_ref = find_ax_element(pid, target_id)?
-            .ok_or_else(|| {
-                crate::Error::UiQueryFailed("node not found for AX action".to_string())
-            })?;
+        let ax_ref = find_ax_element(pid, target_id)?.ok_or_else(|| {
+            crate::Error::UiQueryFailed("node not found for AX action".to_string())
+        })?;
 
         let action = CFString::new(action_name);
         let err = AXUIElementPerformAction(ax_ref, action.as_concrete_TypeRef());
@@ -584,11 +572,8 @@ unsafe fn set_ax_number_value(element: AXUIElementRef, num: f64) -> Result<(), (
     if cf_num.is_null() {
         return Err(());
     }
-    let err = AXUIElementSetAttributeValue(
-        element,
-        attr.as_concrete_TypeRef(),
-        cf_num as CFTypeRef,
-    );
+    let err =
+        AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_num as CFTypeRef);
     CFRelease(cf_num as *const c_void);
     if err != 0 {
         Err(())

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use crate::test::adapter::TestResult;
+use std::path::PathBuf;
 
 /// Write full test details to a temp file. Returns the file path.
 pub fn write_details(
@@ -11,7 +11,12 @@ pub fn write_details(
     let dir = PathBuf::from("/tmp/strobe/tests");
     std::fs::create_dir_all(&dir)?;
 
-    let session_id = uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown").to_string();
+    let session_id = uuid::Uuid::new_v4()
+        .to_string()
+        .split('-')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
     let date = chrono::Utc::now().format("%Y-%m-%d");
     let filename = format!("{}-{}.json", session_id, date);
     let path = dir.join(&filename);
@@ -40,7 +45,11 @@ mod tests {
     fn test_write_details_file() {
         let result = TestResult {
             summary: TestSummary {
-                passed: 1, failed: 0, skipped: 0, stuck: None, duration_ms: 100,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+                stuck: None,
+                duration_ms: 100,
             },
             failures: vec![],
             stuck: vec![],

@@ -81,7 +81,9 @@ async fn test_cargo_execution(sm: &strobe::daemon::SessionManager) {
     // Verify failure details
     assert_eq!(result.result.failures.len(), 1);
     assert!(
-        result.result.failures[0].name.contains("intentional_failure"),
+        result.result.failures[0]
+            .name
+            .contains("intentional_failure"),
         "Failure should be the intentional one"
     );
 }
@@ -115,7 +117,10 @@ async fn test_cargo_single_test(sm: &strobe::daemon::SessionManager) {
         result.result.summary.passed, result.result.summary.failed,
     );
 
-    assert_eq!(result.result.summary.passed, 1, "Should pass exactly 1 test");
+    assert_eq!(
+        result.result.summary.passed, 1,
+        "Should pass exactly 1 test"
+    );
     assert_eq!(result.result.summary.failed, 0, "Should have no failures");
 }
 
@@ -155,13 +160,22 @@ async fn test_catch2_execution(sm: &strobe::daemon::SessionManager) {
     assert_eq!(result.framework, "catch2");
     // C++ fixture has: 9 pass, 1 fail (Intentional failure), 0 skip
     // (Stuck test excluded by default — Catch2 doesn't run [stuck] tagged tests without explicit tag)
-    assert!(result.result.summary.passed >= 8, "Expected >= 8 passing tests");
-    assert!(result.result.summary.failed >= 1, "Expected >= 1 failing test");
+    assert!(
+        result.result.summary.passed >= 8,
+        "Expected >= 8 passing tests"
+    );
+    assert!(
+        result.result.summary.failed >= 1,
+        "Expected >= 1 failing test"
+    );
 
     // Verify failure details include file/line
     if !result.result.failures.is_empty() {
         let failure = &result.result.failures[0];
-        eprintln!("Catch2 failure: name={} message={}", failure.name, failure.message);
+        eprintln!(
+            "Catch2 failure: name={} message={}",
+            failure.name, failure.message
+        );
     }
 }
 
@@ -195,7 +209,10 @@ async fn test_catch2_single_test(sm: &strobe::daemon::SessionManager) {
         result.result.summary.passed, result.result.summary.failed,
     );
 
-    assert_eq!(result.result.summary.passed, 1, "Should pass exactly 1 test");
+    assert_eq!(
+        result.result.summary.passed, 1,
+        "Should pass exactly 1 test"
+    );
     assert_eq!(result.result.summary.failed, 0, "Should have no failures");
 }
 
@@ -228,9 +245,7 @@ async fn test_catch2_stuck_detection(sm: &strobe::daemon::SessionManager) {
         Ok(r) => {
             eprintln!(
                 "Stuck test result: passed={} failed={} stuck={:?}",
-                r.result.summary.passed,
-                r.result.summary.failed,
-                r.result.summary.stuck,
+                r.result.summary.passed, r.result.summary.failed, r.result.summary.stuck,
             );
         }
         Err(e) => {
@@ -250,25 +265,44 @@ fn test_adapter_detection() {
     let rust_project = rust_fixture_project();
     let adapter = runner.detect_adapter(&rust_project, None, None).unwrap();
     eprintln!("Detected adapter for Rust project: {}", adapter.name());
-    assert_eq!(adapter.name(), "cargo", "Should detect Cargo for Rust fixture");
+    assert_eq!(
+        adapter.name(),
+        "cargo",
+        "Should detect Cargo for Rust fixture"
+    );
 
     let cargo_confidence = adapter.detect(&rust_project, None);
     eprintln!("Cargo confidence: {}", cargo_confidence);
-    assert!(cargo_confidence >= 85, "Cargo should detect Rust fixture with high confidence");
+    assert!(
+        cargo_confidence >= 85,
+        "Cargo should detect Rust fixture with high confidence"
+    );
 
     // Catch2 adapter should detect C++ binary
     let cpp_suite = cpp_test_suite();
-    let adapter = runner.detect_adapter(
-        cpp_suite.parent().unwrap(),
-        None,
-        Some(cpp_suite.to_str().unwrap()),
-    ).unwrap();
+    let adapter = runner
+        .detect_adapter(
+            cpp_suite.parent().unwrap(),
+            None,
+            Some(cpp_suite.to_str().unwrap()),
+        )
+        .unwrap();
     eprintln!("Detected adapter for C++ suite: {}", adapter.name());
-    assert_eq!(adapter.name(), "catch2", "Should detect Catch2 for C++ test suite");
+    assert_eq!(
+        adapter.name(),
+        "catch2",
+        "Should detect Catch2 for C++ test suite"
+    );
 
-    let catch2_confidence = adapter.detect(cpp_suite.parent().unwrap(), Some(cpp_suite.to_str().unwrap()));
+    let catch2_confidence = adapter.detect(
+        cpp_suite.parent().unwrap(),
+        Some(cpp_suite.to_str().unwrap()),
+    );
     eprintln!("Catch2 confidence: {}", catch2_confidence);
-    assert!(catch2_confidence >= 80, "Catch2 should detect C++ test suite");
+    assert!(
+        catch2_confidence >= 80,
+        "Catch2 should detect C++ test suite"
+    );
 
     // No framework should error with guidance
     let result = runner.detect_adapter(std::path::Path::new("/nonexistent"), None, None);
@@ -291,18 +325,30 @@ fn test_adapter_detection() {
         let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
         assert_eq!(adapter.name(), "deno", "Should detect Deno from deno.json");
         let confidence = adapter.detect(dir.path(), None);
-        assert!(confidence >= 90, "Deno confidence should be >= 90, got {}", confidence);
+        assert!(
+            confidence >= 90,
+            "Deno confidence should be >= 90, got {}",
+            confidence
+        );
         eprintln!("Deno adapter detected (confidence={})", confidence);
     }
 
     // --- Go adapter detection ---
     {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("go.mod"), "module example.com/test\n\ngo 1.21\n").unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/test\n\ngo 1.21\n",
+        )
+        .unwrap();
         let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
         assert_eq!(adapter.name(), "go", "Should detect Go from go.mod");
         let confidence = adapter.detect(dir.path(), None);
-        assert!(confidence >= 90, "Go confidence should be >= 90, got {}", confidence);
+        assert!(
+            confidence >= 90,
+            "Go confidence should be >= 90, got {}",
+            confidence
+        );
         eprintln!("Go adapter detected (confidence={})", confidence);
     }
 
@@ -311,9 +357,17 @@ fn test_adapter_detection() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".mocharc.yml"), "spec: test/**/*.spec.js\n").unwrap();
         let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
-        assert_eq!(adapter.name(), "mocha", "Should detect Mocha from .mocharc.yml");
+        assert_eq!(
+            adapter.name(),
+            "mocha",
+            "Should detect Mocha from .mocharc.yml"
+        );
         let confidence = adapter.detect(dir.path(), None);
-        assert!(confidence >= 90, "Mocha confidence should be >= 90, got {}", confidence);
+        assert!(
+            confidence >= 90,
+            "Mocha confidence should be >= 90, got {}",
+            confidence
+        );
         eprintln!("Mocha adapter detected (confidence={})", confidence);
     }
 
@@ -323,11 +377,20 @@ fn test_adapter_detection() {
         std::fs::write(
             dir.path().join("CMakeLists.txt"),
             "cmake_minimum_required(VERSION 3.14)\nfind_package(GTest REQUIRED)\n",
-        ).unwrap();
+        )
+        .unwrap();
         let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
-        assert_eq!(adapter.name(), "gtest", "Should detect GTest from CMakeLists.txt with gtest keyword");
+        assert_eq!(
+            adapter.name(),
+            "gtest",
+            "Should detect GTest from CMakeLists.txt with gtest keyword"
+        );
         let confidence = adapter.detect(dir.path(), None);
-        assert!(confidence >= 85, "GTest confidence should be >= 85, got {}", confidence);
+        assert!(
+            confidence >= 85,
+            "GTest confidence should be >= 85, got {}",
+            confidence
+        );
         eprintln!("GTest adapter detected (confidence={})", confidence);
     }
 }
@@ -371,7 +434,10 @@ async fn test_details_file_writing(sm: &strobe::daemon::SessionManager) {
     let content = std::fs::read_to_string(&path).unwrap();
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-    assert!(json.get("framework").is_some(), "Should have framework field");
+    assert!(
+        json.get("framework").is_some(),
+        "Should have framework field"
+    );
     assert!(json.get("summary").is_some(), "Should have summary field");
     assert_eq!(json["framework"], "cargo");
 

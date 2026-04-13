@@ -9,7 +9,6 @@
 ///
 /// All tests share a single SessionManager because Frida's GLib state is
 /// process-global and cannot be safely torn down and recreated.
-
 use std::time::Duration;
 
 mod common;
@@ -42,23 +41,31 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 1: Logpoint produces events without pausing ===");
     {
         let session_id = "lp-nopause";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Set logpoint (not breakpoint)
         let lp = sm
             .set_logpoint_async(
-                session_id, Some("lp-1".to_string()),
+                session_id,
+                Some("lp-1".to_string()),
                 Some("audio::process_buffer".to_string()),
-                None, None,
+                None,
+                None,
                 "process_buffer called on thread {threadId}".to_string(),
                 None,
             )
@@ -73,7 +80,9 @@ async fn test_logpoint_and_write_suite() {
 
         // Wait for Logpoint events in DB
         let logpoint_events = poll_events_typed(
-            &sm, session_id, Duration::from_secs(10),
+            &sm,
+            session_id,
+            Duration::from_secs(10),
             strobe::db::EventType::Logpoint,
             |events| events.len() >= 3,
         )
@@ -116,7 +125,9 @@ async fn test_logpoint_and_write_suite() {
 
         // Wait for process completion
         let stdout_events = poll_events_typed(
-            &sm, session_id, Duration::from_secs(10),
+            &sm,
+            session_id,
+            Duration::from_secs(10),
             strobe::db::EventType::Stdout,
             |events| {
                 let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
@@ -142,22 +153,30 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 2: Logpoint removal ===");
     {
         let session_id = "lp-remove";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         let lp = sm
             .set_logpoint_async(
-                session_id, Some("lp-remove".to_string()),
+                session_id,
+                Some("lp-remove".to_string()),
                 Some("audio::process_buffer".to_string()),
-                None, None,
+                None,
+                None,
                 "logged".to_string(),
                 None,
             )
@@ -171,7 +190,9 @@ async fn test_logpoint_and_write_suite() {
 
         // Wait for some logpoint events
         let _ = poll_events_typed(
-            &sm, session_id, Duration::from_secs(5),
+            &sm,
+            session_id,
+            Duration::from_secs(5),
             strobe::db::EventType::Logpoint,
             |events| events.len() >= 2,
         )
@@ -190,23 +211,31 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 3: Logpoint with conditional ===");
     {
         let session_id = "lp-cond";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Logpoint with condition "false" — should never log
         let lp = sm
             .set_logpoint_async(
-                session_id, Some("lp-never".to_string()),
+                session_id,
+                Some("lp-never".to_string()),
                 Some("audio::process_buffer".to_string()),
-                None, None,
+                None,
+                None,
                 "should never appear".to_string(),
                 Some("false".to_string()),
             )
@@ -217,7 +246,9 @@ async fn test_logpoint_and_write_suite() {
 
         // Wait for process to finish
         let _ = poll_events_typed(
-            &sm, session_id, Duration::from_secs(10),
+            &sm,
+            session_id,
+            Duration::from_secs(10),
             strobe::db::EventType::Stdout,
             |events| {
                 let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
@@ -248,15 +279,21 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 4: debug_write global variable ===");
     {
         let session_id = "write-global";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["write-target".to_string()],
-                None, project_root, None, false,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Wait a moment for the process to start its loop
@@ -288,7 +325,9 @@ async fn test_logpoint_and_write_suite() {
 
         // Verify the process detected g_counter=999 and exited
         let stdout_events = poll_events_typed(
-            &sm, session_id, Duration::from_secs(10),
+            &sm,
+            session_id,
+            Duration::from_secs(10),
             strobe::db::EventType::Stdout,
             |events| {
                 let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
@@ -316,23 +355,33 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 5: Breakpoint pause + debug_write + continue ===");
     {
         let session_id = "bp-write-cont";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["write-target".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Set breakpoint on process_buffer (called in write-target loop)
         let bp = sm
             .set_breakpoint_async(
-                session_id, Some("bp-write".to_string()),
+                session_id,
+                Some("bp-write".to_string()),
                 Some("audio::process_buffer".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
         assert!(bp.is_ok(), "Failed to set breakpoint: {:?}", bp.err());
@@ -374,7 +423,9 @@ async fn test_logpoint_and_write_suite() {
 
         // Process should see g_counter=999 and exit
         let stdout_events = poll_events_typed(
-            &sm, session_id, Duration::from_secs(10),
+            &sm,
+            session_id,
+            Duration::from_secs(10),
             strobe::db::EventType::Stdout,
             |events| {
                 let text: String = events.iter().filter_map(|e| e.text.as_deref()).collect();
@@ -402,15 +453,21 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 6: CModule trace + breakpoint coexistence ===");
     'test6: {
         let session_id = "coexist";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "10".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Install CModule trace FIRST
@@ -442,9 +499,13 @@ async fn test_logpoint_and_write_suite() {
         // Now set breakpoint on SAME function
         let bp = sm
             .set_breakpoint_async(
-                session_id, Some("bp-coex".to_string()),
+                session_id,
+                Some("bp-coex".to_string()),
                 Some("audio::process_buffer".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
         assert!(bp.is_ok(), "Failed to set breakpoint: {:?}", bp.err());
@@ -466,10 +527,7 @@ async fn test_logpoint_and_write_suite() {
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // Verify trace events exist alongside pause events
-        let all_events = sm
-            .db()
-            .query_events(session_id, |q| q.limit(500))
-            .unwrap();
+        let all_events = sm.db().query_events(session_id, |q| q.limit(500)).unwrap();
         let trace_count = all_events
             .iter()
             .filter(|e| {
@@ -497,23 +555,31 @@ async fn test_logpoint_and_write_suite() {
     println!("\n=== Test 7: Logpoint + breakpoint coexistence ===");
     {
         let session_id = "lp-bp-coex";
-        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0).unwrap();
+        sm.create_session(session_id, binary.to_str().unwrap(), project_root, 0)
+            .unwrap();
         let pid = sm
             .spawn_with_frida(
-                session_id, binary.to_str().unwrap(),
+                session_id,
+                binary.to_str().unwrap(),
                 &["breakpoint-loop".to_string(), "5".to_string()],
-                None, project_root, None, true,
                 None,
-        )
-            .await.unwrap();
+                project_root,
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
 
         // Logpoint on generate_sine
         let lp = sm
             .set_logpoint_async(
-                session_id, Some("lp-sine".to_string()),
+                session_id,
+                Some("lp-sine".to_string()),
                 Some("audio::generate_sine".to_string()),
-                None, None,
+                None,
+                None,
                 "sine generated".to_string(),
                 None,
             )
@@ -523,9 +589,13 @@ async fn test_logpoint_and_write_suite() {
         // Breakpoint on process_buffer (called after generate_sine)
         let bp = sm
             .set_breakpoint_async(
-                session_id, Some("bp-proc".to_string()),
+                session_id,
+                Some("bp-proc".to_string()),
                 Some("audio::process_buffer".to_string()),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
         assert!(bp.is_ok());

@@ -2,7 +2,7 @@ mod server;
 mod session_manager;
 
 pub use server::Daemon;
-pub use session_manager::{SessionManager, ActiveWatchState, PauseInfo};
+pub use session_manager::{ActiveWatchState, PauseInfo, SessionManager};
 
 #[cfg(test)]
 mod tests {
@@ -27,7 +27,9 @@ mod tests {
 
         // Create first session
         let id1 = manager.generate_session_id("myapp");
-        manager.create_session(&id1, "/bin/myapp", "/home/user", 1234).unwrap();
+        manager
+            .create_session(&id1, "/bin/myapp", "/home/user", 1234)
+            .unwrap();
 
         // Second session should get -2 suffix if same timestamp
         // (In practice timestamps differ, but the logic should handle it)

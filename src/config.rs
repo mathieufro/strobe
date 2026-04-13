@@ -54,21 +54,13 @@ struct SettingsFile {
 
 /// Resolve settings: defaults → user global → project-local.
 pub fn resolve(project_root: Option<&Path>) -> StrobeSettings {
-    let global_path = dirs::home_dir()
-        .map(|h| h.join(".strobe/settings.json"));
-    let project_path = project_root
-        .map(|r| r.join(".strobe/settings.json"));
-    resolve_with_paths(
-        global_path.as_deref(),
-        project_path.as_deref(),
-    )
+    let global_path = dirs::home_dir().map(|h| h.join(".strobe/settings.json"));
+    let project_path = project_root.map(|r| r.join(".strobe/settings.json"));
+    resolve_with_paths(global_path.as_deref(), project_path.as_deref())
 }
 
 /// Testable resolver that accepts explicit file paths (no home dir dependency).
-fn resolve_with_paths(
-    global_path: Option<&Path>,
-    project_path: Option<&Path>,
-) -> StrobeSettings {
+fn resolve_with_paths(global_path: Option<&Path>, project_path: Option<&Path>) -> StrobeSettings {
     let mut settings = StrobeSettings::default();
 
     if let Some(path) = global_path {
@@ -82,7 +74,9 @@ fn resolve_with_paths(
 }
 
 fn apply_file(settings: &mut StrobeSettings, path: &Path) {
-    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
     let Ok(file) = serde_json::from_str::<SettingsFile>(&content) else {
         tracing::warn!("Invalid settings file, ignoring: {}", path.display());
         return;
@@ -93,7 +87,8 @@ fn apply_file(settings: &mut StrobeSettings, path: &Path) {
         } else {
             tracing::warn!(
                 "events.maxPerSession ({}) out of range (1..{}), using default",
-                v, MAX_EVENT_LIMIT
+                v,
+                MAX_EVENT_LIMIT
             );
         }
     }
@@ -180,7 +175,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let global = dir.path().join("global.json");
         let project = dir.path().join("project.json");
-        std::fs::write(&global, r#"{"events.maxPerSession": 500000, "test.statusRetryMs": 3000}"#).unwrap();
+        std::fs::write(
+            &global,
+            r#"{"events.maxPerSession": 500000, "test.statusRetryMs": 3000}"#,
+        )
+        .unwrap();
         std::fs::write(&project, r#"{"events.maxPerSession": 1000000}"#).unwrap();
 
         let settings = resolve_with_paths(Some(&global), Some(&project));
@@ -200,10 +199,7 @@ mod tests {
 
     #[test]
     fn test_missing_file_ignored() {
-        let settings = resolve_with_paths(
-            Some(Path::new("/nonexistent/settings.json")),
-            None,
-        );
+        let settings = resolve_with_paths(Some(Path::new("/nonexistent/settings.json")), None);
         assert_eq!(settings, StrobeSettings::default());
     }
 
@@ -211,7 +207,11 @@ mod tests {
     fn test_unknown_keys_ignored() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("settings.json");
-        std::fs::write(&file, r#"{"events.maxPerSession": 300000, "unknown.key": true}"#).unwrap();
+        std::fs::write(
+            &file,
+            r#"{"events.maxPerSession": 300000, "unknown.key": true}"#,
+        )
+        .unwrap();
 
         let settings = resolve_with_paths(Some(&file), None);
         assert_eq!(settings.events_max_per_session, 300_000);
@@ -297,12 +297,16 @@ mod tests {
     fn test_vision_config_overrides() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("settings.json");
-        std::fs::write(&file, r#"{
+        std::fs::write(
+            &file,
+            r#"{
             "vision.enabled": true,
             "vision.confidenceThreshold": 0.5,
             "vision.iouMergeThreshold": 0.7,
             "vision.sidecarIdleTimeoutSeconds": 600
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let settings = resolve_with_paths(Some(&file), None);
         assert_eq!(settings.vision_enabled, true);
@@ -342,5 +346,4 @@ mod tests {
         let settings = resolve_with_paths(Some(&file), None);
         assert_eq!(settings.vision_sidecar_idle_timeout_seconds, 300); // default
     }
-
 }

@@ -1,7 +1,7 @@
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use serde::Deserialize;
 
 use super::adapter::*;
 use super::TestProgress;
@@ -59,23 +59,36 @@ struct VitestAssertion {
 impl TestAdapter for VitestAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
         // Highest: explicit vitest config file
-        for cfg in &["vitest.config.ts", "vitest.config.js", "vitest.config.mts", "vitest.config.mjs"] {
-            if project_root.join(cfg).exists() { return 95; }
+        for cfg in &[
+            "vitest.config.ts",
+            "vitest.config.js",
+            "vitest.config.mts",
+            "vitest.config.mjs",
+        ] {
+            if project_root.join(cfg).exists() {
+                return 95;
+            }
         }
         // High: vitest in package.json devDependencies or dependencies
         if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
-            if pkg.contains("\"vitest\"") { return 90; }
+            if pkg.contains("\"vitest\"") {
+                return 90;
+            }
         }
         // Medium: vite.config with test key (Vitest is Vite-native)
         for cfg in &["vite.config.ts", "vite.config.js"] {
             if let Ok(c) = std::fs::read_to_string(project_root.join(cfg)) {
-                if c.contains("\"test\"") || c.contains("'test'") { return 70; }
+                if c.contains("\"test\"") || c.contains("'test'") {
+                    return 70;
+                }
             }
         }
         0
     }
 
-    fn name(&self) -> &str { "vitest" }
+    fn name(&self) -> &str {
+        "vitest"
+    }
 
     fn suite_command(
         &self,
@@ -87,7 +100,8 @@ impl TestAdapter for VitestAdapter {
         Ok(TestCommand {
             program: "npx".to_string(),
             args: vec![
-                "vitest".to_string(), "run".to_string(),
+                "vitest".to_string(),
+                "run".to_string(),
                 "--pool=threads".to_string(),
                 "--reporter=json".to_string(),
                 format!("--reporter={}", reporter_path),
@@ -99,17 +113,23 @@ impl TestAdapter for VitestAdapter {
         })
     }
 
-    fn single_test_command(&self, _project_root: &Path, test_name: &str) -> crate::Result<TestCommand> {
+    fn single_test_command(
+        &self,
+        _project_root: &Path,
+        test_name: &str,
+    ) -> crate::Result<TestCommand> {
         let reporter_path = ensure_reporter_file();
         Ok(TestCommand {
             program: "npx".to_string(),
             args: vec![
-                "vitest".to_string(), "run".to_string(),
+                "vitest".to_string(),
+                "run".to_string(),
                 "--pool=threads".to_string(),
                 "--reporter=json".to_string(),
                 format!("--reporter={}", reporter_path),
                 "--no-coverage".to_string(),
-                "-t".to_string(), test_name.to_string(),
+                "-t".to_string(),
+                test_name.to_string(),
             ],
             env: HashMap::new(),
             cwd: None,
@@ -125,11 +145,7 @@ impl TestAdapter for VitestAdapter {
         build_custom_command(cmd, None)
     }
 
-    fn single_test_for_binary(
-        &self,
-        cmd: &str,
-        test_name: &str,
-    ) -> crate::Result<TestCommand> {
+    fn single_test_for_binary(&self, cmd: &str, test_name: &str) -> crate::Result<TestCommand> {
         build_custom_command(cmd, Some(test_name))
     }
 
@@ -151,14 +167,26 @@ impl TestAdapter for VitestAdapter {
         let failures = if exit_code != 0 {
             vec![TestFailure {
                 name: "Test run crashed".to_string(),
-                file: None, line: None,
-                message: format!("Could not parse vitest output.\nstderr: {}", &stderr[..stderr.len().min(500)]),
+                file: None,
+                line: None,
+                message: format!(
+                    "Could not parse vitest output.\nstderr: {}",
+                    &stderr[..stderr.len().min(500)]
+                ),
                 rerun: None,
                 suggested_traces: vec![],
             }]
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         TestResult {
-            summary: TestSummary { passed: 0, failed: 0, skipped: 0, stuck: None, duration_ms: 0 },
+            summary: TestSummary {
+                passed: 0,
+                failed: 0,
+                skipped: 0,
+                stuck: None,
+                duration_ms: 0,
+            },
             failures,
             stuck: vec![],
             all_tests: vec![],
@@ -168,7 +196,8 @@ impl TestAdapter for VitestAdapter {
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String> {
         let mut traces = vec![];
         if let Some(file) = &failure.file {
-            let stem = Path::new(file).file_stem()
+            let stem = Path::new(file)
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("test");
             let module = stem.trim_end_matches(".test").trim_end_matches(".spec");
@@ -265,10 +294,7 @@ fn parse_json_output(stdout: &str) -> Option<TestResult> {
     let report: VitestReport = serde_json::from_str(json_str).ok()?;
 
     // Valid JSON but empty testResults — don't treat as success, let caller try fallback
-    if report.test_results.is_empty()
-        && report.num_passed == 0
-        && report.num_failed == 0
-    {
+    if report.test_results.is_empty() && report.num_passed == 0 && report.num_failed == 0 {
         return None;
     }
 
@@ -301,12 +327,15 @@ fn parse_json_output(stdout: &str) -> Option<TestResult> {
                 name: full_name.clone(),
                 status: status.clone(),
                 duration_ms,
-                stdout: None, stderr: None, message: None,
+                stdout: None,
+                stderr: None,
+                message: None,
             });
 
             if matches!(status, TestStatus::Fail) {
                 let msg = a.failure_messages.first().cloned().unwrap_or_default();
-                let (file, line) = stack_re.captures(&msg)
+                let (file, line) = stack_re
+                    .captures(&msg)
                     .map(|c| (Some(c[1].to_string()), c[2].parse().ok()))
                     .unwrap_or((None, None));
 
@@ -360,13 +389,30 @@ fn parse_strobe_events(stderr: &str) -> Option<TestResult> {
         };
 
         let event = v.get("e").and_then(|e| e.as_str()).unwrap_or("");
-        let name = v.get("n").and_then(|n| n.as_str()).unwrap_or("").to_string();
-        let duration_ms = v.get("d").and_then(|d| d.as_f64()).map(|d| d as u64).unwrap_or(0);
+        let name = v
+            .get("n")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        let duration_ms = v
+            .get("d")
+            .and_then(|d| d.as_f64())
+            .map(|d| d as u64)
+            .unwrap_or(0);
 
         let status = match event {
-            "pass" => { passed += 1; TestStatus::Pass }
-            "fail" => { failed += 1; TestStatus::Fail }
-            "skip" => { skipped += 1; TestStatus::Skip }
+            "pass" => {
+                passed += 1;
+                TestStatus::Pass
+            }
+            "fail" => {
+                failed += 1;
+                TestStatus::Fail
+            }
+            "skip" => {
+                skipped += 1;
+                TestStatus::Skip
+            }
             _ => continue, // module_start, module_end, start — not result events
         };
 
@@ -376,7 +422,9 @@ fn parse_strobe_events(stderr: &str) -> Option<TestResult> {
             name: name.clone(),
             status: status.clone(),
             duration_ms,
-            stdout: None, stderr: None, message: None,
+            stdout: None,
+            stderr: None,
+            message: None,
         });
 
         if matches!(status, TestStatus::Fail) {
@@ -396,7 +444,13 @@ fn parse_strobe_events(stderr: &str) -> Option<TestResult> {
     }
 
     Some(TestResult {
-        summary: TestSummary { passed, failed, skipped, stuck: None, duration_ms: total_duration_ms },
+        summary: TestSummary {
+            passed,
+            failed,
+            skipped,
+            stuck: None,
+            duration_ms: total_duration_ms,
+        },
         failures,
         stuck: vec![],
         all_tests,
@@ -427,7 +481,11 @@ pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
             p.has_custom_reporter = true;
 
             let event = v.get("e").and_then(|e| e.as_str()).unwrap_or("");
-            let name = v.get("n").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let name = v
+                .get("n")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
 
             match event {
                 "module_start" => {
@@ -439,10 +497,21 @@ pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
                 "module_end" => {
                     // File-level execution finished (informational)
                 }
-                "start" => { p.start_test(name); }
-                "pass"  => { p.passed += 1; p.finish_test(&name); }
-                "fail"  => { p.failed += 1; p.finish_test(&name); }
-                "skip"  => { p.skipped += 1; p.finish_test(&name); }
+                "start" => {
+                    p.start_test(name);
+                }
+                "pass" => {
+                    p.passed += 1;
+                    p.finish_test(&name);
+                }
+                "fail" => {
+                    p.failed += 1;
+                    p.finish_test(&name);
+                }
+                "skip" => {
+                    p.skipped += 1;
+                    p.finish_test(&name);
+                }
                 _ => {}
             }
         }
@@ -456,7 +525,10 @@ pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
                 p.passed += n;
                 return;
             }
-        } else if trimmed.starts_with('×') || trimmed.starts_with('\u{00d7}') || trimmed.starts_with('❯') {
+        } else if trimmed.starts_with('×')
+            || trimmed.starts_with('\u{00d7}')
+            || trimmed.starts_with('❯')
+        {
             if let Some((passed, failed)) = parse_suite_failed_count(trimmed) {
                 p.passed += passed;
                 p.failed += failed;
@@ -570,9 +642,15 @@ mod tests {
         let adapter = VitestAdapter;
         assert_eq!(adapter.detect(dir.path(), None), 0);
 
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"devDependencies": {"vitest": "^1.0.0"}}"#).unwrap();
-        assert!(adapter.detect(dir.path(), None) > 0, "should detect vitest in package.json");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"devDependencies": {"vitest": "^1.0.0"}}"#,
+        )
+        .unwrap();
+        assert!(
+            adapter.detect(dir.path(), None) > 0,
+            "should detect vitest in package.json"
+        );
     }
 
     #[test]
@@ -581,7 +659,10 @@ mod tests {
         let adapter = VitestAdapter;
 
         std::fs::write(dir.path().join("vitest.config.ts"), "export default {}").unwrap();
-        assert!(adapter.detect(dir.path(), None) >= 90, "vitest.config.ts = max confidence");
+        assert!(
+            adapter.detect(dir.path(), None) >= 90,
+            "vitest.config.ts = max confidence"
+        );
     }
 
     #[test]
@@ -592,7 +673,10 @@ mod tests {
         assert_eq!(result.summary.failed, 0);
         assert!(result.failures.is_empty());
         assert_eq!(result.all_tests.len(), 2);
-        assert!(result.all_tests.iter().all(|t| t.status == TestStatus::Pass));
+        assert!(result
+            .all_tests
+            .iter()
+            .all(|t| t.status == TestStatus::Pass));
     }
 
     #[test]
@@ -604,7 +688,10 @@ mod tests {
 
         let f = &result.failures[0];
         assert_eq!(f.name, "Math addition adds correctly");
-        assert!(f.message.contains("expected 3"), "failure message extracted");
+        assert!(
+            f.message.contains("expected 3"),
+            "failure message extracted"
+        );
         assert!(f.file.as_deref().unwrap_or("").ends_with("math.test.ts"));
     }
 
@@ -650,59 +737,95 @@ mod tests {
     fn test_suite_command_structure() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = VitestAdapter;
-        let cmd = adapter.suite_command(dir.path(), None, &Default::default()).unwrap();
+        let cmd = adapter
+            .suite_command(dir.path(), None, &Default::default())
+            .unwrap();
         assert!(cmd.args.iter().any(|a| a.contains("vitest")));
-        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should use threads pool to avoid Frida spawn gating deadlock");
-        assert!(cmd.args.iter().any(|a| a.contains("json")), "should use json reporter");
-        assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")),
-            "should include custom reporter");
+        assert!(
+            cmd.args.iter().any(|a| a == "--pool=threads"),
+            "should use threads pool to avoid Frida spawn gating deadlock"
+        );
+        assert!(
+            cmd.args.iter().any(|a| a.contains("json")),
+            "should use json reporter"
+        );
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a.contains(".strobe-vitest-reporter")),
+            "should include custom reporter"
+        );
     }
 
     #[test]
     fn test_single_test_command() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = VitestAdapter;
-        let cmd = adapter.single_test_command(dir.path(), "Math addition adds correctly").unwrap();
+        let cmd = adapter
+            .single_test_command(dir.path(), "Math addition adds correctly")
+            .unwrap();
         assert!(cmd.args.iter().any(|a| a.contains("Math")));
-        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should use threads pool");
-        assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")),
-            "should include custom reporter");
+        assert!(
+            cmd.args.iter().any(|a| a == "--pool=threads"),
+            "should use threads pool"
+        );
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a.contains(".strobe-vitest-reporter")),
+            "should include custom reporter"
+        );
     }
 
     // --- STROBE_TEST protocol tests ---
 
     #[test]
     fn test_update_progress_strobe_start_and_pass() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let mut p0 = TestProgress::new();
         p0.phase = TestPhase::Running;
         let progress = Arc::new(Mutex::new(p0));
 
         // Test start event
-        update_progress("\nSTROBE_TEST:{\"e\":\"start\",\"n\":\"Math adds\"}\n", &progress);
+        update_progress(
+            "\nSTROBE_TEST:{\"e\":\"start\",\"n\":\"Math adds\"}\n",
+            &progress,
+        );
         {
             let p = progress.lock().unwrap();
-            assert!(p.running_tests.contains_key("Math adds"), "start should populate running_tests");
+            assert!(
+                p.running_tests.contains_key("Math adds"),
+                "start should populate running_tests"
+            );
             assert!(p.has_custom_reporter);
             assert_eq!(p.passed, 0);
         }
 
         // Test pass event
-        update_progress("\nSTROBE_TEST:{\"e\":\"pass\",\"n\":\"Math adds\",\"d\":5}\n", &progress);
+        update_progress(
+            "\nSTROBE_TEST:{\"e\":\"pass\",\"n\":\"Math adds\",\"d\":5}\n",
+            &progress,
+        );
         {
             let p = progress.lock().unwrap();
             assert_eq!(p.passed, 1);
-            assert!(!p.running_tests.contains_key("Math adds"), "pass should remove from running_tests");
-            assert!(p.test_durations.contains_key("Math adds"), "should record duration");
+            assert!(
+                !p.running_tests.contains_key("Math adds"),
+                "pass should remove from running_tests"
+            );
+            assert!(
+                p.test_durations.contains_key("Math adds"),
+                "should record duration"
+            );
         }
     }
 
     #[test]
     fn test_update_progress_strobe_multiple_events_in_chunk() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let mut p0 = TestProgress::new();
         p0.phase = TestPhase::Running;
@@ -723,29 +846,42 @@ mod tests {
 
     #[test]
     fn test_update_progress_strobe_skip() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let mut p0 = TestProgress::new();
         p0.phase = TestPhase::Running;
         let progress = Arc::new(Mutex::new(p0));
 
         // Simulate start then skip — skip should remove from running_tests
-        update_progress("\nSTROBE_TEST:{\"e\":\"start\",\"n\":\"todo test\"}\n", &progress);
-        assert!(progress.lock().unwrap().running_tests.contains_key("todo test"));
+        update_progress(
+            "\nSTROBE_TEST:{\"e\":\"start\",\"n\":\"todo test\"}\n",
+            &progress,
+        );
+        assert!(progress
+            .lock()
+            .unwrap()
+            .running_tests
+            .contains_key("todo test"));
 
-        update_progress("\nSTROBE_TEST:{\"e\":\"skip\",\"n\":\"todo test\"}\n", &progress);
+        update_progress(
+            "\nSTROBE_TEST:{\"e\":\"skip\",\"n\":\"todo test\"}\n",
+            &progress,
+        );
 
         let p = progress.lock().unwrap();
         assert_eq!(p.skipped, 1);
         assert!(p.has_custom_reporter);
-        assert!(!p.running_tests.contains_key("todo test"), "skip should remove from running_tests");
+        assert!(
+            !p.running_tests.contains_key("todo test"),
+            "skip should remove from running_tests"
+        );
     }
 
     #[test]
     fn test_update_progress_strobe_disables_fallback() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let mut p0 = TestProgress::new();
         p0.phase = TestPhase::Running;
@@ -757,15 +893,19 @@ mod tests {
 
         // Second: JSON chunk should be ignored (no double-counting)
         update_progress(r#"{"status":"passed","title":"b"}"#, &progress);
-        assert_eq!(progress.lock().unwrap().passed, 1, "fallback should be disabled");
+        assert_eq!(
+            progress.lock().unwrap().passed,
+            1,
+            "fallback should be disabled"
+        );
     }
 
     // --- Fallback path tests (Jest/Bun/Vitest 2.x) ---
 
     #[test]
     fn test_update_progress_fallback_json_chunk_counting() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let mut p0 = TestProgress::new();
         p0.phase = TestPhase::Running;
@@ -778,13 +918,16 @@ mod tests {
         assert_eq!(p.passed, 3, "should count 3 passed");
         assert_eq!(p.failed, 1, "should count 1 failed");
         assert_eq!(p.skipped, 0);
-        assert!(!p.has_custom_reporter, "should not set custom reporter flag");
+        assert!(
+            !p.has_custom_reporter,
+            "should not set custom reporter flag"
+        );
     }
 
     #[test]
     fn test_update_progress_fallback_skipped() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let mut p0 = TestProgress::new();
         p0.phase = TestPhase::Running;
@@ -799,8 +942,8 @@ mod tests {
 
     #[test]
     fn test_update_progress_phase_transition_via_module_start() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let progress = Arc::new(Mutex::new(TestProgress::new()));
         assert_eq!(progress.lock().unwrap().phase, TestPhase::Compiling);
@@ -810,7 +953,10 @@ mod tests {
         assert_eq!(progress.lock().unwrap().phase, TestPhase::Compiling);
 
         // module_start event should transition from Compiling to Running
-        update_progress("\nSTROBE_TEST:{\"e\":\"module_start\",\"n\":\"src/math.test.ts\"}\n", &progress);
+        update_progress(
+            "\nSTROBE_TEST:{\"e\":\"module_start\",\"n\":\"src/math.test.ts\"}\n",
+            &progress,
+        );
         assert_eq!(progress.lock().unwrap().phase, TestPhase::Running);
         assert!(progress.lock().unwrap().has_custom_reporter);
     }
@@ -819,7 +965,13 @@ mod tests {
     fn test_count_occurrences() {
         assert_eq!(count_occurrences("", "x"), 0);
         assert_eq!(count_occurrences("aaa", "a"), 3);
-        assert_eq!(count_occurrences(r#""status":"passed","status":"passed""#, r#""status":"passed""#), 2);
+        assert_eq!(
+            count_occurrences(
+                r#""status":"passed","status":"passed""#,
+                r#""status":"passed""#
+            ),
+            2
+        );
         assert_eq!(count_occurrences("abab", "ab"), 2);
     }
 
@@ -840,7 +992,10 @@ STROBE_TEST:{"e":"module_end","n":"src/math.test.ts","d":10}
         assert_eq!(result.summary.passed, 2);
         assert_eq!(result.summary.failed, 0);
         assert_eq!(result.all_tests.len(), 2);
-        assert!(result.all_tests.iter().all(|t| t.status == TestStatus::Pass));
+        assert!(result
+            .all_tests
+            .iter()
+            .all(|t| t.status == TestStatus::Pass));
         assert!(result.failures.is_empty());
     }
 
@@ -867,7 +1022,10 @@ STROBE_TEST:{"e":"skip","n":"test C"}
         // Both JSON stdout and STROBE_TEST events available — JSON wins
         let stderr = "\nSTROBE_TEST:{\"e\":\"pass\",\"n\":\"extra test\",\"d\":1}\n";
         let result = adapter.parse_output(PASS_JSON, stderr, 0);
-        assert_eq!(result.summary.passed, 2, "should use JSON counts, not STROBE_TEST");
+        assert_eq!(
+            result.summary.passed, 2,
+            "should use JSON counts, not STROBE_TEST"
+        );
         assert_eq!(result.all_tests.len(), 2);
     }
 
@@ -889,7 +1047,11 @@ STROBE_TEST:{"e":"pass","n":"test A","d":5}
 STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
 "#;
         let result = parse_strobe_events(stderr).unwrap();
-        assert_eq!(result.all_tests.len(), 1, "only pass/fail/skip should produce test entries");
+        assert_eq!(
+            result.all_tests.len(),
+            1,
+            "only pass/fail/skip should produce test entries"
+        );
         assert_eq!(result.summary.passed, 1);
     }
 
@@ -902,9 +1064,15 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         assert!(cmd.args.contains(&"vitest".to_string()));
         assert!(cmd.args.contains(&"run".to_string()));
         assert!(cmd.args.contains(&"src/math.test.ts".to_string()));
-        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
+        assert!(
+            cmd.args.iter().any(|a| a == "--pool=threads"),
+            "should force threads pool"
+        );
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
-        assert!(cmd.args.iter().any(|a| a.contains(".strobe-vitest-reporter")));
+        assert!(cmd
+            .args
+            .iter()
+            .any(|a| a.contains(".strobe-vitest-reporter")));
     }
 
     #[test]
@@ -913,8 +1081,14 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         assert_eq!(cmd.program, "npm");
         assert!(cmd.args.contains(&"run".to_string()));
         assert!(cmd.args.contains(&"test:e2e".to_string()));
-        assert!(cmd.args.contains(&"--".to_string()), "should have -- separator");
-        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
+        assert!(
+            cmd.args.contains(&"--".to_string()),
+            "should have -- separator"
+        );
+        assert!(
+            cmd.args.iter().any(|a| a == "--pool=threads"),
+            "should force threads pool"
+        );
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
     }
 
@@ -925,7 +1099,10 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         assert!(cmd.args.contains(&"run".to_string()));
         assert!(cmd.args.contains(&"test:e2e:server".to_string()));
         assert!(cmd.args.contains(&"--".to_string()));
-        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
+        assert!(
+            cmd.args.iter().any(|a| a == "--pool=threads"),
+            "should force threads pool"
+        );
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
     }
 
@@ -934,7 +1111,10 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         let cmd = build_custom_command("bun run test", Some("my test name")).unwrap();
         assert!(cmd.args.contains(&"-t".to_string()));
         assert!(cmd.args.contains(&"my test name".to_string()));
-        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
+        assert!(
+            cmd.args.iter().any(|a| a == "--pool=threads"),
+            "should force threads pool"
+        );
     }
 
     #[test]
@@ -942,7 +1122,10 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         let cmd = build_custom_command("npx vitest run", Some("my test")).unwrap();
         assert!(cmd.args.contains(&"-t".to_string()));
         assert!(cmd.args.contains(&"my test".to_string()));
-        assert!(cmd.args.iter().any(|a| a == "--pool=threads"), "should force threads pool");
+        assert!(
+            cmd.args.iter().any(|a| a == "--pool=threads"),
+            "should force threads pool"
+        );
         assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
     }
 
@@ -952,6 +1135,9 @@ STROBE_TEST:{"e":"module_end","n":"file.ts","d":10}
         let cmd = build_custom_command("npx vitest run --pool=forks", None).unwrap();
         let pool_args: Vec<_> = cmd.args.iter().filter(|a| a.contains("--pool")).collect();
         assert_eq!(pool_args.len(), 1, "should not duplicate pool flag");
-        assert_eq!(pool_args[0], "--pool=forks", "should keep user's explicit pool choice");
+        assert_eq!(
+            pool_args[0], "--pool=forks",
+            "should keep user's explicit pool choice"
+        );
     }
 }

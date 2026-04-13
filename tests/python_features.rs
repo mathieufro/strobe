@@ -84,7 +84,8 @@ async fn spawn_session(
     session_id: &str,
     mode: &str,
 ) -> u32 {
-    sm.create_session(session_id, script, project_root, 0).unwrap();
+    sm.create_session(session_id, script, project_root, 0)
+        .unwrap();
     let pid = sm
         .spawn_with_frida(
             session_id,
@@ -124,8 +125,14 @@ async fn scenario_read_variable_expressions(
         ]
     });
 
-    let result = sm.execute_debug_read(&read_args).await.expect("execute_debug_read should succeed");
-    let results = result.get("results").and_then(|v| v.as_array()).expect("Should have results");
+    let result = sm
+        .execute_debug_read(&read_args)
+        .await
+        .expect("execute_debug_read should succeed");
+    let results = result
+        .get("results")
+        .and_then(|v| v.as_array())
+        .expect("Should have results");
     assert_eq!(results.len(), 3);
 
     // 1 + 2 = 3
@@ -134,7 +141,9 @@ async fn scenario_read_variable_expressions(
     eprintln!("  1 + 2 = {}", v0);
 
     // list(range(5)) = [0,1,2,3,4]
-    let v1 = results[1].get("value").expect("Should have value for range");
+    let v1 = results[1]
+        .get("value")
+        .expect("Should have value for range");
     assert!(v1.is_array());
     assert_eq!(v1.as_array().unwrap().len(), 5);
     eprintln!("  list(range(5)) = {}", v1);
@@ -168,14 +177,23 @@ async fn scenario_read_module_globals(
         ]
     });
 
-    let result = sm.execute_debug_read(&read_args).await.expect("should succeed");
+    let result = sm
+        .execute_debug_read(&read_args)
+        .await
+        .expect("should succeed");
     let results = result.get("results").and_then(|v| v.as_array()).unwrap();
 
-    let counter = results[0].get("value").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let counter = results[0]
+        .get("value")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
     eprintln!("  g_counter = {}", counter);
     assert!(counter > 0, "g_counter should have been incremented");
 
-    let tempo = results[1].get("value").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    let tempo = results[1]
+        .get("value")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(-1.0);
     eprintln!("  g_tempo = {}", tempo);
     assert!(tempo >= 120.0, "g_tempo should be >= 120.0");
 
@@ -202,13 +220,20 @@ async fn scenario_read_variable_errors(
         ]
     });
 
-    let result = sm.execute_debug_read(&read_args).await.expect("should succeed");
+    let result = sm
+        .execute_debug_read(&read_args)
+        .await
+        .expect("should succeed");
     let results = result.get("results").and_then(|v| v.as_array()).unwrap();
-    let err = results[0].get("error").and_then(|v| v.as_str()).expect("Should have error");
+    let err = results[0]
+        .get("error")
+        .and_then(|v| v.as_str())
+        .expect("Should have error");
     eprintln!("  error: {}", err);
     assert!(
         err.contains("NameError") || err.contains("not defined"),
-        "Error should mention NameError, got: {}", err
+        "Error should mention NameError, got: {}",
+        err
     );
 
     stop_session(sm, session_id).await;
@@ -227,17 +252,23 @@ async fn scenario_breakpoints(
     let _pid = spawn_session(sm, python3, script, project_root, session_id, "globals").await;
 
     // Set breakpoint on audio.py line 7 (first line inside generate_sine)
-    let bp_info = sm.set_breakpoint_async(
-        session_id,
-        Some("bp-test-1".to_string()),
-        None,
-        Some("audio.py".to_string()),
-        Some(7),
-        None,
-        None,
-    ).await.expect("set_breakpoint should succeed");
+    let bp_info = sm
+        .set_breakpoint_async(
+            session_id,
+            Some("bp-test-1".to_string()),
+            None,
+            Some("audio.py".to_string()),
+            Some(7),
+            None,
+            None,
+        )
+        .await
+        .expect("set_breakpoint should succeed");
 
-    eprintln!("  breakpoint set: id={} file={:?} line={:?}", bp_info.id, bp_info.file, bp_info.line);
+    eprintln!(
+        "  breakpoint set: id={} file={:?} line={:?}",
+        bp_info.id, bp_info.file, bp_info.line
+    );
     assert_eq!(bp_info.id, "bp-test-1");
     assert_eq!(bp_info.address, "interpreted");
 
@@ -248,18 +279,30 @@ async fn scenario_breakpoints(
         Duration::from_secs(10),
         EventType::Pause,
         |evs| !evs.is_empty(),
-    ).await;
+    )
+    .await;
 
-    assert!(!pause_events.is_empty(), "Should have at least one pause event");
+    assert!(
+        !pause_events.is_empty(),
+        "Should have at least one pause event"
+    );
     let pause = &pause_events[0];
     if let Some(ref sf) = pause.source_file {
-        assert!(sf.contains("audio.py"), "Pause should be in audio.py, got: {}", sf);
+        assert!(
+            sf.contains("audio.py"),
+            "Pause should be in audio.py, got: {}",
+            sf
+        );
     }
     if let Some(ln) = pause.line_number {
         assert_eq!(ln, 7, "Pause should be on line 7");
     }
-    eprintln!("  breakpoint hit! {} pause events (file={:?} line={:?})",
-        pause_events.len(), pause.source_file, pause.line_number);
+    eprintln!(
+        "  breakpoint hit! {} pause events (file={:?} line={:?})",
+        pause_events.len(),
+        pause.source_file,
+        pause.line_number
+    );
 
     // Resume execution
     let continue_result = sm.debug_continue_async(session_id, None).await;
@@ -282,17 +325,23 @@ async fn scenario_logpoints(
     let _pid = spawn_session(sm, python3, script, project_root, session_id, "globals").await;
 
     // Set logpoint on audio.py line 13 (sum_sq line inside process_buffer)
-    let lp_info = sm.set_logpoint_async(
-        session_id,
-        Some("lp-test-1".to_string()),
-        None,
-        Some("audio.py".to_string()),
-        Some(13),
-        "process_buffer called".to_string(),
-        None,
-    ).await.expect("set_logpoint should succeed");
+    let lp_info = sm
+        .set_logpoint_async(
+            session_id,
+            Some("lp-test-1".to_string()),
+            None,
+            Some("audio.py".to_string()),
+            Some(13),
+            "process_buffer called".to_string(),
+            None,
+        )
+        .await
+        .expect("set_logpoint should succeed");
 
-    eprintln!("  logpoint set: id={} file={:?} line={:?}", lp_info.id, lp_info.file, lp_info.line);
+    eprintln!(
+        "  logpoint set: id={} file={:?} line={:?}",
+        lp_info.id, lp_info.file, lp_info.line
+    );
     assert_eq!(lp_info.id, "lp-test-1");
 
     // Wait for logpoint output
@@ -302,25 +351,30 @@ async fn scenario_logpoints(
         Duration::from_secs(10),
         EventType::Stdout,
         |evs| {
-            let text: String = evs.iter()
+            let text: String = evs
+                .iter()
                 .filter_map(|e| e.text.clone())
                 .collect::<Vec<_>>()
                 .join("");
             text.contains("[logpoint lp-test-1]")
         },
-    ).await;
+    )
+    .await;
 
-    let output: String = events.iter()
+    let output: String = events
+        .iter()
         .filter_map(|e| e.text.clone())
         .collect::<Vec<_>>()
         .join("");
 
     assert!(
         output.contains("[logpoint lp-test-1]"),
-        "Should have logpoint output, got: {}", &output[..output.len().min(200)]
+        "Should have logpoint output, got: {}",
+        &output[..output.len().min(200)]
     );
 
-    let lp_lines: Vec<&str> = output.lines()
+    let lp_lines: Vec<&str> = output
+        .lines()
         .filter(|l| l.contains("[logpoint"))
         .take(3)
         .collect();
@@ -342,12 +396,14 @@ async fn scenario_combined(
     let _pid = spawn_session(sm, python3, script, project_root, session_id, "globals").await;
 
     // Add trace patterns for audio functions
-    let hook_result = sm.update_frida_patterns(
-        session_id,
-        Some(&["modules.audio.*".to_string()]),
-        None,
-        None,
-    ).await;
+    let hook_result = sm
+        .update_frida_patterns(
+            session_id,
+            Some(&["modules.audio.*".to_string()]),
+            None,
+            None,
+        )
+        .await;
 
     if let Ok(ref hr) = hook_result {
         eprintln!("  hooks: installed={} matched={}", hr.installed, hr.matched);
@@ -364,19 +420,28 @@ async fn scenario_combined(
         ]
     });
 
-    let result = sm.execute_debug_read(&read_args).await.expect("should succeed");
+    let result = sm
+        .execute_debug_read(&read_args)
+        .await
+        .expect("should succeed");
     let results = result.get("results").and_then(|v| v.as_array()).unwrap();
     let val = results[0].get("value").and_then(|v| v.as_i64());
     assert_eq!(val, Some(1024), "2**10 should be 1024");
     eprintln!("  readVariable during tracing: 2**10 = {}", val.unwrap());
 
     // Verify trace events
-    let trace_events = sm.db().query_events(session_id, |q| {
-        q.event_type(EventType::FunctionEnter).limit(50)
-    }).unwrap();
+    let trace_events = sm
+        .db()
+        .query_events(session_id, |q| {
+            q.event_type(EventType::FunctionEnter).limit(50)
+        })
+        .unwrap();
 
     eprintln!("  trace events captured: {}", trace_events.len());
-    assert!(trace_events.len() > 0, "Should have trace events during combined scenario");
+    assert!(
+        trace_events.len() > 0,
+        "Should have trace events during combined scenario"
+    );
 
     stop_session(sm, session_id).await;
     eprintln!("✓ Combined scenario (tracing + readVariable) complete");

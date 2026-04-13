@@ -71,14 +71,23 @@ fn test_vitest_detection() {
     let project = vitest_fixture_project();
 
     let adapter = runner.detect_adapter(&project, None, None).unwrap();
-    assert_eq!(adapter.name(), "vitest", "Should detect vitest from vitest.config.js");
+    assert_eq!(
+        adapter.name(),
+        "vitest",
+        "Should detect vitest from vitest.config.js"
+    );
 
     let confidence = adapter.detect(&project, None);
     eprintln!("Vitest confidence: {}", confidence);
-    assert!(confidence >= 90, "Vitest should detect fixture with high confidence");
+    assert!(
+        confidence >= 90,
+        "Vitest should detect fixture with high confidence"
+    );
 
     // Also test explicit framework override
-    let adapter = runner.detect_adapter(&project, Some("vitest"), None).unwrap();
+    let adapter = runner
+        .detect_adapter(&project, Some("vitest"), None)
+        .unwrap();
     assert_eq!(adapter.name(), "vitest");
 }
 
@@ -115,7 +124,10 @@ async fn test_vitest_full_suite(sm: &strobe::daemon::SessionManager) {
     );
 
     assert_eq!(result.framework, "vitest");
-    assert_eq!(result.result.summary.passed, TOTAL_TESTS, "Expected all tests to pass");
+    assert_eq!(
+        result.result.summary.passed, TOTAL_TESTS,
+        "Expected all tests to pass"
+    );
     assert_eq!(result.result.summary.failed, 0, "Expected 0 failing tests");
     assert!(result.result.failures.is_empty());
     assert_eq!(result.result.all_tests.len(), TOTAL_TESTS as usize);
@@ -125,8 +137,14 @@ async fn test_vitest_full_suite(sm: &strobe::daemon::SessionManager) {
 
     // Verify progress was tracked via STROBE_TEST events
     let p = progress.lock().unwrap();
-    assert!(p.has_custom_reporter, "Should have detected STROBE_TEST reporter");
-    eprintln!("Progress: passed={} failed={} skipped={}", p.passed, p.failed, p.skipped);
+    assert!(
+        p.has_custom_reporter,
+        "Should have detected STROBE_TEST reporter"
+    );
+    eprintln!(
+        "Progress: passed={} failed={} skipped={}",
+        p.passed, p.failed, p.skipped
+    );
 }
 
 async fn test_vitest_single_test(sm: &strobe::daemon::SessionManager) {
@@ -158,7 +176,10 @@ async fn test_vitest_single_test(sm: &strobe::daemon::SessionManager) {
         result.result.summary.passed, result.result.summary.failed,
     );
 
-    assert!(result.result.summary.passed >= 1, "Should pass at least 1 test");
+    assert!(
+        result.result.summary.passed >= 1,
+        "Should pass at least 1 test"
+    );
     assert_eq!(result.result.summary.failed, 0, "Should have no failures");
 }
 
@@ -194,7 +215,10 @@ async fn test_vitest_custom_command(sm: &strobe::daemon::SessionManager) {
     );
 
     assert_eq!(result.framework, "vitest");
-    assert_eq!(result.result.summary.passed, 3, "Expected 3 passing tests from math.test.js");
+    assert_eq!(
+        result.result.summary.passed, 3,
+        "Expected 3 passing tests from math.test.js"
+    );
     assert_eq!(result.result.summary.failed, 0);
 }
 
@@ -302,8 +326,11 @@ async fn test_multi_file_threads_pool(sm: &strobe::daemon::SessionManager) {
     );
 
     // All 10 test files (29 tests) must complete
-    assert_eq!(result.result.summary.passed, TOTAL_TESTS,
-        "All {} tests should pass with threads pool", TOTAL_TESTS);
+    assert_eq!(
+        result.result.summary.passed, TOTAL_TESTS,
+        "All {} tests should pass with threads pool",
+        TOTAL_TESTS
+    );
     assert_eq!(result.result.summary.failed, 0);
 
     // Must complete well within timeout
@@ -367,7 +394,9 @@ async fn test_forks_pool_deadlocks(sm: &strobe::daemon::SessionManager) {
     if result.result.summary.passed < TOTAL_TESTS {
         eprintln!(
             "CONFIRMED: forks pool failed to complete all tests ({}/{} passed, killed at {:.1}s)",
-            result.result.summary.passed, TOTAL_TESTS, elapsed.as_secs_f64(),
+            result.result.summary.passed,
+            TOTAL_TESTS,
+            elapsed.as_secs_f64(),
         );
     } else {
         // Rare: all tests completed despite forks pool. Log but don't fail —

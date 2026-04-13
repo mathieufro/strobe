@@ -1,14 +1,14 @@
 mod demangle;
-pub mod resolver;
 pub mod dwarf_resolver;
-pub mod python_resolver;
 pub mod js_resolver;
+pub mod python_resolver;
+pub mod resolver;
 
 pub use demangle::demangle_symbol;
-pub use resolver::{Language, ResolvedTarget, VariableResolution, SymbolResolver};
 pub use dwarf_resolver::DwarfResolver;
-pub use python_resolver::PythonResolver;
 pub use js_resolver::JsResolver;
+pub use python_resolver::PythonResolver;
+pub use resolver::{Language, ResolvedTarget, SymbolResolver, VariableResolution};
 
 #[cfg(test)]
 mod tests {
@@ -59,10 +59,17 @@ mod tests {
 
         for (mangled, expected_prefix) in cases {
             let demangled = demangle_symbol(mangled);
-            assert!(demangled.contains(expected_prefix),
-                "Demangling '{}' should contain '{}', got '{}'", mangled, expected_prefix, demangled);
-            assert!(!demangled.starts_with("_ZN"),
-                "Demangled should not start with _ZN");
+            assert!(
+                demangled.contains(expected_prefix),
+                "Demangling '{}' should contain '{}', got '{}'",
+                mangled,
+                expected_prefix,
+                demangled
+            );
+            assert!(
+                !demangled.starts_with("_ZN"),
+                "Demangled should not start with _ZN"
+            );
         }
     }
 }

@@ -18,8 +18,8 @@ fn bgrx_to_rgba(data: &[u8], width: usize, height: usize, stride: usize) -> Vec<
             let offset = row_start + x * 4;
             rgba.push(data[offset + 2]); // R
             rgba.push(data[offset + 1]); // G
-            rgba.push(data[offset]);     // B
-            rgba.push(0xFF);             // A
+            rgba.push(data[offset]); // B
+            rgba.push(0xFF); // A
         }
     }
     rgba
@@ -34,7 +34,7 @@ fn bgra_to_rgba(data: &[u8], width: usize, height: usize, stride: usize) -> Vec<
             let offset = row_start + x * 4;
             rgba.push(data[offset + 2]); // R
             rgba.push(data[offset + 1]); // G
-            rgba.push(data[offset]);     // B
+            rgba.push(data[offset]); // B
             rgba.push(data[offset + 3]); // A
         }
     }
@@ -50,7 +50,10 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     if rgba.len() != expected_len {
         return Err(crate::Error::Internal(format!(
             "RGBA buffer size {} doesn't match {}x{}x4={}",
-            rgba.len(), width, height, expected_len
+            rgba.len(),
+            width,
+            height,
+            expected_len
         )));
     }
 
@@ -125,11 +128,7 @@ struct WindowInfo {
 }
 
 /// Find the largest visible window for a given PID using _NET_WM_PID.
-fn find_main_window(
-    conn: &impl Connection,
-    screen: &Screen,
-    pid: u32,
-) -> Result<WindowInfo> {
+fn find_main_window(conn: &impl Connection, screen: &Screen, pid: u32) -> Result<WindowInfo> {
     let net_client_list = conn
         .intern_atom(false, b"_NET_CLIENT_LIST")
         .map_err(|e| crate::Error::Internal(format!("intern atom: {}", e)))?
@@ -146,12 +145,22 @@ fn find_main_window(
 
     // Get window list from root
     let reply = conn
-        .get_property(false, screen.root, net_client_list, AtomEnum::WINDOW, 0, 1024)
+        .get_property(
+            false,
+            screen.root,
+            net_client_list,
+            AtomEnum::WINDOW,
+            0,
+            1024,
+        )
         .map_err(|e| crate::Error::Internal(format!("get_property: {}", e)))?
         .reply()
-        .map_err(|e| crate::Error::UiQueryFailed(format!(
-            "Window manager does not support _NET_CLIENT_LIST: {}", e
-        )))?;
+        .map_err(|e| {
+            crate::Error::UiQueryFailed(format!(
+                "Window manager does not support _NET_CLIENT_LIST: {}",
+                e
+            ))
+        })?;
 
     let window_ids: Vec<u32> = reply
         .value32()
@@ -160,7 +169,7 @@ fn find_main_window(
 
     if window_ids.is_empty() {
         return Err(crate::Error::UiQueryFailed(
-            "No windows reported by window manager".into()
+            "No windows reported by window manager".into(),
         ));
     }
 
@@ -201,9 +210,9 @@ fn find_main_window(
         }
     }
 
-    best.ok_or_else(|| crate::Error::UiQueryFailed(format!(
-        "No visible window found for PID {}", pid
-    )))
+    best.ok_or_else(|| {
+        crate::Error::UiQueryFailed(format!("No visible window found for PID {}", pid))
+    })
 }
 
 /// Capture a screenshot of the main window for a given PID.
@@ -232,13 +241,11 @@ pub fn capture_window_screenshot(pid: u32) -> Result<Vec<u8>> {
         .get_window_attributes(win.id)
         .map_err(|e| crate::Error::Internal(format!("get_window_attributes: {}", e)))?
         .reply()
-        .map_err(|e| crate::Error::UiQueryFailed(format!(
-            "Cannot get window attributes: {}", e
-        )))?;
+        .map_err(|e| crate::Error::UiQueryFailed(format!("Cannot get window attributes: {}", e)))?;
 
     if attrs.map_state != MapState::VIEWABLE {
         return Err(crate::Error::UiQueryFailed(
-            "Window is not visible (may be minimized)".into()
+            "Window is not visible (may be minimized)".into(),
         ));
     }
 
@@ -255,9 +262,7 @@ pub fn capture_window_screenshot(pid: u32) -> Result<Vec<u8>> {
         )
         .map_err(|e| crate::Error::Internal(format!("get_image: {}", e)))?
         .reply()
-        .map_err(|e| crate::Error::UiQueryFailed(format!(
-            "Screenshot capture failed: {}", e
-        )))?;
+        .map_err(|e| crate::Error::UiQueryFailed(format!("Screenshot capture failed: {}", e)))?;
 
     let depth = image.depth;
     let w = win.width as usize;
@@ -269,7 +274,8 @@ pub fn capture_window_screenshot(pid: u32) -> Result<Vec<u8>> {
         32 if image.data.len() >= w * h * 4 => bgra_to_rgba(&image.data, w, h, stride),
         _ => {
             return Err(crate::Error::UiQueryFailed(format!(
-                "Unsupported pixel depth: {}", depth
+                "Unsupported pixel depth: {}",
+                depth
             )));
         }
     };
@@ -283,9 +289,7 @@ pub fn capture_element_screenshot(
     element_bounds: &crate::ui::tree::Rect,
 ) -> Result<Vec<u8>> {
     let (conn, screen_num) = x11rb::connect(None).map_err(|e| {
-        crate::Error::UiNotAvailable(format!(
-            "Cannot connect to X11 display: {}", e
-        ))
+        crate::Error::UiNotAvailable(format!("Cannot connect to X11 display: {}", e))
     })?;
 
     let screen = &conn.setup().roots[screen_num];
@@ -295,13 +299,11 @@ pub fn capture_element_screenshot(
         .get_window_attributes(win.id)
         .map_err(|e| crate::Error::Internal(format!("get_window_attributes: {}", e)))?
         .reply()
-        .map_err(|e| crate::Error::UiQueryFailed(format!(
-            "Cannot get window attributes: {}", e
-        )))?;
+        .map_err(|e| crate::Error::UiQueryFailed(format!("Cannot get window attributes: {}", e)))?;
 
     if attrs.map_state != MapState::VIEWABLE {
         return Err(crate::Error::UiQueryFailed(
-            "Window is not visible (may be minimized)".into()
+            "Window is not visible (may be minimized)".into(),
         ));
     }
 
@@ -318,9 +320,7 @@ pub fn capture_element_screenshot(
         )
         .map_err(|e| crate::Error::Internal(format!("get_image: {}", e)))?
         .reply()
-        .map_err(|e| crate::Error::UiQueryFailed(format!(
-            "Screenshot capture failed: {}", e
-        )))?;
+        .map_err(|e| crate::Error::UiQueryFailed(format!("Screenshot capture failed: {}", e)))?;
 
     let depth = image.depth;
     let w = win.width as usize;
@@ -332,7 +332,8 @@ pub fn capture_element_screenshot(
         32 if image.data.len() >= w * h * 4 => bgra_to_rgba(&image.data, w, h, stride),
         _ => {
             return Err(crate::Error::UiQueryFailed(format!(
-                "Unsupported pixel depth: {}", depth
+                "Unsupported pixel depth: {}",
+                depth
             )));
         }
     };
@@ -343,14 +344,16 @@ pub fn capture_element_screenshot(
 
     // Compute crop coordinates relative to window origin, adjusting for scale factor.
     // AT-SPI2 bounds are in logical (screen) coords; X11 image is in physical (pixel) coords.
-    let crop_x = (((element_bounds.x - win.x as f64) * scale).round().max(0.0) as usize).min(w.saturating_sub(1));
-    let crop_y = (((element_bounds.y - win.y as f64) * scale).round().max(0.0) as usize).min(h.saturating_sub(1));
+    let crop_x = (((element_bounds.x - win.x as f64) * scale).round().max(0.0) as usize)
+        .min(w.saturating_sub(1));
+    let crop_y = (((element_bounds.y - win.y as f64) * scale).round().max(0.0) as usize)
+        .min(h.saturating_sub(1));
     let crop_w = ((element_bounds.w * scale).round() as usize).min(w - crop_x);
     let crop_h = ((element_bounds.h * scale).round() as usize).min(h - crop_y);
 
     if crop_w == 0 || crop_h == 0 {
         return Err(crate::Error::UiQueryFailed(
-            "Element has zero-size bounds after cropping".into()
+            "Element has zero-size bounds after cropping".into(),
         ));
     }
 
@@ -379,28 +382,19 @@ mod tests {
 
     #[test]
     fn test_bgrx_to_rgba_two_pixels() {
-        let data = vec![
-            0x10, 0x20, 0x30, 0x00,
-            0xAA, 0xBB, 0xCC, 0x00,
-        ];
+        let data = vec![0x10, 0x20, 0x30, 0x00, 0xAA, 0xBB, 0xCC, 0x00];
         let rgba = bgrx_to_rgba(&data, 2, 1, 8);
-        assert_eq!(rgba, vec![
-            0x30, 0x20, 0x10, 0xFF,
-            0xCC, 0xBB, 0xAA, 0xFF,
-        ]);
+        assert_eq!(rgba, vec![0x30, 0x20, 0x10, 0xFF, 0xCC, 0xBB, 0xAA, 0xFF,]);
     }
 
     #[test]
     fn test_bgrx_to_rgba_with_stride_padding() {
         let data = vec![
-            0x10, 0x20, 0x30, 0x00, 0xDE, 0xAD, 0xBE, 0xEF,
-            0xAA, 0xBB, 0xCC, 0x00, 0xDE, 0xAD, 0xBE, 0xEF,
+            0x10, 0x20, 0x30, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0xAA, 0xBB, 0xCC, 0x00, 0xDE, 0xAD,
+            0xBE, 0xEF,
         ];
         let rgba = bgrx_to_rgba(&data, 1, 2, 8);
-        assert_eq!(rgba, vec![
-            0x30, 0x20, 0x10, 0xFF,
-            0xCC, 0xBB, 0xAA, 0xFF,
-        ]);
+        assert_eq!(rgba, vec![0x30, 0x20, 0x10, 0xFF, 0xCC, 0xBB, 0xAA, 0xFF,]);
     }
 
     #[test]
@@ -472,7 +466,11 @@ mod tests {
         let scale = 2.0; // 2x HiDPI
         let w: usize = 1920;
 
-        let crop_x = (((element_x - win_x) * scale).round().max(0.0) as usize).min(w.saturating_sub(1));
-        assert_eq!(crop_x, 200, "100 logical pixels * 2x scale = 200 physical pixels");
+        let crop_x =
+            (((element_x - win_x) * scale).round().max(0.0) as usize).min(w.saturating_sub(1));
+        assert_eq!(
+            crop_x, 200,
+            "100 logical pixels * 2x scale = 200 physical pixels"
+        );
     }
 }

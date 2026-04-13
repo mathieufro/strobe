@@ -38,10 +38,7 @@ impl super::Database {
         Ok(result.map(|avg| avg.round() as u64))
     }
 
-    pub fn get_project_baselines(
-        &self,
-        project_root: &str,
-    ) -> crate::Result<HashMap<String, u64>> {
+    pub fn get_project_baselines(&self, project_root: &str) -> crate::Result<HashMap<String, u64>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
             "SELECT test_name, AVG(duration_ms) FROM (
@@ -50,7 +47,7 @@ impl super::Database {
                 FROM test_baselines
                 WHERE project_root = ?1 AND status = 'passed'
             ) WHERE rn <= 10
-            GROUP BY test_name"
+            GROUP BY test_name",
         )?;
         let mut map = HashMap::new();
         let rows = stmt.query_map(params![project_root], |row| {
@@ -93,16 +90,20 @@ mod tests {
         assert!(baseline.is_none());
 
         // Record some runs
-        db.record_test_baseline("test_auth", "/project", 1000, "passed").unwrap();
-        db.record_test_baseline("test_auth", "/project", 1200, "passed").unwrap();
-        db.record_test_baseline("test_auth", "/project", 1100, "passed").unwrap();
+        db.record_test_baseline("test_auth", "/project", 1000, "passed")
+            .unwrap();
+        db.record_test_baseline("test_auth", "/project", 1200, "passed")
+            .unwrap();
+        db.record_test_baseline("test_auth", "/project", 1100, "passed")
+            .unwrap();
 
         // Average of last 10 passed runs
         let baseline = db.get_test_baseline("test_auth", "/project").unwrap();
         assert_eq!(baseline, Some(1100)); // avg(1000, 1200, 1100) = 1100
 
         // Failed runs should not affect baseline
-        db.record_test_baseline("test_auth", "/project", 9999, "failed").unwrap();
+        db.record_test_baseline("test_auth", "/project", 9999, "failed")
+            .unwrap();
         let baseline = db.get_test_baseline("test_auth", "/project").unwrap();
         assert_eq!(baseline, Some(1100)); // unchanged
     }
@@ -111,9 +112,12 @@ mod tests {
     fn test_project_baselines_batch() {
         let db = Database::open_in_memory().unwrap();
 
-        db.record_test_baseline("test_a", "/project", 500, "passed").unwrap();
-        db.record_test_baseline("test_b", "/project", 1500, "passed").unwrap();
-        db.record_test_baseline("test_a", "/project", 700, "passed").unwrap();
+        db.record_test_baseline("test_a", "/project", 500, "passed")
+            .unwrap();
+        db.record_test_baseline("test_b", "/project", 1500, "passed")
+            .unwrap();
+        db.record_test_baseline("test_a", "/project", 700, "passed")
+            .unwrap();
 
         let baselines = db.get_project_baselines("/project").unwrap();
         assert_eq!(baselines.get("test_a"), Some(&600)); // avg(500, 700)
@@ -126,7 +130,8 @@ mod tests {
 
         // Record 25 entries
         for i in 0..25 {
-            db.record_test_baseline("test_x", "/project", 1000 + i, "passed").unwrap();
+            db.record_test_baseline("test_x", "/project", 1000 + i, "passed")
+                .unwrap();
         }
 
         db.cleanup_old_baselines("/project").unwrap();

@@ -51,7 +51,10 @@ fn test_line_table_errors() {
     // Line 1 has no code, but resolve_line snaps forward to nearest executable line
     let result = parser.resolve_line("main.cpp", 1);
     if let Some((_addr, actual_line)) = result {
-        assert!(actual_line > 1, "Should snap forward past #include directives");
+        assert!(
+            actual_line > 1,
+            "Should snap forward past #include directives"
+        );
     }
 
     // Non-existent file

@@ -1,11 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookMode {
-    Full,   // enter + exit, no sampling
-    Light,  // enter + exit, adaptive sampling
+    Full,  // enter + exit, no sampling
+    Light, // enter + exit, adaptive sampling
 }
 
 pub struct HookManager {
@@ -90,7 +90,10 @@ mod tests {
 
     #[test]
     fn test_classify_file_pattern_is_light() {
-        assert_eq!(HookManager::classify_pattern("@file:layout_manager"), HookMode::Light);
+        assert_eq!(
+            HookManager::classify_pattern("@file:layout_manager"),
+            HookMode::Light
+        );
     }
 
     #[test]
@@ -100,37 +103,61 @@ mod tests {
 
     #[test]
     fn test_classify_with_count_upgrades_small_match() {
-        assert_eq!(HookManager::classify_with_count("@file:tiny", 5), HookMode::Full);
-        assert_eq!(HookManager::classify_with_count("@file:tiny", 10), HookMode::Full);
+        assert_eq!(
+            HookManager::classify_with_count("@file:tiny", 5),
+            HookMode::Full
+        );
+        assert_eq!(
+            HookManager::classify_with_count("@file:tiny", 10),
+            HookMode::Full
+        );
     }
 
     #[test]
     fn test_classify_with_count_keeps_large_match_light() {
-        assert_eq!(HookManager::classify_with_count("@file:big", 11), HookMode::Light);
-        assert_eq!(HookManager::classify_with_count("@file:big", 100), HookMode::Light);
+        assert_eq!(
+            HookManager::classify_with_count("@file:big", 11),
+            HookMode::Light
+        );
+        assert_eq!(
+            HookManager::classify_with_count("@file:big", 100),
+            HookMode::Light
+        );
     }
 
     #[test]
     fn test_classify_with_count_full_stays_full() {
-        assert_eq!(HookManager::classify_with_count("foo::bar", 1), HookMode::Full);
+        assert_eq!(
+            HookManager::classify_with_count("foo::bar", 1),
+            HookMode::Full
+        );
     }
 
     #[test]
     fn test_hookmode_serde() {
         assert_eq!(serde_json::to_string(&HookMode::Full).unwrap(), "\"full\"");
-        assert_eq!(serde_json::to_string(&HookMode::Light).unwrap(), "\"light\"");
-        assert_eq!(serde_json::from_str::<HookMode>("\"full\"").unwrap(), HookMode::Full);
-        assert_eq!(serde_json::from_str::<HookMode>("\"light\"").unwrap(), HookMode::Light);
+        assert_eq!(
+            serde_json::to_string(&HookMode::Light).unwrap(),
+            "\"light\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HookMode>("\"full\"").unwrap(),
+            HookMode::Full
+        );
+        assert_eq!(
+            serde_json::from_str::<HookMode>("\"light\"").unwrap(),
+            HookMode::Light
+        );
     }
 
     #[test]
     fn test_classify_mode_splitting() {
         // Simulate the mode-splitting logic from spawner::add_patterns
         let patterns = vec![
-            ("foo::bar".to_string(), 1),       // exact -> Full
-            ("foo::**".to_string(), 50),        // deep glob, many -> Light
-            ("@file:tiny".to_string(), 3),      // file pattern, few -> upgraded to Full
-            ("@file:big".to_string(), 200),     // file pattern, many -> Light
+            ("foo::bar".to_string(), 1),    // exact -> Full
+            ("foo::**".to_string(), 50),    // deep glob, many -> Light
+            ("@file:tiny".to_string(), 3),  // file pattern, few -> upgraded to Full
+            ("@file:big".to_string(), 200), // file pattern, many -> Light
         ];
 
         let mut full_count = 0;
@@ -144,7 +171,7 @@ mod tests {
             }
         }
 
-        assert_eq!(full_count, 4);    // foo::bar(1) + @file:tiny(3)
+        assert_eq!(full_count, 4); // foo::bar(1) + @file:tiny(3)
         assert_eq!(light_count, 250); // foo::**(50) + @file:big(200)
     }
 }

@@ -96,12 +96,7 @@ impl TestAdapter for CargoTestAdapter {
         })
     }
 
-    fn parse_output(
-        &self,
-        stdout: &str,
-        stderr: &str,
-        exit_code: i32,
-    ) -> TestResult {
+    fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
         let mut passed = 0u32;
         let mut failed = 0u32;
         let mut skipped = 0u32;
@@ -111,9 +106,11 @@ impl TestAdapter for CargoTestAdapter {
         // Track tests that received libtest's informational "timeout" event (60s warning).
         // These are NOT failures — the test keeps running and will emit "ok" or "failed" later.
         // We only report them as failures if no final result arrives (process was killed).
-        let mut timed_out_tests: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut timed_out_tests: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         // Track tests that received a final result ("ok" or "failed").
-        let mut resolved_tests: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved_tests: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for line in stdout.lines() {
             let line = line.trim();
@@ -132,21 +129,32 @@ impl TestAdapter for CargoTestAdapter {
             match (event_type, event) {
                 ("test", "ok") => {
                     passed += 1;
-                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let name = v
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let exec_time = v.get("exec_time").and_then(|t| t.as_f64()).unwrap_or(0.0);
                     resolved_tests.insert(name.clone());
                     all_tests.push(TestDetail {
                         name,
                         status: TestStatus::Pass,
                         duration_ms: (exec_time * 1000.0) as u64,
-                        stdout: v.get("stdout").and_then(|s| s.as_str()).map(|s| s.to_string()),
+                        stdout: v
+                            .get("stdout")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
                         stderr: None,
                         message: None,
                     });
                 }
                 ("test", "failed") => {
                     failed += 1;
-                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let name = v
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let exec_time = v.get("exec_time").and_then(|t| t.as_f64()).unwrap_or(0.0);
                     let test_stdout = v.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
                     let (file, line_num, message) = parse_panic_location(test_stdout);
@@ -175,12 +183,20 @@ impl TestAdapter for CargoTestAdapter {
                     // keeps running. Don't count as failure yet; the authoritative
                     // "ok"/"failed" event will come later. Only report as failure if
                     // the process is killed before the final result arrives.
-                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let name = v
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     timed_out_tests.insert(name);
                 }
                 ("test", "ignored") => {
                     skipped += 1;
-                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let name = v
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     all_tests.push(TestDetail {
                         name,
                         status: TestStatus::Skip,
@@ -221,7 +237,10 @@ impl TestAdapter for CargoTestAdapter {
                     duration_ms: 0,
                     stdout: None,
                     stderr: None,
-                    message: Some(format!("Test '{}' timed out (killed before completion)", name)),
+                    message: Some(format!(
+                        "Test '{}' timed out (killed before completion)",
+                        name
+                    )),
                 });
             }
         }
@@ -357,7 +376,8 @@ fn parse_crash_from_stderr(stderr: &str) -> Vec<TestFailure> {
                         if let Some(path_end) = after_tick.find('`') {
                             let path = &after_tick[..path_end];
                             // Split on / or space, take the binary name
-                            return path.split(&['/', ' '][..])
+                            return path
+                                .split(&['/', ' '][..])
                                 .find(|s| !s.is_empty() && !s.starts_with('-'))
                                 .unwrap_or("(unknown binary)")
                                 .to_string();
@@ -396,9 +416,7 @@ fn parse_panic_location(stdout: &str) -> (Option<String>, Option<u32>, String) {
             if parts.len() >= 2 {
                 let file = parts[0].trim().to_string();
                 let line_num = parts[1].trim().parse::<u32>().ok();
-                let msg_start = stdout.find(line)
-                    .map(|i| i + line.len())
-                    .unwrap_or(0);
+                let msg_start = stdout.find(line).map(|i| i + line.len()).unwrap_or(0);
                 let message = stdout[msg_start..].trim().to_string();
                 let message = if message.is_empty() {
                     stdout.to_string()
@@ -414,13 +432,19 @@ fn parse_panic_location(stdout: &str) -> (Option<String>, Option<u32>, String) {
 
 /// Parse Cargo JSON output and update progress incrementally.
 /// Input may contain multiple JSON lines (stdout chunks from Frida can batch lines).
-pub fn update_progress(text: &str, progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>) {
+pub fn update_progress(
+    text: &str,
+    progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>,
+) {
     for line in text.lines() {
         update_progress_line(line, progress);
     }
 }
 
-fn update_progress_line(line: &str, progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>) {
+fn update_progress_line(
+    line: &str,
+    progress: &std::sync::Arc<std::sync::Mutex<super::TestProgress>>,
+) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -457,21 +481,24 @@ fn update_progress_line(line: &str, progress: &std::sync::Arc<std::sync::Mutex<s
         ("test", "started") => {
             p.phase = super::TestPhase::Running;
             if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-                p.running_tests.insert(name.to_string(), std::time::Instant::now());
+                p.running_tests
+                    .insert(name.to_string(), std::time::Instant::now());
             }
         }
         ("test", "ok") => {
             p.passed += 1;
             let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
             if let Some(started) = p.running_tests.remove(name) {
-                p.test_durations.insert(name.to_string(), started.elapsed().as_millis() as u64);
+                p.test_durations
+                    .insert(name.to_string(), started.elapsed().as_millis() as u64);
             }
         }
         ("test", "failed") => {
             p.failed += 1;
             let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
             if let Some(started) = p.running_tests.remove(name) {
-                p.test_durations.insert(name.to_string(), started.elapsed().as_millis() as u64);
+                p.test_durations
+                    .insert(name.to_string(), started.elapsed().as_millis() as u64);
             }
         }
         ("test", "timeout") => {
@@ -567,11 +594,13 @@ mod tests {
     #[test]
     fn test_suite_command_unit() {
         let adapter = CargoTestAdapter;
-        let cmd = adapter.suite_command(
-            Path::new("/project"),
-            Some(TestLevel::Unit),
-            &HashMap::new(),
-        ).unwrap();
+        let cmd = adapter
+            .suite_command(
+                Path::new("/project"),
+                Some(TestLevel::Unit),
+                &HashMap::new(),
+            )
+            .unwrap();
         assert_eq!(cmd.program, "cargo");
         assert!(cmd.args.contains(&"--lib".to_string()));
         assert!(cmd.args.contains(&"--format".to_string()));
@@ -581,13 +610,14 @@ mod tests {
     fn test_single_test_command_function_name() {
         let adapter = CargoTestAdapter;
         // Function name filter (no matching tests/<name>.rs) → --tests + filter
-        let cmd = adapter.single_test_command(
-            Path::new("/tmp"),
-            "parser::tests::test_empty_input",
-        ).unwrap();
+        let cmd = adapter
+            .single_test_command(Path::new("/tmp"), "parser::tests::test_empty_input")
+            .unwrap();
         assert_eq!(cmd.program, "cargo");
         assert!(cmd.args.contains(&"--tests".to_string()));
-        assert!(cmd.args.contains(&"parser::tests::test_empty_input".to_string()));
+        assert!(cmd
+            .args
+            .contains(&"parser::tests::test_empty_input".to_string()));
     }
 
     #[test]
@@ -595,10 +625,9 @@ mod tests {
         let adapter = CargoTestAdapter;
         // If tests/<name>.rs exists, use --test <name> (no function filter)
         // We test this with the actual project root which has tests/
-        let cmd = adapter.single_test_command(
-            Path::new("."),
-            "frida_e2e",
-        ).unwrap();
+        let cmd = adapter
+            .single_test_command(Path::new("."), "frida_e2e")
+            .unwrap();
         assert_eq!(cmd.program, "cargo");
         assert!(cmd.args.contains(&"--test".to_string()));
         assert!(cmd.args.contains(&"frida_e2e".to_string()));
@@ -623,7 +652,10 @@ mod tests {
         // exit_code 101 = cargo's "test failed" code
         let result = adapter.parse_output(stdout, stderr, 101);
         assert_eq!(result.summary.passed, 1);
-        assert_eq!(result.summary.failed, 1, "Crash should be counted as a failure");
+        assert_eq!(
+            result.summary.failed, 1,
+            "Crash should be counted as a failure"
+        );
         assert_eq!(result.failures.len(), 1);
         assert!(result.failures[0].name.contains("phase2a_gaps"));
         assert!(result.failures[0].message.contains("SIGSEGV"));
@@ -669,7 +701,10 @@ mod tests {
 "#;
         let result = adapter.parse_output(stdout, "", 0);
         assert_eq!(result.summary.passed, 1);
-        assert_eq!(result.summary.failed, 0, "Timeout warning followed by ok should not be a failure");
+        assert_eq!(
+            result.summary.failed, 0,
+            "Timeout warning followed by ok should not be a failure"
+        );
         assert!(result.failures.is_empty());
     }
 
@@ -686,6 +721,8 @@ mod tests {
         assert_eq!(result.summary.failed, 1);
         assert_eq!(result.failures.len(), 1);
         assert!(result.failures[0].message.contains("timed out"));
-        assert!(result.failures[0].message.contains("killed before completion"));
+        assert!(result.failures[0]
+            .message
+            .contains("killed before completion"));
     }
 }

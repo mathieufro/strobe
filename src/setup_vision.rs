@@ -23,10 +23,11 @@ fn check_models_installed(models_dir: &Path) -> ModelsStatus {
     let florence2_path = models_dir.join("icon_caption/model.safetensors");
 
     let yolo_size = yolo_path.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0;
-    let florence2_size = florence2_path.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0;
+    let florence2_size =
+        florence2_path.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1024.0 / 1024.0;
 
     ModelsStatus {
-        yolo_ok: yolo_size > 20.0,        // Fine-tuned is ~39MB, generic COCO is ~6MB
+        yolo_ok: yolo_size > 20.0, // Fine-tuned is ~39MB, generic COCO is ~6MB
         yolo_size_mb: yolo_size,
         florence2_ok: florence2_size > 500.0, // Fine-tuned is ~1GB
         florence2_size_mb: florence2_size,
@@ -123,10 +124,13 @@ fn ensure_flash_attn_stub(venv_python: &Path) -> crate::Result<()> {
             .output()
             .map_err(|e| crate::Error::Internal(format!("Failed to get site-packages: {}", e)))?;
 
-        let site_packages = String::from_utf8_lossy(&site_pkg_output.stdout).trim().to_string();
+        let site_packages = String::from_utf8_lossy(&site_pkg_output.stdout)
+            .trim()
+            .to_string();
         let stub_dir = Path::new(&site_packages).join("flash_attn");
-        std::fs::create_dir_all(&stub_dir)
-            .map_err(|e| crate::Error::Internal(format!("Failed to create flash_attn stub dir: {}", e)))?;
+        std::fs::create_dir_all(&stub_dir).map_err(|e| {
+            crate::Error::Internal(format!("Failed to create flash_attn stub dir: {}", e))
+        })?;
         std::fs::write(
             stub_dir.join("__init__.py"),
             "\"\"\"Stub for flash_attn on non-CUDA platforms.\"\"\"\n",
@@ -159,7 +163,10 @@ pub fn setup_vision() -> crate::Result<()> {
 
         println!("Already installed:");
         println!("  YOLO icon detection:   {:.1} MB", status.yolo_size_mb);
-        println!("  Florence-2 captioning: {:.0} MB", status.florence2_size_mb);
+        println!(
+            "  Florence-2 captioning: {:.0} MB",
+            status.florence2_size_mb
+        );
         println!("  Python venv:           {}", venv_python.display());
         println!("\nVision is ready. Nothing to do.");
         return Ok(());

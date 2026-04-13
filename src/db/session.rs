@@ -1,7 +1,7 @@
+use super::Database;
+use crate::Result;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use crate::Result;
-use super::Database;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,7 +55,8 @@ impl Session {
             pid: row.get(3)?,
             started_at: row.get(4)?,
             ended_at: row.get(5)?,
-            status: SessionStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(SessionStatus::Stopped),
+            status: SessionStatus::from_str(&row.get::<_, String>(6)?)
+                .unwrap_or(SessionStatus::Stopped),
             retained: retained_at.is_some(),
             retained_at,
             size_bytes: row.get(8).ok().flatten(),
@@ -86,7 +87,10 @@ impl Database {
             params![ended_at],
         )?;
         if count > 0 {
-            tracing::info!("Cleaned up {} stale running sessions from previous daemon", count);
+            tracing::info!(
+                "Cleaned up {} stale running sessions from previous daemon",
+                count
+            );
         }
         Ok(())
     }
@@ -123,28 +127,29 @@ impl Database {
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(
-            &format!("{} FROM sessions WHERE id = ?", SESSION_SELECT)
-        )?;
+        let mut stmt = conn.prepare(&format!("{} FROM sessions WHERE id = ?", SESSION_SELECT))?;
         optional_query(stmt.query_row(params![id], Session::from_row))
     }
 
     pub fn get_running_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(
-            &format!("{} FROM sessions WHERE status = 'running'", SESSION_SELECT)
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{} FROM sessions WHERE status = 'running'",
+            SESSION_SELECT
+        ))?;
 
-        let sessions = stmt.query_map([], Session::from_row)?
+        let sessions = stmt
+            .query_map([], Session::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(sessions)
     }
 
     pub fn get_session_by_binary(&self, binary_path: &str) -> Result<Option<Session>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(
-            &format!("{} FROM sessions WHERE binary_path = ? AND status = 'running'", SESSION_SELECT)
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{} FROM sessions WHERE binary_path = ? AND status = 'running'",
+            SESSION_SELECT
+        ))?;
         optional_query(stmt.query_row(params![binary_path], Session::from_row))
     }
 
@@ -152,17 +157,20 @@ impl Database {
         let conn = self.connection();
 
         // Validate transition: Stopped is a terminal state
-        let current: Option<String> = conn.query_row(
-            "SELECT status FROM sessions WHERE id = ?",
-            params![id],
-            |row| row.get(0),
-        ).ok();
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT status FROM sessions WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .ok();
 
         if let Some(ref current_str) = current {
             if current_str == "stopped" && new_status != SessionStatus::Stopped {
                 tracing::warn!(
                     "Ignoring invalid transition from stopped to {} for session {}",
-                    new_status.as_str(), id
+                    new_status.as_str(),
+                    id
                 );
                 return Ok(());
             }
@@ -184,10 +192,7 @@ impl Database {
 
     pub fn update_session_pid(&self, id: &str, pid: u32) -> Result<()> {
         let conn = self.connection();
-        conn.execute(
-            "UPDATE sessions SET pid = ? WHERE id = ?",
-            params![pid, id],
-        )?;
+        conn.execute("UPDATE sessions SET pid = ? WHERE id = ?", params![pid, id])?;
         Ok(())
     }
 
@@ -232,11 +237,13 @@ impl Database {
 
     pub fn list_retained_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(
-            &format!("{} FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at DESC", SESSION_SELECT)
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{} FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at DESC",
+            SESSION_SELECT
+        ))?;
 
-        let sessions = stmt.query_map([], Session::from_row)?
+        let sessions = stmt
+            .query_map([], Session::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(sessions)
     }
@@ -257,9 +264,9 @@ impl Database {
             "SELECT id, COALESCE(size_bytes, 0) FROM sessions WHERE retained_at IS NOT NULL ORDER BY retained_at ASC"
         )?;
 
-        let sessions: Vec<(String, i64)> = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let sessions: Vec<(String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
         let mut remaining = total;

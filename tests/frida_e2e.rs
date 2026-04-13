@@ -15,7 +15,13 @@ async fn test_frida_e2e_scenarios() {
     let (sm, _dir) = create_session_manager();
     let cpp_str = cpp_bin.to_str().unwrap();
     let rust_str = rust_bin.to_str().unwrap();
-    let cpp_project = cpp_bin.parent().unwrap().parent().unwrap().to_str().unwrap();
+    let cpp_project = cpp_bin
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_str()
+        .unwrap();
     let rust_project = rust_bin
         .parent()
         .unwrap()
@@ -84,10 +90,20 @@ async fn scenario_output_capture(
     let session_id = "e2e-output";
 
     let pid = sm
-        .spawn_with_frida(session_id, binary, &["hello".to_string()], None, project_root, None, false, None)
+        .spawn_with_frida(
+            session_id,
+            binary,
+            &["hello".to_string()],
+            None,
+            project_root,
+            None,
+            false,
+            None,
+        )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
     assert!(pid > 0);
 
     let stdout_events = poll_events_typed(
@@ -103,7 +119,11 @@ async fn scenario_output_capture(
     .await;
 
     let all_stdout = collect_stdout(&stdout_events);
-    eprintln!("Stdout ({} events): {}", stdout_events.len(), all_stdout.trim());
+    eprintln!(
+        "Stdout ({} events): {}",
+        stdout_events.len(),
+        all_stdout.trim()
+    );
 
     assert!(
         all_stdout.contains("Hello from strobe_test_target"),
@@ -143,7 +163,8 @@ async fn scenario_cpp_tracing(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     let patterns = [
         "timing::fast".to_string(),
@@ -156,8 +177,14 @@ async fn scenario_cpp_tracing(
         .update_frida_patterns(session_id, Some(&patterns), None, None)
         .await
         .expect("Hook install must succeed — ensure C++ fixture has debug symbols (dsymutil)");
-    eprintln!("Hooked {} functions (matched: {})", hook_result.installed, hook_result.matched);
-    assert!(hook_result.installed > 0, "Must hook at least one timing function");
+    eprintln!(
+        "Hooked {} functions (matched: {})",
+        hook_result.installed, hook_result.matched
+    );
+    assert!(
+        hook_result.installed > 0,
+        "Must hook at least one timing function"
+    );
 
     // Poll for function exit events
     let exit_events = poll_events_typed(
@@ -165,7 +192,11 @@ async fn scenario_cpp_tracing(
         session_id,
         Duration::from_secs(10),
         strobe::db::EventType::FunctionExit,
-        |events| events.iter().any(|e| e.duration_ns.unwrap_or(0) >= 40_000_000),
+        |events| {
+            events
+                .iter()
+                .any(|e| e.duration_ns.unwrap_or(0) >= 40_000_000)
+        },
     )
     .await;
 
@@ -178,7 +209,10 @@ async fn scenario_cpp_tracing(
         );
     }
 
-    assert!(!exit_events.is_empty(), "Should capture function exit events");
+    assert!(
+        !exit_events.is_empty(),
+        "Should capture function exit events"
+    );
 
     // Verify slow functions have reasonable durations
     let has_slow = exit_events
@@ -215,7 +249,8 @@ async fn scenario_rust_tracing(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     let patterns = ["strobe_test_fixture::audio::**".to_string()];
     sm.add_patterns(session_id, &patterns).unwrap();
@@ -280,7 +315,8 @@ async fn scenario_crash_null(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Poll until a crash event appears.
     // On Linux, crash detection can be slow because Frida's exception handler does
@@ -293,7 +329,9 @@ async fn scenario_crash_null(
     .await;
 
     // Verify crash event first — this is the primary purpose of this test.
-    let has_crash = all_events.iter().any(|e| e.event_type == strobe::db::EventType::Crash);
+    let has_crash = all_events
+        .iter()
+        .any(|e| e.event_type == strobe::db::EventType::Crash);
     assert!(has_crash, "Should capture a crash event");
 
     // On Linux, stdout may still be in transit when the crash event arrives
@@ -302,12 +340,14 @@ async fn scenario_crash_null(
     let all_events = if collect_stdout(&all_events).is_empty() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         poll_events(sm, session_id, Duration::from_secs(3), |events| {
-            let text: String = events.iter()
+            let text: String = events
+                .iter()
                 .filter(|e| e.event_type == strobe::db::EventType::Stdout)
                 .filter_map(|e| e.text.as_deref())
                 .collect();
             text.contains("TARGET")
-        }).await
+        })
+        .await
     } else {
         all_events
     };
@@ -316,7 +356,9 @@ async fn scenario_crash_null(
     // context limits what the agent can do.
     let stdout = collect_stdout(&all_events);
     if stdout.is_empty() {
-        eprintln!("Note: stdout not captured before crash (expected on Linux in signal handler context)");
+        eprintln!(
+            "Note: stdout not captured before crash (expected on Linux in signal handler context)"
+        );
     }
 
     let crash_events: Vec<_> = all_events
@@ -335,9 +377,16 @@ async fn scenario_crash_null(
     );
 
     // Fault address
-    assert!(crash.fault_address.is_some(), "Crash should have fault_address");
+    assert!(
+        crash.fault_address.is_some(),
+        "Crash should have fault_address"
+    );
     let fault_addr = crash.fault_address.as_ref().unwrap();
-    assert!(fault_addr.starts_with("0x"), "Fault address should be hex: {}", fault_addr);
+    assert!(
+        fault_addr.starts_with("0x"),
+        "Fault address should be hex: {}",
+        fault_addr
+    );
 
     // Registers
     assert!(crash.registers.is_some(), "Crash should have registers");
@@ -387,7 +436,8 @@ async fn scenario_crash_abort(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     let all_events = poll_events(sm, session_id, Duration::from_secs(15), |events| {
         events.iter().any(|e| {
@@ -409,7 +459,8 @@ async fn scenario_crash_abort(
         let signal = crash.signal.as_ref().unwrap();
         eprintln!("Abort signal: {}", signal);
         assert!(
-            signal.contains("abort") || signal.contains("ABRT")
+            signal.contains("abort")
+                || signal.contains("ABRT")
                 || signal.contains("access-violation")
                 || signal.contains("SIGABRT"),
             "Signal should indicate abort: {}",
@@ -420,9 +471,13 @@ async fn scenario_crash_abort(
         // Accept if stdout was captured, or just warn.
         let stdout = collect_stdout(&all_events);
         if stdout.contains("About to abort") || stdout.contains("TARGET") {
-            eprintln!("Note: abort() not captured by Frida exception handler, but stdout was captured");
+            eprintln!(
+                "Note: abort() not captured by Frida exception handler, but stdout was captured"
+            );
         } else {
-            eprintln!("Note: abort() not captured by Frida, and stdout not captured (expected on Linux)");
+            eprintln!(
+                "Note: abort() not captured by Frida, and stdout not captured (expected on Linux)"
+            );
         }
     }
 
@@ -452,7 +507,8 @@ async fn scenario_fork_workers(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
     sm.resume_process(pid).await.expect("Resume must succeed");
 
     let stdout_events = poll_events_typed(
@@ -468,9 +524,16 @@ async fn scenario_fork_workers(
     .await;
 
     let all_stdout = collect_stdout(&stdout_events);
-    eprintln!("Fork stdout ({} events):\n{}", stdout_events.len(), all_stdout);
+    eprintln!(
+        "Fork stdout ({} events):\n{}",
+        stdout_events.len(),
+        all_stdout
+    );
 
-    assert!(all_stdout.contains("PARENT"), "Should capture parent stdout");
+    assert!(
+        all_stdout.contains("PARENT"),
+        "Should capture parent stdout"
+    );
     assert!(all_stdout.contains("PID="), "Should see PID info");
 
     let all_pids = sm.get_all_pids(session_id);
@@ -483,11 +546,7 @@ async fn scenario_fork_workers(
 
 // ─── Scenario 7: Fork Exec ──────────────────────────────────────────
 
-async fn scenario_fork_exec(
-    sm: &strobe::daemon::SessionManager,
-    binary: &str,
-    project_root: &str,
-) {
+async fn scenario_fork_exec(sm: &strobe::daemon::SessionManager, binary: &str, project_root: &str) {
     let session_id = "e2e-fork-exec";
 
     let pid = sm
@@ -503,7 +562,8 @@ async fn scenario_fork_exec(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
     sm.resume_process(pid).await.expect("Resume must succeed");
 
     let stdout_events = poll_events_typed(
@@ -552,7 +612,8 @@ async fn scenario_duration_query(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     let patterns = [
         "timing::fast".to_string(),
@@ -567,14 +628,21 @@ async fn scenario_duration_query(
         .await
         .expect("Hook install must succeed — ensure C++ fixture has debug symbols (dsymutil)");
     eprintln!("Hooked {} functions", hook_result.installed);
-    assert!(hook_result.installed > 0, "Must hook at least one timing function");
+    assert!(
+        hook_result.installed > 0,
+        "Must hook at least one timing function"
+    );
 
     let exit_events = poll_events_typed(
         sm,
         session_id,
         Duration::from_secs(10),
         strobe::db::EventType::FunctionExit,
-        |events| events.iter().any(|e| e.duration_ns.unwrap_or(0) >= 40_000_000),
+        |events| {
+            events
+                .iter()
+                .any(|e| e.duration_ns.unwrap_or(0) >= 40_000_000)
+        },
     )
     .await;
 
@@ -600,10 +668,11 @@ async fn scenario_duration_query(
         );
     }
 
-    let fast_in_slow = slow_events
-        .iter()
-        .any(|e| e.function_name.contains("fast"));
-    assert!(!fast_in_slow, "fast function should not appear in >= 40ms filter");
+    let fast_in_slow = slow_events.iter().any(|e| e.function_name.contains("fast"));
+    assert!(
+        !fast_in_slow,
+        "fast function should not appear in >= 40ms filter"
+    );
 
     let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
@@ -631,7 +700,8 @@ async fn scenario_time_range_query(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Wait for stdout to indicate completion
     let events = poll_events_typed(
@@ -694,7 +764,8 @@ async fn scenario_pattern_add_remove(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Add patterns
     let patterns = ["timing::fast".to_string(), "timing::slow".to_string()];
@@ -709,12 +780,7 @@ async fn scenario_pattern_add_remove(
 
     // Remove one pattern
     let remove_result = sm
-        .update_frida_patterns(
-            session_id,
-            None,
-            Some(&["timing::fast".to_string()]),
-            None,
-        )
+        .update_frida_patterns(session_id, None, Some(&["timing::fast".to_string()]), None)
         .await;
 
     match &remove_result {
@@ -748,7 +814,8 @@ async fn scenario_watch_variables(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Add trace pattern for a function that runs periodically
     let patterns = ["audio::process_buffer".to_string()];
@@ -774,7 +841,11 @@ async fn scenario_watch_variables(
 
     let type_kind_str = match &recipe.type_kind {
         strobe::dwarf::TypeKind::Integer { signed } => {
-            if *signed { "int".to_string() } else { "uint".to_string() }
+            if *signed {
+                "int".to_string()
+            } else {
+                "uint".to_string()
+            }
         }
         strobe::dwarf::TypeKind::Float => "float".to_string(),
         strobe::dwarf::TypeKind::Pointer => "pointer".to_string(),
@@ -796,7 +867,10 @@ async fn scenario_watch_variables(
     sm.update_frida_watches(session_id, watch_targets, vec![])
         .await
         .expect("Watch install must succeed");
-    eprintln!("Watch installed for g_counter at 0x{:x}", recipe.base_address);
+    eprintln!(
+        "Watch installed for g_counter at 0x{:x}",
+        recipe.base_address
+    );
 
     // Poll for events with watch values
     let events = poll_events(sm, session_id, Duration::from_secs(5), |events| {
@@ -853,7 +927,8 @@ async fn scenario_multithreaded(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Add trace patterns for audio functions
     let patterns = ["audio::*".to_string()];
@@ -863,8 +938,14 @@ async fn scenario_multithreaded(
         .update_frida_patterns(session_id, Some(&patterns), None, None)
         .await
         .expect("Hook install must succeed");
-    eprintln!("Hooked {} functions for threading test", hook_result.installed);
-    assert!(hook_result.installed > 0, "Must hook at least one audio function");
+    eprintln!(
+        "Hooked {} functions for threading test",
+        hook_result.installed
+    );
+    assert!(
+        hook_result.installed > 0,
+        "Must hook at least one audio function"
+    );
 
     // Poll for stdout completion
     let events = poll_events_typed(
@@ -889,7 +970,8 @@ async fn scenario_multithreaded(
     let func_events = sm
         .db()
         .query_events(session_id, |q| {
-            q.event_type(strobe::db::EventType::FunctionEnter).limit(200)
+            q.event_type(strobe::db::EventType::FunctionEnter)
+                .limit(200)
         })
         .unwrap();
 
@@ -936,7 +1018,8 @@ async fn scenario_read_oneshot(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Resume process now — it will start running the globals loop.
     // The globals mode runs 50 iterations × 100ms = ~5s total.
@@ -960,7 +1043,10 @@ async fn scenario_read_oneshot(
         .await
         .expect("execute_debug_read must succeed");
 
-    eprintln!("Read response: {}", serde_json::to_string_pretty(&response).unwrap());
+    eprintln!(
+        "Read response: {}",
+        serde_json::to_string_pretty(&response).unwrap()
+    );
 
     let results = response
         .get("results")
@@ -980,15 +1066,17 @@ async fn scenario_read_oneshot(
         .as_u64()
         .expect("g_counter should be a number");
     eprintln!("  g_counter = {}", counter_val);
-    assert!(counter_val <= 199, "g_counter should be 0-199, got {}", counter_val);
+    assert!(
+        counter_val <= 199,
+        "g_counter should be 0-199, got {}",
+        counter_val
+    );
 
     // g_tempo: double, set to 120.0 + (i % 10)
     let tempo = &results[1];
     assert_eq!(tempo["target"], "g_tempo");
     assert!(tempo.get("error").is_none(), "g_tempo read should succeed");
-    let tempo_val = tempo["value"]
-        .as_f64()
-        .expect("g_tempo should be a float");
+    let tempo_val = tempo["value"].as_f64().expect("g_tempo should be a float");
     eprintln!("  g_tempo = {}", tempo_val);
     assert!(
         (120.0..=129.0).contains(&tempo_val),
@@ -999,7 +1087,10 @@ async fn scenario_read_oneshot(
     // g_sample_rate: int64, constant 44100
     let sr = &results[2];
     assert_eq!(sr["target"], "g_sample_rate");
-    assert!(sr.get("error").is_none(), "g_sample_rate read should succeed");
+    assert!(
+        sr.get("error").is_none(),
+        "g_sample_rate read should succeed"
+    );
     let sr_val = sr["value"]
         .as_i64()
         .expect("g_sample_rate should be a number");
@@ -1032,7 +1123,8 @@ async fn scenario_read_struct(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Resume and wait for globals loop to run a few iterations.
     sm.resume_process(pid).await.expect("Resume must succeed");
@@ -1077,12 +1169,17 @@ async fn scenario_read_struct(
     let fields_obj = fields_val.as_object().unwrap();
     assert!(fields_obj.contains_key("x"), "Should have field 'x'");
     assert!(fields_obj.contains_key("y"), "Should have field 'y'");
-    assert!(fields_obj.contains_key("value"), "Should have field 'value'");
+    assert!(
+        fields_obj.contains_key("value"),
+        "Should have field 'value'"
+    );
 
     // In "globals" mode: g_point_ptr->x = i, y = i*2, value stays 99.9
     let x = fields_obj["x"].as_i64().expect("x should be a number");
     let y = fields_obj["y"].as_i64().expect("y should be a number");
-    let val = fields_obj["value"].as_f64().expect("value should be a float");
+    let val = fields_obj["value"]
+        .as_f64()
+        .expect("value should be a float");
 
     eprintln!("  Point {{ x: {}, y: {}, value: {} }}", x, y, val);
     assert!(x >= 0 && x <= 199, "x should be 0-199, got {}", x);
@@ -1099,11 +1196,7 @@ async fn scenario_read_struct(
 
 // ─── Scenario 15: debug_read — Poll Mode ─────────────────────────────
 
-async fn scenario_read_poll(
-    sm: &strobe::daemon::SessionManager,
-    binary: &str,
-    project_root: &str,
-) {
+async fn scenario_read_poll(sm: &strobe::daemon::SessionManager, binary: &str, project_root: &str) {
     let session_id = "e2e-read-poll";
 
     let pid = sm
@@ -1119,7 +1212,8 @@ async fn scenario_read_poll(
         )
         .await
         .unwrap();
-    sm.create_session(session_id, binary, project_root, pid).unwrap();
+    sm.create_session(session_id, binary, project_root, pid)
+        .unwrap();
 
     // Resume and wait for globals loop to start.
     sm.resume_process(pid).await.expect("Resume must succeed");
@@ -1180,7 +1274,9 @@ async fn scenario_read_poll(
             .arguments
             .as_ref()
             .expect("Snapshot event should have data in arguments field");
-        let data_obj = data.as_object().expect("Snapshot data should be a JSON object");
+        let data_obj = data
+            .as_object()
+            .expect("Snapshot data should be a JSON object");
         assert!(
             data_obj.contains_key("g_counter"),
             "Snapshot should contain g_counter"
@@ -1194,11 +1290,7 @@ async fn scenario_read_poll(
 
     // Verify snapshots show changing values (g_counter increments every 100ms)
     if snapshot_events.len() >= 2 {
-        let first = snapshot_events[0]
-            .arguments
-            .as_ref()
-            .unwrap()["g_counter"]
-            .as_u64();
+        let first = snapshot_events[0].arguments.as_ref().unwrap()["g_counter"].as_u64();
         let last = snapshot_events[snapshot_events.len() - 1]
             .arguments
             .as_ref()
@@ -1210,7 +1302,9 @@ async fn scenario_read_poll(
             // Over 1.5 seconds, g_counter should change (increments every 100ms)
             // Allow for both cases since timing isn't guaranteed
             if f == l {
-                eprintln!("  Warning: g_counter didn't change between snapshots (timing-dependent)");
+                eprintln!(
+                    "  Warning: g_counter didn't change between snapshots (timing-dependent)"
+                );
             }
         }
     }
@@ -1218,4 +1312,3 @@ async fn scenario_read_poll(
     let _ = sm.stop_frida(session_id).await;
     let _ = sm.stop_session(session_id);
 }
-

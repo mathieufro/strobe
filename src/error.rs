@@ -48,9 +48,15 @@ pub enum Error {
     TestAlreadyRunning(String),
 
     #[error("NO_CODE_AT_LINE: No executable code at {file}:{line}. Valid lines: {nearest_lines}")]
-    NoCodeAtLine { file: String, line: u32, nearest_lines: String },
+    NoCodeAtLine {
+        file: String,
+        line: u32,
+        nearest_lines: String,
+    },
 
-    #[error("OPTIMIZED_OUT: Variable '{variable}' is optimized out at this PC. Recompile with -O0.")]
+    #[error(
+        "OPTIMIZED_OUT: Variable '{variable}' is optimized out at this PC. Recompile with -O0."
+    )]
     OptimizedOut { variable: String },
 
     #[error("Database error: {0}")]

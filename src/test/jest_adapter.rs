@@ -1,6 +1,6 @@
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
-use serde::Deserialize;
 
 use super::adapter::*;
 
@@ -41,18 +41,31 @@ struct JestAssertion {
 
 impl TestAdapter for JestAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
-        for cfg in &["jest.config.js", "jest.config.ts", "jest.config.cjs", "jest.config.mjs"] {
-            if project_root.join(cfg).exists() { return 92; }
+        for cfg in &[
+            "jest.config.js",
+            "jest.config.ts",
+            "jest.config.cjs",
+            "jest.config.mjs",
+        ] {
+            if project_root.join(cfg).exists() {
+                return 92;
+            }
         }
         if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
             // Check for jest in dependencies (but NOT vitest — vitest takes priority)
-            if pkg.contains("\"jest\"") && !pkg.contains("\"vitest\"") { return 88; }
-            if pkg.contains("\"jest\"") { return 70; }
+            if pkg.contains("\"jest\"") && !pkg.contains("\"vitest\"") {
+                return 88;
+            }
+            if pkg.contains("\"jest\"") {
+                return 70;
+            }
         }
         0
     }
 
-    fn name(&self) -> &str { "jest" }
+    fn name(&self) -> &str {
+        "jest"
+    }
 
     fn suite_command(
         &self,
@@ -73,14 +86,19 @@ impl TestAdapter for JestAdapter {
         })
     }
 
-    fn single_test_command(&self, _project_root: &Path, test_name: &str) -> crate::Result<TestCommand> {
+    fn single_test_command(
+        &self,
+        _project_root: &Path,
+        test_name: &str,
+    ) -> crate::Result<TestCommand> {
         Ok(TestCommand {
             program: "npx".to_string(),
             args: vec![
                 "jest".to_string(),
                 "--json".to_string(),
                 "--no-coverage".to_string(),
-                "-t".to_string(), test_name.to_string(),
+                "-t".to_string(),
+                test_name.to_string(),
             ],
             env: HashMap::new(),
             cwd: None,
@@ -98,14 +116,26 @@ impl TestAdapter for JestAdapter {
                 let failures = if exit_code != 0 {
                     vec![TestFailure {
                         name: "Test run crashed".to_string(),
-                        file: None, line: None,
-                        message: format!("Could not parse jest output.\nstderr: {}", &stderr[..stderr.len().min(500)]),
+                        file: None,
+                        line: None,
+                        message: format!(
+                            "Could not parse jest output.\nstderr: {}",
+                            &stderr[..stderr.len().min(500)]
+                        ),
                         rerun: None,
                         suggested_traces: vec![],
                     }]
-                } else { vec![] };
+                } else {
+                    vec![]
+                };
                 return TestResult {
-                    summary: TestSummary { passed: 0, failed: 0, skipped: 0, stuck: None, duration_ms: 0 },
+                    summary: TestSummary {
+                        passed: 0,
+                        failed: 0,
+                        skipped: 0,
+                        stuck: None,
+                        duration_ms: 0,
+                    },
                     failures,
                     stuck: vec![],
                     all_tests: vec![],
@@ -115,7 +145,8 @@ impl TestAdapter for JestAdapter {
 
         let stack_re = regex::Regex::new(r"\(([^)]+\.(?:test|spec)\.\w+):(\d+):\d+\)").unwrap();
         // Also match Jest's "at Object.<anonymous> (file:line:col)" format
-        let stack_re2 = regex::Regex::new(r"at\s+\S+\s+\(([^)]+\.(?:test|spec)\.\w+):(\d+):\d+\)").unwrap();
+        let stack_re2 =
+            regex::Regex::new(r"at\s+\S+\s+\(([^)]+\.(?:test|spec)\.\w+):(\d+):\d+\)").unwrap();
         let mut failures = vec![];
         let mut all_tests = vec![];
         let mut total_duration_ms = 0u64;
@@ -142,17 +173,24 @@ impl TestAdapter for JestAdapter {
                     name: full_name.clone(),
                     status: status.clone(),
                     duration_ms,
-                    stdout: None, stderr: None, message: None,
+                    stdout: None,
+                    stderr: None,
+                    message: None,
                 });
 
                 if matches!(status, TestStatus::Fail) {
                     let msg = a.failure_messages.first().cloned().unwrap_or_default();
-                    let (file, line) = stack_re.captures(&msg)
+                    let (file, line) = stack_re
+                        .captures(&msg)
                         .or_else(|| stack_re2.captures(&msg))
                         .map(|c| (Some(c[1].to_string()), c[2].parse().ok()))
                         .unwrap_or_else(|| {
                             // Fall back to the suite-level file path
-                            let f = if suite.file_path.is_empty() { None } else { Some(suite.file_path.clone()) };
+                            let f = if suite.file_path.is_empty() {
+                                None
+                            } else {
+                                Some(suite.file_path.clone())
+                            };
                             (f, None)
                         });
 
@@ -185,7 +223,8 @@ impl TestAdapter for JestAdapter {
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String> {
         let mut traces = vec![];
         if let Some(file) = &failure.file {
-            let stem = Path::new(file).file_stem()
+            let stem = Path::new(file)
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("test");
             let module = stem.trim_end_matches(".test").trim_end_matches(".spec");
@@ -271,14 +310,20 @@ mod tests {
         let result = JestAdapter.parse_output(JEST_FAIL, "", 1);
         assert_eq!(result.summary.failed, 1);
         assert_eq!(result.failures[0].name, "Calculator multiply multiplies");
-        assert!(result.failures[0].file.as_deref().unwrap_or("").ends_with("calc.test.js"));
+        assert!(result.failures[0]
+            .file
+            .as_deref()
+            .unwrap_or("")
+            .ends_with("calc.test.js"));
         assert_eq!(result.failures[0].line, Some(15));
     }
 
     #[test]
     fn test_suite_command_uses_json_flag() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = JestAdapter.suite_command(dir.path(), None, &Default::default()).unwrap();
+        let cmd = JestAdapter
+            .suite_command(dir.path(), None, &Default::default())
+            .unwrap();
         assert!(cmd.args.iter().any(|a| a == "--json"));
     }
 }

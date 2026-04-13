@@ -89,14 +89,29 @@ pub fn merge_agent_capabilities(
     }
 
     // Update capability levels from agent
-    if let Some(ft) = agent_payload.get("functionTracing").and_then(|v| v.as_bool()) {
-        baseline.function_tracing = if ft { CapabilityLevel::Full } else { CapabilityLevel::None };
+    if let Some(ft) = agent_payload
+        .get("functionTracing")
+        .and_then(|v| v.as_bool())
+    {
+        baseline.function_tracing = if ft {
+            CapabilityLevel::Full
+        } else {
+            CapabilityLevel::None
+        };
     }
     if let Some(bp) = agent_payload.get("breakpoints").and_then(|v| v.as_bool()) {
-        baseline.breakpoints = if bp { CapabilityLevel::Full } else { CapabilityLevel::None };
+        baseline.breakpoints = if bp {
+            CapabilityLevel::Full
+        } else {
+            CapabilityLevel::None
+        };
     }
     if let Some(st) = agent_payload.get("stepping").and_then(|v| v.as_bool()) {
-        baseline.stepping = if st { CapabilityLevel::Full } else { CapabilityLevel::None };
+        baseline.stepping = if st {
+            CapabilityLevel::Full
+        } else {
+            CapabilityLevel::None
+        };
     }
 
     // Replace limitations if agent provides them

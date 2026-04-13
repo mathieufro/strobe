@@ -1,15 +1,17 @@
-use gimli::{self, RunTimeEndian, EndianSlice, SectionId};
-use object::{Object, ObjectSection, ObjectSegment, FileKind};
-use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
+use super::{
+    FunctionInfo, LocalVarLocation, LocalVariableInfo, TypeKind, VariableInfo, WatchRecipe,
+};
+use crate::symbols::demangle_symbol;
+use crate::{Error, Result};
+use gimli::{self, EndianSlice, RunTimeEndian, SectionId};
 use memmap2::Mmap;
+use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
+use object::{FileKind, Object, ObjectSection, ObjectSegment};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use crate::{Error, Result};
 use std::sync::Mutex;
-use rayon::prelude::*;
-use crate::symbols::demangle_symbol;
-use super::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation};
 
 /// Extract the native architecture slice from a fat (universal) Mach-O binary.
 /// Returns `(offset, size)` for the slice matching the current architecture,
@@ -26,7 +28,9 @@ fn extract_native_arch_range(data: &[u8]) -> Option<(u64, u64)> {
                 }
             }
             // Fallback: return first arch if no exact match
-            fat.arches().first().map(|a| (a.offset().into(), a.size().into()))
+            fat.arches()
+                .first()
+                .map(|a| (a.offset().into(), a.size().into()))
         }
         FileKind::MachOFat64 => {
             let fat = MachOFatFile64::parse(data).ok()?;
@@ -77,8 +81,8 @@ struct LoadedDwarf {
 /// Load DWARF sections from a binary file. Section data is copied into owned `Vec<u8>`
 /// so the returned value is self-contained with no lifetime dependencies on the mmap.
 fn load_dwarf_sections(path: &Path) -> Result<LoadedDwarf> {
-    let file = File::open(path)
-        .map_err(|e| Error::Frida(format!("Failed to open binary: {}", e)))?;
+    let file =
+        File::open(path).map_err(|e| Error::Frida(format!("Failed to open binary: {}", e)))?;
     let mmap = unsafe { Mmap::map(&file) }
         .map_err(|e| Error::Frida(format!("Failed to mmap binary: {}", e)))?;
     let object = parse_object_file(&mmap)
@@ -109,15 +113,18 @@ fn load_dwarf_sections(path: &Path) -> Result<LoadedDwarf> {
     let sections = gimli::DwarfSections::load(&load_section)
         .map_err(|e| Error::Frida(format!("Failed to load DWARF: {}", e)))?;
 
-    Ok(LoadedDwarf { sections, endian, has_debug_info })
+    Ok(LoadedDwarf {
+        sections,
+        endian,
+        has_debug_info,
+    })
 }
 
 impl LoadedDwarf {
     /// Borrow the owned sections as `EndianSlice` references for DWARF traversal.
     fn borrow(&self) -> gimli::Dwarf<EndianSlice<'_, RunTimeEndian>> {
-        self.sections.borrow(|section| {
-            EndianSlice::new(section, self.endian)
-        })
+        self.sections
+            .borrow(|section| EndianSlice::new(section, self.endian))
     }
 }
 
@@ -172,7 +179,11 @@ impl DwarfParser {
         Self::parse_with_options(binary_path, search_root, None)
     }
 
-    pub fn parse_with_options(binary_path: &Path, search_root: Option<&Path>, symbols_path: Option<&Path>) -> Result<Self> {
+    pub fn parse_with_options(
+        binary_path: &Path,
+        search_root: Option<&Path>,
+        symbols_path: Option<&Path>,
+    ) -> Result<Self> {
         // Extract image base from the original binary (needed for ASLR adjustment)
         let image_base = Self::extract_image_base(binary_path).unwrap_or(0);
 
@@ -202,7 +213,8 @@ impl DwarfParser {
                 // Search project root for any .dSYM containing this binary's DWARF.
                 // Handles .app bundles, XCArchives, DerivedData, and any exotic layout.
                 if let Some(root) = search_root {
-                    if let Some(parser) = Self::search_dsym_in_root(root, binary_name, image_base)? {
+                    if let Some(parser) = Self::search_dsym_in_root(root, binary_name, image_base)?
+                    {
                         return Ok(parser);
                     }
                 }
@@ -215,7 +227,11 @@ impl DwarfParser {
     /// Try to load DWARF from an explicitly provided symbols path.
     /// Handles: direct DWARF files, .dSYM bundles (by structure, not extension), and
     /// directories containing .dSYM bundles.
-    fn try_explicit_symbols(sym_path: &Path, binary_path: &Path, image_base: u64) -> Result<Option<Self>> {
+    fn try_explicit_symbols(
+        sym_path: &Path,
+        binary_path: &Path,
+        image_base: u64,
+    ) -> Result<Option<Self>> {
         // Try as direct DWARF/ELF file
         if sym_path.is_file() {
             if let Ok(mut parser) = Self::parse_file(sym_path) {
@@ -235,7 +251,8 @@ impl DwarfParser {
                 }
 
                 // If it's a directory containing .dSYM bundles
-                if let Some(parser) = Self::search_dsym_in_root(sym_path, binary_name, image_base)? {
+                if let Some(parser) = Self::search_dsym_in_root(sym_path, binary_name, image_base)?
+                {
                     return Ok(Some(parser));
                 }
             }
@@ -246,7 +263,11 @@ impl DwarfParser {
 
     /// Try to load DWARF from a specific .dSYM bundle path.
     #[cfg(target_os = "macos")]
-    fn try_dsym(dsym_path: &Path, binary_name: &std::ffi::OsStr, image_base: u64) -> Result<Option<Self>> {
+    fn try_dsym(
+        dsym_path: &Path,
+        binary_name: &std::ffi::OsStr,
+        image_base: u64,
+    ) -> Result<Option<Self>> {
         if dsym_path.exists() {
             let dwarf_file = dsym_path
                 .join("Contents")
@@ -264,7 +285,11 @@ impl DwarfParser {
 
     /// Walk `root` looking for any `.dSYM` bundle that contains DWARF for `binary_name`.
     #[cfg(target_os = "macos")]
-    fn search_dsym_in_root(root: &Path, binary_name: &std::ffi::OsStr, image_base: u64) -> Result<Option<Self>> {
+    fn search_dsym_in_root(
+        root: &Path,
+        binary_name: &std::ffi::OsStr,
+        image_base: u64,
+    ) -> Result<Option<Self>> {
         use walkdir::WalkDir;
 
         for entry in WalkDir::new(root)
@@ -410,12 +435,19 @@ impl DwarfParser {
                             // Collect declaration names for cross-CU resolution.
                             // These are subprograms with a name but DW_AT_declaration=true
                             // (no code body), typically from class method declarations.
-                            let is_declaration = entry.attr_value(gimli::DW_AT_declaration)
-                                .ok().flatten()
+                            let is_declaration = entry
+                                .attr_value(gimli::DW_AT_declaration)
+                                .ok()
+                                .flatten()
                                 .map(|v| matches!(v, gimli::AttributeValue::Flag(true)))
                                 .unwrap_or(false);
                             if is_declaration {
-                                let linkage = Self::resolve_string_attr(&dwarf, &unit, entry, gimli::DW_AT_linkage_name);
+                                let linkage = Self::resolve_string_attr(
+                                    &dwarf,
+                                    &unit,
+                                    entry,
+                                    gimli::DW_AT_linkage_name,
+                                );
                                 if let Some(name) = linkage {
                                     // Compute absolute .debug_info offset for this entry
                                     let entry_offset = entry.offset();
@@ -430,23 +462,49 @@ impl DwarfParser {
                                 Ok(None) => {
                                     // Function had no name AND no same-CU reference — check
                                     // for cross-CU DW_AT_specification that we can resolve later
-                                    if let Some(spec_off) = Self::cross_cu_spec_offset(&unit, entry) {
+                                    if let Some(spec_off) = Self::cross_cu_spec_offset(&unit, entry)
+                                    {
                                         // Only collect if it has a code address (low_pc)
-                                        if let Some(low_pc) = entry.attr_value(gimli::DW_AT_low_pc).ok().flatten()
-                                            .and_then(|v| dwarf.attr_address(&unit, v).ok().flatten())
+                                        if let Some(low_pc) = entry
+                                            .attr_value(gimli::DW_AT_low_pc)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|v| {
+                                                dwarf.attr_address(&unit, v).ok().flatten()
+                                            })
                                         {
-                                            let high_pc = match entry.attr_value(gimli::DW_AT_high_pc).ok().flatten() {
-                                                Some(gimli::AttributeValue::Udata(offset)) => low_pc + offset,
-                                                Some(attr_val) => dwarf.attr_address(&unit, attr_val).ok().flatten().unwrap_or(low_pc + 1),
+                                            let high_pc = match entry
+                                                .attr_value(gimli::DW_AT_high_pc)
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                Some(gimli::AttributeValue::Udata(offset)) => {
+                                                    low_pc + offset
+                                                }
+                                                Some(attr_val) => dwarf
+                                                    .attr_address(&unit, attr_val)
+                                                    .ok()
+                                                    .flatten()
+                                                    .unwrap_or(low_pc + 1),
                                                 _ => low_pc + 1,
                                             };
-                                            let source_file = Self::parse_source_file(&dwarf, &unit, entry);
-                                            let line_number = match entry.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
-                                                Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
+                                            let source_file =
+                                                Self::parse_source_file(&dwarf, &unit, entry);
+                                            let line_number = match entry
+                                                .attr_value(gimli::DW_AT_decl_line)
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                Some(gimli::AttributeValue::Udata(n)) => {
+                                                    Some(n as u32)
+                                                }
                                                 _ => None,
                                             };
                                             unresolved.push(UnresolvedFunc {
-                                                low_pc, high_pc, source_file, line_number,
+                                                low_pc,
+                                                high_pc,
+                                                source_file,
+                                                line_number,
                                                 spec_offset: spec_off,
                                             });
                                         }
@@ -461,18 +519,29 @@ impl DwarfParser {
                                 if matches!(var.type_kind, TypeKind::Pointer) {
                                     // Get DW_AT_type — fall back to referenced declaration entry
                                     // for C++ extern vars where definition has DW_AT_specification only
-                                    let type_attr = entry.attr_value(gimli::DW_AT_type).ok().flatten()
-                                        .or_else(|| {
-                                            Self::resolve_reference(&unit, entry)
-                                                .and_then(|ref_e| ref_e.attr_value(gimli::DW_AT_type).ok().flatten())
-                                        });
+                                    let type_attr =
+                                        entry.attr_value(gimli::DW_AT_type).ok().flatten().or_else(
+                                            || {
+                                                Self::resolve_reference(&unit, entry).and_then(
+                                                    |ref_e| {
+                                                        ref_e
+                                                            .attr_value(gimli::DW_AT_type)
+                                                            .ok()
+                                                            .flatten()
+                                                    },
+                                                )
+                                            },
+                                        );
                                     let type_unit_off = match type_attr {
                                         Some(gimli::AttributeValue::UnitRef(off)) => Some(off),
-                                        Some(gimli::AttributeValue::DebugInfoRef(off)) => off.to_unit_offset(&unit.header),
+                                        Some(gimli::AttributeValue::DebugInfoRef(off)) => {
+                                            off.to_unit_offset(&unit.header)
+                                        }
                                         _ => None,
                                     };
                                     if let Some(type_off) = type_unit_off {
-                                        lazy_infos.push((var.name.clone(), (cu_offset, type_off.0)));
+                                        lazy_infos
+                                            .push((var.name.clone(), (cu_offset, type_off.0)));
                                     }
                                 }
                                 variables.push(var);
@@ -520,7 +589,11 @@ impl DwarfParser {
                 }
             }
             if actually_resolved > 0 {
-                tracing::debug!("Resolved {}/{} cross-CU function references", actually_resolved, resolved_count);
+                tracing::debug!(
+                    "Resolved {}/{} cross-CU function references",
+                    actually_resolved,
+                    resolved_count
+                );
             }
         }
 
@@ -578,7 +651,10 @@ impl DwarfParser {
         entry: &gimli::DebuggingInformationEntry<R>,
         attr: gimli::DwAt,
     ) -> Option<String> {
-        entry.attr_value(attr).ok().flatten()
+        entry
+            .attr_value(attr)
+            .ok()
+            .flatten()
             .and_then(|v| dwarf.attr_string(unit, v).ok())
             .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()))
     }
@@ -588,18 +664,23 @@ impl DwarfParser {
         unit: &'a gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
     ) -> Option<gimli::DebuggingInformationEntry<'a, 'a, R>> {
-        let ref_offset = entry.attr_value(gimli::DW_AT_specification).ok().flatten()
-            .or_else(|| entry.attr_value(gimli::DW_AT_abstract_origin).ok().flatten());
+        let ref_offset = entry
+            .attr_value(gimli::DW_AT_specification)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                entry
+                    .attr_value(gimli::DW_AT_abstract_origin)
+                    .ok()
+                    .flatten()
+            });
 
         match ref_offset {
-            Some(gimli::AttributeValue::UnitRef(offset)) => {
-                unit.entry(offset).ok()
-            }
+            Some(gimli::AttributeValue::UnitRef(offset)) => unit.entry(offset).ok(),
             // Cross-CU reference: try converting DebugInfoRef to same-CU UnitRef
-            Some(gimli::AttributeValue::DebugInfoRef(offset)) => {
-                offset.to_unit_offset(&unit.header)
-                    .and_then(|unit_offset| unit.entry(unit_offset).ok())
-            }
+            Some(gimli::AttributeValue::DebugInfoRef(offset)) => offset
+                .to_unit_offset(&unit.header)
+                .and_then(|unit_offset| unit.entry(unit_offset).ok()),
             _ => None,
         }
     }
@@ -610,8 +691,16 @@ impl DwarfParser {
         unit: &gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
     ) -> Option<usize> {
-        let ref_offset = entry.attr_value(gimli::DW_AT_specification).ok().flatten()
-            .or_else(|| entry.attr_value(gimli::DW_AT_abstract_origin).ok().flatten());
+        let ref_offset = entry
+            .attr_value(gimli::DW_AT_specification)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                entry
+                    .attr_value(gimli::DW_AT_abstract_origin)
+                    .ok()
+                    .flatten()
+            });
         match ref_offset {
             Some(gimli::AttributeValue::DebugInfoRef(offset)) => {
                 // Only return if it's truly cross-CU (couldn't be converted to UnitRef)
@@ -632,7 +721,8 @@ impl DwarfParser {
     ) -> Result<Option<FunctionInfo>> {
         // Get function name: prefer DW_AT_linkage_name (fully qualified mangled name) over
         // DW_AT_name (short name). Handles DWARF v4 and v5 string forms.
-        let mut linkage_name = Self::resolve_string_attr(dwarf, unit, entry, gimli::DW_AT_linkage_name);
+        let mut linkage_name =
+            Self::resolve_string_attr(dwarf, unit, entry, gimli::DW_AT_linkage_name);
         let mut short_name = Self::resolve_string_attr(dwarf, unit, entry, gimli::DW_AT_name);
 
         // If no name found, follow DW_AT_specification / DW_AT_abstract_origin to the
@@ -642,7 +732,8 @@ impl DwarfParser {
         if linkage_name.is_none() && short_name.is_none() {
             ref_entry = Self::resolve_reference(unit, entry);
             if let Some(ref ref_e) = ref_entry {
-                linkage_name = Self::resolve_string_attr(dwarf, unit, ref_e, gimli::DW_AT_linkage_name);
+                linkage_name =
+                    Self::resolve_string_attr(dwarf, unit, ref_e, gimli::DW_AT_linkage_name);
                 short_name = Self::resolve_string_attr(dwarf, unit, ref_e, gimli::DW_AT_name);
             }
         }
@@ -655,43 +746,37 @@ impl DwarfParser {
 
         // Get low_pc (handles DWARF v4 Addr and DWARF v5 DebugAddrIndex)
         let low_pc = match entry.attr_value(gimli::DW_AT_low_pc).ok().flatten() {
-            Some(attr_val) => {
-                match dwarf.attr_address(unit, attr_val).ok().flatten() {
-                    Some(addr) => addr,
-                    None => return Ok(None),
-                }
-            }
+            Some(attr_val) => match dwarf.attr_address(unit, attr_val).ok().flatten() {
+                Some(addr) => addr,
+                None => return Ok(None),
+            },
             _ => return Ok(None),
         };
 
         // Get high_pc (can be absolute address, indexed address, or offset from low_pc)
         let high_pc = match entry.attr_value(gimli::DW_AT_high_pc).ok().flatten() {
             Some(gimli::AttributeValue::Udata(offset)) => low_pc + offset,
-            Some(attr_val) => {
-                match dwarf.attr_address(unit, attr_val) {
-                    Ok(Some(addr)) => addr,
-                    _ => low_pc + 1,
-                }
-            }
+            Some(attr_val) => match dwarf.attr_address(unit, attr_val) {
+                Ok(Some(addr)) => addr,
+                _ => low_pc + 1,
+            },
             _ => low_pc + 1, // Minimal range if not specified
         };
 
         // Get source file and line number (fall back to referenced entry)
-        let source_file = Self::parse_source_file(dwarf, unit, entry)
-            .or_else(|| {
-                Self::resolve_reference(unit, entry)
-                    .and_then(|ref_e| Self::parse_source_file(dwarf, unit, &ref_e))
-            });
+        let source_file = Self::parse_source_file(dwarf, unit, entry).or_else(|| {
+            Self::resolve_reference(unit, entry)
+                .and_then(|ref_e| Self::parse_source_file(dwarf, unit, &ref_e))
+        });
 
         let line_number = match entry.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
             Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
-            _ => {
-                Self::resolve_reference(unit, entry)
-                    .and_then(|ref_e| match ref_e.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
-                        Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
-                        _ => None,
-                    })
-            }
+            _ => Self::resolve_reference(unit, entry).and_then(|ref_e| {
+                match ref_e.attr_value(gimli::DW_AT_decl_line).ok().flatten() {
+                    Some(gimli::AttributeValue::Udata(n)) => Some(n as u32),
+                    _ => None,
+                }
+            }),
         };
 
         // Demangle the name
@@ -723,7 +808,8 @@ impl DwarfParser {
 
         let (linkage_name, short_name) = if linkage_name.is_none() && short_name.is_none() {
             if let Some(ref_entry) = Self::resolve_reference(unit, entry) {
-                let ln = Self::resolve_string_attr(dwarf, unit, &ref_entry, gimli::DW_AT_linkage_name);
+                let ln =
+                    Self::resolve_string_attr(dwarf, unit, &ref_entry, gimli::DW_AT_linkage_name);
                 let sn = Self::resolve_string_attr(dwarf, unit, &ref_entry, gimli::DW_AT_name);
                 (ln, sn)
             } else {
@@ -813,7 +899,9 @@ impl DwarfParser {
         type_attr: gimli::AttributeValue<R>,
         depth: usize,
     ) -> Option<(u8, TypeKind, Option<String>)> {
-        if depth > 10 { return None; } // prevent infinite loops
+        if depth > 10 {
+            return None;
+        } // prevent infinite loops
 
         match type_attr {
             gimli::AttributeValue::UnitRef(offset) => {
@@ -860,23 +948,30 @@ impl DwarfParser {
 
         match type_entry.tag() {
             gimli::DW_TAG_base_type => {
-                let byte_size = type_entry.attr_value(gimli::DW_AT_byte_size).ok()?
+                let byte_size = type_entry
+                    .attr_value(gimli::DW_AT_byte_size)
+                    .ok()?
                     .and_then(|v| match v {
                         gimli::AttributeValue::Udata(n) => Some(n as u8),
                         _ => None,
                     })?;
-                let encoding = type_entry.attr_value(gimli::DW_AT_encoding).ok()?
+                let encoding = type_entry
+                    .attr_value(gimli::DW_AT_encoding)
+                    .ok()?
                     .and_then(|v| match v {
                         gimli::AttributeValue::Encoding(e) => Some(e),
                         _ => None,
                     });
                 let type_kind = match encoding {
                     Some(gimli::DW_ATE_float) => TypeKind::Float,
-                    Some(gimli::DW_ATE_signed) | Some(gimli::DW_ATE_signed_char) =>
-                        TypeKind::Integer { signed: true },
+                    Some(gimli::DW_ATE_signed) | Some(gimli::DW_ATE_signed_char) => {
+                        TypeKind::Integer { signed: true }
+                    }
                     _ => TypeKind::Integer { signed: false },
                 };
-                let type_name = type_entry.attr_value(gimli::DW_AT_name).ok()?
+                let type_name = type_entry
+                    .attr_value(gimli::DW_AT_name)
+                    .ok()?
                     .and_then(|v| dwarf.attr_string(unit, v).ok())
                     .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
                 Some((byte_size, type_kind, type_name))
@@ -885,18 +980,26 @@ impl DwarfParser {
                 let size = unit.encoding().address_size;
                 Some((size, TypeKind::Pointer, Some("pointer".to_string())))
             }
-            gimli::DW_TAG_typedef | gimli::DW_TAG_const_type
-            | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type => {
+            gimli::DW_TAG_typedef
+            | gimli::DW_TAG_const_type
+            | gimli::DW_TAG_volatile_type
+            | gimli::DW_TAG_restrict_type => {
                 let next = type_entry.attr_value(gimli::DW_AT_type).ok()??;
                 Self::follow_type_chain(dwarf, unit, next, depth + 1)
             }
             gimli::DW_TAG_enumeration_type => {
-                let byte_size = type_entry.attr_value(gimli::DW_AT_byte_size).ok()?
+                let byte_size = type_entry
+                    .attr_value(gimli::DW_AT_byte_size)
+                    .ok()?
                     .and_then(|v| match v {
                         gimli::AttributeValue::Udata(n) => Some(n as u8),
                         _ => None,
                     })?;
-                Some((byte_size, TypeKind::Integer { signed: false }, Some("enum".to_string())))
+                Some((
+                    byte_size,
+                    TypeKind::Integer { signed: false },
+                    Some("enum".to_string()),
+                ))
             }
             gimli::DW_TAG_structure_type => {
                 // For single-field structs at offset 0 (Rust newtypes like AtomicU64,
@@ -910,11 +1013,13 @@ impl DwarfParser {
                         continue;
                     }
                     member_count += 1;
-                    if member_count > 1 { break; } // more than one member, not a newtype
-                    // Check offset is 0
+                    if member_count > 1 {
+                        break;
+                    } // more than one member, not a newtype
+                      // Check offset is 0
                     if Self::parse_member_offset(child.entry()) == 0 {
-                        member_type_attr = child.entry()
-                            .attr_value(gimli::DW_AT_type).ok().flatten();
+                        member_type_attr =
+                            child.entry().attr_value(gimli::DW_AT_type).ok().flatten();
                     }
                 }
                 if member_count == 1 {
@@ -929,10 +1034,9 @@ impl DwarfParser {
     }
 
     /// Extract the byte offset of a struct member from DW_AT_data_member_location.
-    fn parse_member_offset<R: gimli::Reader>(
-        entry: &gimli::DebuggingInformationEntry<R>,
-    ) -> u64 {
-        entry.attr_value(gimli::DW_AT_data_member_location)
+    fn parse_member_offset<R: gimli::Reader>(entry: &gimli::DebuggingInformationEntry<R>) -> u64 {
+        entry
+            .attr_value(gimli::DW_AT_data_member_location)
             .ok()
             .flatten()
             .and_then(|v| match v {
@@ -963,7 +1067,9 @@ impl DwarfParser {
                         if let Ok(s) = dwarf.attr_string(unit, file.path_name()) {
                             path.push_str(&s.to_string_lossy().unwrap_or_default());
                         }
-                        if !path.is_empty() { return Some(path); }
+                        if !path.is_empty() {
+                            return Some(path);
+                        }
                     }
                 }
                 None
@@ -980,7 +1086,9 @@ impl DwarfParser {
         type_attr: gimli::AttributeValue<R>,
         depth: usize,
     ) -> Option<Vec<StructMember>> {
-        if depth > 10 { return None; }
+        if depth > 10 {
+            return None;
+        }
 
         let offset = match type_attr {
             gimli::AttributeValue::UnitRef(o) => o,
@@ -1003,7 +1111,10 @@ impl DwarfParser {
                         continue;
                     }
 
-                    let member_name = child_entry.attr_value(gimli::DW_AT_name).ok().flatten()
+                    let member_name = child_entry
+                        .attr_value(gimli::DW_AT_name)
+                        .ok()
+                        .flatten()
                         .and_then(|v| dwarf.attr_string(unit, v).ok())
                         .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()));
 
@@ -1016,7 +1127,8 @@ impl DwarfParser {
 
                     // Get member type info
                     let member_type_attr = child_entry.attr_value(gimli::DW_AT_type).ok().flatten();
-                    let (byte_size, type_kind, type_name) = member_type_attr.as_ref()
+                    let (byte_size, type_kind, type_name) = member_type_attr
+                        .as_ref()
                         .and_then(|attr| Self::follow_type_chain(dwarf, unit, attr.clone(), 0))
                         .unwrap_or((0, TypeKind::Unknown, None));
 
@@ -1027,7 +1139,9 @@ impl DwarfParser {
                         member_type_attr.and_then(|attr| {
                             let ptr_off = match attr {
                                 gimli::AttributeValue::UnitRef(o) => o,
-                                gimli::AttributeValue::DebugInfoRef(di_off) => di_off.to_unit_offset(&unit.header)?,
+                                gimli::AttributeValue::DebugInfoRef(di_off) => {
+                                    di_off.to_unit_offset(&unit.header)?
+                                }
                                 _ => return None,
                             };
                             let mut pt = unit.entries_tree(Some(ptr_off)).ok()?;
@@ -1051,10 +1165,16 @@ impl DwarfParser {
                     });
                 }
 
-                if members.is_empty() { None } else { Some(members) }
+                if members.is_empty() {
+                    None
+                } else {
+                    Some(members)
+                }
             }
-            gimli::DW_TAG_typedef | gimli::DW_TAG_const_type
-            | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type => {
+            gimli::DW_TAG_typedef
+            | gimli::DW_TAG_const_type
+            | gimli::DW_TAG_volatile_type
+            | gimli::DW_TAG_restrict_type => {
                 let next = type_entry.attr_value(gimli::DW_AT_type).ok()??;
                 Self::parse_struct_members_from_type(dwarf, unit, next, depth + 1)
             }
@@ -1073,45 +1193,62 @@ impl DwarfParser {
             }
         }
 
-        let &(cu_offset, type_die_offset) = self.lazy_struct_info.get(var_name)
-            .ok_or_else(|| Error::Frida(format!(
-                "No type info stored for pointer variable '{}'", var_name
-            )))?;
+        let &(cu_offset, type_die_offset) =
+            self.lazy_struct_info.get(var_name).ok_or_else(|| {
+                Error::Frida(format!(
+                    "No type info stored for pointer variable '{}'",
+                    var_name
+                ))
+            })?;
 
-        let binary_path = self.binary_path.as_ref()
-            .ok_or_else(|| Error::Frida("No binary path for lazy struct member resolution".into()))?;
+        let binary_path = self.binary_path.as_ref().ok_or_else(|| {
+            Error::Frida("No binary path for lazy struct member resolution".into())
+        })?;
 
         let loaded = load_dwarf_sections(binary_path)?;
         let dwarf = loaded.borrow();
 
         // Jump directly to the right CU using stored offset
-        let header = dwarf.debug_info.header_from_offset(gimli::DebugInfoOffset(cu_offset))
-            .map_err(|e| Error::Frida(format!("Failed to find CU at offset {}: {}", cu_offset, e)))?;
-        let unit = dwarf.unit(header)
+        let header = dwarf
+            .debug_info
+            .header_from_offset(gimli::DebugInfoOffset(cu_offset))
+            .map_err(|e| {
+                Error::Frida(format!("Failed to find CU at offset {}: {}", cu_offset, e))
+            })?;
+        let unit = dwarf
+            .unit(header)
             .map_err(|e| Error::Frida(format!("Failed to parse CU: {}", e)))?;
 
         // Navigate to the pointer type DIE using stored offset
         let ptr_offset = gimli::UnitOffset(type_die_offset);
-        let mut ptr_tree = unit.entries_tree(Some(ptr_offset))
+        let mut ptr_tree = unit
+            .entries_tree(Some(ptr_offset))
             .map_err(|e| Error::Frida(format!("Failed to find type DIE: {}", e)))?;
-        let ptr_root = ptr_tree.root()
+        let ptr_root = ptr_tree
+            .root()
             .map_err(|e| Error::Frida(format!("Failed to read type DIE: {}", e)))?;
         let ptr_entry = ptr_root.entry();
 
         if ptr_entry.tag() != gimli::DW_TAG_pointer_type {
             return Err(Error::Frida(format!(
-                "Type for '{}' is not a pointer type (tag: {:?})", var_name, ptr_entry.tag()
+                "Type for '{}' is not a pointer type (tag: {:?})",
+                var_name,
+                ptr_entry.tag()
             )));
         }
 
-        let pointee_attr = ptr_entry.attr_value(gimli::DW_AT_type)
+        let pointee_attr = ptr_entry
+            .attr_value(gimli::DW_AT_type)
             .map_err(|e| Error::Frida(format!("Failed to get pointee type: {}", e)))?
             .ok_or_else(|| Error::Frida("Pointer type has no pointee type".into()))?;
 
         let members = Self::parse_struct_members_from_type(&dwarf, &unit, pointee_attr, 0)
-            .ok_or_else(|| Error::Frida(format!(
-                "No struct members found for pointee of '{}'", var_name
-            )))?;
+            .ok_or_else(|| {
+                Error::Frida(format!(
+                    "No struct members found for pointee of '{}'",
+                    var_name
+                ))
+            })?;
 
         let mut cache = self.struct_members.lock().unwrap();
         cache.insert(var_name.to_string(), members);
@@ -1121,7 +1258,8 @@ impl DwarfParser {
     pub fn resolve_watch_expression(&self, expr: &str) -> Result<WatchRecipe> {
         if !expr.contains("->") {
             // Simple variable — direct read
-            let var = self.find_variable_by_name(expr)
+            let var = self
+                .find_variable_by_name(expr)
                 .ok_or_else(|| Error::Frida(format!("Variable '{}' not found", expr)))?;
             return Ok(WatchRecipe {
                 label: expr.to_string(),
@@ -1137,7 +1275,8 @@ impl DwarfParser {
         let parts: Vec<&str> = expr.split("->").collect();
         let root_name = parts[0];
 
-        let var = self.find_variable_by_name(root_name)
+        let var = self
+            .find_variable_by_name(root_name)
             .ok_or_else(|| Error::Frida(format!("Variable '{}' not found", root_name)))?;
 
         // Root must be a pointer
@@ -1162,21 +1301,21 @@ impl DwarfParser {
 
         let cache = self.struct_members.lock().unwrap();
         let mut deref_chain = Vec::new();
-        let mut current_members = cache.get(&root_var.name)
-            .ok_or_else(|| Error::Frida(format!(
-                "No struct info for pointer '{}'", root_var.name
-            )))?;
+        let mut current_members = cache.get(&root_var.name).ok_or_else(|| {
+            Error::Frida(format!("No struct info for pointer '{}'", root_var.name))
+        })?;
 
         let mut final_size = 0u8;
         let mut final_type_kind = TypeKind::Unknown;
         let mut final_type_name = None;
 
         for (i, &member_name) in member_path.iter().enumerate() {
-            let member = current_members.iter()
+            let member = current_members
+                .iter()
                 .find(|m| m.name == member_name)
-                .ok_or_else(|| Error::Frida(format!(
-                    "Member '{}' not found in struct", member_name
-                )))?;
+                .ok_or_else(|| {
+                    Error::Frida(format!("Member '{}' not found in struct", member_name))
+                })?;
 
             deref_chain.push(member.offset);
             final_size = member.byte_size;
@@ -1185,10 +1324,12 @@ impl DwarfParser {
 
             // If this member is itself a pointer and there are more parts, continue
             if member.is_pointer && i + 1 < member_path.len() {
-                current_members = member.pointed_struct_members.as_ref()
-                    .ok_or_else(|| Error::Frida(format!(
-                        "No struct info for pointer member '{}'", member_name
-                    )))?;
+                current_members = member.pointed_struct_members.as_ref().ok_or_else(|| {
+                    Error::Frida(format!(
+                        "No struct info for pointer member '{}'",
+                        member_name
+                    ))
+                })?;
             }
         }
 
@@ -1208,20 +1349,29 @@ impl DwarfParser {
     /// NOTE: Currently only depth=1 is effective. Depth > 1 marks nested structs
     /// as truncated rather than recursively expanding them. Recursive expansion
     /// would require nested field JSON in the agent protocol.
-    pub(crate) fn struct_members_to_recipes(members: &[StructMember], depth: usize) -> Vec<super::StructFieldRecipe> {
-        members.iter().map(|m| {
-            let is_struct_field = !matches!(m.type_kind, TypeKind::Integer { .. } | TypeKind::Float | TypeKind::Pointer);
-            let is_truncated = is_struct_field && depth <= 1;
+    pub(crate) fn struct_members_to_recipes(
+        members: &[StructMember],
+        depth: usize,
+    ) -> Vec<super::StructFieldRecipe> {
+        members
+            .iter()
+            .map(|m| {
+                let is_struct_field = !matches!(
+                    m.type_kind,
+                    TypeKind::Integer { .. } | TypeKind::Float | TypeKind::Pointer
+                );
+                let is_truncated = is_struct_field && depth <= 1;
 
-            super::StructFieldRecipe {
-                name: m.name.clone(),
-                offset: m.offset,
-                size: m.byte_size,
-                type_kind: m.type_kind.clone(),
-                type_name: m.type_name.clone(),
-                is_truncated_struct: is_truncated,
-            }
-        }).collect()
+                super::StructFieldRecipe {
+                    name: m.name.clone(),
+                    offset: m.offset,
+                    size: m.byte_size,
+                    type_kind: m.type_kind.clone(),
+                    type_name: m.type_name.clone(),
+                    is_truncated_struct: is_truncated,
+                }
+            })
+            .collect()
     }
 
     /// Resolve a variable to a read recipe, optionally expanding struct fields.
@@ -1256,7 +1406,10 @@ impl DwarfParser {
 
     pub fn find_variables_by_pattern(&self, pattern: &str) -> Vec<&VariableInfo> {
         let matcher = PatternMatcher::new(pattern);
-        self.variables.iter().filter(|v| matcher.matches(&v.name)).collect()
+        self.variables
+            .iter()
+            .filter(|v| matcher.matches(&v.name))
+            .collect()
     }
 
     pub fn find_by_name(&self, name: &str) -> Vec<&FunctionInfo> {
@@ -1297,7 +1450,9 @@ impl DwarfParser {
     /// Parse local variables for the function containing the given PC address.
     /// Re-opens the DWARF file and does a targeted parse. Only called on crash (rare).
     pub fn parse_locals_at_pc(&self, crash_pc: u64) -> Result<Vec<LocalVariableInfo>> {
-        let binary_path = self.binary_path.as_ref()
+        let binary_path = self
+            .binary_path
+            .as_ref()
             .ok_or_else(|| Error::Frida("No binary path for DWARF re-parse".into()))?;
 
         let loaded = load_dwarf_sections(binary_path)?;
@@ -1327,11 +1482,19 @@ impl DwarfParser {
 
                 match entry.tag() {
                     gimli::DW_TAG_subprogram => {
-                        let low_pc = entry.attr_value(gimli::DW_AT_low_pc).ok().flatten()
+                        let low_pc = entry
+                            .attr_value(gimli::DW_AT_low_pc)
+                            .ok()
+                            .flatten()
                             .and_then(|v| dwarf.attr_address(&unit, v).ok().flatten());
-                        let high_pc = entry.attr_value(gimli::DW_AT_high_pc).ok().flatten()
+                        let high_pc = entry
+                            .attr_value(gimli::DW_AT_high_pc)
+                            .ok()
+                            .flatten()
                             .map(|v| match v {
-                                gimli::AttributeValue::Udata(offset) => low_pc.map(|lp| lp + offset),
+                                gimli::AttributeValue::Udata(offset) => {
+                                    low_pc.map(|lp| lp + offset)
+                                }
                                 _ => dwarf.attr_address(&unit, v).ok().flatten(),
                             })
                             .flatten();
@@ -1365,7 +1528,10 @@ impl DwarfParser {
         unit: &gimli::Unit<R>,
         entry: &gimli::DebuggingInformationEntry<R>,
     ) -> Option<LocalVariableInfo> {
-        let name = entry.attr_value(gimli::DW_AT_name).ok().flatten()
+        let name = entry
+            .attr_value(gimli::DW_AT_name)
+            .ok()
+            .flatten()
             .and_then(|v| dwarf.attr_string(unit, v).ok())
             .and_then(|s| s.to_string_lossy().ok().map(|c| c.to_string()))?;
 
@@ -1380,9 +1546,9 @@ impl DwarfParser {
                     Some(gimli::Operation::Register { register }) => {
                         LocalVarLocation::Register(register.0)
                     }
-                    Some(gimli::Operation::RegisterOffset { register, offset, .. }) => {
-                        LocalVarLocation::RegisterOffset(register.0, offset)
-                    }
+                    Some(gimli::Operation::RegisterOffset {
+                        register, offset, ..
+                    }) => LocalVarLocation::RegisterOffset(register.0, offset),
                     Some(gimli::Operation::Address { address }) => {
                         LocalVarLocation::Address(address)
                     }
@@ -1393,8 +1559,8 @@ impl DwarfParser {
         };
 
         // Get type info
-        let (byte_size, type_kind, type_name) = Self::resolve_type_info(dwarf, unit, entry)
-            .unwrap_or((0, TypeKind::Unknown, None));
+        let (byte_size, type_kind, type_name) =
+            Self::resolve_type_info(dwarf, unit, entry).unwrap_or((0, TypeKind::Unknown, None));
 
         Some(LocalVariableInfo {
             name,
@@ -1423,7 +1589,10 @@ impl DwarfParser {
         let mut matches: Vec<_> = entries
             .iter()
             .filter(|e| {
-                e.is_statement && (e.file == file || e.file.ends_with(&sep_file) || e.file.ends_with(&sep_file_win))
+                e.is_statement
+                    && (e.file == file
+                        || e.file.ends_with(&sep_file)
+                        || e.file.ends_with(&sep_file_win))
             })
             .collect();
 
@@ -1453,7 +1622,12 @@ impl DwarfParser {
         let sep_file_win = format!("\\{}", file);
         let mut lines: Vec<u32> = entries
             .iter()
-            .filter(|e| e.is_statement && (e.file == file || e.file.ends_with(&sep_file) || e.file.ends_with(&sep_file_win)))
+            .filter(|e| {
+                e.is_statement
+                    && (e.file == file
+                        || e.file.ends_with(&sep_file)
+                        || e.file.ends_with(&sep_file_win))
+            })
             .map(|e| e.line)
             .collect();
 
@@ -1483,10 +1657,13 @@ impl DwarfParser {
     /// O(log N) lookup: find the function containing `address` via binary search
     /// on the sorted functions_by_addr index. Returns (low_pc, high_pc) or None.
     fn function_containing(&self, address: u64) -> Option<(u64, u64)> {
-        let idx = match self.functions_by_addr.binary_search_by_key(&address, |&(low, _)| low) {
-            Ok(idx) => idx,           // Exact match on low_pc
-            Err(0) => return None,    // Before all functions
-            Err(idx) => idx - 1,      // Check preceding function
+        let idx = match self
+            .functions_by_addr
+            .binary_search_by_key(&address, |&(low, _)| low)
+        {
+            Ok(idx) => idx,        // Exact match on low_pc
+            Err(0) => return None, // Before all functions
+            Err(idx) => idx - 1,   // Check preceding function
         };
         let (low, high) = self.functions_by_addr[idx];
         if address >= low && address < high {
@@ -1506,9 +1683,9 @@ impl DwarfParser {
         let entries = table.as_ref()?;
 
         let idx = match entries.binary_search_by_key(&address, |e| e.address) {
-            Ok(idx) => idx,           // Exact match
-            Err(0) => return None,    // Before all entries
-            Err(idx) => idx - 1,      // Closest preceding entry
+            Ok(idx) => idx,        // Exact match
+            Err(0) => return None, // Before all entries
+            Err(idx) => idx - 1,   // Closest preceding entry
         };
 
         // Verify the address is within a known function to avoid returning
@@ -1531,7 +1708,11 @@ impl DwarfParser {
     /// overwritten region, so any line entries within that region are unreachable.
     /// Use `min_offset = 16` for step hooks, or `0` for initial breakpoints where
     /// the trampoline is at a function entry (typically far from the next line).
-    pub fn next_line_in_function(&self, address: u64, min_offset: u64) -> Option<(u64, String, u32)> {
+    pub fn next_line_in_function(
+        &self,
+        address: u64,
+        min_offset: u64,
+    ) -> Option<(u64, String, u32)> {
         self.ensure_line_table();
         let table = self.line_table.lock().unwrap();
         let entries = table.as_ref()?;
@@ -1555,7 +1736,12 @@ impl DwarfParser {
         entries[idx + 1..]
             .iter()
             .take_while(|e| func_high_pc.map_or(true, |hp| e.address < hp))
-            .find(|e| e.is_statement && e.file == current.file && e.line != current.line && e.address >= min_address)
+            .find(|e| {
+                e.is_statement
+                    && e.file == current.file
+                    && e.line != current.line
+                    && e.address >= min_address
+            })
             .map(|e| (e.address, e.file.clone(), e.line))
     }
 
@@ -1630,7 +1816,8 @@ impl DwarfParser {
                 let file = match row.file(header) {
                     Some(file_entry) => {
                         let path_attr = file_entry.path_name();
-                        dwarf.attr_string(&unit, path_attr)
+                        dwarf
+                            .attr_string(&unit, path_attr)
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|_| "<unknown>".to_string())
                     }
@@ -1662,7 +1849,10 @@ pub struct PatternMatcher<'a> {
 
 impl<'a> PatternMatcher<'a> {
     pub fn new(pattern: &'a str) -> Self {
-        Self { pattern, separator: "::" }
+        Self {
+            pattern,
+            separator: "::",
+        }
     }
 
     pub fn new_with_separator(pattern: &'a str, sep: char) -> Self {
@@ -1706,7 +1896,8 @@ impl<'a> PatternMatcher<'a> {
 
             // Try matching at every position in text
             for i in 0..=text.len() {
-                if self.glob_match(&pattern[2..], &text[i..]) { // keep the separator in pattern
+                if self.glob_match(&pattern[2..], &text[i..]) {
+                    // keep the separator in pattern
                     return true;
                 }
             }
@@ -1819,16 +2010,25 @@ mod pattern_tests {
         assert!(!m.matches(rust_name), "* should not cross :: boundaries");
 
         let m = PatternMatcher::new("stress_tester::**");
-        assert!(m.matches(rust_name), "** should match through all :: levels");
+        assert!(
+            m.matches(rust_name),
+            "** should match through all :: levels"
+        );
 
         let m = PatternMatcher::new("**::process_note_on**");
         assert!(m.matches(rust_name), "**::name** should match anywhere");
 
         let m = PatternMatcher::new("stress_tester::midi::*");
-        assert!(!m.matches(rust_name), "midi::* shouldn't match because of hash suffix");
+        assert!(
+            !m.matches(rust_name),
+            "midi::* shouldn't match because of hash suffix"
+        );
 
         let m = PatternMatcher::new("stress_tester::midi::**");
-        assert!(m.matches(rust_name), "midi::** should match through hash suffix");
+        assert!(
+            m.matches(rust_name),
+            "midi::** should match through hash suffix"
+        );
     }
 
     #[test]
@@ -1884,12 +2084,17 @@ mod pattern_tests {
 
         for (pattern, expected_indices) in test_cases {
             let matcher = PatternMatcher::new(pattern);
-            let matched: Vec<usize> = real_names.iter().enumerate()
+            let matched: Vec<usize> = real_names
+                .iter()
+                .enumerate()
                 .filter(|(_, name)| matcher.matches(name))
                 .map(|(i, _)| i)
                 .collect();
-            assert_eq!(matched, expected_indices,
-                "Pattern '{}' matched wrong functions", pattern);
+            assert_eq!(
+                matched, expected_indices,
+                "Pattern '{}' matched wrong functions",
+                pattern
+            );
         }
     }
 }
@@ -1959,14 +2164,23 @@ mod struct_expansion_tests {
         // At depth=1, nested struct fields should be truncated
         let recipes = DwarfParser::struct_members_to_recipes(&members, 1);
         assert_eq!(recipes.len(), 2);
-        assert!(!recipes[0].is_truncated_struct, "primitive field should not be truncated");
-        assert!(recipes[1].is_truncated_struct, "nested struct at depth=1 should be truncated");
+        assert!(
+            !recipes[0].is_truncated_struct,
+            "primitive field should not be truncated"
+        );
+        assert!(
+            recipes[1].is_truncated_struct,
+            "nested struct at depth=1 should be truncated"
+        );
         assert_eq!(recipes[1].type_name.as_deref(), Some("AudioEngine"));
 
         // At depth=2, nested struct fields should NOT be truncated
         // (even though recursive expansion isn't implemented yet)
         let recipes_d2 = DwarfParser::struct_members_to_recipes(&members, 2);
-        assert!(!recipes_d2[1].is_truncated_struct, "nested struct at depth=2 should not be truncated");
+        assert!(
+            !recipes_d2[1].is_truncated_struct,
+            "nested struct at depth=2 should not be truncated"
+        );
     }
 
     #[test]

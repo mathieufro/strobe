@@ -29,7 +29,9 @@ fn get_node_path() -> String {
         .ok()
         .and_then(|out| {
             if out.status.success() {
-                String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(out.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
@@ -66,7 +68,8 @@ async fn scenario_node_esm_output(
     project_root: &str,
 ) {
     let session_id = "node-esm-output";
-    sm.create_session(session_id, fixture, project_root, 0).unwrap();
+    sm.create_session(session_id, fixture, project_root, 0)
+        .unwrap();
 
     let _pid = sm
         .spawn_with_frida(
@@ -89,7 +92,11 @@ async fn scenario_node_esm_output(
         Duration::from_secs(10),
         EventType::Stdout,
         |evs| {
-            let text: String = evs.iter().filter_map(|e| e.text.clone()).collect::<Vec<_>>().join("");
+            let text: String = evs
+                .iter()
+                .filter_map(|e| e.text.clone())
+                .collect::<Vec<_>>()
+                .join("");
             text.contains("esm_target: starting")
         },
     )
@@ -114,7 +121,8 @@ async fn scenario_node_esm_lifecycle(
     project_root: &str,
 ) {
     let session_id = "node-esm-lifecycle";
-    sm.create_session(session_id, fixture, project_root, 0).unwrap();
+    sm.create_session(session_id, fixture, project_root, 0)
+        .unwrap();
 
     let pid = sm
         .spawn_with_frida(

@@ -1,10 +1,13 @@
-mod parser;
 mod function;
 mod handle;
+mod parser;
 
-pub use parser::{DwarfParser, LineEntry};
-pub use function::{FunctionInfo, VariableInfo, TypeKind, WatchRecipe, LocalVariableInfo, LocalVarLocation, StructFieldRecipe};
+pub use function::{
+    FunctionInfo, LocalVarLocation, LocalVariableInfo, StructFieldRecipe, TypeKind, VariableInfo,
+    WatchRecipe,
+};
 pub use handle::DwarfHandle;
+pub use parser::{DwarfParser, LineEntry};
 
 // Re-export PatternMatcher for integration tests
 pub use parser::PatternMatcher;
@@ -31,40 +34,47 @@ pub fn resolve_crash_locals(
     // Frame memory starts at fp - 512
     let frame_start = fp_addr.saturating_sub(512);
 
-    locals.iter().filter_map(|local| {
-        let value = match &local.location {
-            LocalVarLocation::FrameBaseRelative(offset) => {
-                let addr = (fp_addr as i64 + offset) as u64;
-                read_from_frame(&frame_bytes, frame_start, addr, local.byte_size)
-            }
-            LocalVarLocation::Register(reg_num) => {
-                let reg_name = register_name(*reg_num, arch);
-                registers.get(&reg_name)
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                    .map(|v| format_value(v, local.byte_size, &local.type_kind))
-            }
-            LocalVarLocation::RegisterOffset(reg_num, offset) => {
-                let reg_name = register_name(*reg_num, arch);
-                let base = registers.get(&reg_name)
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())?;
-                let addr = (base as i64 + offset) as u64;
-                read_from_frame(&frame_bytes, frame_start, addr, local.byte_size)
-            }
-            LocalVarLocation::Address(_) => {
-                // Fixed address — can't read without agent help
-                None
-            }
-            LocalVarLocation::Complex => None,
-        };
+    locals
+        .iter()
+        .filter_map(|local| {
+            let value = match &local.location {
+                LocalVarLocation::FrameBaseRelative(offset) => {
+                    let addr = (fp_addr as i64 + offset) as u64;
+                    read_from_frame(&frame_bytes, frame_start, addr, local.byte_size)
+                }
+                LocalVarLocation::Register(reg_num) => {
+                    let reg_name = register_name(*reg_num, arch);
+                    registers
+                        .get(&reg_name)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                        .map(|v| format_value(v, local.byte_size, &local.type_kind))
+                }
+                LocalVarLocation::RegisterOffset(reg_num, offset) => {
+                    let reg_name = register_name(*reg_num, arch);
+                    let base = registers
+                        .get(&reg_name)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())?;
+                    let addr = (base as i64 + offset) as u64;
+                    read_from_frame(&frame_bytes, frame_start, addr, local.byte_size)
+                }
+                LocalVarLocation::Address(_) => {
+                    // Fixed address — can't read without agent help
+                    None
+                }
+                LocalVarLocation::Complex => None,
+            };
 
-        value.map(|v| serde_json::json!({
-            "name": local.name,
-            "value": v,
-            "type": local.type_name,
-        }))
-    }).collect()
+            value.map(|v| {
+                serde_json::json!({
+                    "name": local.name,
+                    "value": v,
+                    "type": local.type_name,
+                })
+            })
+        })
+        .collect()
 }
 
 fn read_from_frame(frame_bytes: &[u8], frame_start: u64, addr: u64, size: u8) -> Option<String> {
@@ -88,7 +98,7 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
         .step_by(2)
         .filter_map(|i| {
             if i + 2 <= hex.len() {
-                u8::from_str_radix(&hex[i..i+2], 16).ok()
+                u8::from_str_radix(&hex[i..i + 2], 16).ok()
             } else {
                 None
             }
@@ -124,23 +134,19 @@ fn register_name(dwarf_reg: u16, arch: &str) -> String {
 
 fn format_value(raw: u64, size: u8, type_kind: &TypeKind) -> String {
     match type_kind {
-        TypeKind::Integer { signed: true } => {
-            match size {
-                1 => format!("{}", raw as i8),
-                2 => format!("{}", raw as i16),
-                4 => format!("{}", raw as i32),
-                8 => format!("{}", raw as i64),
-                _ => format!("0x{:x}", raw),
-            }
-        }
+        TypeKind::Integer { signed: true } => match size {
+            1 => format!("{}", raw as i8),
+            2 => format!("{}", raw as i16),
+            4 => format!("{}", raw as i32),
+            8 => format!("{}", raw as i64),
+            _ => format!("0x{:x}", raw),
+        },
         TypeKind::Integer { signed: false } => format!("{}", raw),
-        TypeKind::Float => {
-            match size {
-                4 => format!("{}", f32::from_bits(raw as u32)),
-                8 => format!("{}", f64::from_bits(raw)),
-                _ => format!("0x{:x}", raw),
-            }
-        }
+        TypeKind::Float => match size {
+            4 => format!("{}", f32::from_bits(raw as u32)),
+            8 => format!("{}", f64::from_bits(raw)),
+            _ => format!("0x{:x}", raw),
+        },
         TypeKind::Pointer => format!("0x{:x}", raw),
         TypeKind::Unknown => format!("0x{:x}", raw),
     }
@@ -223,12 +229,14 @@ mod tests {
     /// Rust functions are found, demangled, and matchable.
     #[test]
     fn test_parse_rust_binary_stress_tester() {
-        let binary_path = Path::new(
-            env!("CARGO_MANIFEST_DIR")
-        ).join("tests/stress_test_phase1b/target/debug/stress_tester");
+        let binary_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/stress_test_phase1b/target/debug/stress_tester");
 
         if !binary_path.exists() {
-            eprintln!("Skipping test: stress_tester binary not found at {:?}", binary_path);
+            eprintln!(
+                "Skipping test: stress_tester binary not found at {:?}",
+                binary_path
+            );
             return;
         }
 
@@ -242,16 +250,29 @@ mod tests {
             .expect("DwarfParser::parse should succeed for stress_tester with dSYM");
 
         // Should have found functions
-        eprintln!("Parsed {} functions, {} variables", parser.functions.len(), parser.variables.len());
-        assert!(parser.functions.len() > 0, "Should find at least some functions");
+        eprintln!(
+            "Parsed {} functions, {} variables",
+            parser.functions.len(),
+            parser.variables.len()
+        );
+        assert!(
+            parser.functions.len() > 0,
+            "Should find at least some functions"
+        );
 
         // Check that we find key Rust functions by demangled name
         let note_on_fns = parser.find_by_pattern("**::process_note_on**");
-        eprintln!("process_note_on matches: {:?}", note_on_fns.iter().map(|f| &f.name).collect::<Vec<_>>());
+        eprintln!(
+            "process_note_on matches: {:?}",
+            note_on_fns.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
         assert!(!note_on_fns.is_empty(), "Should find process_note_on");
 
         let audio_fns = parser.find_by_pattern("**::process_audio_buffer**");
-        eprintln!("process_audio_buffer matches: {:?}", audio_fns.iter().map(|f| &f.name).collect::<Vec<_>>());
+        eprintln!(
+            "process_audio_buffer matches: {:?}",
+            audio_fns.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
         assert!(!audio_fns.is_empty(), "Should find process_audio_buffer");
 
         // Check @file: pattern works
@@ -261,7 +282,10 @@ mod tests {
 
         // Print first few function names for debugging
         for func in parser.functions.iter().take(20) {
-            eprintln!("  func: {} (raw: {:?}, file: {:?})", func.name, func.name_raw, func.source_file);
+            eprintln!(
+                "  func: {} (raw: {:?}, file: {:?})",
+                func.name, func.name_raw, func.source_file
+            );
         }
     }
 

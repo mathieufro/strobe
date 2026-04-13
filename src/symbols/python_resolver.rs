@@ -1,7 +1,7 @@
+use rustpython_parser::{ast, parse, Mode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-use rustpython_parser::{parse, ast, Mode};
 
 use super::resolver::*;
 
@@ -14,11 +14,22 @@ pub struct PythonResolver {
 
 /// Directories to exclude from Python source scanning.
 fn is_python_excluded(name: &str) -> bool {
-    matches!(name,
-        "__pycache__" | "venv" | ".venv" | "env" | ".env" |
-        "node_modules" | ".git" | ".tox" | ".mypy_cache" |
-        ".pytest_cache" | "dist" | "build"
-    ) || name.ends_with(".egg-info") || name.ends_with(".dist-info")
+    matches!(
+        name,
+        "__pycache__"
+            | "venv"
+            | ".venv"
+            | "env"
+            | ".env"
+            | "node_modules"
+            | ".git"
+            | ".tox"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | "dist"
+            | "build"
+    ) || name.ends_with(".egg-info")
+        || name.ends_with(".dist-info")
 }
 
 /// Build a lookup table of byte-offset → 1-indexed line number.
@@ -46,8 +57,9 @@ pub fn extract_functions_from_source(
     source: &str,
     file_path: &Path,
 ) -> crate::Result<HashMap<String, (PathBuf, u32, u32)>> {
-    let ast = parse(source, Mode::Module, "<input>")
-        .map_err(|e| crate::Error::Internal(format!("Python parse error in {:?}: {}", file_path, e)))?;
+    let ast = parse(source, Mode::Module, "<input>").map_err(|e| {
+        crate::Error::Internal(format!("Python parse error in {:?}: {}", file_path, e))
+    })?;
 
     let line_starts = build_line_starts(source);
     let mut functions = HashMap::new();
@@ -130,7 +142,10 @@ fn extract_from_stmt(
             };
             let def_line = offset_to_line(line_starts, f.range.start().to_u32());
             let body_line = body_first_line(&f.body, line_starts, def_line);
-            functions.insert(qualified_name.clone(), (file_path.to_path_buf(), def_line, body_line));
+            functions.insert(
+                qualified_name.clone(),
+                (file_path.to_path_buf(), def_line, body_line),
+            );
 
             let mut new_prefix = prefix.to_vec();
             new_prefix.push(f.name.to_string());
@@ -146,7 +161,10 @@ fn extract_from_stmt(
             };
             let def_line = offset_to_line(line_starts, f.range.start().to_u32());
             let body_line = body_first_line(&f.body, line_starts, def_line);
-            functions.insert(qualified_name.clone(), (file_path.to_path_buf(), def_line, body_line));
+            functions.insert(
+                qualified_name.clone(),
+                (file_path.to_path_buf(), def_line, body_line),
+            );
 
             let mut new_prefix = prefix.to_vec();
             new_prefix.push(f.name.to_string());
@@ -158,7 +176,13 @@ fn extract_from_stmt(
             let mut class_prefix = prefix.to_vec();
             class_prefix.push(c.name.to_string());
             for method_stmt in &c.body {
-                extract_from_stmt(method_stmt, file_path, &class_prefix, line_starts, functions);
+                extract_from_stmt(
+                    method_stmt,
+                    file_path,
+                    &class_prefix,
+                    line_starts,
+                    functions,
+                );
             }
         }
         _ => {}
@@ -201,7 +225,9 @@ impl PythonResolver {
             }
         }
 
-        Ok(Self { functions: all_functions })
+        Ok(Self {
+            functions: all_functions,
+        })
     }
 
     pub fn function_count(&self) -> usize {
@@ -212,7 +238,10 @@ impl PythonResolver {
     #[cfg(test)]
     pub fn from_functions(fns: Vec<(String, (PathBuf, u32))>) -> Self {
         Self {
-            functions: fns.into_iter().map(|(name, (file, line))| (name, (file, line, line + 1))).collect(),
+            functions: fns
+                .into_iter()
+                .map(|(name, (file, line))| (name, (file, line, line + 1)))
+                .collect(),
         }
     }
 }
@@ -220,7 +249,8 @@ impl PythonResolver {
 /// Convert a file path like "modules/audio.py" to module path "modules.audio".
 fn python_module_path(rel_path: &Path) -> String {
     let stem = rel_path.with_extension("");
-    let parts: Vec<_> = stem.components()
+    let parts: Vec<_> = stem
+        .components()
         .filter_map(|c| c.as_os_str().to_str())
         .filter(|s| *s != "__init__")
         .collect();
@@ -228,57 +258,79 @@ fn python_module_path(rel_path: &Path) -> String {
 }
 
 impl SymbolResolver for PythonResolver {
-    fn resolve_pattern(&self, pattern: &str, _project_root: &Path) -> crate::Result<Vec<ResolvedTarget>> {
+    fn resolve_pattern(
+        &self,
+        pattern: &str,
+        _project_root: &Path,
+    ) -> crate::Result<Vec<ResolvedTarget>> {
         if pattern.starts_with("@file:") {
             let file_substr = &pattern[6..];
-            return Ok(self.functions.iter()
-                .filter(|(_, (file, _, _))| {
-                    file.to_string_lossy().contains(file_substr)
-                })
-                .map(|(name, (file, def_line, _body_line))| ResolvedTarget::SourceLocation {
-                    file: file.to_string_lossy().to_string(),
-                    line: *def_line,
-                    name: name.clone(),
-                })
+            return Ok(self
+                .functions
+                .iter()
+                .filter(|(_, (file, _, _))| file.to_string_lossy().contains(file_substr))
+                .map(
+                    |(name, (file, def_line, _body_line))| ResolvedTarget::SourceLocation {
+                        file: file.to_string_lossy().to_string(),
+                        line: *def_line,
+                        name: name.clone(),
+                    },
+                )
                 .collect());
         }
 
         // Use PatternMatcher with `.` as separator for Python
         let matcher = crate::dwarf::PatternMatcher::new_with_separator(pattern, '.');
-        Ok(self.functions.iter()
+        Ok(self
+            .functions
+            .iter()
             .filter(|(name, _)| matcher.matches(name))
-            .map(|(name, (file, def_line, _body_line))| ResolvedTarget::SourceLocation {
-                file: file.to_string_lossy().to_string(),
-                line: *def_line,
-                name: name.clone(),
-            })
+            .map(
+                |(name, (file, def_line, _body_line))| ResolvedTarget::SourceLocation {
+                    file: file.to_string_lossy().to_string(),
+                    line: *def_line,
+                    name: name.clone(),
+                },
+            )
             .collect())
     }
 
     /// For breakpoints, resolve to the first executable line in the function body,
     /// not the `def` line. Python's sys.settrace 'line' events never fire on the
     /// `def` line itself — only on executable lines within the body.
-    fn resolve_breakpoint_pattern(&self, pattern: &str, _project_root: &Path) -> crate::Result<Vec<ResolvedTarget>> {
+    fn resolve_breakpoint_pattern(
+        &self,
+        pattern: &str,
+        _project_root: &Path,
+    ) -> crate::Result<Vec<ResolvedTarget>> {
         if pattern.starts_with("@file:") {
             let file_substr = &pattern[6..];
-            return Ok(self.functions.iter()
+            return Ok(self
+                .functions
+                .iter()
                 .filter(|(_, (file, _, _))| file.to_string_lossy().contains(file_substr))
-                .map(|(name, (file, _def_line, body_line))| ResolvedTarget::SourceLocation {
-                    file: file.to_string_lossy().to_string(),
-                    line: *body_line,
-                    name: name.clone(),
-                })
+                .map(
+                    |(name, (file, _def_line, body_line))| ResolvedTarget::SourceLocation {
+                        file: file.to_string_lossy().to_string(),
+                        line: *body_line,
+                        name: name.clone(),
+                    },
+                )
                 .collect());
         }
 
         let matcher = crate::dwarf::PatternMatcher::new_with_separator(pattern, '.');
-        Ok(self.functions.iter()
+        Ok(self
+            .functions
+            .iter()
             .filter(|(name, _)| matcher.matches(name))
-            .map(|(name, (file, _def_line, body_line))| ResolvedTarget::SourceLocation {
-                file: file.to_string_lossy().to_string(),
-                line: *body_line,
-                name: name.clone(),
-            })
+            .map(
+                |(name, (file, _def_line, body_line))| ResolvedTarget::SourceLocation {
+                    file: file.to_string_lossy().to_string(),
+                    line: *body_line,
+                    name: name.clone(),
+                },
+            )
             .collect())
     }
 
@@ -303,7 +355,9 @@ impl SymbolResolver for PythonResolver {
 
     fn resolve_variable(&self, name: &str) -> crate::Result<VariableResolution> {
         // Python variables are runtime expressions
-        Ok(VariableResolution::RuntimeExpression { expr: name.to_string() })
+        Ok(VariableResolution::RuntimeExpression {
+            expr: name.to_string(),
+        })
     }
 
     fn image_base(&self) -> u64 {
@@ -374,11 +428,22 @@ def outer():
     #[test]
     fn test_pattern_matching_dot_separator() {
         let resolver = PythonResolver::from_functions(vec![
-            ("modules.audio.process_buffer".to_string(), (PathBuf::from("audio.py"), 10)),
-            ("modules.audio.generate_sine".to_string(), (PathBuf::from("audio.py"), 20)),
-            ("modules.midi.note_on".to_string(), (PathBuf::from("midi.py"), 5)),
+            (
+                "modules.audio.process_buffer".to_string(),
+                (PathBuf::from("audio.py"), 10),
+            ),
+            (
+                "modules.audio.generate_sine".to_string(),
+                (PathBuf::from("audio.py"), 20),
+            ),
+            (
+                "modules.midi.note_on".to_string(),
+                (PathBuf::from("midi.py"), 5),
+            ),
         ]);
-        let targets = resolver.resolve_pattern("modules.audio.*", Path::new(".")).unwrap();
+        let targets = resolver
+            .resolve_pattern("modules.audio.*", Path::new("."))
+            .unwrap();
         assert_eq!(targets.len(), 2);
     }
 
@@ -388,7 +453,9 @@ def outer():
             ("handler".to_string(), (PathBuf::from("app/handler.py"), 10)),
             ("main".to_string(), (PathBuf::from("app/main.py"), 1)),
         ]);
-        let targets = resolver.resolve_pattern("@file:handler", Path::new(".")).unwrap();
+        let targets = resolver
+            .resolve_pattern("@file:handler", Path::new("."))
+            .unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].name(), "handler");
     }
@@ -406,8 +473,11 @@ def outer():
         let functions = extract_functions_from_source(source, Path::new("deep.py")).unwrap();
         assert!(functions.contains_key("outer"));
         assert!(functions.contains_key("outer.inner"));
-        assert!(functions.contains_key("outer.inner.deepest"),
-            "Depth-3 nesting should be outer.inner.deepest, got: {:?}", functions.keys().collect::<Vec<_>>());
+        assert!(
+            functions.contains_key("outer.inner.deepest"),
+            "Depth-3 nesting should be outer.inner.deepest, got: {:?}",
+            functions.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

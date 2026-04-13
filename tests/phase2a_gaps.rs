@@ -6,7 +6,6 @@
 /// These validate:
 /// 1. Multiple threads can independently pause via recv().wait() without deadlocking
 /// 2. CModule trace hooks and breakpoints can coexist on the same function
-
 use std::time::Duration;
 
 mod common;
@@ -36,7 +35,7 @@ async fn test_phase2a_gap_suite() {
                 None,
                 false,
                 None,
-        )
+            )
             .await
             .unwrap();
         sm.update_session_pid(session_id, pid).unwrap();
@@ -62,10 +61,7 @@ async fn test_phase2a_gap_suite() {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let paused = sm.get_all_paused_threads(session_id);
             if !paused.is_empty() {
-                println!(
-                    "✓ {} thread(s) paused at breakpoint",
-                    paused.len()
-                );
+                println!("✓ {} thread(s) paused at breakpoint", paused.len());
                 found_pause = true;
 
                 // If we have 2+ paused threads, that's the ideal validation
@@ -76,13 +72,20 @@ async fn test_phase2a_gap_suite() {
                 let resume_result = sm
                     .debug_continue_async(session_id, Some("continue".to_string()))
                     .await;
-                assert!(resume_result.is_ok(), "Resume failed: {:?}", resume_result.err());
+                assert!(
+                    resume_result.is_ok(),
+                    "Resume failed: {:?}",
+                    resume_result.err()
+                );
                 println!("✓ Resumed paused thread(s)");
                 break;
             }
         }
 
-        assert!(found_pause, "No threads paused at breakpoint within timeout");
+        assert!(
+            found_pause,
+            "No threads paused at breakpoint within timeout"
+        );
 
         let _ = sm.stop_frida(session_id).await;
         sm.stop_session(session_id).await.unwrap();
@@ -130,7 +133,10 @@ async fn test_phase2a_gap_suite() {
                 println!("✓ CModule trace installed: {} hooks", result.installed);
             }
             Err(e) => {
-                println!("Note: CModule trace install failed (expected on some configs): {}", e);
+                println!(
+                    "Note: CModule trace install failed (expected on some configs): {}",
+                    e
+                );
                 let _ = sm.stop_frida(session_id).await;
                 sm.stop_session(session_id).await.unwrap();
                 println!("✓ CModule+breakpoint coexistence test skipped (trace install failed)");
@@ -177,10 +183,7 @@ async fn test_phase2a_gap_suite() {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Query for trace events — CModule should still be recording
-        let events = sm
-            .db()
-            .query_events(session_id, |q| q.limit(100))
-            .unwrap();
+        let events = sm.db().query_events(session_id, |q| q.limit(100)).unwrap();
         let trace_events: Vec<_> = events
             .iter()
             .filter(|e| {

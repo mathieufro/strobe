@@ -82,12 +82,7 @@ impl TestAdapter for GoTestAdapter {
         })
     }
 
-    fn parse_output(
-        &self,
-        stdout: &str,
-        stderr: &str,
-        exit_code: i32,
-    ) -> TestResult {
+    fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
         parse_go_json(stdout, stderr, exit_code)
     }
 
@@ -146,10 +141,7 @@ fn parse_go_json(stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
             "output" => {
                 if let (Some(ref test_name), Some(ref output)) = (&event.test, &event.output) {
                     let key = format!("{}::{}", event.package, test_name);
-                    test_output
-                        .entry(key)
-                        .or_default()
-                        .push_str(output);
+                    test_output.entry(key).or_default().push_str(output);
                 }
             }
             "pass" => {
@@ -182,7 +174,8 @@ fn parse_go_json(stdout: &str, stderr: &str, exit_code: i32) -> TestResult {
                     let (file, line_num) = extract_go_file_line(&file_line_re, &output_text);
                     // Extract the actual assertion message, skipping test framework lines
                     // like "=== RUN", "--- FAIL:", and empty lines
-                    let message = output_text.lines()
+                    let message = output_text
+                        .lines()
                         .map(|l| l.trim())
                         .filter(|l| {
                             !l.is_empty()
@@ -324,7 +317,10 @@ fn extract_go_file_line(re: &Regex, output: &str) -> (Option<String>, Option<u32
 
     for caps in re.captures_iter(output) {
         let file = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let line = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
+        let line = caps
+            .get(2)
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
 
         // Prefer _test.go files — these are the user's test assertions
         if file.ends_with("_test.go") {
@@ -420,9 +416,17 @@ mod tests {
 
         // A dir with go.mod → 90
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("go.mod"), "module example.com/foo\n\ngo 1.21\n").unwrap();
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/foo\n\ngo 1.21\n",
+        )
+        .unwrap();
         let confidence = adapter.detect(tmp.path(), None);
-        assert!(confidence >= 90, "Expected >= 90 for go.mod, got {}", confidence);
+        assert!(
+            confidence >= 90,
+            "Expected >= 90 for go.mod, got {}",
+            confidence
+        );
     }
 
     #[test]
@@ -431,7 +435,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("go.sum"), "example.com/foo v1.0.0\n").unwrap();
         let confidence = adapter.detect(tmp.path(), None);
-        assert!(confidence >= 80, "Expected >= 80 for go.sum, got {}", confidence);
+        assert!(
+            confidence >= 80,
+            "Expected >= 80 for go.sum, got {}",
+            confidence
+        );
     }
 
     #[test]
@@ -575,7 +583,10 @@ mod tests {
     fn test_default_timeout() {
         let adapter = GoTestAdapter;
         assert_eq!(adapter.default_timeout(Some(TestLevel::Unit)), 120_000);
-        assert_eq!(adapter.default_timeout(Some(TestLevel::Integration)), 300_000);
+        assert_eq!(
+            adapter.default_timeout(Some(TestLevel::Integration)),
+            300_000
+        );
         assert_eq!(adapter.default_timeout(Some(TestLevel::E2e)), 600_000);
         assert_eq!(adapter.default_timeout(None), 300_000);
     }

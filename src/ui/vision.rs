@@ -66,10 +66,13 @@ impl VisionSidecar {
         let response = self.send_request(&request)?;
 
         if response.get("type").and_then(|t| t.as_str()) == Some("error") {
-            return Err(crate::Error::UiQueryFailed(
-                format!("Vision sidecar error: {}",
-                    response.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"))
-            ));
+            return Err(crate::Error::UiQueryFailed(format!(
+                "Vision sidecar error: {}",
+                response
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown")
+            )));
         }
 
         let elements: Vec<VisionElement> = response
@@ -84,7 +87,10 @@ impl VisionSidecar {
     pub fn check_idle_timeout(&mut self, timeout_seconds: u64) {
         let timeout = Duration::from_secs(timeout_seconds);
         if self.process.is_some() && self.last_used.elapsed() > timeout {
-            tracing::info!("Vision sidecar idle for {}s, shutting down", timeout_seconds);
+            tracing::info!(
+                "Vision sidecar idle for {}s, shutting down",
+                timeout_seconds
+            );
             self.shutdown();
         }
     }
@@ -147,8 +153,7 @@ impl VisionSidecar {
         let sidecar_dir = self.find_sidecar_dir()?;
 
         // Python resolution: standard install venv > sidecar-local venv > system python
-        let strobe_venv = dirs::home_dir()
-            .map(|h| h.join(".strobe/vision-env/bin/python"));
+        let strobe_venv = dirs::home_dir().map(|h| h.join(".strobe/vision-env/bin/python"));
         let local_venv = sidecar_dir.join("venv/bin/python");
 
         let python = if strobe_venv.as_ref().map_or(false, |p| p.exists()) {
@@ -166,9 +171,12 @@ impl VisionSidecar {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()) // Pass through to daemon stderr
             .spawn()
-            .map_err(|e| crate::Error::UiQueryFailed(
-                format!("Failed to start vision sidecar: {}. Run `strobe setup-vision` to install.", e)
-            ))?;
+            .map_err(|e| {
+                crate::Error::UiQueryFailed(format!(
+                    "Failed to start vision sidecar: {}. Run `strobe setup-vision` to install.",
+                    e
+                ))
+            })?;
 
         self.process = Some(child);
 
@@ -178,33 +186,44 @@ impl VisionSidecar {
         if pong.get("type").and_then(|t| t.as_str()) != Some("pong") {
             self.shutdown();
             return Err(crate::Error::UiQueryFailed(
-                "Vision sidecar failed health check".to_string()
+                "Vision sidecar failed health check".to_string(),
             ));
         }
 
-        let device = pong.get("device").and_then(|d| d.as_str()).unwrap_or("unknown");
+        let device = pong
+            .get("device")
+            .and_then(|d| d.as_str())
+            .unwrap_or("unknown");
         tracing::info!("Vision sidecar started (device={})", device);
 
         Ok(())
     }
 
     fn send_request(&mut self, request: &serde_json::Value) -> Result<serde_json::Value> {
-        let child = self.process.as_mut()
+        let child = self
+            .process
+            .as_mut()
             .ok_or_else(|| crate::Error::UiQueryFailed("Sidecar not running".to_string()))?;
 
-        let stdin = child.stdin.as_mut()
+        let stdin = child
+            .stdin
+            .as_mut()
             .ok_or_else(|| crate::Error::UiQueryFailed("Sidecar stdin closed".to_string()))?;
 
         let mut line = serde_json::to_string(request)?;
         line.push('\n');
-        stdin.write_all(line.as_bytes())
-            .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to write to sidecar: {}", e)))?;
-        stdin.flush()
-            .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to flush sidecar stdin: {}", e)))?;
+        stdin.write_all(line.as_bytes()).map_err(|e| {
+            crate::Error::UiQueryFailed(format!("Failed to write to sidecar: {}", e))
+        })?;
+        stdin.flush().map_err(|e| {
+            crate::Error::UiQueryFailed(format!("Failed to flush sidecar stdin: {}", e))
+        })?;
 
         // CORR-1: Read response line without taking ownership of stdout
         // SEC-7: Use poll(2) with 30s timeout to prevent indefinite blocking
-        let stdout = child.stdout.as_mut()
+        let stdout = child
+            .stdout
+            .as_mut()
             .ok_or_else(|| crate::Error::UiQueryFailed("Sidecar stdout closed".to_string()))?;
 
         {
@@ -218,30 +237,37 @@ impl VisionSidecar {
             let poll_result = unsafe { libc::poll(&mut pollfd, 1, 30_000) };
             if poll_result == 0 {
                 return Err(crate::Error::UiQueryFailed(
-                    "Sidecar response timed out after 30s".to_string()
+                    "Sidecar response timed out after 30s".to_string(),
                 ));
             } else if poll_result < 0 {
-                return Err(crate::Error::UiQueryFailed(
-                    format!("Poll error waiting for sidecar: {}", std::io::Error::last_os_error())
-                ));
+                return Err(crate::Error::UiQueryFailed(format!(
+                    "Poll error waiting for sidecar: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
         }
 
         let mut response_line = String::new();
-        BufReader::new(stdout.by_ref()).read_line(&mut response_line)
-            .map_err(|e| crate::Error::UiQueryFailed(format!("Failed to read sidecar response: {}", e)))?;
+        BufReader::new(stdout.by_ref())
+            .read_line(&mut response_line)
+            .map_err(|e| {
+                crate::Error::UiQueryFailed(format!("Failed to read sidecar response: {}", e))
+            })?;
 
         // CORR-5: Check for empty response (process crash)
         if response_line.trim().is_empty() {
             return Err(crate::Error::UiQueryFailed(
-                "Sidecar returned empty response (process may have crashed)".to_string()
+                "Sidecar returned empty response (process may have crashed)".to_string(),
             ));
         }
 
-        serde_json::from_str(&response_line)
-            .map_err(|e| crate::Error::UiQueryFailed(
-                format!("Invalid sidecar JSON: {}. Response: {}", e, response_line.trim())
+        serde_json::from_str(&response_line).map_err(|e| {
+            crate::Error::UiQueryFailed(format!(
+                "Invalid sidecar JSON: {}. Response: {}",
+                e,
+                response_line.trim()
             ))
+        })
     }
 
     fn find_sidecar_dir(&self) -> Result<std::path::PathBuf> {
@@ -270,7 +296,7 @@ impl VisionSidecar {
         }
 
         Err(crate::Error::UiQueryFailed(
-            "Vision sidecar not found. Run `strobe setup-vision` to install.".to_string()
+            "Vision sidecar not found. Run `strobe setup-vision` to install.".to_string(),
         ))
     }
 }
@@ -368,7 +394,8 @@ mod tests {
         assert!(result.is_err(), "Empty screenshot should fail");
 
         // Test truncated data
-        let truncated_b64 = base64::engine::general_purpose::STANDARD.encode(&[0x89, 0x50, 0x4E, 0x47]);
+        let truncated_b64 =
+            base64::engine::general_purpose::STANDARD.encode(&[0x89, 0x50, 0x4E, 0x47]);
         let result = sidecar.detect(&truncated_b64, 0.5, 0.5);
         assert!(result.is_err(), "Truncated screenshot should fail");
 
