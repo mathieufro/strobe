@@ -1,19 +1,19 @@
 pub mod adapter;
+pub mod bun_adapter;
 pub mod cargo_adapter;
 pub mod catch2_adapter;
-pub mod pytest_adapter;
-pub mod unittest_adapter;
-pub mod vitest_adapter;
-pub mod jest_adapter;
-pub mod bun_adapter;
 pub mod deno_adapter;
 pub mod go_adapter;
 pub mod gtest_adapter;
+pub mod jest_adapter;
 pub mod mocha_adapter;
+pub mod output;
 pub mod playwright_adapter;
+pub mod pytest_adapter;
 pub mod stacks;
 pub mod stuck_detector;
-pub mod output;
+pub mod unittest_adapter;
+pub mod vitest_adapter;
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -22,19 +22,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use adapter::*;
+use bun_adapter::BunAdapter;
 use cargo_adapter::CargoTestAdapter;
 use catch2_adapter::Catch2Adapter;
-use pytest_adapter::PytestAdapter;
-use unittest_adapter::UnittestAdapter;
-use vitest_adapter::VitestAdapter;
-use jest_adapter::JestAdapter;
-use bun_adapter::BunAdapter;
 use deno_adapter::DenoAdapter;
 use go_adapter::GoTestAdapter;
 use gtest_adapter::GTestAdapter;
+use jest_adapter::JestAdapter;
 use mocha_adapter::MochaAdapter;
 use playwright_adapter::PlaywrightAdapter;
+use pytest_adapter::PytestAdapter;
 use stuck_detector::StuckDetector;
+use unittest_adapter::UnittestAdapter;
+use vitest_adapter::VitestAdapter;
 
 /// Phase of a test run lifecycle.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,7 +113,8 @@ impl TestProgress {
 
     /// Get the "current test" — the one that's been running longest (for stuck detection).
     pub fn current_test(&self) -> Option<String> {
-        self.running_tests.iter()
+        self.running_tests
+            .iter()
             .min_by_key(|(_, started)| *started)
             .map(|(name, _)| name.clone())
     }
@@ -127,9 +128,7 @@ impl TestProgress {
 /// State of a tracked test run stored in daemon.
 pub enum TestRunState {
     /// Test is still running.
-    Running {
-        progress: Arc<Mutex<TestProgress>>,
-    },
+    Running { progress: Arc<Mutex<TestProgress>> },
     /// Test completed with results (pre-serialized DebugTestResponse).
     Completed {
         response: serde_json::Value,
@@ -275,7 +274,9 @@ impl TestRunner {
         // Run pretest script if one exists (e.g. pretest:e2e for DB setup).
         // Executed outside Frida — these are setup commands, not test code.
         if let Some(pretest) = adapter.pretest_command(project_root, level) {
-            let pretest_cwd = pretest.cwd.as_deref()
+            let pretest_cwd = pretest
+                .cwd
+                .as_deref()
                 .unwrap_or(project_root.to_str().unwrap_or("."));
             tracing::info!(
                 cmd = %pretest.program,
@@ -330,28 +331,30 @@ impl TestRunner {
 
         // Spawn via Frida — defer resume if we need to install hooks first
         let has_trace_patterns = !trace_patterns.is_empty();
-        let spawn_cwd = test_cmd.cwd.as_deref()
+        let spawn_cwd = test_cmd
+            .cwd
+            .as_deref()
             .unwrap_or(project_root.to_str().unwrap_or("."));
-        let pid = session_manager.spawn_with_frida(
-            session_id,
-            &program,
-            &test_cmd.args,
-            Some(spawn_cwd),
-            project_root.to_str().unwrap_or("."),
-            Some(&combined_env),
-            has_trace_patterns, // defer_resume: install hooks before running
-            None, // symbols_path: test runner uses automatic resolution
-        ).await?;
+        let pid = session_manager
+            .spawn_with_frida(
+                session_id,
+                &program,
+                &test_cmd.args,
+                Some(spawn_cwd),
+                project_root.to_str().unwrap_or("."),
+                Some(&combined_env),
+                has_trace_patterns, // defer_resume: install hooks before running
+                None,               // symbols_path: test runner uses automatic resolution
+            )
+            .await?;
 
         // Apply trace patterns BEFORE resuming the process
         if has_trace_patterns {
             session_manager.add_patterns(session_id, trace_patterns)?;
-            match session_manager.update_frida_patterns(
-                session_id,
-                Some(trace_patterns),
-                None,
-                None,
-            ).await {
+            match session_manager
+                .update_frida_patterns(session_id, Some(trace_patterns), None, None)
+                .await
+            {
                 Ok(result) => {
                     session_manager.set_hook_count(session_id, result.installed);
                 }
@@ -364,7 +367,8 @@ impl TestRunner {
         }
 
         // Select progress updater based on adapter
-        let progress_fn: Option<fn(&str, &Arc<Mutex<TestProgress>>)> = match framework_name.as_str() {
+        let progress_fn: Option<fn(&str, &Arc<Mutex<TestProgress>>)> = match framework_name.as_str()
+        {
             "cargo" => Some(cargo_adapter::update_progress),
             "catch2" => Some(catch2_adapter::update_progress),
             "deno" => Some(deno_adapter::update_progress),
@@ -395,7 +399,9 @@ impl TestRunner {
             let paused = session_manager.paused_threads_ref();
             let sid = session_id.to_string();
             detector = detector.with_pause_check(Arc::new(move || {
-                paused.read().unwrap_or_else(|e| e.into_inner())
+                paused
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&sid)
                     .map_or(false, |m| !m.is_empty())
             }));
@@ -451,13 +457,16 @@ impl TestRunner {
 
             // Poll DB for new text events (stdout + stderr) and update progress.
             if let Some(update_fn) = progress_fn {
-                let mut new_events = session_manager.db().query_events(session_id, |q| {
-                    let mut q = q.text_output().limit(500);
-                    if last_seen_timestamp_ns > 0 {
-                        q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
-                    }
-                    q
-                }).unwrap_or_default();
+                let mut new_events = session_manager
+                    .db()
+                    .query_events(session_id, |q| {
+                        let mut q = q.text_output().limit(500);
+                        if last_seen_timestamp_ns > 0 {
+                            q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
+                        }
+                        q
+                    })
+                    .unwrap_or_default();
 
                 new_events.reverse();
 
@@ -479,9 +488,15 @@ impl TestRunner {
 
             // For JS frameworks with buffered reporters, force transition
             // from Compiling to Running after 3s.
-            if matches!(framework_name.as_str(), "vitest" | "jest" | "bun" | "playwright") {
+            if matches!(
+                framework_name.as_str(),
+                "vitest" | "jest" | "bun" | "playwright"
+            ) {
                 if let Ok(mut p) = progress.lock() {
-                    if p.phase == TestPhase::Compiling && !p.has_custom_reporter && start.elapsed().as_secs() >= 3 {
+                    if p.phase == TestPhase::Compiling
+                        && !p.has_custom_reporter
+                        && start.elapsed().as_secs() >= 3
+                    {
                         p.phase = TestPhase::Running;
                     }
                 }
@@ -494,10 +509,12 @@ impl TestRunner {
                     // node process. Keep polling the progress file until it stops growing
                     // or all tests have reported results, up to hard_timeout.
                     let last_file_size = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
-                        .map(|m| m.len()).unwrap_or(0);
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let new_file_size = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
-                        .map(|m| m.len()).unwrap_or(0);
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     if new_file_size > last_file_size {
                         // File still growing — tests are still running, keep looping
                         continue;
@@ -521,14 +538,17 @@ impl TestRunner {
         if is_playwright {
             if let Some(update_fn) = progress_fn {
                 let poll_wait = std::time::Duration::from_secs(3);
-                for _ in 0..60 { // max 3 minutes wait
+                for _ in 0..60 {
+                    // max 3 minutes wait
                     update_fn("", &progress);
                     let size_before = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
-                        .map(|m| m.len()).unwrap_or(0);
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     tokio::time::sleep(poll_wait).await;
                     update_fn("", &progress);
                     let size_after = std::fs::metadata(playwright_adapter::PROGRESS_FILE)
-                        .map(|m| m.len()).unwrap_or(0);
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     if size_after == size_before && size_after > 0 {
                         break; // File stopped growing — tests done
                     }
@@ -550,13 +570,16 @@ impl TestRunner {
         // Final progress drain — process any remaining text events (stdout + stderr) that
         // arrived after the last poll (e.g., test "ok" events emitted just before process exit).
         if let Some(update_fn) = progress_fn {
-            let mut remaining = session_manager.db().query_events(session_id, |q| {
-                let mut q = q.text_output().limit_uncapped(5000);
-                if last_seen_timestamp_ns > 0 {
-                    q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
-                }
-                q
-            }).unwrap_or_default();
+            let mut remaining = session_manager
+                .db()
+                .query_events(session_id, |q| {
+                    let mut q = q.text_output().limit_uncapped(5000);
+                    if last_seen_timestamp_ns > 0 {
+                        q.timestamp_from_ns = Some(last_seen_timestamp_ns + 1);
+                    }
+                    q
+                })
+                .unwrap_or_default();
 
             remaining.reverse(); // Chronological order
 
@@ -568,20 +591,36 @@ impl TestRunner {
         }
 
         // Query ALL stdout/stderr from DB
-        let stdout_buf = collect_output(session_manager.db(), session_id, crate::db::EventType::Stdout);
-        let stderr_buf = collect_output(session_manager.db(), session_id, crate::db::EventType::Stderr);
+        let stdout_buf = collect_output(
+            session_manager.db(),
+            session_id,
+            crate::db::EventType::Stdout,
+        );
+        let stderr_buf = collect_output(
+            session_manager.db(),
+            session_id,
+            crate::db::EventType::Stderr,
+        );
 
         // Get exit code: use already-reaped status from polling loop, or try waitpid
         let exit_code = {
             let status = reaped_status.unwrap_or_else(|| {
                 let mut s: i32 = 0;
                 let r = unsafe { libc::waitpid(pid as i32, &mut s, libc::WNOHANG) };
-                if r > 0 { s } else { -1 }
+                if r > 0 {
+                    s
+                } else {
+                    -1
+                }
             });
             if status == -1 {
                 // Not our child or already reaped — infer from test results
                 let p = progress.lock().unwrap();
-                if p.failed > 0 { 1 } else { 0 }
+                if p.failed > 0 {
+                    1
+                } else {
+                    0
+                }
             } else if unsafe { libc::WIFEXITED(status) } {
                 unsafe { libc::WEXITSTATUS(status) }
             } else if unsafe { libc::WIFSIGNALED(status) } {
@@ -601,9 +640,13 @@ impl TestRunner {
             let mut test_start_times: HashMap<String, i64> = HashMap::new();
             let mut test_durations: HashMap<String, u64> = HashMap::new();
 
-            let mut all_stdout = session_manager.db().query_events(session_id, |q| {
-                q.event_type(crate::db::EventType::Stdout).limit_uncapped(50000)
-            }).unwrap_or_default();
+            let mut all_stdout = session_manager
+                .db()
+                .query_events(session_id, |q| {
+                    q.event_type(crate::db::EventType::Stdout)
+                        .limit_uncapped(50000)
+                })
+                .unwrap_or_default();
             all_stdout.reverse(); // Chronological order
 
             for event in &all_stdout {
@@ -620,7 +663,8 @@ impl TestRunner {
                                 }
                                 ("test", "ok") | ("test", "failed") if !name.is_empty() => {
                                     if let Some(start_ns) = test_start_times.get(name) {
-                                        let dur_ms = (event.timestamp_ns - start_ns).max(0) as u64 / 1_000_000;
+                                        let dur_ms = (event.timestamp_ns - start_ns).max(0) as u64
+                                            / 1_000_000;
                                         test_durations.insert(name.to_string(), dur_ms);
                                     }
                                 }
@@ -688,6 +732,67 @@ fn resolve_program(program: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn prepare_debuggable_bun(program: &str) -> Option<String> {
+    const REQUIRED_ENTITLEMENTS: &[&str] = &[
+        "com.apple.security.get-task-allow",
+        "com.apple.security.cs.disable-library-validation",
+    ];
+
+    fn read_entitlements(path: &Path) -> Option<String> {
+        let output = std::process::Command::new("codesign")
+            .args([
+                "-d",
+                "--entitlements",
+                ":-",
+                path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .ok()?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let start = combined.find("<?xml")?;
+        Some(combined[start..].trim().to_string())
+    }
+
+    fn extract_entitlement_keys(xml: &str) -> std::collections::BTreeSet<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        let mut rest = xml;
+        while let Some(start) = rest.find("<key>") {
+            let after_start = &rest[start + 5..];
+            if let Some(end) = after_start.find("</key>") {
+                keys.insert(after_start[..end].trim().to_string());
+                rest = &after_start[end + 6..];
+            } else {
+                break;
+            }
+        }
+        keys
+    }
+
+    fn merged_entitlements_xml(existing: Option<&str>) -> String {
+        let mut xml = existing.unwrap_or(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+</dict></plist>"#,
+        )
+        .to_string();
+
+        for key in REQUIRED_ENTITLEMENTS {
+            let marker = format!("<key>{}</key>", key);
+            if xml.contains(&marker) {
+                continue;
+            }
+            if let Some(idx) = xml.find("</dict>") {
+                xml.insert_str(idx, &format!("<key>{}</key><true/>", key));
+            }
+        }
+
+        xml
+    }
+
     let path = Path::new(program);
     let name = path.file_name()?.to_str()?.to_ascii_lowercase();
     if !name.contains("bun") || name == "strobe-bun-debug" {
@@ -696,12 +801,28 @@ fn prepare_debuggable_bun(program: &str) -> Option<String> {
 
     let debug_path = std::env::temp_dir().join("strobe-bun-debug");
     let ent_path = std::env::temp_dir().join("strobe-bun-debug.entitlements");
+    let source_entitlements = read_entitlements(path);
+    let required_keys: std::collections::BTreeSet<String> = source_entitlements
+        .as_deref()
+        .map(extract_entitlement_keys)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(REQUIRED_ENTITLEMENTS.iter().map(|key| key.to_string()))
+        .collect();
 
     let needs_refresh = match (std::fs::metadata(path), std::fs::metadata(&debug_path)) {
         (Ok(src), Ok(dst)) => {
             let src_mtime = src.modified().ok();
             let dst_mtime = dst.modified().ok();
-            src_mtime.zip(dst_mtime).map(|(src, dst)| src > dst).unwrap_or(true)
+            let stale_binary = src_mtime
+                .zip(dst_mtime)
+                .map(|(src, dst)| src > dst)
+                .unwrap_or(true);
+            let existing_keys = read_entitlements(&debug_path)
+                .as_deref()
+                .map(extract_entitlement_keys)
+                .unwrap_or_default();
+            stale_binary || !required_keys.is_subset(&existing_keys)
         }
         (Ok(_), Err(_)) => true,
         _ => return None,
@@ -711,12 +832,7 @@ fn prepare_debuggable_bun(program: &str) -> Option<String> {
         return Some(debug_path.to_string_lossy().into_owned());
     }
 
-    let entitlements = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>com.apple.security.get-task-allow</key><true/>
-<key>com.apple.security.cs.disable-library-validation</key><true/>
-</dict></plist>"#;
+    let entitlements = merged_entitlements_xml(source_entitlements.as_deref());
 
     if let Err(err) = std::fs::write(&ent_path, entitlements) {
         tracing::warn!("Failed to write Bun entitlements file: {}", err);
@@ -754,14 +870,20 @@ fn prepare_debuggable_bun(program: &str) -> Option<String> {
 }
 
 /// Collect all output events of a given type from the database into a single string.
-fn collect_output(db: &crate::db::Database, session_id: &str, event_type: crate::db::EventType) -> String {
-    let mut events = db.query_events(session_id, |q| {
-        q.event_type(event_type).limit_uncapped(50000)
-    })
-    .unwrap_or_default();
+fn collect_output(
+    db: &crate::db::Database,
+    session_id: &str,
+    event_type: crate::db::EventType,
+) -> String {
+    let mut events = db
+        .query_events(session_id, |q| {
+            q.event_type(event_type).limit_uncapped(50000)
+        })
+        .unwrap_or_default();
     // Query returns newest-first; reverse to chronological for output concatenation
     events.reverse();
-    events.into_iter()
+    events
+        .into_iter()
         .filter_map(|e| e.text)
         .collect::<Vec<_>>()
         .join("")
@@ -801,7 +923,11 @@ mod tests {
         assert!(err.contains("Deno"), "should mention Deno: {}", err);
         assert!(err.contains("Go"), "should mention Go: {}", err);
         assert!(err.contains("Mocha"), "should mention Mocha: {}", err);
-        assert!(err.contains("Google Test"), "should mention Google Test: {}", err);
+        assert!(
+            err.contains("Google Test"),
+            "should mention Google Test: {}",
+            err
+        );
     }
 
     #[test]
@@ -817,7 +943,11 @@ mod tests {
     fn test_adapter_detection_go() {
         let runner = TestRunner::new();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("go.mod"), "module example.com/foo\ngo 1.21\n").unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/foo\ngo 1.21\n",
+        )
+        .unwrap();
         let adapter = runner.detect_adapter(dir.path(), None, None).unwrap();
         assert_eq!(adapter.name(), "go");
     }
@@ -834,7 +964,9 @@ mod tests {
     #[test]
     fn test_adapter_detection_gtest_by_name() {
         let runner = TestRunner::new();
-        let adapter = runner.detect_adapter(Path::new("/nonexistent"), Some("gtest"), None).unwrap();
+        let adapter = runner
+            .detect_adapter(Path::new("/nonexistent"), Some("gtest"), None)
+            .unwrap();
         assert_eq!(adapter.name(), "gtest");
     }
 

@@ -1,3 +1,6 @@
+use super::SessionManager;
+use crate::mcp::*;
+use crate::Result;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -7,9 +10,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use crate::mcp::*;
-use crate::Result;
-use super::SessionManager;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60); // 30 minutes
 const MAX_SESSIONS_PER_CONNECTION: usize = 10;
@@ -62,7 +62,9 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
         });
     }
 
-    if event.event_type == crate::db::EventType::Stdout || event.event_type == crate::db::EventType::Stderr {
+    if event.event_type == crate::db::EventType::Stdout
+        || event.event_type == crate::db::EventType::Stderr
+    {
         return serde_json::json!({
             "id": event.id,
             "timestamp_ns": event.timestamp_ns,
@@ -169,8 +171,8 @@ fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
 /// Parse a type hint string (e.g. "u32", "f64", "pointer") into (size_bytes, type_kind_str).
 pub fn parse_type_hint(hint: &str) -> (u8, String) {
     match hint {
-        "i8"  => (1, "int".to_string()),
-        "u8"  => (1, "uint".to_string()),
+        "i8" => (1, "int".to_string()),
+        "u8" => (1, "uint".to_string()),
         "i16" => (2, "int".to_string()),
         "u16" => (2, "uint".to_string()),
         "i32" => (4, "int".to_string()),
@@ -193,7 +195,9 @@ fn hook_status_message(
     // When function tracing is unavailable for this runtime, give prescriptive guidance
     if let Some(caps) = capabilities {
         if matches!(caps.function_tracing, crate::mcp::CapabilityLevel::None) && !patterns_empty {
-            let first_limitation = caps.limitations.first()
+            let first_limitation = caps
+                .limitations
+                .first()
                 .map(|s| s.as_str())
                 .unwrap_or("Function tracing is not available for this runtime.");
             return format!("Function tracing not available: {}", first_limitation);
@@ -203,7 +207,10 @@ fn hook_status_message(
     if installed > 0 && matched > installed {
         format!("{} functions hooked (out of {} matches — excess skipped to stay under limit). Use debug_query to see traced events.", installed, matched)
     } else if installed > 0 {
-        format!("{} functions hooked. Use debug_query to see traced events.", installed)
+        format!(
+            "{} functions hooked. Use debug_query to see traced events.",
+            installed
+        )
     } else if matched > 0 {
         format!("{} functions matched but could not be hooked. They may be inlined or optimized out. Try broader patterns or @file: patterns.", matched)
     } else if patterns_empty {
@@ -229,9 +236,8 @@ impl Daemon {
             .write(true)
             .open(&lock_path)?;
 
-        let lock_result = unsafe {
-            libc::flock(_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-        };
+        let lock_result =
+            unsafe { libc::flock(_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if lock_result != 0 {
             tracing::info!("Another daemon is already running (lock held), exiting");
             return Ok(());
@@ -258,7 +264,9 @@ impl Daemon {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
+            vision_sidecar: Arc::new(std::sync::Mutex::new(
+                crate::ui::vision::VisionSidecar::new(),
+            )),
         });
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -270,9 +278,8 @@ impl Daemon {
             daemon_clone.idle_timeout_loop().await;
         });
 
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )?;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let shutdown = Arc::clone(&daemon.shutdown_signal);
         let mut consecutive_accept_errors: u32 = 0;
 
@@ -347,7 +354,9 @@ impl Daemon {
         tracing::info!("Starting graceful shutdown...");
 
         // Phase 1: Stop all Frida sessions (stops event generation)
-        let session_ids: Vec<String> = self.session_manager.get_running_sessions()
+        let session_ids: Vec<String> = self
+            .session_manager
+            .get_running_sessions()
             .unwrap_or_default()
             .into_iter()
             .map(|s| s.id)
@@ -396,7 +405,9 @@ impl Daemon {
             // Update activity timestamp
             *self.last_activity.write().await = Instant::now();
 
-            let response = self.handle_message(&line, &mut initialized, &connection_id).await;
+            let response = self
+                .handle_message(&line, &mut initialized, &connection_id)
+                .await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -472,7 +483,9 @@ impl Daemon {
         let response = McpInitializeResponse {
             protocol_version: "2024-11-05".to_string(),
             capabilities: McpServerCapabilities {
-                tools: McpToolsCapability { list_changed: false },
+                tools: McpToolsCapability {
+                    list_changed: false,
+                },
             },
             server_info: McpServerInfo {
                 name: "strobe".to_string(),
@@ -824,7 +837,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         Ok(serde_json::to_value(response)?)
     }
 
-    async fn handle_tools_call(&self, params: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+    async fn handle_tools_call(
+        &self,
+        params: &serde_json::Value,
+        connection_id: &str,
+    ) -> Result<serde_json::Value> {
         let call: McpToolCallRequest = serde_json::from_value(params.clone())?;
 
         let result = match call.name.as_str() {
@@ -836,24 +853,26 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             "debug_memory" => self.tool_debug_memory(&call.arguments).await,
             "debug_breakpoint" => self.tool_debug_breakpoint(&call.arguments).await,
             "debug_continue" => self.tool_debug_continue(&call.arguments).await,
-            "debug_ui" => {
-                match self.tool_debug_ui(&call.arguments).await {
-                    Ok(content) => {
-                        let response = McpToolCallResponse { content, is_error: None };
-                        return Ok(serde_json::to_value(response)?);
-                    }
-                    Err(e) => Err(e),
+            "debug_ui" => match self.tool_debug_ui(&call.arguments).await {
+                Ok(content) => {
+                    let response = McpToolCallResponse {
+                        content,
+                        is_error: None,
+                    };
+                    return Ok(serde_json::to_value(response)?);
                 }
-            }
-            "debug_ui_action" => {
-                match self.tool_debug_ui_action(&call.arguments).await {
-                    Ok(content) => {
-                        let response = McpToolCallResponse { content, is_error: None };
-                        return Ok(serde_json::to_value(response)?);
-                    }
-                    Err(e) => Err(e),
+                Err(e) => Err(e),
+            },
+            "debug_ui_action" => match self.tool_debug_ui_action(&call.arguments).await {
+                Ok(content) => {
+                    let response = McpToolCallResponse {
+                        content,
+                        is_error: None,
+                    };
+                    return Ok(serde_json::to_value(response)?);
                 }
-            }
+                Err(e) => Err(e),
+            },
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
 
@@ -871,7 +890,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 let mcp_error: McpError = e.into();
                 let response = McpToolCallResponse {
                     content: vec![McpContent::Text {
-                        text: format!("{}: {}", serde_json::to_string(&mcp_error.code)?, mcp_error.message),
+                        text: format!(
+                            "{}: {}",
+                            serde_json::to_string(&mcp_error.code)?,
+                            mcp_error.message
+                        ),
                     }],
                     is_error: Some(true),
                 };
@@ -881,7 +904,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
     }
 
     fn require_session(&self, session_id: &str) -> crate::Result<crate::db::Session> {
-        self.session_manager.get_session(session_id)?
+        self.session_manager
+            .get_session(session_id)?
             .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))
     }
 
@@ -924,7 +948,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     let sm = Arc::clone(&self.session_manager);
                     let is_test = test_session_ids.contains(&session_id);
                     join_set.spawn(async move {
-                        tracing::info!("Cleaning up session {} after client disconnect", session_id);
+                        tracing::info!(
+                            "Cleaning up session {} after client disconnect",
+                            session_id
+                        );
                         let _ = sm.stop_frida(&session_id).await;
                         if is_test {
                             let _ = sm.stop_session_retain(&session_id).await;
@@ -937,10 +964,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         }
 
         // Wait for all session stops with a global timeout
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            async { while join_set.join_next().await.is_some() {} },
-        ).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while join_set.join_next().await.is_some() {}
+        })
+        .await;
 
         // Transition running test runs from this connection to Failed
         {
@@ -958,25 +985,29 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         }
     }
 
-    async fn tool_debug_launch(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+    async fn tool_debug_launch(
+        &self,
+        args: &serde_json::Value,
+        connection_id: &str,
+    ) -> Result<serde_json::Value> {
         let req: DebugLaunchRequest = serde_json::from_value(args.clone())?;
         req.validate()?;
 
         // Validate paths: reject path traversal attempts
         if req.command.contains("..") {
             return Err(crate::Error::ValidationError(
-                "command path must not contain '..' components".to_string()
+                "command path must not contain '..' components".to_string(),
             ));
         }
         if req.project_root.contains("..") {
             return Err(crate::Error::ValidationError(
-                "projectRoot must not contain '..' components".to_string()
+                "projectRoot must not contain '..' components".to_string(),
             ));
         }
         if let Some(ref sp) = req.symbols_path {
             if sp.contains("..") {
                 return Err(crate::Error::ValidationError(
-                    "symbolsPath must not contain '..' components".to_string()
+                    "symbolsPath must not contain '..' components".to_string(),
                 ));
             }
         }
@@ -1011,9 +1042,16 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         }
 
         // Auto-cleanup: if there's already a session for this binary, stop it first
-        if let Some(existing) = self.session_manager.db().get_session_by_binary(&req.command)? {
+        if let Some(existing) = self
+            .session_manager
+            .db()
+            .get_session_by_binary(&req.command)?
+        {
             if existing.status == crate::db::SessionStatus::Running {
-                tracing::info!("Auto-stopping existing session {} before new launch", existing.id);
+                tracing::info!(
+                    "Auto-stopping existing session {} before new launch",
+                    existing.id
+                );
                 let _ = self.session_manager.stop_frida(&existing.id).await;
                 let _ = self.session_manager.stop_session(&existing.id).await;
 
@@ -1043,16 +1081,20 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         // Launch always starts fast (no DWARF blocking, no initial hooks).
         // DWARF parsing happens in the background.
         let args_vec = req.args.unwrap_or_default();
-        let pid = match self.session_manager.spawn_with_frida(
-            &session_id,
-            &req.command,
-            &args_vec,
-            req.cwd.as_deref(),
-            &req.project_root,
-            req.env.as_ref(),
-            false, // debug_launch: resume immediately
-            req.symbols_path.as_deref(),
-        ).await {
+        let pid = match self
+            .session_manager
+            .spawn_with_frida(
+                &session_id,
+                &req.command,
+                &args_vec,
+                req.cwd.as_deref(),
+                &req.project_root,
+                req.env.as_ref(),
+                false, // debug_launch: resume immediately
+                req.symbols_path.as_deref(),
+            )
+            .await
+        {
             Ok(pid) => {
                 // Update PID now that we know it
                 self.session_manager.update_session_pid(&session_id, pid)?;
@@ -1073,7 +1115,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         // Register session ownership for disconnect cleanup
         {
             let mut sessions = self.connection_sessions.write().await;
-            sessions.entry(connection_id.to_string()).or_default().push(session_id.clone());
+            sessions
+                .entry(connection_id.to_string())
+                .or_default()
+                .push(session_id.clone());
         }
 
         // Get and clear this connection's pending patterns
@@ -1091,16 +1136,29 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let had_pending_patterns = !pending_patterns.is_empty();
 
         if !pending_patterns.is_empty() {
-            self.session_manager.add_patterns(&session_id, &pending_patterns)?;
+            self.session_manager
+                .add_patterns(&session_id, &pending_patterns)?;
 
             let sm = Arc::clone(&self.session_manager);
             let sid = session_id.clone();
             tokio::spawn(async move {
-                match sm.update_frida_patterns(&sid, Some(&pending_patterns), None, None).await {
+                match sm
+                    .update_frida_patterns(&sid, Some(&pending_patterns), None, None)
+                    .await
+                {
                     Ok(result) => {
-                        tracing::info!("Deferred hooks installed for {}: {} hooked ({} matched)", sid, result.installed, result.matched);
+                        tracing::info!(
+                            "Deferred hooks installed for {}: {} hooked ({} matched)",
+                            sid,
+                            result.installed,
+                            result.matched
+                        );
                         if !result.warnings.is_empty() {
-                            tracing::warn!("Deferred hook warnings for {}: {:?}", sid, result.warnings);
+                            tracing::warn!(
+                                "Deferred hook warnings for {}: {:?}",
+                                sid,
+                                result.warnings
+                            );
                         }
                         sm.set_hook_count(&sid, result.installed);
                     }
@@ -1133,7 +1191,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         Ok(serde_json::to_value(response)?)
     }
 
-    async fn tool_debug_trace(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+    async fn tool_debug_trace(
+        &self,
+        args: &serde_json::Value,
+        connection_id: &str,
+    ) -> Result<serde_json::Value> {
         let req: DebugTraceRequest = serde_json::from_value(args.clone())?;
 
         // Validate request first
@@ -1189,12 +1251,16 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 }
 
                 // Update Frida hooks
-                let hook_result = match self.session_manager.update_frida_patterns(
-                    session_id,
-                    req.add.as_deref(),
-                    req.remove.as_deref(),
-                    req.serialization_depth,
-                ).await {
+                let hook_result = match self
+                    .session_manager
+                    .update_frida_patterns(
+                        session_id,
+                        req.add.as_deref(),
+                        req.remove.as_deref(),
+                        req.serialization_depth,
+                    )
+                    .await
+                {
                     Ok(result) => result,
                     Err(e) => {
                         tracing::warn!("Failed to update Frida patterns for {}: {}", session_id, e);
@@ -1221,18 +1287,21 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     }
                 };
 
-                self.session_manager.set_hook_count(session_id, hook_result.installed);
+                self.session_manager
+                    .set_hook_count(session_id, hook_result.installed);
 
                 // Resolve settings from project root
                 let project_root_str = req.project_root.clone().or_else(|| {
-                    self.session_manager.get_session(session_id).ok()
+                    self.session_manager
+                        .get_session(session_id)
+                        .ok()
                         .flatten()
                         .map(|s| s.project_root)
                 });
-                let settings = crate::config::resolve(
-                    project_root_str.as_deref().map(std::path::Path::new)
-                );
-                self.session_manager.set_event_limit(session_id, settings.events_max_per_session);
+                let settings =
+                    crate::config::resolve(project_root_str.as_deref().map(std::path::Path::new));
+                self.session_manager
+                    .set_event_limit(session_id, settings.events_max_per_session);
 
                 let patterns = self.session_manager.get_patterns(session_id);
                 let event_limit = self.session_manager.get_event_limit(session_id);
@@ -1247,12 +1316,16 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                         let mut expr_watches = vec![];
                         let mut state_watches = vec![];
 
-                        use crate::mcp::{MAX_WATCH_EXPRESSION_LENGTH as MAX_WATCH_EXPR_LEN, MAX_WATCH_EXPRESSION_DEPTH as MAX_DEREF_DEPTH, MAX_WATCHES_PER_SESSION};
+                        use crate::mcp::{
+                            MAX_WATCHES_PER_SESSION, MAX_WATCH_EXPRESSION_DEPTH as MAX_DEREF_DEPTH,
+                            MAX_WATCH_EXPRESSION_LENGTH as MAX_WATCH_EXPR_LEN,
+                        };
 
                         let existing_watches = self.session_manager.get_watches(session_id);
 
                         for watch_target in add_watches {
-                            let total_watch_count = existing_watches.len() + frida_watches.len() + expr_watches.len();
+                            let total_watch_count =
+                                existing_watches.len() + frida_watches.len() + expr_watches.len();
                             if total_watch_count >= MAX_WATCHES_PER_SESSION {
                                 watch_warnings.push(format!(
                                     "Watch limit reached ({} existing + {} new >= {} max). Additional watches ignored.",
@@ -1267,12 +1340,23 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
                             // 1) Address-based watch: raw address, no DWARF needed
                             if let Some(ref addr_str) = watch_target.address {
-                                let addr = u64::from_str_radix(addr_str.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                                    .map_err(|_| crate::Error::Frida(format!("Invalid watch address: {}", addr_str)))?;
+                                let addr = u64::from_str_radix(
+                                    addr_str.trim_start_matches("0x").trim_start_matches("0X"),
+                                    16,
+                                )
+                                .map_err(|_| {
+                                    crate::Error::Frida(format!(
+                                        "Invalid watch address: {}",
+                                        addr_str
+                                    ))
+                                })?;
 
                                 let type_hint = watch_target.type_hint.as_deref().unwrap_or("u32");
                                 let (size, type_kind_str) = parse_type_hint(type_hint);
-                                let label = watch_target.label.clone().unwrap_or_else(|| format!("0x{:x}", addr));
+                                let label = watch_target
+                                    .label
+                                    .clone()
+                                    .unwrap_or_else(|| format!("0x{:x}", addr));
 
                                 frida_watches.push(crate::frida_collector::WatchTarget {
                                     label: label.clone(),
@@ -1316,12 +1400,15 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                                     if expr.len() > MAX_WATCH_EXPR_LEN {
                                         watch_warnings.push(format!(
                                             "Watch expression too long (max {} chars): {}...",
-                                            MAX_WATCH_EXPR_LEN, &expr[..50.min(expr.len())]
+                                            MAX_WATCH_EXPR_LEN,
+                                            &expr[..50.min(expr.len())]
                                         ));
                                         continue;
                                     }
-                                    let label = watch_target.label.clone().unwrap_or_else(|| expr.clone());
-                                    let is_global = on_patterns.as_ref().map_or(true, |p| p.is_empty());
+                                    let label =
+                                        watch_target.label.clone().unwrap_or_else(|| expr.clone());
+                                    let is_global =
+                                        on_patterns.as_ref().map_or(true, |p| p.is_empty());
 
                                     expr_watches.push(crate::frida_collector::ExprWatchTarget {
                                         label: label.clone(),
@@ -1342,15 +1429,20 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                             }
 
                             // 3) DWARF variable watch: resolve via DWARF symbols
-                            let var_or_expr = watch_target.variable.as_ref()
+                            let var_or_expr = watch_target
+                                .variable
+                                .as_ref()
                                 .or(watch_target.expr.as_ref());
 
-                            let Some(name) = var_or_expr else { continue; };
+                            let Some(name) = var_or_expr else {
+                                continue;
+                            };
 
                             if name.len() > MAX_WATCH_EXPR_LEN {
                                 watch_warnings.push(format!(
                                     "Watch expression too long (max {} chars): {}...",
-                                    MAX_WATCH_EXPR_LEN, &name[..50.min(name.len())]
+                                    MAX_WATCH_EXPR_LEN,
+                                    &name[..50.min(name.len())]
                                 ));
                                 continue;
                             }
@@ -1363,16 +1455,24 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                             }
 
                             let Some(ref dwarf) = dwarf else {
-                                watch_warnings.push("No debug symbols available for DWARF variable watches".to_string());
+                                watch_warnings.push(
+                                    "No debug symbols available for DWARF variable watches"
+                                        .to_string(),
+                                );
                                 break;
                             };
 
                             let recipe = dwarf.resolve_watch_expression(name)?;
 
-                            let label = watch_target.label.as_ref().unwrap_or(&recipe.label).clone();
+                            let label =
+                                watch_target.label.as_ref().unwrap_or(&recipe.label).clone();
                             let type_kind_str = match recipe.type_kind {
                                 crate::dwarf::TypeKind::Integer { signed } => {
-                                    if signed { "int".to_string() } else { "uint".to_string() }
+                                    if signed {
+                                        "int".to_string()
+                                    } else {
+                                        "uint".to_string()
+                                    }
                                 }
                                 crate::dwarf::TypeKind::Float => "float".to_string(),
                                 crate::dwarf::TypeKind::Pointer => "pointer".to_string(),
@@ -1416,7 +1516,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
                         // Send watches to Frida agent
                         if !frida_watches.is_empty() || !expr_watches.is_empty() {
-                            self.session_manager.update_frida_watches(session_id, frida_watches, expr_watches).await?;
+                            self.session_manager
+                                .update_frida_watches(session_id, frida_watches, expr_watches)
+                                .await?;
                             self.session_manager.set_watches(session_id, state_watches);
                         }
                     }
@@ -1424,25 +1526,31 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     // Handle watch removal
                     if let Some(ref remove_labels) = watch_update.remove {
                         // Remove watches from session state
-                        let remaining_watches = self.session_manager.remove_watches(session_id, remove_labels);
+                        let remaining_watches = self
+                            .session_manager
+                            .remove_watches(session_id, remove_labels);
 
                         // Send updated watch list to Frida agent
-                        let frida_watches: Vec<crate::frida_collector::WatchTarget> = remaining_watches.iter().map(|w| {
-                            crate::frida_collector::WatchTarget {
-                                label: w.label.clone(),
-                                address: w.address,
-                                size: w.size,
-                                type_kind_str: w.type_kind_str.clone(),
-                                deref_depth: w.deref_depth,
-                                deref_offset: w.deref_offset,
-                                type_name: w.type_name.clone(),
-                                on_patterns: w.on_patterns.clone(),
-                                no_slide: w.no_slide,
-                            }
-                        }).collect();
+                        let frida_watches: Vec<crate::frida_collector::WatchTarget> =
+                            remaining_watches
+                                .iter()
+                                .map(|w| crate::frida_collector::WatchTarget {
+                                    label: w.label.clone(),
+                                    address: w.address,
+                                    size: w.size,
+                                    type_kind_str: w.type_kind_str.clone(),
+                                    deref_depth: w.deref_depth,
+                                    deref_offset: w.deref_offset,
+                                    type_name: w.type_name.clone(),
+                                    on_patterns: w.on_patterns.clone(),
+                                    no_slide: w.no_slide,
+                                })
+                                .collect();
 
                         // Update agent with remaining watches (empty list if all removed)
-                        self.session_manager.update_frida_watches(session_id, frida_watches, vec![]).await?;
+                        self.session_manager
+                            .update_frida_watches(session_id, frida_watches, vec![])
+                            .await?;
 
                         watch_warnings.push(format!("Removed {} watch(es)", remove_labels.len()));
                     }
@@ -1498,11 +1606,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                         return s.parse::<i64>().ok();
                     }
                     let (num_str, multiplier) = if s.ends_with("ms") {
-                        (&s[1..s.len()-2], 1_000_000i64)
+                        (&s[1..s.len() - 2], 1_000_000i64)
                     } else if s.ends_with('s') {
-                        (&s[1..s.len()-1], 1_000_000_000i64)
+                        (&s[1..s.len() - 1], 1_000_000_000i64)
                     } else if s.ends_with('m') {
-                        (&s[1..s.len()-1], 60_000_000_000i64)
+                        (&s[1..s.len() - 1], 60_000_000_000i64)
                     } else {
                         return None;
                     };
@@ -1523,130 +1631,144 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         // Resolve relative time values
         let latest_ns = if req.time_from.is_some() || req.time_to.is_some() {
-            self.session_manager.db().get_latest_timestamp(&req.session_id)?
+            self.session_manager
+                .db()
+                .get_latest_timestamp(&req.session_id)?
         } else {
             0
         };
-        let timestamp_from_ns = req.time_from.as_ref()
+        let timestamp_from_ns = req
+            .time_from
+            .as_ref()
             .and_then(|v| resolve_time_value(v, latest_ns));
-        let timestamp_to_ns = req.time_to.as_ref()
+        let timestamp_to_ns = req
+            .time_to
+            .as_ref()
             .and_then(|v| resolve_time_value(v, latest_ns));
 
-        let events = self.session_manager.db().query_events(&req.session_id, |mut q| {
-            if let Some(ref et) = req.event_type {
-                q = q.event_type(match et {
-                    EventTypeFilter::FunctionEnter => crate::db::EventType::FunctionEnter,
-                    EventTypeFilter::FunctionExit => crate::db::EventType::FunctionExit,
-                    EventTypeFilter::Stdout => crate::db::EventType::Stdout,
-                    EventTypeFilter::Stderr => crate::db::EventType::Stderr,
-                    EventTypeFilter::Crash => crate::db::EventType::Crash,
-                    EventTypeFilter::VariableSnapshot => crate::db::EventType::VariableSnapshot,
-                    EventTypeFilter::Pause => crate::db::EventType::Pause,
-                    EventTypeFilter::Logpoint => crate::db::EventType::Logpoint,
-                    EventTypeFilter::ConditionError => crate::db::EventType::ConditionError,
-                });
-            }
-            if let Some(ref f) = req.function {
-                if let Some(ref eq) = f.equals {
-                    q = q.function_equals(eq);
+        let events = self
+            .session_manager
+            .db()
+            .query_events(&req.session_id, |mut q| {
+                if let Some(ref et) = req.event_type {
+                    q = q.event_type(match et {
+                        EventTypeFilter::FunctionEnter => crate::db::EventType::FunctionEnter,
+                        EventTypeFilter::FunctionExit => crate::db::EventType::FunctionExit,
+                        EventTypeFilter::Stdout => crate::db::EventType::Stdout,
+                        EventTypeFilter::Stderr => crate::db::EventType::Stderr,
+                        EventTypeFilter::Crash => crate::db::EventType::Crash,
+                        EventTypeFilter::VariableSnapshot => crate::db::EventType::VariableSnapshot,
+                        EventTypeFilter::Pause => crate::db::EventType::Pause,
+                        EventTypeFilter::Logpoint => crate::db::EventType::Logpoint,
+                        EventTypeFilter::ConditionError => crate::db::EventType::ConditionError,
+                    });
                 }
-                if let Some(ref contains) = f.contains {
-                    q = q.function_contains(contains);
+                if let Some(ref f) = req.function {
+                    if let Some(ref eq) = f.equals {
+                        q = q.function_equals(eq);
+                    }
+                    if let Some(ref contains) = f.contains {
+                        q = q.function_contains(contains);
+                    }
                 }
-            }
-            if let Some(ref sf) = req.source_file {
-                if let Some(ref contains) = sf.contains {
-                    q = q.source_file_contains(contains);
+                if let Some(ref sf) = req.source_file {
+                    if let Some(ref contains) = sf.contains {
+                        q = q.source_file_contains(contains);
+                    }
                 }
-            }
-            if let Some(ref tn) = req.thread_name {
-                if let Some(ref contains) = tn.contains {
-                    q = q.thread_name_contains(contains);
+                if let Some(ref tn) = req.thread_name {
+                    if let Some(ref contains) = tn.contains {
+                        q = q.thread_name_contains(contains);
+                    }
                 }
-            }
-            if let Some(from) = timestamp_from_ns {
-                q.timestamp_from_ns = Some(from);
-            }
-            if let Some(to) = timestamp_to_ns {
-                q.timestamp_to_ns = Some(to);
-            }
-            if let Some(dur) = req.min_duration_ns {
-                q.min_duration_ns = Some(dur);
-            }
-            if let Some(pid) = req.pid {
-                q.pid_equals = Some(pid);
-            }
-            if let Some(after) = req.after_event_id {
-                q.after_rowid = Some(after);
-            }
-            q.limit(limit).offset(offset)
-        })?;
+                if let Some(from) = timestamp_from_ns {
+                    q.timestamp_from_ns = Some(from);
+                }
+                if let Some(to) = timestamp_to_ns {
+                    q.timestamp_to_ns = Some(to);
+                }
+                if let Some(dur) = req.min_duration_ns {
+                    q.min_duration_ns = Some(dur);
+                }
+                if let Some(pid) = req.pid {
+                    q.pid_equals = Some(pid);
+                }
+                if let Some(after) = req.after_event_id {
+                    q.after_rowid = Some(after);
+                }
+                q.limit(limit).offset(offset)
+            })?;
 
         // Count with same filters (except limit/offset) for accurate totalCount
-        let total_count = self.session_manager.db().count_filtered_events(&req.session_id, |mut q| {
-            if let Some(ref et) = req.event_type {
-                q = q.event_type(match et {
-                    EventTypeFilter::FunctionEnter => crate::db::EventType::FunctionEnter,
-                    EventTypeFilter::FunctionExit => crate::db::EventType::FunctionExit,
-                    EventTypeFilter::Stdout => crate::db::EventType::Stdout,
-                    EventTypeFilter::Stderr => crate::db::EventType::Stderr,
-                    EventTypeFilter::Crash => crate::db::EventType::Crash,
-                    EventTypeFilter::VariableSnapshot => crate::db::EventType::VariableSnapshot,
-                    EventTypeFilter::Pause => crate::db::EventType::Pause,
-                    EventTypeFilter::Logpoint => crate::db::EventType::Logpoint,
-                    EventTypeFilter::ConditionError => crate::db::EventType::ConditionError,
-                });
-            }
-            if let Some(ref f) = req.function {
-                if let Some(ref eq) = f.equals {
-                    q = q.function_equals(eq);
-                }
-                if let Some(ref contains) = f.contains {
-                    q = q.function_contains(contains);
-                }
-            }
-            if let Some(ref sf) = req.source_file {
-                if let Some(ref contains) = sf.contains {
-                    q = q.source_file_contains(contains);
-                }
-            }
-            if let Some(ref tn) = req.thread_name {
-                if let Some(ref contains) = tn.contains {
-                    q = q.thread_name_contains(contains);
-                }
-            }
-            if let Some(from) = timestamp_from_ns {
-                q.timestamp_from_ns = Some(from);
-            }
-            if let Some(to) = timestamp_to_ns {
-                q.timestamp_to_ns = Some(to);
-            }
-            if let Some(dur) = req.min_duration_ns {
-                q.min_duration_ns = Some(dur);
-            }
-            if let Some(pid) = req.pid {
-                q.pid_equals = Some(pid);
-            }
-            if let Some(after) = req.after_event_id {
-                q.after_rowid = Some(after);
-            }
-            q
-        })?;
+        let total_count =
+            self.session_manager
+                .db()
+                .count_filtered_events(&req.session_id, |mut q| {
+                    if let Some(ref et) = req.event_type {
+                        q = q.event_type(match et {
+                            EventTypeFilter::FunctionEnter => crate::db::EventType::FunctionEnter,
+                            EventTypeFilter::FunctionExit => crate::db::EventType::FunctionExit,
+                            EventTypeFilter::Stdout => crate::db::EventType::Stdout,
+                            EventTypeFilter::Stderr => crate::db::EventType::Stderr,
+                            EventTypeFilter::Crash => crate::db::EventType::Crash,
+                            EventTypeFilter::VariableSnapshot => {
+                                crate::db::EventType::VariableSnapshot
+                            }
+                            EventTypeFilter::Pause => crate::db::EventType::Pause,
+                            EventTypeFilter::Logpoint => crate::db::EventType::Logpoint,
+                            EventTypeFilter::ConditionError => crate::db::EventType::ConditionError,
+                        });
+                    }
+                    if let Some(ref f) = req.function {
+                        if let Some(ref eq) = f.equals {
+                            q = q.function_equals(eq);
+                        }
+                        if let Some(ref contains) = f.contains {
+                            q = q.function_contains(contains);
+                        }
+                    }
+                    if let Some(ref sf) = req.source_file {
+                        if let Some(ref contains) = sf.contains {
+                            q = q.source_file_contains(contains);
+                        }
+                    }
+                    if let Some(ref tn) = req.thread_name {
+                        if let Some(ref contains) = tn.contains {
+                            q = q.thread_name_contains(contains);
+                        }
+                    }
+                    if let Some(from) = timestamp_from_ns {
+                        q.timestamp_from_ns = Some(from);
+                    }
+                    if let Some(to) = timestamp_to_ns {
+                        q.timestamp_to_ns = Some(to);
+                    }
+                    if let Some(dur) = req.min_duration_ns {
+                        q.min_duration_ns = Some(dur);
+                    }
+                    if let Some(pid) = req.pid {
+                        q.pid_equals = Some(pid);
+                    }
+                    if let Some(after) = req.after_event_id {
+                        q.after_rowid = Some(after);
+                    }
+                    q
+                })?;
         let has_more = (offset as u64 + events.len() as u64) < total_count;
 
         // Convert to appropriate format
         let verbose = req.verbose.unwrap_or(false);
-        let event_values: Vec<serde_json::Value> = events.iter()
-            .map(|e| format_event(e, verbose))
-            .collect();
+        let event_values: Vec<serde_json::Value> =
+            events.iter().map(|e| format_event(e, verbose)).collect();
 
         // Compute cursor fields
-        let last_event_id = events.iter()
-            .filter_map(|e| e.rowid)
-            .max();
+        let last_event_id = events.iter().filter_map(|e| e.rowid).max();
 
         let events_dropped = if let Some(after) = req.after_event_id {
-            let min_rowid = self.session_manager.db().min_rowid_for_session(&req.session_id)?;
+            let min_rowid = self
+                .session_manager
+                .db()
+                .min_rowid_for_session(&req.session_id)?;
             Some(match min_rowid {
                 Some(min) => after + 1 < min,
                 None => after > 0, // All events evicted → dropped if cursor was set
@@ -1657,9 +1779,13 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         // Always check for crash events regardless of eventType filter
         let crash = if req.event_type.as_ref() != Some(&EventTypeFilter::Crash) {
-            let crash_events = self.session_manager.db().query_events(&req.session_id, |q| {
-                q.event_type(crate::db::EventType::Crash).limit(1)
-            }).unwrap_or_default();
+            let crash_events = self
+                .session_manager
+                .db()
+                .query_events(&req.session_id, |q| {
+                    q.event_type(crate::db::EventType::Crash).limit(1)
+                })
+                .unwrap_or_default();
             crash_events.first().map(|e| format_event(e, true))
         } else {
             None // Already included in the main events list
@@ -1687,28 +1813,40 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             crate::mcp::MemoryAction::Read => {
                 let read_req = crate::mcp::DebugReadRequest {
                     session_id: req.session_id,
-                    targets: req.targets.into_iter().map(|t| crate::mcp::ReadTarget {
-                        variable: t.variable,
-                        address: t.address,
-                        size: t.size,
-                        type_hint: t.type_hint,
-                    }).collect(),
+                    targets: req
+                        .targets
+                        .into_iter()
+                        .map(|t| crate::mcp::ReadTarget {
+                            variable: t.variable,
+                            address: t.address,
+                            size: t.size,
+                            type_hint: t.type_hint,
+                        })
+                        .collect(),
                     depth: req.depth,
                     poll: req.poll,
                 };
-                self.session_manager.execute_debug_read(&serde_json::to_value(read_req)?).await
+                self.session_manager
+                    .execute_debug_read(&serde_json::to_value(read_req)?)
+                    .await
             }
             crate::mcp::MemoryAction::Write => {
                 let write_req = crate::mcp::DebugWriteRequest {
                     session_id: req.session_id,
-                    targets: req.targets.into_iter().map(|t| crate::mcp::WriteTarget {
-                        variable: t.variable,
-                        address: t.address,
-                        value: t.value.unwrap_or(serde_json::Value::Null),
-                        type_hint: t.type_hint,
-                    }).collect(),
+                    targets: req
+                        .targets
+                        .into_iter()
+                        .map(|t| crate::mcp::WriteTarget {
+                            variable: t.variable,
+                            address: t.address,
+                            value: t.value.unwrap_or(serde_json::Value::Null),
+                            type_hint: t.type_hint,
+                        })
+                        .collect(),
                 };
-                self.session_manager.execute_debug_write(&serde_json::to_value(write_req)?).await
+                self.session_manager
+                    .execute_debug_write(&serde_json::to_value(write_req)?)
+                    .await
             }
         }
     }
@@ -1723,15 +1861,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 let status = self.session_manager.session_status(session_id)?;
                 Ok(serde_json::to_value(status)?)
             }
-            SessionAction::Stop => {
-                self.tool_debug_stop(args).await
-            }
-            SessionAction::List => {
-                self.tool_debug_list_sessions().await
-            }
-            SessionAction::Delete => {
-                self.tool_debug_delete_session(args).await
-            }
+            SessionAction::Stop => self.tool_debug_stop(args).await,
+            SessionAction::List => self.tool_debug_list_sessions().await,
+            SessionAction::Delete => self.tool_debug_delete_session(args).await,
         }
     }
 
@@ -1749,16 +1881,23 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         // Mark session as retained BEFORE stop_session, which deletes the DB rows.
         // When retaining, we skip the DB deletion so events remain queryable.
         if retain {
-            self.session_manager.db().mark_session_retained(&req.session_id)?;
+            self.session_manager
+                .db()
+                .mark_session_retained(&req.session_id)?;
             // Enforce global size limit
             let deleted = self.session_manager.db().enforce_global_size_limit()?;
             if deleted > 0 {
-                tracing::info!("Deleted {} old retained sessions to enforce 10GB limit", deleted);
+                tracing::info!(
+                    "Deleted {} old retained sessions to enforce 10GB limit",
+                    deleted
+                );
             }
         }
 
         let events_collected = if retain {
-            self.session_manager.stop_session_retain(&req.session_id).await?
+            self.session_manager
+                .stop_session_retain(&req.session_id)
+                .await?
         } else {
             self.session_manager.stop_session(&req.session_id).await?
         };
@@ -1777,18 +1916,21 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
     async fn tool_debug_list_sessions(&self) -> Result<serde_json::Value> {
         let sessions = self.session_manager.db().list_retained_sessions()?;
 
-        let session_list: Vec<serde_json::Value> = sessions.iter().map(|s| {
-            serde_json::json!({
-                "sessionId": s.id,
-                "binaryPath": s.binary_path,
-                "pid": s.pid,
-                "startedAt": s.started_at,
-                "endedAt": s.ended_at,
-                "status": s.status.as_str(),
-                "retainedAt": s.retained_at,
-                "sizeBytes": s.size_bytes,
+        let session_list: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "sessionId": s.id,
+                    "binaryPath": s.binary_path,
+                    "pid": s.pid,
+                    "startedAt": s.started_at,
+                    "endedAt": s.ended_at,
+                    "status": s.status.as_str(),
+                    "retainedAt": s.retained_at,
+                    "sizeBytes": s.size_bytes,
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(serde_json::json!({
             "sessions": session_list,
@@ -1796,8 +1938,12 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         }))
     }
 
-    async fn tool_debug_delete_session(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        let session_id = args.get("sessionId")
+    async fn tool_debug_delete_session(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let session_id = args
+            .get("sessionId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| crate::Error::ValidationError("sessionId is required".to_string()))?;
 
@@ -1805,9 +1951,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let session = self.require_session(session_id)?;
 
         if !session.retained {
-            return Err(crate::Error::Frida(
-                format!("Session {} is not retained and cannot be manually deleted", session_id)
-            ));
+            return Err(crate::Error::Frida(format!(
+                "Session {} is not retained and cannot be manually deleted",
+                session_id
+            )));
         }
 
         // Delete the session
@@ -1819,7 +1966,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         }))
     }
 
-    async fn tool_debug_test(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+    async fn tool_debug_test(
+        &self,
+        args: &serde_json::Value,
+        connection_id: &str,
+    ) -> Result<serde_json::Value> {
         let req: crate::mcp::DebugTestRequest = serde_json::from_value(args.clone())?;
         req.validate()?;
 
@@ -1833,7 +1984,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         }
     }
 
-    async fn tool_debug_test_run(&self, args: &serde_json::Value, connection_id: &str) -> Result<serde_json::Value> {
+    async fn tool_debug_test_run(
+        &self,
+        args: &serde_json::Value,
+        connection_id: &str,
+    ) -> Result<serde_json::Value> {
         // Cleanup stale runs
         self.cleanup_stale_test_runs().await;
 
@@ -1842,17 +1997,24 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         // Detect framework name for the start response (outside lock)
         let runner = crate::test::TestRunner::new();
         let project_root_path = std::path::Path::new(&req.project_root);
-        let framework_name = runner.detect_adapter(
-            project_root_path,
-            req.framework.as_deref(),
-            req.command.as_deref(),
-        )?.name().to_string();
+        let framework_name = runner
+            .detect_adapter(
+                project_root_path,
+                req.framework.as_deref(),
+                req.command.as_deref(),
+            )?
+            .name()
+            .to_string();
 
         // Create shared progress tracker (outside lock)
         let progress = std::sync::Arc::new(std::sync::Mutex::new(crate::test::TestProgress::new()));
         let progress_clone = std::sync::Arc::clone(&progress);
         let test_run_id = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let session_id = format!("test-{}-{}", framework_name, &uuid::Uuid::new_v4().to_string()[..8]);
+        let session_id = format!(
+            "test-{}-{}",
+            framework_name,
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
 
         // Atomic check + insert under a single write lock (fixes TOCTOU race)
         {
@@ -1874,20 +2036,26 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 return Err(crate::Error::TestAlreadyRunning(running.id.clone()));
             }
 
-            runs.insert(test_run_id.clone(), crate::test::TestRun {
-                id: test_run_id.clone(),
-                state: crate::test::TestRunState::Running { progress },
-                fetched: false,
-                session_id: Some(session_id.clone()),
-                project_root: req.project_root.clone(),
-                connection_id: connection_id.to_string(),
-            });
+            runs.insert(
+                test_run_id.clone(),
+                crate::test::TestRun {
+                    id: test_run_id.clone(),
+                    state: crate::test::TestRunState::Running { progress },
+                    fetched: false,
+                    session_id: Some(session_id.clone()),
+                    project_root: req.project_root.clone(),
+                    connection_id: connection_id.to_string(),
+                },
+            );
         }
 
         // Register test session for disconnect cleanup
         {
             let mut sessions = self.connection_sessions.write().await;
-            sessions.entry(connection_id.to_string()).or_default().push(session_id.clone());
+            sessions
+                .entry(connection_id.to_string())
+                .or_default()
+                .push(session_id.clone());
         }
 
         // Clone everything needed for the spawned task
@@ -1904,21 +2072,23 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             let trace_patterns = req_clone.trace_patterns.unwrap_or_default();
             let project_root = std::path::PathBuf::from(&req_clone.project_root);
 
-            let run_result = runner.run(
-                &project_root,
-                req_clone.framework.as_deref(),
-                req_clone.level,
-                req_clone.test.as_deref(),
-                req_clone.command.as_deref(),
-                &env,
-                req_clone.timeout,  // explicit timeout overrides adapter default + settings.json
-                &session_manager,
-                &trace_patterns,
-                req_clone.watches.as_ref(),
-                &connection_id_owned,
-                &session_id_clone,
-                progress_clone,
-            ).await;
+            let run_result = runner
+                .run(
+                    &project_root,
+                    req_clone.framework.as_deref(),
+                    req_clone.level,
+                    req_clone.test.as_deref(),
+                    req_clone.command.as_deref(),
+                    &env,
+                    req_clone.timeout, // explicit timeout overrides adapter default + settings.json
+                    &session_manager,
+                    &trace_patterns,
+                    req_clone.watches.as_ref(),
+                    &connection_id_owned,
+                    &session_id_clone,
+                    progress_clone,
+                )
+                .await;
 
             // Clean up Frida session — test process is dead, release resources.
             // Without this, the output_registry and session state from the old run
@@ -1935,9 +2105,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                         test_detail.status.as_str(),
                     );
                 }
-                let _ = session_manager.db().cleanup_old_baselines(
-                    project_root.to_str().unwrap_or(".")
-                );
+                let _ = session_manager
+                    .db()
+                    .cleanup_old_baselines(project_root.to_str().unwrap_or("."));
             }
 
             // Transition state
@@ -1948,7 +2118,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                         &run_result.result,
                         &run_result.raw_stdout,
                         &run_result.raw_stderr,
-                    ).ok();
+                    )
+                    .ok();
 
                     // Detect compilation failure: 0 tests ran and stderr contains error
                     let is_compile_failure = run_result.result.all_tests.is_empty()
@@ -1958,7 +2129,12 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
                     let hint = if is_compile_failure {
                         Some("COMPILATION FAILED — 0 tests ran. Check 'details' file for compiler errors in rawStderr.".to_string())
-                    } else if run_result.result.all_tests.is_empty() && run_result.result.failures.is_empty() {
+                    } else if run_result.result.all_tests.is_empty()
+                        && run_result.result.failures.is_empty()
+                        && run_result.result.summary.passed == 0
+                        && run_result.result.summary.failed == 0
+                        && run_result.result.summary.skipped == 0
+                    {
                         Some("No tests found. Possible causes: (1) framework or test filter mismatch, \
                               (2) test process crashed during setup — check rawStderr in the details file, \
                               (3) stale session from previous run — try again.".to_string())
@@ -1968,22 +2144,32 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
                     // Check if the test session had a crash
                     let crash_info = run_result.session_id.as_ref().and_then(|sid| {
-                        let crash_events = session_manager.db().query_events(sid, |q| {
-                            q.event_type(crate::db::EventType::Crash).limit(1)
-                        }).ok()?;
+                        let crash_events = session_manager
+                            .db()
+                            .query_events(sid, |q| {
+                                q.event_type(crate::db::EventType::Crash).limit(1)
+                            })
+                            .ok()?;
                         let crash = crash_events.first()?;
-                        let top_frame = crash.backtrace.as_ref()
+                        let top_frame = crash
+                            .backtrace
+                            .as_ref()
                             .and_then(|bt| bt.as_array())
                             .and_then(|frames| frames.first())
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
                             .map(|s| s.to_string());
-                        let throw_top_frame = crash.throw_backtrace.as_ref()
+                        let throw_top_frame = crash
+                            .throw_backtrace
+                            .as_ref()
                             .and_then(|bt| bt.as_array())
-                            .and_then(|frames| frames.iter().find(|f| {
-                                let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                                !name.contains("__cxa_throw") && !name.contains("__cxa_allocate")
-                            }))
+                            .and_then(|frames| {
+                                frames.iter().find(|f| {
+                                    let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                    !name.contains("__cxa_throw")
+                                        && !name.contains("__cxa_allocate")
+                                })
+                            })
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
                             .map(|s| s.to_string());
@@ -2053,7 +2239,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         loop {
             let runs = self.test_runs.read().await;
-            let test_run = runs.get(&test_run_id)
+            let test_run = runs
+                .get(&test_run_id)
                 .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
 
             match &test_run.state {
@@ -2071,7 +2258,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         // Use read lock for building the response — avoids blocking the background
         // task from writing completion state while we do SQLite baseline queries.
         let runs = self.test_runs.read().await;
-        let test_run = runs.get(&test_run_id)
+        let test_run = runs
+            .get(&test_run_id)
             .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
 
         let response = match &test_run.state {
@@ -2084,25 +2272,27 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 };
 
                 // Convert internal warnings to MCP type
-                let warnings: Vec<crate::mcp::TestStuckWarning> = p.warnings.iter().map(|w| {
-                    crate::mcp::TestStuckWarning {
+                let warnings: Vec<crate::mcp::TestStuckWarning> = p
+                    .warnings
+                    .iter()
+                    .map(|w| crate::mcp::TestStuckWarning {
                         test_name: w.test_name.clone(),
                         idle_ms: w.idle_ms,
                         diagnosis: w.diagnosis.clone(),
                         suggested_traces: w.suggested_traces.clone(),
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 // Build running_tests snapshot — cap at 20 longest-running to avoid
                 // flooding the response (Vitest fires onTestCaseReady at collection
                 // time, so hundreds of tests can appear "running" simultaneously).
-                let mut running_tests_snapshot: Vec<crate::mcp::RunningTestSnapshot> = p.running_tests.iter()
-                    .map(|(name, started)| {
-                        crate::mcp::RunningTestSnapshot {
-                            name: name.clone(),
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                            baseline_ms: None,
-                        }
+                let mut running_tests_snapshot: Vec<crate::mcp::RunningTestSnapshot> = p
+                    .running_tests
+                    .iter()
+                    .map(|(name, started)| crate::mcp::RunningTestSnapshot {
+                        name: name.clone(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        baseline_ms: None,
                     })
                     .collect();
                 running_tests_snapshot.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
@@ -2110,17 +2300,21 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 running_tests_snapshot.truncate(20);
                 // Only fetch baselines for the displayed tests
                 for t in &mut running_tests_snapshot {
-                    t.baseline_ms = self.session_manager.db()
+                    t.baseline_ms = self
+                        .session_manager
+                        .db()
                         .get_test_baseline(&t.name, &test_run.project_root)
                         .unwrap_or(None);
                 }
 
                 // current_test = longest-running test (backward compat + stuck detector)
                 let current_test = p.current_test();
-                let current_test_elapsed_ms = p.current_test_started_at()
+                let current_test_elapsed_ms = p
+                    .current_test_started_at()
                     .map(|t| t.elapsed().as_millis() as u64);
                 let baseline_ms = current_test.as_ref().and_then(|name| {
-                    self.session_manager.db()
+                    self.session_manager
+                        .db()
                         .get_test_baseline(name, &test_run.project_root)
                         .unwrap_or(None)
                 });
@@ -2139,7 +2333,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                         current_test_elapsed_ms,
                         current_test_baseline_ms: baseline_ms,
                         running_tests: running_tests_snapshot,
-                        total_running: if total_running > 20 { Some(total_running as u32) } else { None },
+                        total_running: if total_running > 20 {
+                            Some(total_running as u32)
+                        } else {
+                            None
+                        },
                         compile_message: p.compile_message.clone(),
                     }),
                     result: None,
@@ -2149,7 +2347,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             }
             crate::test::TestRunState::Completed { response, .. } => {
                 // Surface hint at the top level so the agent sees it immediately
-                let hint = response.get("hint").and_then(|h| h.as_str()).map(|s| s.to_string());
+                let hint = response
+                    .get("hint")
+                    .and_then(|h| h.as_str())
+                    .map(|s| s.to_string());
                 crate::mcp::DebugTestStatusResponse {
                     test_run_id: test_run_id.clone(),
                     status: "completed".to_string(),
@@ -2171,8 +2372,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             }
         };
         // Drop read lock before taking write lock
-        let needs_fetched = matches!(&test_run.state,
-            crate::test::TestRunState::Completed { .. } | crate::test::TestRunState::Failed { .. });
+        let needs_fetched = matches!(
+            &test_run.state,
+            crate::test::TestRunState::Completed { .. } | crate::test::TestRunState::Failed { .. }
+        );
         drop(runs);
 
         // Brief write lock only to mark as fetched (Completed/Failed states)
@@ -2192,21 +2395,19 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         {
             let mut runs = self.test_runs.write().await;
             let now = std::time::Instant::now();
-            runs.retain(|_id, run| {
-                match &run.state {
-                    crate::test::TestRunState::Running { .. } => true,
-                    crate::test::TestRunState::Completed { completed_at, .. }
-                    | crate::test::TestRunState::Failed { completed_at, .. } => {
-                        let age = now.duration_since(*completed_at);
-                        let expired = (run.fetched && age > Duration::from_secs(300))
-                            || age > Duration::from_secs(1800);
-                        if expired {
-                            if let Some(ref sid) = run.session_id {
-                                sessions_to_delete.push(sid.clone());
-                            }
+            runs.retain(|_id, run| match &run.state {
+                crate::test::TestRunState::Running { .. } => true,
+                crate::test::TestRunState::Completed { completed_at, .. }
+                | crate::test::TestRunState::Failed { completed_at, .. } => {
+                    let age = now.duration_since(*completed_at);
+                    let expired = (run.fetched && age > Duration::from_secs(300))
+                        || age > Duration::from_secs(1800);
+                    if expired {
+                        if let Some(ref sid) = run.session_id {
+                            sessions_to_delete.push(sid.clone());
                         }
-                        !expired
                     }
+                    !expired
                 }
             });
         }
@@ -2232,7 +2433,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             for target in targets {
                 if let Some(message) = target.message {
                     // Logpoint path: has message
-                    let logpoint = self.session_manager
+                    let logpoint = self
+                        .session_manager
                         .set_logpoint_async(
                             &req.session_id,
                             None,
@@ -2246,7 +2448,8 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     all_logpoints.push(logpoint);
                 } else {
                     // Breakpoint path: no message
-                    let breakpoint = self.session_manager
+                    let breakpoint = self
+                        .session_manager
                         .set_breakpoint_async(
                             &req.session_id,
                             None,
@@ -2266,30 +2469,41 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         if let Some(ids) = req.remove {
             for id in &ids {
                 if id.starts_with("lp-") {
-                    self.session_manager.remove_logpoint(&req.session_id, id).await;
+                    self.session_manager
+                        .remove_logpoint(&req.session_id, id)
+                        .await;
                 } else {
-                    self.session_manager.remove_breakpoint(&req.session_id, id).await;
+                    self.session_manager
+                        .remove_breakpoint(&req.session_id, id)
+                        .await;
                 }
             }
         }
 
         // Return current breakpoints if none were just added
         if all_breakpoints.is_empty() {
-            all_breakpoints = self.session_manager
+            all_breakpoints = self
+                .session_manager
                 .get_breakpoints(&req.session_id)
                 .into_iter()
                 .map(|bp| crate::mcp::BreakpointInfo {
                     id: bp.id,
                     function: match &bp.target {
-                        crate::daemon::session_manager::BreakpointTarget::Function(f) => Some(f.clone()),
+                        crate::daemon::session_manager::BreakpointTarget::Function(f) => {
+                            Some(f.clone())
+                        }
                         _ => None,
                     },
                     file: match &bp.target {
-                        crate::daemon::session_manager::BreakpointTarget::Line { file, .. } => Some(file.clone()),
+                        crate::daemon::session_manager::BreakpointTarget::Line { file, .. } => {
+                            Some(file.clone())
+                        }
                         _ => None,
                     },
                     line: match &bp.target {
-                        crate::daemon::session_manager::BreakpointTarget::Line { line, .. } => Some(*line),
+                        crate::daemon::session_manager::BreakpointTarget::Line { line, .. } => {
+                            Some(*line)
+                        }
                         _ => None,
                     },
                     address: format!("0x{:x}", bp.address),
@@ -2299,22 +2513,29 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         // Return current logpoints if none were just added
         if all_logpoints.is_empty() {
-            all_logpoints = self.session_manager
+            all_logpoints = self
+                .session_manager
                 .get_logpoints(&req.session_id)
                 .into_iter()
                 .map(|lp| crate::mcp::LogpointInfo {
                     id: lp.id,
                     message: lp.message,
                     function: match &lp.target {
-                        crate::daemon::session_manager::BreakpointTarget::Function(f) => Some(f.clone()),
+                        crate::daemon::session_manager::BreakpointTarget::Function(f) => {
+                            Some(f.clone())
+                        }
                         _ => None,
                     },
                     file: match &lp.target {
-                        crate::daemon::session_manager::BreakpointTarget::Line { file, .. } => Some(file.clone()),
+                        crate::daemon::session_manager::BreakpointTarget::Line { file, .. } => {
+                            Some(file.clone())
+                        }
                         _ => None,
                     },
                     line: match &lp.target {
-                        crate::daemon::session_manager::BreakpointTarget::Line { line, .. } => Some(*line),
+                        crate::daemon::session_manager::BreakpointTarget::Line { line, .. } => {
+                            Some(*line)
+                        }
                         _ => None,
                     },
                     address: format!("0x{:x}", lp.address),
@@ -2332,7 +2553,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let req: crate::mcp::DebugContinueRequest = serde_json::from_value(args.clone())?;
         req.validate()?;
 
-        let response = self.session_manager.debug_continue_async(&req.session_id, req.action).await?;
+        let response = self
+            .session_manager
+            .debug_continue_async(&req.session_id, req.action)
+            .await?;
 
         Ok(serde_json::to_value(response)?)
     }
@@ -2343,9 +2567,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         let session = self.require_session(&req.session_id)?;
         if session.status != crate::db::SessionStatus::Running {
-            return Err(crate::Error::UiQueryFailed(
-                format!("Process not running (PID {} exited). Cannot query UI.", session.pid)
-            ));
+            return Err(crate::Error::UiQueryFailed(format!(
+                "Process not running (PID {} exited). Cannot query UI.",
+                session.pid
+            )));
         }
 
         let start = std::time::Instant::now();
@@ -2358,17 +2583,26 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let mut vision_count = 0;
         let mut merged_count = 0;
 
-        let needs_tree = matches!(req.mode, crate::mcp::UiMode::Tree | crate::mcp::UiMode::Both);
-        let needs_screenshot = matches!(req.mode, crate::mcp::UiMode::Screenshot | crate::mcp::UiMode::Both);
+        let needs_tree = matches!(
+            req.mode,
+            crate::mcp::UiMode::Tree | crate::mcp::UiMode::Both
+        );
+        let needs_screenshot = matches!(
+            req.mode,
+            crate::mcp::UiMode::Screenshot | crate::mcp::UiMode::Both
+        );
 
         // Query AX tree
         if needs_tree {
             let pid = session.pid;
 
             #[cfg(target_os = "macos")]
-            let nodes = tokio::task::spawn_blocking(move || {
-                crate::ui::accessibility::query_ax_tree(pid)
-            }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
+            let nodes =
+                tokio::task::spawn_blocking(move || crate::ui::accessibility::query_ax_tree(pid))
+                    .await
+                    .map_err(|e| {
+                        crate::Error::Internal(format!("AX query task failed: {}", e))
+                    })??;
 
             #[cfg(target_os = "linux")]
             let nodes = crate::ui::accessibility::query_ax_tree(pid).await?;
@@ -2389,21 +2623,25 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 // Allow 1 call per second per session
                 {
                     use std::sync::{Mutex, OnceLock};
-                    static LAST_VISION_CALL: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>>
-                        = OnceLock::new();
+                    static LAST_VISION_CALL: OnceLock<
+                        Mutex<std::collections::HashMap<String, std::time::Instant>>,
+                    > = OnceLock::new();
 
                     let now = std::time::Instant::now();
-                    let rate_limiter = LAST_VISION_CALL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+                    let rate_limiter = LAST_VISION_CALL
+                        .get_or_init(|| Mutex::new(std::collections::HashMap::new()));
                     let mut last_calls = rate_limiter.lock().unwrap();
                     // Prune entries older than 60s to prevent unbounded growth
-                    last_calls.retain(|_, last| now.duration_since(*last) < std::time::Duration::from_secs(60));
+                    last_calls.retain(|_, last| {
+                        now.duration_since(*last) < std::time::Duration::from_secs(60)
+                    });
                     if let Some(last_time) = last_calls.get(&req.session_id) {
                         let elapsed = now.duration_since(*last_time);
                         if elapsed < std::time::Duration::from_secs(1) {
-                            return Err(crate::Error::UiQueryFailed(
-                                format!("Vision rate limit exceeded. Please wait {:.1}s before next call.",
-                                    1.0 - elapsed.as_secs_f64())
-                            ));
+                            return Err(crate::Error::UiQueryFailed(format!(
+                                "Vision rate limit exceeded. Please wait {:.1}s before next call.",
+                                1.0 - elapsed.as_secs_f64()
+                            )));
                         }
                     }
                     last_calls.insert(req.session_id.clone(), now);
@@ -2414,7 +2652,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     let pid = session.pid;
                     let png_bytes = tokio::task::spawn_blocking(move || {
                         crate::ui::capture::capture_window_screenshot(pid)
-                    }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
+                    })
+                    .await
+                    .map_err(|e| {
+                        crate::Error::Internal(format!("Screenshot task failed: {}", e))
+                    })??;
 
                     use base64::Engine;
                     base64::engine::general_purpose::STANDARD.encode(&png_bytes)
@@ -2461,7 +2703,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 #[cfg(target_os = "macos")]
                 let nodes = tokio::task::spawn_blocking(move || {
                     crate::ui::accessibility::query_ax_tree(pid)
-                }).await.map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
+                })
+                .await
+                .map_err(|e| crate::Error::Internal(format!("AX query task failed: {}", e)))??;
 
                 #[cfg(target_os = "linux")]
                 let nodes = crate::ui::accessibility::query_ax_tree(pid).await?;
@@ -2470,9 +2714,12 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     .ok_or_else(|| crate::Error::UiQueryFailed(
                         format!("Element '{}' not found. Use debug_ui with mode=tree to see current element IDs.", target_id)
                     ))?;
-                Some(node.bounds.ok_or_else(|| crate::Error::UiQueryFailed(
-                    format!("Element '{}' has no bounds (may be off-screen or invisible)", target_id)
-                ))?)
+                Some(node.bounds.ok_or_else(|| {
+                    crate::Error::UiQueryFailed(format!(
+                        "Element '{}' has no bounds (may be off-screen or invisible)",
+                        target_id
+                    ))
+                })?)
             } else {
                 None
             };
@@ -2483,7 +2730,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 } else {
                     crate::ui::capture::capture_window_screenshot(pid)
                 }
-            }).await.map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
+            })
+            .await
+            .map_err(|e| crate::Error::Internal(format!("Screenshot task failed: {}", e)))??;
 
             use base64::Engine;
             screenshot_output = Some(base64::engine::general_purpose::STANDARD.encode(&png_bytes));
@@ -2525,9 +2774,10 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         let session = self.require_session(&req.session_id)?;
         if session.status != crate::db::SessionStatus::Running {
-            return Err(crate::Error::UiQueryFailed(
-                format!("Process not running (PID {} exited). Cannot perform UI action.", session.pid)
-            ));
+            return Err(crate::Error::UiQueryFailed(format!(
+                "Process not running (PID {} exited). Cannot perform UI action.",
+                session.pid
+            )));
         }
 
         let pid = session.pid;
@@ -2539,7 +2789,6 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         }
         Ok(vec![McpContent::Text { text }])
     }
-
 }
 
 #[cfg(test)]
@@ -2562,7 +2811,9 @@ mod tests {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
+            vision_sidecar: Arc::new(std::sync::Mutex::new(
+                crate::ui::vision::VisionSidecar::new(),
+            )),
         };
 
         (daemon, dir)
@@ -2574,7 +2825,8 @@ mod tests {
             "id": id,
             "method": method,
             "params": {}
-        }).to_string()
+        })
+        .to_string()
     }
 
     fn make_initialize_request() -> String {
@@ -2587,7 +2839,8 @@ mod tests {
                 "capabilities": {},
                 "clientInfo": { "name": "test", "version": "0.1" }
             }
-        }).to_string()
+        })
+        .to_string()
     }
 
     #[tokio::test]
@@ -2615,7 +2868,9 @@ mod tests {
 
         // Initialize first
         let init_msg = make_initialize_request();
-        let resp = daemon.handle_message(&init_msg, &mut initialized, conn_id).await;
+        let resp = daemon
+            .handle_message(&init_msg, &mut initialized, conn_id)
+            .await;
         assert!(initialized);
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
@@ -2636,7 +2891,9 @@ mod tests {
         // Send initialize — even with empty params, our handler accepts it (params are ignored)
         // But a truly broken JSON should be rejected at parse level
         let bad_json = "not json at all";
-        let resp = daemon.handle_message(bad_json, &mut initialized, conn_id).await;
+        let resp = daemon
+            .handle_message(bad_json, &mut initialized, conn_id)
+            .await;
 
         // Parse error should not set initialized
         assert!(!initialized);
@@ -2675,24 +2932,36 @@ mod tests {
 
         // Create a session in the DB and register it to this connection
         let session_id = daemon.session_manager.generate_session_id("testapp");
-        daemon.session_manager.create_session(
-            &session_id, "/bin/testapp", "/home/user", 99999,
-        ).unwrap();
+        daemon
+            .session_manager
+            .create_session(&session_id, "/bin/testapp", "/home/user", 99999)
+            .unwrap();
 
         {
             let mut sessions = daemon.connection_sessions.write().await;
-            sessions.entry(conn_id.to_string()).or_default().push(session_id.clone());
+            sessions
+                .entry(conn_id.to_string())
+                .or_default()
+                .push(session_id.clone());
         }
 
         // Verify session is running
-        let session = daemon.session_manager.get_session(&session_id).unwrap().unwrap();
+        let session = daemon
+            .session_manager
+            .get_session(&session_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(session.status, crate::db::SessionStatus::Running);
 
         // Disconnect — should clean up the session
         daemon.handle_disconnect(conn_id).await;
 
         // Connection tracking should be cleared
-        assert!(!daemon.connection_sessions.read().await.contains_key(conn_id));
+        assert!(!daemon
+            .connection_sessions
+            .read()
+            .await
+            .contains_key(conn_id));
 
         // Session should be deleted from DB (stop_session deletes)
         let session = daemon.session_manager.get_session(&session_id).unwrap();
@@ -2705,9 +2974,10 @@ mod tests {
 
         // Create a running session in the DB
         let session_id = daemon.session_manager.generate_session_id("testapp");
-        daemon.session_manager.create_session(
-            &session_id, "/bin/testapp", "/home/user", 99999,
-        ).unwrap();
+        daemon
+            .session_manager
+            .create_session(&session_id, "/bin/testapp", "/home/user", 99999)
+            .unwrap();
 
         // Verify it shows up as running
         let running = daemon.session_manager.get_running_sessions().unwrap();
@@ -2745,7 +3015,8 @@ mod tests {
                     "add": ["conn_a_pattern::*"]
                 }
             }
-        }).to_string();
+        })
+        .to_string();
         daemon.handle_message(&trace_msg, &mut init_a, conn_a).await;
 
         // Connection B sets different patterns
@@ -2759,7 +3030,8 @@ mod tests {
                     "add": ["conn_b_pattern::*"]
                 }
             }
-        }).to_string();
+        })
+        .to_string();
         daemon.handle_message(&trace_msg, &mut init_b, conn_b).await;
 
         // Verify isolation
@@ -2787,9 +3059,7 @@ mod tests {
             .open(&lock_path)
             .unwrap();
 
-        let result1 = unsafe {
-            libc::flock(lock_file1.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-        };
+        let result1 = unsafe { libc::flock(lock_file1.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(result1, 0, "First lock should succeed");
 
         // Second lock acquisition should fail
@@ -2799,17 +3069,13 @@ mod tests {
             .open(&lock_path)
             .unwrap();
 
-        let result2 = unsafe {
-            libc::flock(lock_file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-        };
+        let result2 = unsafe { libc::flock(lock_file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_ne!(result2, 0, "Second lock should fail while first is held");
 
         // After dropping first lock, acquisition should succeed
         drop(lock_file1);
 
-        let result3 = unsafe {
-            libc::flock(lock_file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-        };
+        let result3 = unsafe { libc::flock(lock_file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(result3, 0, "Lock should succeed after release");
     }
 
@@ -2837,7 +3103,9 @@ mod tests {
             connection_sessions: Arc::new(RwLock::new(HashMap::new())),
             test_runs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            vision_sidecar: Arc::new(std::sync::Mutex::new(crate::ui::vision::VisionSidecar::new())),
+            vision_sidecar: Arc::new(std::sync::Mutex::new(
+                crate::ui::vision::VisionSidecar::new(),
+            )),
         };
 
         daemon.graceful_shutdown().await;
@@ -2881,7 +3149,8 @@ mod tests {
                     "mode": mode
                 }
             }
-        }).to_string()
+        })
+        .to_string()
     }
 
     #[tokio::test]
@@ -2891,19 +3160,28 @@ mod tests {
         let mut initialized = false;
         let conn_id = "test-ui-1";
 
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
 
         let msg = make_debug_ui_call("nonexistent-session", "tree", 10);
         let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
 
         // Tool errors are wrapped as successful JSON-RPC with isError in content
         let result = resp.result.expect("Should have result");
-        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         assert!(is_error, "Should return error for nonexistent session");
 
         let content = result.get("content").unwrap().as_array().unwrap();
         let text = content[0].get("text").unwrap().as_str().unwrap();
-        assert!(text.contains("SESSION_NOT_FOUND"), "Error should mention SESSION_NOT_FOUND, got: {}", text);
+        assert!(
+            text.contains("SESSION_NOT_FOUND"),
+            "Error should mention SESSION_NOT_FOUND, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2913,28 +3191,39 @@ mod tests {
         let mut initialized = false;
         let conn_id = "test-ui-2";
 
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
 
         // Create a session and mark it as stopped (process exited)
         let session_id = daemon.session_manager.generate_session_id("testapp");
-        daemon.session_manager.create_session(
-            &session_id, "/bin/testapp", "/home/user", 99999,
-        ).unwrap();
-        daemon.session_manager.db().update_session_status(
-            &session_id, crate::db::SessionStatus::Stopped,
-        ).unwrap();
+        daemon
+            .session_manager
+            .create_session(&session_id, "/bin/testapp", "/home/user", 99999)
+            .unwrap();
+        daemon
+            .session_manager
+            .db()
+            .update_session_status(&session_id, crate::db::SessionStatus::Stopped)
+            .unwrap();
 
         let msg = make_debug_ui_call(&session_id, "tree", 10);
         let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
 
         let result = resp.result.expect("Should have result");
-        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         assert!(is_error, "Should return error for stopped process");
 
         let content = result.get("content").unwrap().as_array().unwrap();
         let text = content[0].get("text").unwrap().as_str().unwrap();
-        assert!(text.contains("not running") || text.contains("exited"),
-            "Error should mention process not running, got: {}", text);
+        assert!(
+            text.contains("not running") || text.contains("exited"),
+            "Error should mention process not running, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2944,14 +3233,17 @@ mod tests {
         let mut initialized = false;
         let conn_id = "test-ui-3";
 
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
 
         // Create a running session (process won't actually exist, but we'll hit
         // the vision check before the AX query since vision is checked first)
         let session_id = daemon.session_manager.generate_session_id("testapp");
-        daemon.session_manager.create_session(
-            &session_id, "/bin/testapp", "/home/user", 99999,
-        ).unwrap();
+        daemon
+            .session_manager
+            .create_session(&session_id, "/bin/testapp", "/home/user", 99999)
+            .unwrap();
 
         // Request vision on a running session — should fail because vision is disabled by default
         let msg = serde_json::json!({
@@ -2966,14 +3258,21 @@ mod tests {
                     "vision": true
                 }
             }
-        }).to_string();
+        })
+        .to_string();
         let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
 
         let result = resp.result.expect("Should have result");
-        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // This may fail with either "vision not enabled" or an AX error (since PID 99999 doesn't exist).
         // Both are acceptable - the key is it doesn't panic.
-        assert!(is_error, "Should return error (vision disabled or invalid PID)");
+        assert!(
+            is_error,
+            "Should return error (vision disabled or invalid PID)"
+        );
     }
 
     // ---- E2E: debug_ui_action through MCP ----
@@ -2985,22 +3284,24 @@ mod tests {
     fn build_ui_test_app() -> std::path::PathBuf {
         use std::sync::OnceLock;
         static CACHED: OnceLock<std::path::PathBuf> = OnceLock::new();
-        CACHED.get_or_init(|| {
-            let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/ui-test-app");
-            let binary = fixture_dir.join("build/UITestApp");
-            if !binary.exists() {
-                eprintln!("Building SwiftUI UI test app for E2E MCP tests...");
-                let status = std::process::Command::new("bash")
-                    .arg(fixture_dir.join("build.sh"))
-                    .current_dir(&fixture_dir)
-                    .status()
-                    .expect("Failed to run build.sh");
-                assert!(status.success(), "UI test app build failed");
-            }
-            assert!(binary.exists(), "UI test app not found: {:?}", binary);
-            binary
-        }).clone()
+        CACHED
+            .get_or_init(|| {
+                let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/ui-test-app");
+                let binary = fixture_dir.join("build/UITestApp");
+                if !binary.exists() {
+                    eprintln!("Building SwiftUI UI test app for E2E MCP tests...");
+                    let status = std::process::Command::new("bash")
+                        .arg(fixture_dir.join("build.sh"))
+                        .current_dir(&fixture_dir)
+                        .status()
+                        .expect("Failed to run build.sh");
+                    assert!(status.success(), "UI test app build failed");
+                }
+                assert!(binary.exists(), "UI test app not found: {:?}", binary);
+                binary
+            })
+            .clone()
     }
 
     /// Send a tools/call MCP request, return the parsed result JSON.
@@ -3021,7 +3322,8 @@ mod tests {
                 "name": tool_name,
                 "arguments": arguments
             }
-        }).to_string();
+        })
+        .to_string();
         let resp = daemon.handle_message(&msg, initialized, conn_id).await;
         assert!(resp.error.is_none(), "JSON-RPC error: {:?}", resp.error);
         resp.result.expect("MCP tool call should have result")
@@ -3038,7 +3340,10 @@ mod tests {
     /// Check if MCP result is an error response.
     #[cfg(target_os = "macos")]
     fn is_mcp_error(result: &serde_json::Value) -> bool {
-        result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false)
+        result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     /// Full E2E journey through MCP:
@@ -3054,21 +3359,28 @@ mod tests {
         let conn_id = "e2e-ui-action";
 
         // 1. Initialize MCP session
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
         assert!(initialized);
 
         // 2. Launch UITestApp via debug_launch MCP tool
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_launch",
             serde_json::json!({
                 "command": binary.to_str().unwrap(),
                 "projectRoot": project_root
             }),
             10,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "debug_launch should succeed");
         let launch_data = extract_mcp_text(&result);
-        let session_id = launch_data["sessionId"].as_str()
+        let session_id = launch_data["sessionId"]
+            .as_str()
             .expect("debug_launch should return sessionId");
         let pid = launch_data["pid"].as_u64().expect("should have pid");
         assert!(pid > 0, "PID should be non-zero");
@@ -3077,30 +3389,45 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // 3. Query UI tree via debug_ui MCP tool
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "tree" }),
             20,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "debug_ui tree should succeed");
         // debug_ui returns compact text, not JSON — just verify it has content
         let content = result.get("content").unwrap().as_array().unwrap();
         let tree_text = content[0].get("text").unwrap().as_str().unwrap();
-        assert!(tree_text.contains("AXButton"), "Tree should contain a button, got: {}",
-            &tree_text[..tree_text.len().min(200)]);
+        assert!(
+            tree_text.contains("AXButton"),
+            "Tree should contain a button, got: {}",
+            &tree_text[..tree_text.len().min(200)]
+        );
 
         // Extract a button ID from the tree text (format: id=btn_XXXX)
-        let button_id = tree_text.lines()
+        let button_id = tree_text
+            .lines()
             .find(|l| l.contains("AXButton"))
             .and_then(|l| {
                 l.split_whitespace()
                     .find(|w| w.starts_with("id="))
-                    .map(|w| w.trim_start_matches("id=").trim_end_matches(']').to_string())
+                    .map(|w| {
+                        w.trim_start_matches("id=")
+                            .trim_end_matches(']')
+                            .to_string()
+                    })
             })
             .expect("Should find button ID in tree output");
 
         // 4. Click button via debug_ui_action MCP tool
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3108,24 +3435,43 @@ mod tests {
                 "id": button_id
             }),
             30,
-        ).await;
-        assert!(!is_mcp_error(&result), "debug_ui_action click should not be MCP error");
+        )
+        .await;
+        assert!(
+            !is_mcp_error(&result),
+            "debug_ui_action click should not be MCP error"
+        );
         let action_data = extract_mcp_text(&result);
-        assert_eq!(action_data["success"], true, "click should succeed: {}", action_data);
+        assert_eq!(
+            action_data["success"], true,
+            "click should succeed: {}",
+            action_data
+        );
         assert!(action_data["method"].is_string(), "should report method");
-        assert!(!action_data["nodeAfter"].is_null(), "should return nodeAfter");
+        assert!(
+            !action_data["nodeAfter"].is_null(),
+            "should return nodeAfter"
+        );
 
         // 5. Find text field and set value via debug_ui_action
-        let text_field_id = tree_text.lines()
+        let text_field_id = tree_text
+            .lines()
             .find(|l| l.contains("AXTextField"))
             .and_then(|l| {
                 l.split_whitespace()
                     .find(|w| w.starts_with("id="))
-                    .map(|w| w.trim_start_matches("id=").trim_end_matches(']').to_string())
+                    .map(|w| {
+                        w.trim_start_matches("id=")
+                            .trim_end_matches(']')
+                            .to_string()
+                    })
             })
             .expect("Should find text field ID in tree output");
 
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3135,7 +3481,8 @@ mod tests {
                 "settleMs": 200
             }),
             40,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "setValue should not be MCP error");
         let action_data = extract_mcp_text(&result);
         if action_data["success"] == true {
@@ -3143,7 +3490,10 @@ mod tests {
         }
 
         // 6. Type text via debug_ui_action
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3153,14 +3503,25 @@ mod tests {
                 "settleMs": 200
             }),
             50,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "type should not be MCP error");
         let action_data = extract_mcp_text(&result);
-        assert_eq!(action_data["success"], true, "type should succeed: {}", action_data);
-        assert!(!action_data["nodeAfter"].is_null(), "type should have nodeAfter");
+        assert_eq!(
+            action_data["success"], true,
+            "type should succeed: {}",
+            action_data
+        );
+        assert!(
+            !action_data["nodeAfter"].is_null(),
+            "type should have nodeAfter"
+        );
 
         // 7. Send key via debug_ui_action (Tab — safe, no modifiers)
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3169,21 +3530,30 @@ mod tests {
                 "settleMs": 100
             }),
             60,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "key should not be MCP error");
         let action_data = extract_mcp_text(&result);
-        assert_eq!(action_data["success"], true, "key should succeed: {}", action_data);
+        assert_eq!(
+            action_data["success"], true,
+            "key should succeed: {}",
+            action_data
+        );
         assert_eq!(action_data["method"], "cgevent");
         // Key actions without id should have no node snapshots
         assert!(action_data["nodeBefore"].is_null());
         assert!(action_data["nodeAfter"].is_null());
 
         // 8. Stop session via debug_session MCP tool
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_session",
             serde_json::json!({ "sessionId": session_id, "action": "stop" }),
             70,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "session stop should succeed");
     }
 
@@ -3197,24 +3567,33 @@ mod tests {
         let mut initialized = false;
         let conn_id = "e2e-ui-validation";
 
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
 
         // Launch app
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_launch",
             serde_json::json!({
                 "command": binary.to_str().unwrap(),
                 "projectRoot": project_root
             }),
             10,
-        ).await;
+        )
+        .await;
         let launch_data = extract_mcp_text(&result);
         let session_id = launch_data["sessionId"].as_str().unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // ---- Error 1: click without id ----
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3222,14 +3601,25 @@ mod tests {
                 // missing "id"
             }),
             20,
-        ).await;
-        assert!(is_mcp_error(&result), "click without id should be MCP error");
+        )
+        .await;
+        assert!(
+            is_mcp_error(&result),
+            "click without id should be MCP error"
+        );
         let content = result.get("content").unwrap().as_array().unwrap();
         let err_text = content[0].get("text").unwrap().as_str().unwrap();
-        assert!(err_text.contains("id"), "Error should mention missing id: {}", err_text);
+        assert!(
+            err_text.contains("id"),
+            "Error should mention missing id: {}",
+            err_text
+        );
 
         // ---- Error 2: nonexistent session ----
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": "does-not-exist",
@@ -3237,15 +3627,22 @@ mod tests {
                 "id": "btn_0000"
             }),
             30,
-        ).await;
+        )
+        .await;
         assert!(is_mcp_error(&result), "bad session should be MCP error");
         let content = result.get("content").unwrap().as_array().unwrap();
         let err_text = content[0].get("text").unwrap().as_str().unwrap();
-        assert!(err_text.contains("SESSION_NOT_FOUND") || err_text.contains("not found"),
-            "Error should mention session not found: {}", err_text);
+        assert!(
+            err_text.contains("SESSION_NOT_FOUND") || err_text.contains("not found"),
+            "Error should mention session not found: {}",
+            err_text
+        );
 
         // ---- Error 3: action on bogus node (runtime error, not validation) ----
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3253,15 +3650,25 @@ mod tests {
                 "id": "btn_9999"
             }),
             40,
-        ).await;
+        )
+        .await;
         // This goes through execute_ui_action and returns success=false, not MCP error
-        assert!(!is_mcp_error(&result), "bogus node should return action response, not MCP error");
+        assert!(
+            !is_mcp_error(&result),
+            "bogus node should return action response, not MCP error"
+        );
         let action_data = extract_mcp_text(&result);
-        assert_eq!(action_data["success"], false, "bogus node click should fail");
+        assert_eq!(
+            action_data["success"], false,
+            "bogus node click should fail"
+        );
         assert!(action_data["error"].as_str().unwrap().contains("not found"));
 
         // ---- Error 4: unknown key name ----
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3269,18 +3676,29 @@ mod tests {
                 "key": "nonexistent_key"
             }),
             50,
-        ).await;
-        assert!(!is_mcp_error(&result), "unknown key should return action response");
+        )
+        .await;
+        assert!(
+            !is_mcp_error(&result),
+            "unknown key should return action response"
+        );
         let action_data = extract_mcp_text(&result);
         assert_eq!(action_data["success"], false);
-        assert!(action_data["error"].as_str().unwrap().contains("unknown key"));
+        assert!(action_data["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown key"));
 
         // Cleanup
-        let _ = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let _ = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_session",
             serde_json::json!({ "sessionId": session_id, "action": "stop" }),
             60,
-        ).await;
+        )
+        .await;
     }
 
     /// Verify debug_ui_action on a stopped session returns proper MCP error.
@@ -3293,32 +3711,45 @@ mod tests {
         let mut initialized = false;
         let conn_id = "e2e-ui-stopped";
 
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
 
         // Launch and immediately stop
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_launch",
             serde_json::json!({
                 "command": binary.to_str().unwrap(),
                 "projectRoot": project_root
             }),
             10,
-        ).await;
+        )
+        .await;
         let launch_data = extract_mcp_text(&result);
         let session_id = launch_data["sessionId"].as_str().unwrap();
 
         // Stop session
-        let _ = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let _ = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_session",
             serde_json::json!({ "sessionId": session_id, "action": "stop" }),
             20,
-        ).await;
+        )
+        .await;
 
         // Small delay for session state to settle
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Try debug_ui_action on the stopped session
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3326,13 +3757,20 @@ mod tests {
                 "id": "btn_0000"
             }),
             30,
-        ).await;
-        assert!(is_mcp_error(&result), "action on stopped session should be MCP error");
+        )
+        .await;
+        assert!(
+            is_mcp_error(&result),
+            "action on stopped session should be MCP error"
+        );
         let content = result.get("content").unwrap().as_array().unwrap();
         let err_text = content[0].get("text").unwrap().as_str().unwrap();
         assert!(
-            err_text.contains("not running") || err_text.contains("exited") || err_text.contains("SESSION_NOT_FOUND"),
-            "Error should mention session gone: {}", err_text
+            err_text.contains("not running")
+                || err_text.contains("exited")
+                || err_text.contains("SESSION_NOT_FOUND"),
+            "Error should mention session gone: {}",
+            err_text
         );
     }
 
@@ -3347,42 +3785,65 @@ mod tests {
         let mut initialized = false;
         let conn_id = "e2e-ui-observe";
 
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
 
         // Launch
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_launch",
             serde_json::json!({
                 "command": binary.to_str().unwrap(),
                 "projectRoot": project_root
             }),
             10,
-        ).await;
+        )
+        .await;
         let launch_data = extract_mcp_text(&result);
         let session_id = launch_data["sessionId"].as_str().unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Get initial tree — find text field
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "tree" }),
             20,
-        ).await;
+        )
+        .await;
         let content = result.get("content").unwrap().as_array().unwrap();
-        let tree_before = content[0].get("text").unwrap().as_str().unwrap().to_string();
+        let tree_before = content[0]
+            .get("text")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
 
-        let text_field_id = tree_before.lines()
+        let text_field_id = tree_before
+            .lines()
             .find(|l| l.contains("AXTextField"))
             .and_then(|l| {
                 l.split_whitespace()
                     .find(|w| w.starts_with("id="))
-                    .map(|w| w.trim_start_matches("id=").trim_end_matches(']').to_string())
+                    .map(|w| {
+                        w.trim_start_matches("id=")
+                            .trim_end_matches(']')
+                            .to_string()
+                    })
             })
             .expect("Should find text field in tree");
 
         // Set value to a known string via MCP
-        let _ = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let _ = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui_action",
             serde_json::json!({
                 "sessionId": session_id,
@@ -3392,39 +3853,56 @@ mod tests {
                 "settleMs": 300
             }),
             30,
-        ).await;
+        )
+        .await;
 
         // Query tree again — the text field should now show the new value
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "tree" }),
             40,
-        ).await;
+        )
+        .await;
         let content = result.get("content").unwrap().as_array().unwrap();
         let tree_after = content[0].get("text").unwrap().as_str().unwrap();
 
         // The tree should contain "observable" in the text field value
-        let _tf_line_after = tree_after.lines()
+        let _tf_line_after = tree_after
+            .lines()
             .find(|l| l.contains("AXTextField"))
             .unwrap_or("");
         // SwiftUI text field may or may not reflect AX value change in tree text —
         // at minimum verify tree is still queryable and has structure
-        assert!(tree_after.contains("AXTextField"), "Tree should still have text field");
+        assert!(
+            tree_after.contains("AXTextField"),
+            "Tree should still have text field"
+        );
 
         // The nodeAfter from the setValue action should also report the change
         // (already verified in the full journey test above)
 
         // Verify a click changes the button label
-        let button_id = tree_before.lines()
+        let button_id = tree_before
+            .lines()
             .find(|l| l.contains("AXButton") && l.contains("Action"))
             .and_then(|l| {
                 l.split_whitespace()
                     .find(|w| w.starts_with("id="))
-                    .map(|w| w.trim_start_matches("id=").trim_end_matches(']').to_string())
+                    .map(|w| {
+                        w.trim_start_matches("id=")
+                            .trim_end_matches(']')
+                            .to_string()
+                    })
             });
 
         if let Some(btn_id) = button_id {
-            let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+            let result = mcp_tool_call(
+                &daemon,
+                &mut initialized,
+                conn_id,
                 "debug_ui_action",
                 serde_json::json!({
                     "sessionId": session_id,
@@ -3433,7 +3911,8 @@ mod tests {
                     "settleMs": 300
                 }),
                 50,
-            ).await;
+            )
+            .await;
             let action_data = extract_mcp_text(&result);
             if action_data["success"] == true {
                 // nodeAfter should reflect the button state post-click
@@ -3443,11 +3922,15 @@ mod tests {
         }
 
         // Cleanup
-        let _ = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let _ = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_session",
             serde_json::json!({ "sessionId": session_id, "action": "stop" }),
             60,
-        ).await;
+        )
+        .await;
     }
 
     /// E2E: debug_ui localized screenshot — full window, cropped to element, and error cases.
@@ -3460,92 +3943,142 @@ mod tests {
         let mut initialized = false;
         let conn_id = "e2e-ui-screenshot";
 
-        daemon.handle_message(&make_initialize_request(), &mut initialized, conn_id).await;
+        daemon
+            .handle_message(&make_initialize_request(), &mut initialized, conn_id)
+            .await;
 
         // Launch
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_launch",
             serde_json::json!({
                 "command": binary.to_str().unwrap(),
                 "projectRoot": project_root
             }),
             10,
-        ).await;
+        )
+        .await;
         let launch_data = extract_mcp_text(&result);
         let session_id = launch_data["sessionId"].as_str().unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // 1. Full window screenshot (no id) — should return image content
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "screenshot" }),
             20,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "full screenshot should succeed");
         let content = result.get("content").unwrap().as_array().unwrap();
         // Should have text (stats) + image
-        let has_image = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
+        let has_image = content
+            .iter()
+            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
         assert!(has_image, "full screenshot should return an image");
 
         // 2. Get tree to find a button ID
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "tree" }),
             30,
-        ).await;
+        )
+        .await;
         let tree_content = result.get("content").unwrap().as_array().unwrap();
         let tree_text = tree_content[0].get("text").unwrap().as_str().unwrap();
 
-        let button_id = tree_text.lines()
+        let button_id = tree_text
+            .lines()
             .find(|l| l.contains("AXButton"))
             .and_then(|l| {
                 l.split_whitespace()
                     .find(|w| w.starts_with("id="))
-                    .map(|w| w.trim_start_matches("id=").trim_end_matches(']').to_string())
+                    .map(|w| {
+                        w.trim_start_matches("id=")
+                            .trim_end_matches(']')
+                            .to_string()
+                    })
             })
             .expect("Should find button ID in tree");
 
         // 3. Localized screenshot with valid id — should return cropped image
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "screenshot", "id": button_id }),
             40,
-        ).await;
-        assert!(!is_mcp_error(&result), "localized screenshot should succeed");
+        )
+        .await;
+        assert!(
+            !is_mcp_error(&result),
+            "localized screenshot should succeed"
+        );
         let content = result.get("content").unwrap().as_array().unwrap();
-        let has_image = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
+        let has_image = content
+            .iter()
+            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
         assert!(has_image, "localized screenshot should return an image");
 
         // 4. "both" mode with id — should return tree text + cropped image
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "both", "id": button_id }),
             50,
-        ).await;
+        )
+        .await;
         assert!(!is_mcp_error(&result), "both+id should succeed");
         let content = result.get("content").unwrap().as_array().unwrap();
-        let has_text = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("text"));
-        let has_image = content.iter().any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
+        let has_text = content
+            .iter()
+            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("text"));
+        let has_image = content
+            .iter()
+            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("image"));
         assert!(has_text, "both mode should return text (tree)");
         assert!(has_image, "both mode should return image");
 
         // 5. Localized screenshot with nonexistent id — should return MCP error
-        let result = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let result = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_ui",
             serde_json::json!({ "sessionId": session_id, "mode": "screenshot", "id": "btn_9999" }),
             60,
-        ).await;
+        )
+        .await;
         assert!(is_mcp_error(&result), "nonexistent id should be MCP error");
         let content = result.get("content").unwrap().as_array().unwrap();
         let err_text = content[0].get("text").unwrap().as_str().unwrap();
-        assert!(err_text.contains("not found"), "Error should mention element not found: {}", err_text);
+        assert!(
+            err_text.contains("not found"),
+            "Error should mention element not found: {}",
+            err_text
+        );
 
         // Cleanup
-        let _ = mcp_tool_call(&daemon, &mut initialized, conn_id,
+        let _ = mcp_tool_call(
+            &daemon,
+            &mut initialized,
+            conn_id,
             "debug_session",
             serde_json::json!({ "sessionId": session_id, "action": "stop" }),
             70,
-        ).await;
+        )
+        .await;
     }
 }

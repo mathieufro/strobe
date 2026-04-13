@@ -43,13 +43,19 @@ impl TestAdapter for BunAdapter {
         }
 
         if let Ok(pkg) = std::fs::read_to_string(project_root.join("package.json")) {
-            if pkg.contains("\"bun test\"") || pkg.contains("\"bun:test\"") { return 90; }
-            if pkg.contains("\"bun\"") { return 75; }
+            if pkg.contains("\"bun test\"") || pkg.contains("\"bun:test\"") {
+                return 90;
+            }
+            if pkg.contains("\"bun\"") {
+                return 75;
+            }
         }
         0
     }
 
-    fn name(&self) -> &str { "bun" }
+    fn name(&self) -> &str {
+        "bun"
+    }
 
     fn suite_command(
         &self,
@@ -77,19 +83,27 @@ impl TestAdapter for BunAdapter {
                     // "apps/api"), avoid doubling the path. The orchestrator script
                     // specifies cwd relative to the monorepo root, but project_root
                     // may already BE that subdirectory.
-                    cwd = Some(if joined.exists() {
-                        joined
-                    } else if project_root.ends_with(&suite.cwd) {
-                        project_root.to_path_buf()
-                    } else {
-                        // Try resolving from monorepo root (parent dirs)
-                        let mut ancestor = project_root.to_path_buf();
-                        loop {
-                            if !ancestor.pop() { break joined; }
-                            let candidate = ancestor.join(&suite.cwd);
-                            if candidate.exists() { break candidate; }
+                    cwd = Some(
+                        if joined.exists() {
+                            joined
+                        } else if project_root.ends_with(&suite.cwd) {
+                            project_root.to_path_buf()
+                        } else {
+                            // Try resolving from monorepo root (parent dirs)
+                            let mut ancestor = project_root.to_path_buf();
+                            loop {
+                                if !ancestor.pop() {
+                                    break joined;
+                                }
+                                let candidate = ancestor.join(&suite.cwd);
+                                if candidate.exists() {
+                                    break candidate;
+                                }
+                            }
                         }
-                    }.to_string_lossy().into_owned());
+                        .to_string_lossy()
+                        .into_owned(),
+                    );
                 }
             }
         }
@@ -109,7 +123,8 @@ impl TestAdapter for BunAdapter {
                     TestLevel::Integration => "test:integration",
                     TestLevel::E2e => "test:e2e",
                 };
-                let pkg_path = cwd.as_deref()
+                let pkg_path = cwd
+                    .as_deref()
                     .map(|c| Path::new(c).join("package.json"))
                     .unwrap_or_else(|| project_root.join("package.json"));
                 if let Ok(pkg) = std::fs::read_to_string(&pkg_path) {
@@ -143,12 +158,19 @@ impl TestAdapter for BunAdapter {
         })
     }
 
-    fn single_test_command(&self, project_root: &Path, test_name: &str) -> crate::Result<TestCommand> {
+    fn single_test_command(
+        &self,
+        project_root: &Path,
+        test_name: &str,
+    ) -> crate::Result<TestCommand> {
         // Explicit file path — has extension or path separator
         let is_file_path = test_name.contains('/')
-            || test_name.ends_with(".ts") || test_name.ends_with(".tsx")
-            || test_name.ends_with(".js") || test_name.ends_with(".jsx")
-            || test_name.contains(".test.") || test_name.contains(".spec.");
+            || test_name.ends_with(".ts")
+            || test_name.ends_with(".tsx")
+            || test_name.ends_with(".js")
+            || test_name.ends_with(".jsx")
+            || test_name.contains(".test.")
+            || test_name.contains(".spec.");
 
         if is_file_path {
             let (cwd, relative_path) = resolve_workspace_path(project_root, test_name);
@@ -180,8 +202,7 @@ impl TestAdapter for BunAdapter {
 
         // Name pattern — need workspace cwd for bunfig.toml discovery.
         // Escape regex metacharacters so the pattern is a literal substring match.
-        let cwd = find_bun_workspace(project_root)
-            .map(|ws| ws.to_string_lossy().into_owned());
+        let cwd = find_bun_workspace(project_root).map(|ws| ws.to_string_lossy().into_owned());
         let remove_env = bun_remove_env(&cwd, project_root);
         Ok(TestCommand {
             program: "bun".to_string(),
@@ -200,7 +221,12 @@ impl TestAdapter for BunAdapter {
         // Bun writes test output to stderr (default reporter).
         // Wrappers may redirect child stderr to stdout — try stderr first, fall back to stdout.
         let result = parse_bun_output(stderr);
-        if !result.all_tests.is_empty() {
+        let has_structured_result = !result.all_tests.is_empty()
+            || !result.failures.is_empty()
+            || result.summary.passed > 0
+            || result.summary.failed > 0
+            || result.summary.skipped > 0;
+        if has_structured_result {
             return result;
         }
         parse_bun_output(stdout)
@@ -209,7 +235,8 @@ impl TestAdapter for BunAdapter {
     fn suggest_traces(&self, failure: &TestFailure) -> Vec<String> {
         let mut traces = vec![];
         if let Some(file) = &failure.file {
-            let stem = Path::new(file).file_stem()
+            let stem = Path::new(file)
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("test");
             let module = stem.trim_end_matches(".test").trim_end_matches(".spec");
@@ -258,11 +285,13 @@ impl TestAdapter for BunAdapter {
             };
 
             // Try level-specific pretest first, then generic pretest
-            let script_keys: Vec<&str> = level_key.into_iter().chain(std::iter::once("pretest")).collect();
+            let script_keys: Vec<&str> = level_key
+                .into_iter()
+                .chain(std::iter::once("pretest"))
+                .collect();
             for key in script_keys {
                 if extract_script_value(&pkg, key).is_some() {
-                    let cwd = pkg_path.parent()
-                        .map(|p| p.to_string_lossy().into_owned());
+                    let cwd = pkg_path.parent().map(|p| p.to_string_lossy().into_owned());
                     return Some(TestCommand {
                         program: "bun".to_string(),
                         args: vec!["run".to_string(), key.to_string()],
@@ -303,18 +332,27 @@ pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
     let mut reading_failure = false;
 
     // Helper closure to finalize a testcase
-    let finalize_testcase = |passed: &mut u32, failed: &mut u32, skipped: &mut u32,
-                             failures: &mut Vec<TestFailure>, all_tests: &mut Vec<TestDetail>,
-                             tc_name: &str, tc_classname: &str, tc_duration_ms: u64,
-                             tc_skipped: bool, tc_failed: bool,
-                             tc_failure_msg: &str, tc_failure_body: &str| {
+    let finalize_testcase = |passed: &mut u32,
+                             failed: &mut u32,
+                             skipped: &mut u32,
+                             failures: &mut Vec<TestFailure>,
+                             all_tests: &mut Vec<TestDetail>,
+                             tc_name: &str,
+                             tc_classname: &str,
+                             tc_duration_ms: u64,
+                             tc_skipped: bool,
+                             tc_failed: bool,
+                             tc_failure_msg: &str,
+                             tc_failure_body: &str| {
         if tc_skipped {
             *skipped += 1;
             all_tests.push(TestDetail {
                 name: tc_name.to_string(),
                 status: TestStatus::Skip,
                 duration_ms: tc_duration_ms,
-                stdout: None, stderr: None, message: None,
+                stdout: None,
+                stderr: None,
+                message: None,
             });
         } else if tc_failed {
             *failed += 1;
@@ -323,7 +361,11 @@ pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
             } else {
                 tc_failure_msg.to_string()
             };
-            let file = if !tc_classname.is_empty() { Some(tc_classname.to_string()) } else { None };
+            let file = if !tc_classname.is_empty() {
+                Some(tc_classname.to_string())
+            } else {
+                None
+            };
 
             failures.push(TestFailure {
                 name: tc_name.to_string(),
@@ -337,7 +379,8 @@ pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
                 name: tc_name.to_string(),
                 status: TestStatus::Fail,
                 duration_ms: tc_duration_ms,
-                stdout: None, stderr: None,
+                stdout: None,
+                stderr: None,
                 message: Some(message),
             });
         } else {
@@ -346,7 +389,9 @@ pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
                 name: tc_name.to_string(),
                 status: TestStatus::Pass,
                 duration_ms: tc_duration_ms,
-                stdout: None, stderr: None, message: None,
+                stdout: None,
+                stderr: None,
+                message: None,
             });
         }
     };
@@ -363,9 +408,20 @@ pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
                         let classname = get_attr(e, "classname");
                         let secs = get_attr(e, "time");
                         let dur = (secs.parse::<f64>().unwrap_or(0.0) * 1000.0) as u64;
-                        finalize_testcase(&mut passed, &mut failed, &mut skipped,
-                            &mut failures, &mut all_tests,
-                            &name, &classname, dur, false, false, "", "");
+                        finalize_testcase(
+                            &mut passed,
+                            &mut failed,
+                            &mut skipped,
+                            &mut failures,
+                            &mut all_tests,
+                            &name,
+                            &classname,
+                            dur,
+                            false,
+                            false,
+                            "",
+                            "",
+                        );
                     }
                     b"skipped" if in_testcase => {
                         tc_skipped = true;
@@ -373,48 +429,54 @@ pub(crate) fn parse_junit_xml(xml: &str) -> TestResult {
                     _ => {}
                 }
             }
-            Ok(Event::Start(ref e)) => {
-                match e.local_name().as_ref() {
-                    b"testcase" => {
-                        in_testcase = true;
-                        tc_name = get_attr(e, "name");
-                        tc_classname = get_attr(e, "classname");
-                        let secs = get_attr(e, "time");
-                        tc_duration_ms = (secs.parse::<f64>().unwrap_or(0.0) * 1000.0) as u64;
-                        tc_failure_msg.clear();
-                        tc_failure_body.clear();
-                        tc_skipped = false;
-                        tc_failed = false;
-                        reading_failure = false;
-                    }
-                    b"failure" if in_testcase => {
-                        tc_failed = true;
-                        tc_failure_msg = get_attr(e, "message");
-                        reading_failure = true;
-                    }
-                    _ => {}
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"testcase" => {
+                    in_testcase = true;
+                    tc_name = get_attr(e, "name");
+                    tc_classname = get_attr(e, "classname");
+                    let secs = get_attr(e, "time");
+                    tc_duration_ms = (secs.parse::<f64>().unwrap_or(0.0) * 1000.0) as u64;
+                    tc_failure_msg.clear();
+                    tc_failure_body.clear();
+                    tc_skipped = false;
+                    tc_failed = false;
+                    reading_failure = false;
                 }
-            }
+                b"failure" if in_testcase => {
+                    tc_failed = true;
+                    tc_failure_msg = get_attr(e, "message");
+                    reading_failure = true;
+                }
+                _ => {}
+            },
             Ok(Event::Text(ref e)) => {
                 if reading_failure {
                     tc_failure_body = e.unescape().unwrap_or_default().to_string();
                 }
             }
-            Ok(Event::End(ref e)) => {
-                match e.local_name().as_ref() {
-                    b"failure" => {
-                        reading_failure = false;
-                    }
-                    b"testcase" => {
-                        finalize_testcase(&mut passed, &mut failed, &mut skipped,
-                            &mut failures, &mut all_tests,
-                            &tc_name, &tc_classname, tc_duration_ms,
-                            tc_skipped, tc_failed, &tc_failure_msg, &tc_failure_body);
-                        in_testcase = false;
-                    }
-                    _ => {}
+            Ok(Event::End(ref e)) => match e.local_name().as_ref() {
+                b"failure" => {
+                    reading_failure = false;
                 }
-            }
+                b"testcase" => {
+                    finalize_testcase(
+                        &mut passed,
+                        &mut failed,
+                        &mut skipped,
+                        &mut failures,
+                        &mut all_tests,
+                        &tc_name,
+                        &tc_classname,
+                        tc_duration_ms,
+                        tc_skipped,
+                        tc_failed,
+                        &tc_failure_msg,
+                        &tc_failure_body,
+                    );
+                    in_testcase = false;
+                }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(_) => break,
             _ => {}
@@ -456,11 +518,15 @@ fn extract_script_value(pkg_json: &str, key: &str) -> Option<String> {
 /// Parse Bun's default test output into TestResult.
 /// Bun writes per-test markers (✓/✗/-) to stderr with durations and failure details.
 pub(crate) fn parse_bun_output(output: &str) -> TestResult {
+    let cleaned_output = strip_ansi_sequences(output);
     let mut passed = 0u32;
     let mut failed = 0u32;
     let mut skipped = 0u32;
     let mut failures: Vec<TestFailure> = Vec::new();
     let mut all_tests: Vec<TestDetail> = Vec::new();
+    let mut summary_passed = 0u32;
+    let mut summary_failed = 0u32;
+    let mut summary_skipped = 0u32;
 
     // Current file header (e.g., "src/auth.test.ts")
     let mut current_file: Option<String> = None;
@@ -473,8 +539,17 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
     // We collect non-marker, non-header lines and attach them to the next (fail).
     let mut pending_error: Vec<String> = Vec::new();
 
-    for line in output.lines() {
+    for line in cleaned_output.lines() {
         let trimmed = line.trim();
+
+        if let Some((kind, count)) = parse_summary_counter_line(trimmed) {
+            match kind {
+                SummaryKind::Pass => summary_passed = count,
+                SummaryKind::Fail => summary_failed = count,
+                SummaryKind::Skip | SummaryKind::Todo => summary_skipped += count,
+            }
+            continue;
+        }
 
         // File header: "path/to/file.test.ts:" (line ending with colon, looks like a test file)
         if is_file_header(trimmed) {
@@ -485,7 +560,8 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
         }
 
         // Pass: ✓ Test Name [1.23ms]  or  (pass) Test Name [1.23ms]
-        if trimmed.starts_with('✓') || trimmed.starts_with('\u{2713}')
+        if trimmed.starts_with('✓')
+            || trimmed.starts_with('\u{2713}')
             || trimmed.starts_with("(pass)")
         {
             flush_failure(&mut failure_ctx, &mut failures);
@@ -494,15 +570,20 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
             if !name.is_empty() {
                 passed += 1;
                 all_tests.push(TestDetail {
-                    name, status: TestStatus::Pass, duration_ms: dur,
-                    stdout: None, stderr: None, message: None,
+                    name,
+                    status: TestStatus::Pass,
+                    duration_ms: dur,
+                    stdout: None,
+                    stderr: None,
+                    message: None,
                 });
             }
             continue;
         }
 
         // Fail: ✗ Test Name [0.12ms]  or  (fail) Test Name [0.12ms]
-        if trimmed.starts_with('✗') || trimmed.starts_with('\u{2717}')
+        if trimmed.starts_with('✗')
+            || trimmed.starts_with('\u{2717}')
             || trimmed.starts_with('\u{2718}')
             || trimmed.starts_with("(fail)")
         {
@@ -515,8 +596,12 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
                 let pre_lines = std::mem::take(&mut pending_error);
                 failure_ctx = Some((name.clone(), current_file.clone(), pre_lines));
                 all_tests.push(TestDetail {
-                    name, status: TestStatus::Fail, duration_ms: dur,
-                    stdout: None, stderr: None, message: None,
+                    name,
+                    status: TestStatus::Fail,
+                    duration_ms: dur,
+                    stdout: None,
+                    stderr: None,
+                    message: None,
                 });
             }
             continue;
@@ -530,15 +615,20 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
             if !name.is_empty() {
                 skipped += 1;
                 all_tests.push(TestDetail {
-                    name, status: TestStatus::Skip, duration_ms: 0,
-                    stdout: None, stderr: None, message: None,
+                    name,
+                    status: TestStatus::Skip,
+                    duration_ms: 0,
+                    stdout: None,
+                    stderr: None,
+                    message: None,
                 });
             }
             continue;
         }
         // Only check - / » outside failure context — diff output has '-' prefixed lines
         if failure_ctx.is_none()
-            && (trimmed.starts_with("- ") || trimmed.starts_with('»')
+            && (trimmed.starts_with("- ")
+                || trimmed.starts_with('»')
                 || trimmed.starts_with('\u{00bb}'))
             && trimmed.len() > 2
         {
@@ -548,8 +638,12 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
                 pending_error.clear();
                 skipped += 1;
                 all_tests.push(TestDetail {
-                    name, status: TestStatus::Skip, duration_ms: 0,
-                    stdout: None, stderr: None, message: None,
+                    name,
+                    status: TestStatus::Skip,
+                    duration_ms: 0,
+                    stdout: None,
+                    stderr: None,
+                    message: None,
                 });
             }
             continue;
@@ -572,12 +666,71 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
 
     flush_failure(&mut failure_ctx, &mut failures);
 
+    if all_tests.is_empty() {
+        passed = summary_passed;
+        failed = summary_failed;
+        skipped = summary_skipped;
+    }
+
     let total_duration = all_tests.iter().map(|t| t.duration_ms).sum();
     TestResult {
-        summary: TestSummary { passed, failed, skipped, stuck: None, duration_ms: total_duration },
+        summary: TestSummary {
+            passed,
+            failed,
+            skipped,
+            stuck: None,
+            duration_ms: total_duration,
+        },
         failures,
         stuck: vec![],
         all_tests,
+    }
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+enum SummaryKind {
+    Pass,
+    Fail,
+    Skip,
+    Todo,
+}
+
+fn parse_summary_counter_line(line: &str) -> Option<(SummaryKind, u32)> {
+    let trimmed = line.trim();
+    let mut parts = trimmed.split_whitespace();
+    let count = parts.next()?.parse::<u32>().ok()?;
+    let kind = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match kind {
+        "pass" => Some((SummaryKind::Pass, count)),
+        "fail" => Some((SummaryKind::Fail, count)),
+        "skip" => Some((SummaryKind::Skip, count)),
+        "todo" => Some((SummaryKind::Todo, count)),
+        _ => None,
     }
 }
 
@@ -585,8 +738,12 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
 fn is_summary_line(line: &str) -> bool {
     let trimmed = line.trim();
     // " 498 pass", " 2 fail", " 1 skip", " 2 todo", "Ran 525 tests...", "N expect() calls"
-    if trimmed.starts_with("Ran ") && trimmed.contains(" tests ") { return true; }
-    if trimmed.ends_with(" expect() calls") { return true; }
+    if trimmed.starts_with("Ran ") && trimmed.contains(" tests ") {
+        return true;
+    }
+    if trimmed.ends_with(" expect() calls") {
+        return true;
+    }
     // "  N pass", "  N fail", "  N skip", "  N todo"
     let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
     if parts.len() == 2 {
@@ -604,7 +761,10 @@ fn is_summary_line(line: &str) -> bool {
 fn is_file_header(line: &str) -> bool {
     line.ends_with(':')
         && !line.starts_with(' ')
-        && (line.contains(".test.") || line.contains(".spec.") || line.contains(".ts:") || line.contains(".js:"))
+        && (line.contains(".test.")
+            || line.contains(".spec.")
+            || line.contains(".ts:")
+            || line.contains(".js:"))
 }
 
 /// Extract test name and duration from a marker line like "✓ Test Name [1.23ms]"
@@ -660,8 +820,12 @@ fn flush_failure(
     if let Some((name, file_from_header, msg_lines)) = ctx.take() {
         if msg_lines.is_empty() {
             failures.push(TestFailure {
-                name, file: file_from_header, line: None,
-                message: String::new(), rerun: None, suggested_traces: vec![],
+                name,
+                file: file_from_header,
+                line: None,
+                message: String::new(),
+                rerun: None,
+                suggested_traces: vec![],
             });
             return;
         }
@@ -672,8 +836,12 @@ fn flush_failure(
         let (file, line) = extract_location_from_stack(&msg_lines, &file_from_header);
 
         failures.push(TestFailure {
-            name, file, line,
-            message, rerun: None, suggested_traces: vec![],
+            name,
+            file,
+            line,
+            message,
+            rerun: None,
+            suggested_traces: vec![],
         });
     }
 }
@@ -686,7 +854,9 @@ fn extract_location_from_stack(
 ) -> (Option<String>, Option<u32>) {
     for line in lines {
         let trimmed = line.trim();
-        if !trimmed.starts_with("at ") { continue; }
+        if !trimmed.starts_with("at ") {
+            continue;
+        }
         // Patterns: "at /abs/path:line:col" or "at func (path:line:col)"
         let path_part = if let Some(paren_start) = trimmed.rfind('(') {
             &trimmed[paren_start + 1..trimmed.len() - trimmed.ends_with(')') as usize]
@@ -704,7 +874,8 @@ fn extract_location_from_stack(
             // Make path relative if absolute
             let relative = if file_path.starts_with('/') {
                 // Try stripping common prefixes
-                file_path.rsplit_once("/src/")
+                file_path
+                    .rsplit_once("/src/")
                     .map(|(_, rest)| format!("src/{}", rest))
                     .unwrap_or_else(|| file_path.to_string())
             } else {
@@ -719,7 +890,9 @@ fn extract_location_from_stack(
 /// Check if any workspace directory contains bunfig.toml (bun:test).
 fn has_bun_test_workspace(project_root: &Path, pkg_json: &str) -> bool {
     let workspace_dirs = find_workspace_dirs(project_root, pkg_json);
-    workspace_dirs.iter().any(|ws| ws.join("bunfig.toml").exists())
+    workspace_dirs
+        .iter()
+        .any(|ws| ws.join("bunfig.toml").exists())
 }
 
 /// Resolve workspace glob patterns to concrete directory paths.
@@ -744,7 +917,9 @@ pub(crate) fn find_workspace_dirs(project_root: &Path, pkg_json: &str) -> Vec<st
 
     for item in array_content.split(',') {
         let pattern = item.trim().trim_matches('"').trim_matches('\'');
-        if pattern.is_empty() { continue; }
+        if pattern.is_empty() {
+            continue;
+        }
 
         if pattern.ends_with("/*") {
             // Glob: "apps/*" → list subdirs of apps/
@@ -759,7 +934,9 @@ pub(crate) fn find_workspace_dirs(project_root: &Path, pkg_json: &str) -> Vec<st
         } else {
             // Direct: "packages/shared"
             let ws = project_root.join(pattern);
-            if ws.is_dir() { dirs.push(ws); }
+            if ws.is_dir() {
+                dirs.push(ws);
+            }
         }
     }
     dirs
@@ -769,7 +946,9 @@ pub(crate) fn find_workspace_dirs(project_root: &Path, pkg_json: &str) -> Vec<st
 /// Returns the first workspace with bunfig.toml, or None.
 pub(crate) fn find_bun_workspace(project_root: &Path) -> Option<std::path::PathBuf> {
     let pkg = std::fs::read_to_string(project_root.join("package.json")).ok()?;
-    if !pkg.contains("\"workspaces\"") { return None; }
+    if !pkg.contains("\"workspaces\"") {
+        return None;
+    }
     let dirs = find_workspace_dirs(project_root, &pkg);
     dirs.into_iter().find(|ws| ws.join("bunfig.toml").exists())
 }
@@ -777,7 +956,8 @@ pub(crate) fn find_bun_workspace(project_root: &Path) -> Option<std::path::PathB
 /// Build remove_env list: only strip DATABASE_URL when a .env.test file exists
 /// in the test cwd (Bun auto-loads it, and inherited env would override).
 fn bun_remove_env(cwd: &Option<String>, project_root: &Path) -> Vec<String> {
-    let has_env_test = cwd.as_deref()
+    let has_env_test = cwd
+        .as_deref()
         .map(|c| Path::new(c).join(".env.test").exists())
         .unwrap_or_else(|| project_root.join(".env.test").exists());
     if has_env_test {
@@ -793,7 +973,10 @@ fn bun_remove_env(cwd: &Option<String>, project_root: &Path) -> Vec<String> {
 fn escape_regex(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
-        if matches!(c, '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$') {
+        if matches!(
+            c,
+            '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+        ) {
             out.push('\\');
         }
         out.push(c);
@@ -806,7 +989,10 @@ fn escape_regex(s: &str) -> String {
 ///
 /// Returns `(cwd, relative_paths)` on match. Prefers exact stem matches over
 /// partial contains matches (only used when unambiguous — single result).
-fn find_test_files_by_stem(project_root: &Path, query: &str) -> Option<(Option<String>, Vec<String>)> {
+fn find_test_files_by_stem(
+    project_root: &Path,
+    query: &str,
+) -> Option<(Option<String>, Vec<String>)> {
     let (search_root, cwd) = if let Some(ws) = find_bun_workspace(project_root) {
         let cwd_str = ws.to_string_lossy().into_owned();
         (ws, Some(cwd_str))
@@ -821,13 +1007,17 @@ fn find_test_files_by_stem(project_root: &Path, query: &str) -> Option<(Option<S
         .max_depth(10)
         .into_iter()
         .filter_entry(|e| {
-            if e.depth() == 0 { return true; }
+            if e.depth() == 0 {
+                return true;
+            }
             let name = e.file_name().to_string_lossy();
             !name.starts_with('.') && name != "node_modules" && name != "dist" && name != "build"
         })
         .flatten()
     {
-        if !entry.file_type().is_file() { continue; }
+        if !entry.file_type().is_file() {
+            continue;
+        }
 
         let file_name = entry.file_name().to_string_lossy();
 
@@ -840,7 +1030,8 @@ fn find_test_files_by_stem(project_root: &Path, query: &str) -> Option<(Option<S
             continue;
         };
 
-        let relative = entry.path()
+        let relative = entry
+            .path()
             .strip_prefix(&search_root)
             .unwrap_or(entry.path())
             .to_string_lossy()
@@ -930,7 +1121,9 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
         // Detect start of SUITES object
         if !in_suites_block {
             if (trimmed.contains("SUITES") || trimmed.contains("suites"))
-                && (trimmed.contains("Record<") || trimmed.contains(": {") || trimmed.contains("= {"))
+                && (trimmed.contains("Record<")
+                    || trimmed.contains(": {")
+                    || trimmed.contains("= {"))
             {
                 in_suites_block = true;
                 brace_depth = 1;
@@ -948,7 +1141,8 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
                 let is_bun_test = all_strings.first().map(|s| s == "bun").unwrap_or(false)
                     && all_strings.get(1).map(|s| s == "test").unwrap_or(false);
                 current_dirs = if is_bun_test {
-                    all_strings.into_iter()
+                    all_strings
+                        .into_iter()
                         .filter(|s| s != "bun" && s != "test" && !s.starts_with("--"))
                         .collect()
                 } else {
@@ -966,10 +1160,13 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
         if brace_depth <= 0 && in_suites_block && !suites.is_empty() {
             // Flush last suite
             if let Some(name) = current_name.take() {
-                suites.insert(name, OrchestratorSuite {
-                    dirs: std::mem::take(&mut current_dirs),
-                    cwd: current_cwd.take().unwrap_or_default(),
-                });
+                suites.insert(
+                    name,
+                    OrchestratorSuite {
+                        dirs: std::mem::take(&mut current_dirs),
+                        cwd: current_cwd.take().unwrap_or_default(),
+                    },
+                );
             }
             break;
         }
@@ -978,10 +1175,13 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
         if trimmed.ends_with(": {") || trimmed.ends_with(":{") || trimmed.ends_with(": {,") {
             // Flush previous suite
             if let Some(name) = current_name.take() {
-                suites.insert(name, OrchestratorSuite {
-                    dirs: std::mem::take(&mut current_dirs),
-                    cwd: current_cwd.take().unwrap_or_default(),
-                });
+                suites.insert(
+                    name,
+                    OrchestratorSuite {
+                        dirs: std::mem::take(&mut current_dirs),
+                        cwd: current_cwd.take().unwrap_or_default(),
+                    },
+                );
             }
             let name_part = trimmed.split(':').next().unwrap_or("").trim();
             let name = name_part.trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
@@ -999,7 +1199,8 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
                 let is_bun_test = all_strings.first().map(|s| s == "bun").unwrap_or(false)
                     && all_strings.get(1).map(|s| s == "test").unwrap_or(false);
                 current_dirs = if is_bun_test {
-                    all_strings.into_iter()
+                    all_strings
+                        .into_iter()
                         .filter(|s| s != "bun" && s != "test" && !s.starts_with("--"))
                         .collect()
                 } else {
@@ -1022,13 +1223,20 @@ pub(crate) fn parse_suites_from_ts(content: &str) -> Option<HashMap<String, Orch
 
     // Flush last
     if let Some(name) = current_name.take() {
-        suites.insert(name, OrchestratorSuite {
-            dirs: std::mem::take(&mut current_dirs),
-            cwd: current_cwd.take().unwrap_or_default(),
-        });
+        suites.insert(
+            name,
+            OrchestratorSuite {
+                dirs: std::mem::take(&mut current_dirs),
+                cwd: current_cwd.take().unwrap_or_default(),
+            },
+        );
     }
 
-    if suites.is_empty() { None } else { Some(suites) }
+    if suites.is_empty() {
+        None
+    } else {
+        Some(suites)
+    }
 }
 
 /// Extract all double/single-quoted strings from a line.
@@ -1040,10 +1248,14 @@ fn extract_quoted_strings(line: &str) -> Vec<String> {
             let quote = c;
             let mut s = String::new();
             for c in chars.by_ref() {
-                if c == quote { break; }
+                if c == quote {
+                    break;
+                }
                 s.push(c);
             }
-            if !s.is_empty() { strings.push(s); }
+            if !s.is_empty() {
+                strings.push(s);
+            }
         }
     }
     strings
@@ -1104,7 +1316,8 @@ pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
         }
 
         // Pass
-        if trimmed.starts_with('✓') || trimmed.starts_with('\u{2713}')
+        if trimmed.starts_with('✓')
+            || trimmed.starts_with('\u{2713}')
             || trimmed.starts_with("(pass)")
         {
             let (name, _) = parse_test_marker_line(trimmed);
@@ -1117,7 +1330,8 @@ pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
         }
 
         // Fail
-        if trimmed.starts_with('✗') || trimmed.starts_with('\u{2717}')
+        if trimmed.starts_with('✗')
+            || trimmed.starts_with('\u{2717}')
             || trimmed.starts_with('\u{2718}')
             || trimmed.starts_with("(fail)")
         {
@@ -1140,7 +1354,8 @@ pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
             }
             continue;
         }
-        if (trimmed.starts_with("- ") || trimmed.starts_with('»')
+        if (trimmed.starts_with("- ")
+            || trimmed.starts_with('»')
             || trimmed.starts_with('\u{00bb}'))
             && trimmed.len() > 2
         {
@@ -1159,9 +1374,7 @@ fn get_attr(e: &quick_xml::events::BytesStart, name: &str) -> String {
     e.attributes()
         .flatten()
         .find(|a| a.key.as_ref() == name.as_bytes())
-        .and_then(|a| {
-            a.unescape_value().ok().map(|s| s.to_string())
-        })
+        .and_then(|a| a.unescape_value().ok().map(|s| s.to_string()))
         .unwrap_or_default()
 }
 
@@ -1206,14 +1419,20 @@ AssertionError: Expected 6, got 5
         assert_eq!(adapter.detect(dir.path(), None), 0);
 
         std::fs::write(dir.path().join("bun.lockb"), b"").unwrap();
-        assert!(adapter.detect(dir.path(), None) >= 85, "bun.lockb → high confidence");
+        assert!(
+            adapter.detect(dir.path(), None) >= 85,
+            "bun.lockb → high confidence"
+        );
     }
 
     #[test]
     fn test_detect_bun_package_json() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"scripts": {"test": "bun test"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"test": "bun test"}}"#,
+        )
+        .unwrap();
         let adapter = BunAdapter;
         assert!(adapter.detect(dir.path(), None) >= 80);
     }
@@ -1248,13 +1467,19 @@ AssertionError: Expected 6, got 5
     fn test_parse_xml_entities_unescaped() {
         let result = parse_junit_xml(JUNIT_FAIL);
         let msg = &result.failures[0].message;
-        assert!(msg.contains("<anonymous>"), "XML entities should be decoded, got: {}", msg);
+        assert!(
+            msg.contains("<anonymous>"),
+            "XML entities should be decoded, got: {}",
+            msg
+        );
     }
 
     #[test]
     fn test_suite_command() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = BunAdapter.suite_command(dir.path(), None, &Default::default()).unwrap();
+        let cmd = BunAdapter
+            .suite_command(dir.path(), None, &Default::default())
+            .unwrap();
         assert_eq!(cmd.program, "bun");
         assert!(cmd.args.contains(&"test".to_string()));
     }
@@ -1262,18 +1487,32 @@ AssertionError: Expected 6, got 5
     #[test]
     fn test_suite_command_with_level() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"scripts": {"test": "bun test", "test:e2e": "bun test src/tests/e2e"}}"#).unwrap();
-        let cmd = BunAdapter.suite_command(dir.path(), Some(TestLevel::E2e), &Default::default()).unwrap();
-        assert!(cmd.args.contains(&"src/tests/e2e".to_string()),
-            "E2E level should add paths from package.json script, got: {:?}", cmd.args);
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"test": "bun test", "test:e2e": "bun test src/tests/e2e"}}"#,
+        )
+        .unwrap();
+        let cmd = BunAdapter
+            .suite_command(dir.path(), Some(TestLevel::E2e), &Default::default())
+            .unwrap();
+        assert!(
+            cmd.args.contains(&"src/tests/e2e".to_string()),
+            "E2E level should add paths from package.json script, got: {:?}",
+            cmd.args
+        );
     }
 
     #[test]
     fn test_extract_script_value() {
         let pkg = r#"{"scripts": {"test:e2e": "bun test src/tests/e2e", "test": "bun test"}}"#;
-        assert_eq!(extract_script_value(pkg, "test:e2e"), Some("bun test src/tests/e2e".to_string()));
-        assert_eq!(extract_script_value(pkg, "test"), Some("bun test".to_string()));
+        assert_eq!(
+            extract_script_value(pkg, "test:e2e"),
+            Some("bun test src/tests/e2e".to_string())
+        );
+        assert_eq!(
+            extract_script_value(pkg, "test"),
+            Some("bun test".to_string())
+        );
         assert_eq!(extract_script_value(pkg, "test:missing"), None);
     }
 
@@ -1312,25 +1551,42 @@ src/services/todo.test.ts:
         assert_eq!(result.all_tests.len(), 4);
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].name, "Auth > rejects expired");
-        assert!(result.failures[0].message.contains("Expected: 401"), "should capture pre-marker error, got: {}", result.failures[0].message);
-        assert!(result.failures[0].message.contains("Received: 200"), "should capture full error");
-        assert_eq!(result.failures[0].file.as_deref(), Some("src/services/auth.test.ts"));
+        assert!(
+            result.failures[0].message.contains("Expected: 401"),
+            "should capture pre-marker error, got: {}",
+            result.failures[0].message
+        );
+        assert!(
+            result.failures[0].message.contains("Received: 200"),
+            "should capture full error"
+        );
+        assert_eq!(
+            result.failures[0].file.as_deref(),
+            Some("src/services/auth.test.ts")
+        );
         assert_eq!(result.failures[0].line, Some(45));
     }
 
     #[test]
     fn test_bun_update_progress_paren_format() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let progress = Arc::new(Mutex::new(TestProgress::new()));
 
-        update_progress("src/auth.test.ts:\n(pass) Auth > passes [1.00ms]\n(fail) Auth > fails [0.10ms]\n", &progress);
+        update_progress(
+            "src/auth.test.ts:\n(pass) Auth > passes [1.00ms]\n(fail) Auth > fails [0.10ms]\n",
+            &progress,
+        );
 
         let p = progress.lock().unwrap();
         assert_eq!(p.passed, 1, "should count (pass)");
         assert_eq!(p.failed, 1, "should count (fail)");
-        assert_eq!(p.phase, TestPhase::Running, "file header should transition to Running");
+        assert_eq!(
+            p.phase,
+            TestPhase::Running,
+            "file header should transition to Running"
+        );
     }
 
     // --- File path tests ---
@@ -1338,19 +1594,30 @@ src/services/todo.test.ts:
     #[test]
     fn test_single_test_file_path() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = BunAdapter.single_test_command(dir.path(), "src/middleware/auth.test.ts").unwrap();
-        assert!(!cmd.args.contains(&"--test-name-pattern".to_string()),
-            "file path should not use --test-name-pattern");
-        assert!(cmd.args.contains(&"src/middleware/auth.test.ts".to_string()),
-            "file path should be passed directly to bun test");
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "src/middleware/auth.test.ts")
+            .unwrap();
+        assert!(
+            !cmd.args.contains(&"--test-name-pattern".to_string()),
+            "file path should not use --test-name-pattern"
+        );
+        assert!(
+            cmd.args
+                .contains(&"src/middleware/auth.test.ts".to_string()),
+            "file path should be passed directly to bun test"
+        );
     }
 
     #[test]
     fn test_single_test_name_pattern() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = BunAdapter.single_test_command(dir.path(), "should validate token").unwrap();
-        assert!(cmd.args.contains(&"--test-name-pattern".to_string()),
-            "name pattern should use --test-name-pattern");
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "should validate token")
+            .unwrap();
+        assert!(
+            cmd.args.contains(&"--test-name-pattern".to_string()),
+            "name pattern should use --test-name-pattern"
+        );
         assert!(cmd.args.contains(&"should validate token".to_string()));
     }
 
@@ -1361,17 +1628,27 @@ src/services/todo.test.ts:
         let api = dir.path().join("apps/api");
         std::fs::create_dir_all(&api).unwrap();
         std::fs::write(api.join("bunfig.toml"), "[test]").unwrap();
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"workspaces": ["apps/*"]}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"]}"#,
+        )
+        .unwrap();
 
         // Path includes workspace prefix
-        let cmd = BunAdapter.single_test_command(
-            dir.path(), "apps/api/src/middleware/auth.test.ts"
-        ).unwrap();
-        assert!(cmd.args.contains(&"src/middleware/auth.test.ts".to_string()),
-            "should strip workspace prefix, got: {:?}", cmd.args);
-        assert!(cmd.cwd.as_ref().unwrap().ends_with("apps/api"),
-            "should set cwd to workspace dir, got: {:?}", cmd.cwd);
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "apps/api/src/middleware/auth.test.ts")
+            .unwrap();
+        assert!(
+            cmd.args
+                .contains(&"src/middleware/auth.test.ts".to_string()),
+            "should strip workspace prefix, got: {:?}",
+            cmd.args
+        );
+        assert!(
+            cmd.cwd.as_ref().unwrap().ends_with("apps/api"),
+            "should set cwd to workspace dir, got: {:?}",
+            cmd.cwd
+        );
     }
 
     #[test]
@@ -1380,10 +1657,12 @@ src/services/todo.test.ts:
         // Non-monorepo with bunfig.toml
         std::fs::write(dir.path().join("bunfig.toml"), "[test]").unwrap();
 
-        let cmd = BunAdapter.single_test_command(
-            dir.path(), "src/middleware/auth.test.ts"
-        ).unwrap();
-        assert!(cmd.args.contains(&"src/middleware/auth.test.ts".to_string()));
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "src/middleware/auth.test.ts")
+            .unwrap();
+        assert!(cmd
+            .args
+            .contains(&"src/middleware/auth.test.ts".to_string()));
     }
 
     // --- Fuzzy file stem matching tests ---
@@ -1396,11 +1675,20 @@ src/services/todo.test.ts:
         std::fs::create_dir_all(&test_dir).unwrap();
         std::fs::write(test_dir.join("session-lifecycle.test.ts"), "").unwrap();
 
-        let cmd = BunAdapter.single_test_command(dir.path(), "session-lifecycle").unwrap();
-        assert!(!cmd.args.contains(&"--test-name-pattern".to_string()),
-            "fuzzy stem match should not use --test-name-pattern");
-        assert!(cmd.args.iter().any(|a| a.ends_with("session-lifecycle.test.ts")),
-            "should find test file by stem, got: {:?}", cmd.args);
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "session-lifecycle")
+            .unwrap();
+        assert!(
+            !cmd.args.contains(&"--test-name-pattern".to_string()),
+            "fuzzy stem match should not use --test-name-pattern"
+        );
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a.ends_with("session-lifecycle.test.ts")),
+            "should find test file by stem, got: {:?}",
+            cmd.args
+        );
     }
 
     #[test]
@@ -1411,24 +1699,38 @@ src/services/todo.test.ts:
         let test_dir = api.join("src/__tests__");
         std::fs::create_dir_all(&test_dir).unwrap();
         std::fs::write(api.join("bunfig.toml"), "[test]").unwrap();
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"workspaces": ["apps/*"]}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"]}"#,
+        )
+        .unwrap();
         std::fs::write(test_dir.join("auth-service.test.ts"), "").unwrap();
 
-        let cmd = BunAdapter.single_test_command(dir.path(), "auth-service").unwrap();
-        assert!(cmd.args.iter().any(|a| a.contains("auth-service.test.ts")),
-            "should find test file in workspace by stem, got: {:?}", cmd.args);
-        assert!(cmd.cwd.as_ref().unwrap().ends_with("apps/api"),
-            "should set cwd to workspace dir");
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "auth-service")
+            .unwrap();
+        assert!(
+            cmd.args.iter().any(|a| a.contains("auth-service.test.ts")),
+            "should find test file in workspace by stem, got: {:?}",
+            cmd.args
+        );
+        assert!(
+            cmd.cwd.as_ref().unwrap().ends_with("apps/api"),
+            "should set cwd to workspace dir"
+        );
     }
 
     #[test]
     fn test_single_test_fuzzy_stem_no_match_falls_to_pattern() {
         let dir = tempfile::tempdir().unwrap();
         // No test files exist — should fall through to --test-name-pattern
-        let cmd = BunAdapter.single_test_command(dir.path(), "nonexistent").unwrap();
-        assert!(cmd.args.contains(&"--test-name-pattern".to_string()),
-            "no matching file should fall through to name pattern");
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "nonexistent")
+            .unwrap();
+        assert!(
+            cmd.args.contains(&"--test-name-pattern".to_string()),
+            "no matching file should fall through to name pattern"
+        );
     }
 
     #[test]
@@ -1442,8 +1744,11 @@ src/services/todo.test.ts:
 
         // "auth" partially matches both stems but neither is exact
         let cmd = BunAdapter.single_test_command(dir.path(), "auth").unwrap();
-        assert!(cmd.args.contains(&"--test-name-pattern".to_string()),
-            "ambiguous partial match should fall through to name pattern, got: {:?}", cmd.args);
+        assert!(
+            cmd.args.contains(&"--test-name-pattern".to_string()),
+            "ambiguous partial match should fall through to name pattern, got: {:?}",
+            cmd.args
+        );
     }
 
     #[test]
@@ -1456,10 +1761,15 @@ src/services/todo.test.ts:
 
         // "auth" partially matches only one stem — unambiguous
         let cmd = BunAdapter.single_test_command(dir.path(), "auth").unwrap();
-        assert!(!cmd.args.contains(&"--test-name-pattern".to_string()),
-            "unique partial match should resolve to file, got: {:?}", cmd.args);
-        assert!(cmd.args.iter().any(|a| a.contains("auth-login.test.ts")),
-            "should find the matching file");
+        assert!(
+            !cmd.args.contains(&"--test-name-pattern".to_string()),
+            "unique partial match should resolve to file, got: {:?}",
+            cmd.args
+        );
+        assert!(
+            cmd.args.iter().any(|a| a.contains("auth-login.test.ts")),
+            "should find the matching file"
+        );
     }
 
     #[test]
@@ -1470,8 +1780,11 @@ src/services/todo.test.ts:
         std::fs::write(test_dir.join("utils.spec.ts"), "").unwrap();
 
         let cmd = BunAdapter.single_test_command(dir.path(), "utils").unwrap();
-        assert!(cmd.args.iter().any(|a| a.contains("utils.spec.ts")),
-            "should find .spec. files too, got: {:?}", cmd.args);
+        assert!(
+            cmd.args.iter().any(|a| a.contains("utils.spec.ts")),
+            "should find .spec. files too, got: {:?}",
+            cmd.args
+        );
     }
 
     // --- Regex escaping tests ---
@@ -1479,10 +1792,15 @@ src/services/todo.test.ts:
     #[test]
     fn test_single_test_name_pattern_escapes_regex() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = BunAdapter.single_test_command(dir.path(), "handles (edge case)").unwrap();
+        let cmd = BunAdapter
+            .single_test_command(dir.path(), "handles (edge case)")
+            .unwrap();
         assert!(cmd.args.contains(&"--test-name-pattern".to_string()));
-        assert!(cmd.args.contains(&r"handles \(edge case\)".to_string()),
-            "should escape regex metacharacters, got: {:?}", cmd.args);
+        assert!(
+            cmd.args.contains(&r"handles \(edge case\)".to_string()),
+            "should escape regex metacharacters, got: {:?}",
+            cmd.args
+        );
     }
 
     #[test]
@@ -1528,22 +1846,34 @@ const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
 };
 "#;
         let suites = parse_suites_from_ts(content).unwrap();
-        assert!(suites.len() >= 4, "should parse at least 4 suites, got {}", suites.len());
+        assert!(
+            suites.len() >= 4,
+            "should parse at least 4 suites, got {}",
+            suites.len()
+        );
 
         let unit = &suites["unit"];
-        assert_eq!(unit.dirs, vec!["src/services", "src/middleware", "src/lib", "src/db"]);
+        assert_eq!(
+            unit.dirs,
+            vec!["src/services", "src/middleware", "src/lib", "src/db"]
+        );
         assert_eq!(unit.cwd, "apps/api");
 
         let integration = &suites["integration"];
         assert!(integration.dirs.contains(&"src/routes".to_string()));
-        assert!(integration.dirs.contains(&"src/tests/auth-service.test.ts".to_string()));
+        assert!(integration
+            .dirs
+            .contains(&"src/tests/auth-service.test.ts".to_string()));
 
         let e2e = &suites["e2e"];
         assert_eq!(e2e.dirs, vec!["src/tests/e2e"]);
         assert_eq!(e2e.cwd, "apps/api");
 
         let all = &suites["all"];
-        assert!(all.dirs.is_empty(), "all suite should have no dirs (runs everything)");
+        assert!(
+            all.dirs.is_empty(),
+            "all suite should have no dirs (runs everything)"
+        );
         assert_eq!(all.cwd, "apps/api");
     }
 
@@ -1580,11 +1910,14 @@ const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
 
         // Multi-line cmd correctly parsed (with comments before cmd:)
         let integration = &suites["integration"];
-        assert_eq!(integration.dirs, vec![
-            "src/tests/auth-service.test.ts",
-            "src/tests/auth-login-error.test.ts",
-            "src/tests/event-bus.test.ts",
-        ]);
+        assert_eq!(
+            integration.dirs,
+            vec![
+                "src/tests/auth-service.test.ts",
+                "src/tests/auth-login-error.test.ts",
+                "src/tests/event-bus.test.ts",
+            ]
+        );
         assert_eq!(integration.cwd, "apps/api");
 
         // Single-line still works
@@ -1652,14 +1985,32 @@ const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
 
         // integration: multi-line cmd with comments before it
         let integration = &suites["integration"];
-        assert_eq!(integration.dirs.len(), 9, "integration should have 9 specific files, got: {:?}", integration.dirs);
-        assert!(integration.dirs.contains(&"src/tests/auth-service.test.ts".to_string()));
-        assert!(integration.dirs.contains(&"src/tests/jobs-integration.test.ts".to_string()));
+        assert_eq!(
+            integration.dirs.len(),
+            9,
+            "integration should have 9 specific files, got: {:?}",
+            integration.dirs
+        );
+        assert!(integration
+            .dirs
+            .contains(&"src/tests/auth-service.test.ts".to_string()));
+        assert!(integration
+            .dirs
+            .contains(&"src/tests/jobs-integration.test.ts".to_string()));
         assert_eq!(integration.cwd, "apps/api");
 
         // unit: single-line cmd
         let unit = &suites["unit"];
-        assert_eq!(unit.dirs, vec!["src/modules", "src/infra", "src/middleware", "src/lib", "src/db"]);
+        assert_eq!(
+            unit.dirs,
+            vec![
+                "src/modules",
+                "src/infra",
+                "src/middleware",
+                "src/lib",
+                "src/db"
+            ]
+        );
 
         // e2e: single-line cmd
         let e2e = &suites["e2e"];
@@ -1667,7 +2018,10 @@ const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
 
         // e2e-parallel: custom runner (not bun test) → empty dirs
         let parallel = &suites["e2e-parallel"];
-        assert!(parallel.dirs.is_empty(), "custom runner should have no dirs");
+        assert!(
+            parallel.dirs.is_empty(),
+            "custom runner should have no dirs"
+        );
 
         // all: bun test with no dirs
         let all = &suites["all"];
@@ -1687,14 +2041,18 @@ const SUITES: Record<string, { cmd: string[]; cwd: string }> = {
         // Set up monorepo with orchestrator
         let scripts = dir.path().join("scripts");
         std::fs::create_dir_all(&scripts).unwrap();
-        std::fs::write(scripts.join("test-run.ts"), r#"
+        std::fs::write(
+            scripts.join("test-run.ts"),
+            r#"
 const SUITES = {
   unit: {
     cmd: ["bun", "test", "src/services", "src/lib"],
     cwd: path.join(ROOT, "apps/api"),
   },
 };
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         std::fs::write(dir.path().join("package.json"),
             r#"{"workspaces": ["apps/*"], "scripts": {"test:unit": "bun run scripts/test-run.ts unit"}}"#
@@ -1704,12 +2062,21 @@ const SUITES = {
         std::fs::create_dir_all(&api).unwrap();
         std::fs::write(api.join("bunfig.toml"), "[test]").unwrap();
 
-        let cmd = BunAdapter.suite_command(dir.path(), Some(TestLevel::Unit), &Default::default()).unwrap();
+        let cmd = BunAdapter
+            .suite_command(dir.path(), Some(TestLevel::Unit), &Default::default())
+            .unwrap();
         assert_eq!(cmd.program, "bun");
-        assert!(cmd.args.contains(&"src/services".to_string()), "should include dirs from orchestrator, got: {:?}", cmd.args);
+        assert!(
+            cmd.args.contains(&"src/services".to_string()),
+            "should include dirs from orchestrator, got: {:?}",
+            cmd.args
+        );
         assert!(cmd.args.contains(&"src/lib".to_string()));
         assert!(cmd.cwd.is_some(), "should set cwd");
-        assert!(cmd.cwd.as_ref().unwrap().ends_with("apps/api"), "cwd should be workspace dir");
+        assert!(
+            cmd.cwd.as_ref().unwrap().ends_with("apps/api"),
+            "cwd should be workspace dir"
+        );
     }
 
     // --- Detection tests ---
@@ -1719,16 +2086,21 @@ const SUITES = {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bunfig.toml"), "[test]\ntimeout = 30000").unwrap();
         let adapter = BunAdapter;
-        assert!(adapter.detect(dir.path(), None) >= 90,
-            "bunfig.toml should give high confidence");
+        assert!(
+            adapter.detect(dir.path(), None) >= 90,
+            "bunfig.toml should give high confidence"
+        );
     }
 
     #[test]
     fn test_detect_monorepo_bun_workspace() {
         let dir = tempfile::tempdir().unwrap();
         // Root has vitest in deps (from web app) + workspaces
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"workspaces": ["apps/*"], "devDependencies": {"vitest": "^3"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"], "devDependencies": {"vitest": "^3"}}"#,
+        )
+        .unwrap();
         std::fs::write(dir.path().join("bun.lock"), "").unwrap();
         // API workspace has bunfig.toml
         let api = dir.path().join("apps/api");
@@ -1737,31 +2109,40 @@ const SUITES = {
 
         let adapter = BunAdapter;
         let conf = adapter.detect(dir.path(), None);
-        assert!(conf >= 85,
-            "monorepo with bun:test workspace should detect despite vitest in root, got {}", conf);
+        assert!(
+            conf >= 85,
+            "monorepo with bun:test workspace should detect despite vitest in root, got {}",
+            conf
+        );
     }
 
     #[test]
     fn test_detect_monorepo_no_bun_workspace() {
         let dir = tempfile::tempdir().unwrap();
         // Root has vitest + workspaces but NO bun:test workspace
-        std::fs::write(dir.path().join("package.json"),
-            r#"{"workspaces": ["apps/*"], "devDependencies": {"vitest": "^3"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/*"], "devDependencies": {"vitest": "^3"}}"#,
+        )
+        .unwrap();
         let web = dir.path().join("apps/web");
         std::fs::create_dir_all(&web).unwrap();
         std::fs::write(web.join("vitest.config.ts"), "export default {}").unwrap();
 
         let adapter = BunAdapter;
         let conf = adapter.detect(dir.path(), None);
-        assert_eq!(conf, 0, "monorepo with only vitest workspaces should return 0");
+        assert_eq!(
+            conf, 0,
+            "monorepo with only vitest workspaces should return 0"
+        );
     }
 
     // --- Progress tracker tests ---
 
     #[test]
     fn test_bun_update_progress_pass() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let progress = Arc::new(Mutex::new(TestProgress::new()));
 
@@ -1770,21 +2151,31 @@ const SUITES = {
         let p = progress.lock().unwrap();
         assert_eq!(p.passed, 1, "should count 1 pass");
         assert_eq!(p.failed, 0);
-        assert_eq!(p.phase, TestPhase::Running, "file header should transition to Running");
+        assert_eq!(
+            p.phase,
+            TestPhase::Running,
+            "file header should transition to Running"
+        );
     }
 
     #[test]
     fn test_bun_update_progress_mixed() {
+        use super::super::{TestPhase, TestProgress};
         use std::sync::{Arc, Mutex};
-        use super::super::{TestProgress, TestPhase};
 
         let progress = Arc::new(Mutex::new(TestProgress::new()));
 
         // First chunk: file header + some results
-        update_progress("src/math.test.ts:\n✓ adds [1.00ms]\n✗ divides [0.10ms]\n", &progress);
+        update_progress(
+            "src/math.test.ts:\n✓ adds [1.00ms]\n✗ divides [0.10ms]\n",
+            &progress,
+        );
 
         // Second chunk: more results from another file
-        update_progress("src/todo.test.ts:\n✓ exists [0.30ms]\n- skipped [skip]\n", &progress);
+        update_progress(
+            "src/todo.test.ts:\n✓ exists [0.30ms]\n- skipped [skip]\n",
+            &progress,
+        );
 
         let p = progress.lock().unwrap();
         assert_eq!(p.passed, 2);
@@ -1794,8 +2185,8 @@ const SUITES = {
 
     #[test]
     fn test_bun_update_progress_ignores_non_test_lines() {
-        use std::sync::{Arc, Mutex};
         use super::super::TestProgress;
+        use std::sync::{Arc, Mutex};
 
         let progress = Arc::new(Mutex::new(TestProgress::new()));
 
@@ -1948,8 +2339,15 @@ Ran 2 tests across 1 files. [5.00ms]
 
         let f = &result.failures[0];
         assert_eq!(f.name, "Auth > rejects expired token");
-        assert!(f.message.contains("Expected: 401"), "message should contain expected value, got: {}", f.message);
-        assert!(f.message.contains("Received: 200"), "message should contain received value");
+        assert!(
+            f.message.contains("Expected: 401"),
+            "message should contain expected value, got: {}",
+            f.message
+        );
+        assert!(
+            f.message.contains("Received: 200"),
+            "message should contain received value"
+        );
         assert_eq!(f.file.as_deref(), Some("src/auth.test.ts"));
         assert_eq!(f.line, Some(45));
     }
@@ -1987,6 +2385,16 @@ Ran 2 tests across 1 files. [5.00ms]
     }
 
     #[test]
+    fn test_parse_bun_summary_only_with_ansi() {
+        let output = "\n\u{1b}[0m\u{1b}[32m 1 pass\u{1b}[0m\n \u{1b}[0m\u{1b}[2m1608 filtered out\u{1b}[0m\n\u{1b}[0m\u{1b}[2m 0 fail\u{1b}[0m\n 1 expect() calls\nRan 1 test across 172 files. \u{1b}[0m\u{1b}[2m[\u{1b}[1m364.00ms\u{1b}[0m\u{1b}[2m]\u{1b}[0m\n";
+        let result = parse_bun_output(output);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.failed, 0);
+        assert_eq!(result.summary.skipped, 0);
+        assert!(result.all_tests.is_empty());
+    }
+
+    #[test]
     fn test_parse_output_prefers_stderr() {
         // Bun writes test output to stderr; stdout may have user console.log
         let adapter = BunAdapter;
@@ -1999,7 +2407,10 @@ Ran 2 tests across 1 files. [5.00ms]
         // Wrappers may redirect child stderr to stdout
         let adapter = BunAdapter;
         let result = adapter.parse_output(BUN_NATIVE_PASS, "", 0);
-        assert_eq!(result.summary.passed, 2, "should fall back to stdout when stderr empty");
+        assert_eq!(
+            result.summary.passed, 2,
+            "should fall back to stdout when stderr empty"
+        );
     }
 
     #[test]
@@ -2008,10 +2419,19 @@ Ran 2 tests across 1 files. [5.00ms]
         let result = parse_bun_output(BUN_NATIVE_DIFF_FAILURE);
         assert_eq!(result.summary.passed, 1);
         assert_eq!(result.summary.failed, 1);
-        assert_eq!(result.summary.skipped, 0, "diff lines starting with '-' must not count as skipped");
+        assert_eq!(
+            result.summary.skipped, 0,
+            "diff lines starting with '-' must not count as skipped"
+        );
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].name, "Snapshot > matches complex");
-        assert!(result.failures[0].message.contains("Expected"), "full diff should be in message");
-        assert!(result.failures[0].message.contains("401"), "diff content should be preserved");
+        assert!(
+            result.failures[0].message.contains("Expected"),
+            "full diff should be in message"
+        );
+        assert!(
+            result.failures[0].message.contains("401"),
+            "diff content should be preserved"
+        );
     }
 }

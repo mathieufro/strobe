@@ -1,15 +1,15 @@
-use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use tokio::sync::{mpsc, oneshot};
+use super::{HookManager, HookMode};
 use crate::db::{Event, EventType};
-use crate::dwarf::{DwarfParser, DwarfHandle, FunctionInfo};
+use crate::dwarf::{DwarfHandle, DwarfParser, FunctionInfo};
 use crate::symbols::Language;
 use crate::Result;
-use super::{HookManager, HookMode};
 use libc;
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tokio::sync::{mpsc, oneshot};
 
 // On Linux, frida-sys's static devkit prefixes GLib symbols with `_frida_`.
 // `g_error_free` is not re-exported, so we declare the prefixed version directly.
@@ -36,6 +36,19 @@ unsafe fn check_gerror(error: *mut frida_sys::GError) -> std::result::Result<(),
         .to_string();
     g_error_free_platform(error);
     Err(msg)
+}
+
+unsafe fn detach_and_unref_session(
+    session_ptr: *mut frida_sys::_FridaSession,
+    pid: u32,
+    context: &str,
+) {
+    let mut error: *mut frida_sys::GError = std::ptr::null_mut();
+    frida_sys::frida_session_detach_sync(session_ptr, std::ptr::null_mut(), &mut error);
+    if let Err(msg) = check_gerror(error) {
+        tracing::debug!(pid, context, error = %msg, "Frida session detach returned an error")
+    }
+    frida_sys::frida_unref(session_ptr as *mut c_void);
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +92,11 @@ unsafe extern "C" fn raw_on_message(
     };
 
     let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    tracing::debug!("raw_on_message [{}]: envelope_type={}", handler.session_id, msg_type);
+    tracing::debug!(
+        "raw_on_message [{}]: envelope_type={}",
+        handler.session_id,
+        msg_type
+    );
 
     match msg_type {
         "send" => {
@@ -91,12 +108,23 @@ unsafe extern "C" fn raw_on_message(
             }
         }
         "log" => {
-            let level = parsed.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+            let level = parsed
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("info");
             let payload = parsed.get("payload").and_then(|v| v.as_str()).unwrap_or("");
-            tracing::info!("Agent log [{}] [{}]: {}", handler.session_id, level, payload);
+            tracing::info!(
+                "Agent log [{}] [{}]: {}",
+                handler.session_id,
+                level,
+                payload
+            );
         }
         "error" => {
-            let desc = parsed.get("description").and_then(|v| v.as_str()).unwrap_or("?");
+            let desc = parsed
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let stack = parsed.get("stack").and_then(|v| v.as_str()).unwrap_or("");
             tracing::error!("Agent error [{}]: {}\n{}", handler.session_id, desc, stack);
         }
@@ -183,10 +211,9 @@ unsafe fn register_handler_raw(
     let handler_ptr = Box::into_raw(Box::new(handler));
     let signal_name = CString::new("message").unwrap();
 
-    let callback = Some(std::mem::transmute::<
-        *mut c_void,
-        unsafe extern "C" fn(),
-    >(raw_on_message as *mut c_void));
+    let callback = Some(std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(
+        raw_on_message as *mut c_void,
+    ));
 
     frida_sys::g_signal_connect_data(
         script_ptr as *mut _,
@@ -266,7 +293,11 @@ unsafe extern "C" fn raw_on_output(
         return;
     }
 
-    let event_type = if fd == 1 { EventType::Stdout } else { EventType::Stderr };
+    let event_type = if fd == 1 {
+        EventType::Stdout
+    } else {
+        EventType::Stderr
+    };
 
     // Accumulate stderr for ASAN crash detection by process_death_monitor
     if fd == 2 {
@@ -319,8 +350,16 @@ type HooksReadySignal = Arc<Mutex<Option<std::sync::mpsc::Sender<u64>>>>;
 type ReadResponseSignal = Arc<Mutex<Option<std::sync::mpsc::Sender<serde_json::Value>>>>;
 
 /// Signal the worker that hooks or watches are ready.
-fn signal_ready(hooks_ready: &HooksReadySignal, label: &str, session_id: &str, payload: &serde_json::Value) {
-    let count = payload.get("activeCount").and_then(|v| v.as_u64()).unwrap_or(0);
+fn signal_ready(
+    hooks_ready: &HooksReadySignal,
+    label: &str,
+    session_id: &str,
+    payload: &serde_json::Value,
+) {
+    let count = payload
+        .get("activeCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     tracing::info!("{} for session {}: {} active", label, session_id, count);
     if let Ok(mut guard) = hooks_ready.lock() {
         if let Some(tx) = guard.take() {
@@ -372,15 +411,26 @@ impl AgentMessageHandler {
         match msg_type {
             "events" => {
                 if let Some(events) = payload.get("events").and_then(|v| v.as_array()) {
-                    tracing::debug!("Received {} events from agent [{}]", events.len(), self.session_id);
+                    tracing::debug!(
+                        "Received {} events from agent [{}]",
+                        events.len(),
+                        self.session_id
+                    );
                     for event_json in events {
                         if let Some(event) = parse_event(&self.session_id, event_json) {
                             if event.event_type == EventType::Crash {
                                 self.crash_reported.store(true, Ordering::Release);
-                                tracing::info!("Crash event received from agent [{}]", self.session_id);
+                                tracing::info!(
+                                    "Crash event received from agent [{}]",
+                                    self.session_id
+                                );
                             }
                             if let Err(e) = self.event_tx.try_send(event) {
-                                tracing::warn!("Agent trace event dropped for [{}]: {}", self.session_id, e);
+                                tracing::warn!(
+                                    "Agent trace event dropped for [{}]: {}",
+                                    self.session_id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -390,10 +440,20 @@ impl AgentMessageHandler {
                 tracing::info!("Agent initialized for session {}", self.session_id);
             }
             "hooks_updated" => {
-                signal_ready(&self.hooks_ready, "Hooks updated", &self.session_id, payload);
+                signal_ready(
+                    &self.hooks_ready,
+                    "Hooks updated",
+                    &self.session_id,
+                    payload,
+                );
             }
             "watches_updated" => {
-                signal_ready(&self.hooks_ready, "Watches updated", &self.session_id, payload);
+                signal_ready(
+                    &self.hooks_ready,
+                    "Watches updated",
+                    &self.session_id,
+                    payload,
+                );
             }
             "log" => {
                 if let Some(msg) = payload.get("message").and_then(|v| v.as_str()) {
@@ -406,29 +466,50 @@ impl AgentMessageHandler {
                 }
             }
             "sampling_state_change" => {
-                let func_name = payload.get("funcName").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let enabled = payload.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                let sample_rate = payload.get("sampleRate").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let func_name = payload
+                    .get("funcName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let enabled = payload
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let sample_rate = payload
+                    .get("sampleRate")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
                 let rate_pct = (sample_rate * 100.0) as u32;
 
                 if enabled {
                     tracing::warn!(
                         "[{}] Hot function detected: '{}' - auto-sampling at {}%",
-                        self.session_id, func_name, rate_pct
+                        self.session_id,
+                        func_name,
+                        rate_pct
                     );
                 } else {
                     tracing::info!(
                         "[{}] Function cooled down: '{}' - full capture resumed",
-                        self.session_id, func_name
+                        self.session_id,
+                        func_name
                     );
                 }
             }
             "sampling_stats" => {
                 if let Some(stats) = payload.get("stats").and_then(|v| v.as_array()) {
-                    let sampling_count = stats.iter().filter(|s| {
-                        s.get("samplingEnabled").and_then(|v| v.as_bool()).unwrap_or(false)
-                    }).count();
-                    tracing::debug!("[{}] Sampling stats: {} functions being sampled", self.session_id, sampling_count);
+                    let sampling_count = stats
+                        .iter()
+                        .filter(|s| {
+                            s.get("samplingEnabled")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    tracing::debug!(
+                        "[{}] Sampling stats: {} functions being sampled",
+                        self.session_id,
+                        sampling_count
+                    );
                 }
             }
             "read_response" | "eval_response" => {
@@ -450,16 +531,33 @@ impl AgentMessageHandler {
             }
             "paused" => {
                 // Phase 2: Breakpoint pause event
-                let thread_id = payload.get("threadId").and_then(|v| v.as_u64()).unwrap_or(0);
-                let breakpoint_id_str = payload.get("breakpointId").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let thread_id = payload
+                    .get("threadId")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let breakpoint_id_str = payload
+                    .get("breakpointId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 let hits = payload.get("hits").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let func_name = payload.get("funcName").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let file = payload.get("file").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let line = payload.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
-                let return_address = payload.get("returnAddress")
+                let func_name = payload
+                    .get("funcName")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let file = payload
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let line = payload
+                    .get("line")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let return_address = payload
+                    .get("returnAddress")
                     .and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-                let address = payload.get("address")
+                let address = payload
+                    .get("address")
                     .and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
@@ -467,15 +565,29 @@ impl AgentMessageHandler {
                     .get("backtrace")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
-                        arr.iter().filter_map(|frame| {
-                            Some(crate::mcp::BacktraceFrame {
-                                address: frame.get("address")?.as_str()?.to_string(),
-                                module_name: frame.get("moduleName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                function_name: frame.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                file: frame.get("fileName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                line: frame.get("lineNumber").and_then(|v| v.as_u64()).map(|n| n as u32),
+                        arr.iter()
+                            .filter_map(|frame| {
+                                Some(crate::mcp::BacktraceFrame {
+                                    address: frame.get("address")?.as_str()?.to_string(),
+                                    module_name: frame
+                                        .get("moduleName")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                    function_name: frame
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                    file: frame
+                                        .get("fileName")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                    line: frame
+                                        .get("lineNumber")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|n| n as u32),
+                                })
                             })
-                        }).collect()
+                            .collect()
                     })
                     .unwrap_or_default();
 
@@ -483,19 +595,24 @@ impl AgentMessageHandler {
                     .get("arguments")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
-                        arr.iter().filter_map(|arg| {
-                            Some(crate::mcp::CapturedArg {
-                                index: arg.get("index")?.as_u64()? as u32,
-                                value: arg.get("value")?.as_str()?.to_string(),
+                        arr.iter()
+                            .filter_map(|arg| {
+                                Some(crate::mcp::CapturedArg {
+                                    index: arg.get("index")?.as_u64()? as u32,
+                                    value: arg.get("value")?.as_str()?.to_string(),
+                                })
                             })
-                        }).collect()
+                            .collect()
                     })
                     .unwrap_or_default();
 
                 tracing::info!(
                     "[{}] Thread {} paused at breakpoint {} (addr=0x{:x?}, ret=0x{:x?})",
-                    self.session_id, thread_id, breakpoint_id_str,
-                    address.unwrap_or(0), return_address.unwrap_or(0)
+                    self.session_id,
+                    thread_id,
+                    breakpoint_id_str,
+                    address.unwrap_or(0),
+                    return_address.unwrap_or(0)
                 );
 
                 // Create a Pause event for the database (process-relative timestamp)
@@ -544,20 +661,37 @@ impl AgentMessageHandler {
                 }
             }
             "breakpointSet" | "logpointSet" => {
-                let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let id = payload
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 tracing::info!("[{}] {} confirmed: {}", self.session_id, msg_type, id);
                 // Signal the hooks_ready channel so set_breakpoint_async can unblock
                 signal_ready(&self.hooks_ready, msg_type, &self.session_id, payload);
             }
             "breakpointRemoved" | "logpointRemoved" => {
-                let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let id = payload
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 tracing::info!("[{}] {} confirmed: {}", self.session_id, msg_type, id);
                 signal_ready(&self.hooks_ready, msg_type, &self.session_id, payload);
             }
             "conditionError" => {
-                let bp_id = payload.get("breakpointId").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let error = payload.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                tracing::warn!("[{}] Condition error on breakpoint {}: {}", self.session_id, bp_id, error);
+                let bp_id = payload
+                    .get("breakpointId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let error = payload
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                tracing::warn!(
+                    "[{}] Condition error on breakpoint {}: {}",
+                    self.session_id,
+                    bp_id,
+                    error
+                );
 
                 // Store as event for queryability (process-relative timestamp)
                 let timestamp_ns = std::time::SystemTime::now()
@@ -577,16 +711,32 @@ impl AgentMessageHandler {
                 let _ = self.event_tx.try_send(event);
             }
             "runtime_detected" => {
-                let runtime = payload.get("runtime").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let runtime = payload
+                    .get("runtime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 tracing::info!("Agent [{}] detected runtime: {}", self.session_id, runtime);
             }
             "capabilities" => {
-                let detail = payload.get("runtimeDetail").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let tracing_ok = payload.get("functionTracing").and_then(|v| v.as_bool()).unwrap_or(false);
-                let lims = payload.get("limitations").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let detail = payload
+                    .get("runtimeDetail")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let tracing_ok = payload
+                    .get("functionTracing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let lims = payload
+                    .get("limitations")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 tracing::info!(
                     "Agent [{}] capabilities: runtime={}, functionTracing={}, limitations={}",
-                    self.session_id, detail, tracing_ok, lims
+                    self.session_id,
+                    detail,
+                    tracing_ok,
+                    lims
                 );
             }
             _ => {
@@ -767,20 +917,22 @@ unsafe extern "C" fn destroy_spawn_tx(data: *mut c_void, _closure: *mut frida_sy
 /// Coordinator thread: handles device-level operations (spawn, kill, child processes).
 /// Per-session script operations are delegated to dedicated session_worker threads.
 fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
-    use frida::{Frida, DeviceManager, DeviceType, SpawnOptions, SpawnStdio};
+    use frida::{DeviceManager, DeviceType, Frida, SpawnOptions, SpawnStdio};
 
     // Frida's global state (GLib g_slice allocator, GMainLoop, etc.) must never be
     // deinitialized: frida_deinit() + frida_init() is not re-entrant — GLib's
     // thread-local slice allocator crashes on the next DeviceManager::obtain().
     // Leak the Frida singleton so Frida::drop() (which calls frida_deinit) never runs.
     static FRIDA: std::sync::OnceLock<&'static Frida> = std::sync::OnceLock::new();
-    let frida: &'static Frida = FRIDA.get_or_init(|| {
-        Box::leak(Box::new(unsafe { Frida::obtain() }))
-    });
+    let frida: &'static Frida =
+        FRIDA.get_or_init(|| Box::leak(Box::new(unsafe { Frida::obtain() })));
     let device_manager = DeviceManager::obtain(frida);
 
     let devices = device_manager.enumerate_all_devices();
-    let mut device = match devices.into_iter().find(|d| d.get_type() == DeviceType::Local) {
+    let mut device = match devices
+        .into_iter()
+        .find(|d| d.get_type() == DeviceType::Local)
+    {
         Some(d) => d,
         None => {
             tracing::error!("No local Frida device found");
@@ -793,10 +945,9 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
     unsafe {
         let device_ptr = device_raw_ptr(&device);
         let signal_name = CString::new("output").unwrap();
-        let callback = Some(std::mem::transmute::<
-            *mut c_void,
-            unsafe extern "C" fn(),
-        >(raw_on_output as *mut c_void));
+        let callback = Some(std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(
+            raw_on_output as *mut c_void,
+        ));
         let registry_ptr = Arc::as_ptr(&output_registry) as *mut c_void;
         frida_sys::g_signal_connect_data(
             device_ptr as *mut _,
@@ -825,10 +976,9 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
 
             let signal_name = CString::new("spawn-added").unwrap();
             let tx_ptr = Box::into_raw(Box::new(spawn_tx.clone()));
-            let callback = Some(std::mem::transmute::<
-                *mut c_void,
-                unsafe extern "C" fn(),
-            >(raw_on_spawn_added as *mut c_void));
+            let callback = Some(std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(
+                raw_on_spawn_added as *mut c_void,
+            ));
             frida_sys::g_signal_connect_data(
                 device_ptr as *mut _,
                 signal_name.as_ptr(),
@@ -860,7 +1010,8 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
 
         match cmd {
             CoordinatorCommand::Resume { pid, response } => {
-                let result = device.resume(pid)
+                let result = device
+                    .resume(pid)
                     .map_err(|e| crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)));
                 let _ = response.send(result);
             }
@@ -880,13 +1031,15 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     let spawn_start = std::time::Instant::now();
                     let max_attempts = 5u32;
                     let is_interpreted = language != Language::Native;
+                    let needs_self_spawn = language == Language::Python;
+                    let used_device_spawn = !needs_self_spawn;
 
                     // -------------------------------------------------------
                     // Step 1: Spawn process — method depends on language type
                     // -------------------------------------------------------
                     let stderr_buffer_outer = Arc::new(Mutex::new(String::new()));
-                    let pid = if is_interpreted {
-                        // Self-spawn for interpreted languages (Python, etc.)
+                    let pid = if needs_self_spawn {
+                        // Self-spawn only for Python.
                         //
                         // Frida's device.spawn() has a broken-pipe issue with
                         // Python on macOS — the GLib main loop dies after
@@ -911,12 +1064,19 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             }
                         }
 
-                        let mut child = cmd.spawn()
-                            .map_err(|e| crate::Error::FridaAttachFailed(
-                                format!("Failed to spawn {}: {}", command, e)))?;
+                        let mut child = cmd.spawn().map_err(|e| {
+                            crate::Error::FridaAttachFailed(format!(
+                                "Failed to spawn {}: {}",
+                                command, e
+                            ))
+                        })?;
                         let pid = child.id();
-                        tracing::info!("Self-spawned {} with PID {} (interpreted runtime: {:?})",
-                            command, pid, language);
+                        tracing::info!(
+                            "Self-spawned {} with PID {} (interpreted runtime: {:?})",
+                            command,
+                            pid,
+                            language
+                        );
 
                         // Capture stdout/stderr via pipe reader threads
                         let start_ns = std::time::SystemTime::now()
@@ -936,13 +1096,18 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                                     match reader.read(&mut buf) {
                                         Ok(0) => break,
                                         Ok(n) => {
-                                            let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                                            if text.is_empty() { continue; }
+                                            let text =
+                                                String::from_utf8_lossy(&buf[..n]).to_string();
+                                            if text.is_empty() {
+                                                continue;
+                                            }
                                             counter += 1;
                                             let now_ns = (std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
-                                                .as_nanos() as i64) - start_ns;
+                                                .as_nanos()
+                                                as i64)
+                                                - start_ns;
                                             let event = Event {
                                                 id: format!("{}-stdout-{}", sid, counter),
                                                 session_id: sid.clone(),
@@ -952,7 +1117,9 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                                                 pid: Some(pid),
                                                 ..Event::default()
                                             };
-                                            if tx.try_send(event).is_err() { break; }
+                                            if tx.try_send(event).is_err() {
+                                                break;
+                                            }
                                         }
                                         Err(_) => break,
                                     }
@@ -972,13 +1139,18 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                                     match reader.read(&mut buf) {
                                         Ok(0) => break,
                                         Ok(n) => {
-                                            let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                                            if text.is_empty() { continue; }
+                                            let text =
+                                                String::from_utf8_lossy(&buf[..n]).to_string();
+                                            if text.is_empty() {
+                                                continue;
+                                            }
                                             counter += 1;
                                             let now_ns = (std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
-                                                .as_nanos() as i64) - start_ns;
+                                                .as_nanos()
+                                                as i64)
+                                                - start_ns;
                                             let event = Event {
                                                 id: format!("{}-stderr-{}", sid, counter),
                                                 session_id: sid.clone(),
@@ -988,7 +1160,9 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                                                 pid: Some(pid),
                                                 ..Event::default()
                                             };
-                                            if tx.try_send(event).is_err() { break; }
+                                            if tx.try_send(event).is_err() {
+                                                break;
+                                            }
                                         }
                                         Err(_) => break,
                                     }
@@ -1009,9 +1183,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             reg.insert(pid, output_ctx);
                         }
 
-                        // Wait for interpreter to initialize before attaching Frida.
-                        // For deferred-start (Python), the process is blocked on
-                        // stdin.read(1) — it's running but idle, safe to attach.
+                        // Give Python a moment to initialize before attaching Frida.
                         thread::sleep(std::time::Duration::from_millis(100));
                         tracing::debug!("PERF: self-spawn took {:?}", spawn_start.elapsed());
 
@@ -1022,9 +1194,8 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                         argv.extend(arg_refs);
 
-                        let mut spawn_opts = SpawnOptions::new()
-                            .argv(&argv)
-                            .stdio(SpawnStdio::Pipe);
+                        let mut spawn_opts =
+                            SpawnOptions::new().argv(&argv).stdio(SpawnStdio::Pipe);
 
                         let cwd_cstr: Option<CString>;
                         if let Some(ref dir) = cwd {
@@ -1040,13 +1211,15 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         // binaries, and Frida's device output signal may not drain all
                         // pipe data before session cleanup after process death.
                         {
-                            let mut merged: std::collections::HashMap<String, String> = std::env::vars().collect();
+                            let mut merged: std::collections::HashMap<String, String> =
+                                std::env::vars().collect();
                             if let Some(ref env_vars) = env {
                                 for (k, v) in env_vars.iter() {
                                     merged.insert(k.clone(), v.clone());
                                 }
                             }
-                            let sanitizer_log_path = format!("/tmp/.strobe-sanitizer-{}", session_id);
+                            let sanitizer_log_path =
+                                format!("/tmp/.strobe-sanitizer-{}", session_id);
                             for key in ["ASAN_OPTIONS", "TSAN_OPTIONS", "UBSAN_OPTIONS"] {
                                 let existing = merged.get(key).cloned().unwrap_or_default();
                                 let sep = if existing.is_empty() { "" } else { ":" };
@@ -1068,7 +1241,10 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                             let mut spawned_pid = None;
                             for attempt in 0..max_attempts {
                                 match device.spawn(&command, &spawn_opts) {
-                                    Ok(p) => { spawned_pid = Some(p); break; }
+                                    Ok(p) => {
+                                        spawned_pid = Some(p);
+                                        break;
+                                    }
                                     Err(e) => {
                                         last_err = format!("{}", e);
                                         if attempt + 1 < max_attempts {
@@ -1079,7 +1255,12 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                                     }
                                 }
                             }
-                            spawned_pid.ok_or_else(|| crate::Error::FridaAttachFailed(format!("Spawn failed after {} attempts: {}", max_attempts, last_err)))?
+                            spawned_pid.ok_or_else(|| {
+                                crate::Error::FridaAttachFailed(format!(
+                                    "Spawn failed after {} attempts: {}",
+                                    max_attempts, last_err
+                                ))
+                            })?
                         };
                         tracing::info!("Spawned process {} with PID {}", command, pid);
                         tracing::debug!("PERF: device.spawn() took {:?}", t.elapsed());
@@ -1115,7 +1296,10 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                         let mut attached = None;
                         for attempt in 0..max_attempts {
                             match device.attach(pid) {
-                                Ok(s) => { attached = Some(s); break; }
+                                Ok(s) => {
+                                    attached = Some(s);
+                                    break;
+                                }
                                 Err(e) => {
                                     last_err = format!("{}", e);
                                     if attempt + 1 < max_attempts {
@@ -1149,22 +1333,26 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     // after we've already inserted into session_ptrs. Without this,
                     // orphaned Frida session GObjects accumulate and exhaust device
                     // state, causing all subsequent attach() calls to fail permanently.
-                    let cleanup_session_on_error = |
-                        session_ptrs: &mut HashMap<u32, *mut frida_sys::_FridaSession>,
-                        output_registry: &OutputRegistry,
-                        pid: u32,
-                        device: &mut frida::Device<'_>,
-                    | {
-                        if let Some(ptr) = session_ptrs.remove(&pid) {
-                            unsafe { frida_sys::frida_unref(ptr as *mut c_void) };
-                        }
-                        if let Ok(mut reg) = output_registry.lock() {
-                            reg.remove(&pid);
-                        }
-                        // Kill the spawned process so it doesn't linger
-                        let _ = device.kill(pid);
-                        tracing::warn!("Cleaned up leaked Frida session for PID {} after spawn failure", pid);
-                    };
+                    let cleanup_session_on_error =
+                        |session_ptrs: &mut HashMap<u32, *mut frida_sys::_FridaSession>,
+                         output_registry: &OutputRegistry,
+                         pid: u32,
+                         device: &mut frida::Device<'_>| {
+                            if let Some(ptr) = session_ptrs.remove(&pid) {
+                                unsafe {
+                                    detach_and_unref_session(ptr, pid, "spawn-failure-cleanup")
+                                };
+                            }
+                            if let Ok(mut reg) = output_registry.lock() {
+                                reg.remove(&pid);
+                            }
+                            // Kill the spawned process so it doesn't linger
+                            let _ = device.kill(pid);
+                            tracing::warn!(
+                                "Cleaned up leaked Frida session for PID {} after spawn failure",
+                                pid
+                            );
+                        };
 
                     // -------------------------------------------------------
                     // Step 3: Create and load agent script (common path)
@@ -1180,8 +1368,16 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     } {
                         Ok(ptr) => ptr,
                         Err(e) => {
-                            cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
-                            return Err(crate::Error::FridaAttachFailed(format!("Script creation failed: {}", e)));
+                            cleanup_session_on_error(
+                                &mut session_ptrs,
+                                &output_registry,
+                                pid,
+                                &mut device,
+                            );
+                            return Err(crate::Error::FridaAttachFailed(format!(
+                                "Script creation failed: {}",
+                                e
+                            )));
                         }
                     };
                     tracing::debug!("PERF: create_script took {:?}", t.elapsed());
@@ -1212,36 +1408,67 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                     let load_result = unsafe { load_script_raw(script_ptr) };
                     if let Err(e) = load_result {
                         unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
-                        cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
-                        return Err(crate::Error::FridaAttachFailed(format!("Script load failed: {}", e)));
+                        cleanup_session_on_error(
+                            &mut session_ptrs,
+                            &output_registry,
+                            pid,
+                            &mut device,
+                        );
+                        return Err(crate::Error::FridaAttachFailed(format!(
+                            "Script load failed: {}",
+                            e
+                        )));
                     }
                     tracing::debug!("PERF: script load + handler setup took {:?}", t.elapsed());
 
                     // Initialize agent
-                    let init_msg = serde_json::json!({ "type": "initialize", "sessionId": session_id });
+                    let init_msg =
+                        serde_json::json!({ "type": "initialize", "sessionId": session_id });
                     if let Err(e) = unsafe {
                         post_message_raw(script_ptr, &serde_json::to_string(&init_msg).unwrap())
                     } {
                         unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
-                        cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
-                        return Err(crate::Error::FridaAttachFailed(format!("Init message failed: {}", e)));
+                        cleanup_session_on_error(
+                            &mut session_ptrs,
+                            &output_registry,
+                            pid,
+                            &mut device,
+                        );
+                        return Err(crate::Error::FridaAttachFailed(format!(
+                            "Init message failed: {}",
+                            e
+                        )));
                     }
 
-                    // Resume the process (interpreted processes are already running)
-                    if !is_interpreted {
+                    // Resume the process when we used Frida's device.spawn().
+                    // Self-spawned interpreters are already running.
+                    if used_device_spawn {
                         if !defer_resume {
                             let t = std::time::Instant::now();
                             if let Err(e) = device.resume(pid) {
-                                unsafe { frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void) };
-                                cleanup_session_on_error(&mut session_ptrs, &output_registry, pid, &mut device);
-                                return Err(crate::Error::FridaAttachFailed(format!("Resume failed: {}", e)));
+                                unsafe {
+                                    frida_sys::frida_unref(script_ptr as *mut std::ffi::c_void)
+                                };
+                                cleanup_session_on_error(
+                                    &mut session_ptrs,
+                                    &output_registry,
+                                    pid,
+                                    &mut device,
+                                );
+                                return Err(crate::Error::FridaAttachFailed(format!(
+                                    "Resume failed: {}",
+                                    e
+                                )));
                             }
                             tracing::debug!("PERF: device.resume() took {:?}", t.elapsed());
                         } else {
                             tracing::info!("Process {} spawned with deferred resume", pid);
                         }
                     }
-                    tracing::debug!("PERF: Total coordinator spawn took {:?}", spawn_start.elapsed());
+                    tracing::debug!(
+                        "PERF: Total coordinator spawn took {:?}",
+                        spawn_start.elapsed()
+                    );
 
                     // Start process death monitor for crash detection fallback
                     let monitor_pid = pid;
@@ -1289,7 +1516,8 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                 //   coordinator holds lock → device.kill() waits for GLib →
                 //   GLib blocked on lock in raw_on_output → deadlock
                 let pids_to_remove: Vec<u32> = if let Ok(mut reg) = output_registry.lock() {
-                    let pids: Vec<u32> = reg.iter()
+                    let pids: Vec<u32> = reg
+                        .iter()
                         .filter(|(_, ctx)| ctx.session_id == session_id)
                         .map(|(&pid, _)| pid)
                         .collect();
@@ -1307,13 +1535,18 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                 // can hang because Frida tries to restore the original code in the
                 // stopped process. SIGKILL always works.
                 for pid in &pids_to_remove {
-                    tracing::info!("Killing process tree for PID {} (session {})", pid, session_id);
+                    tracing::info!(
+                        "Killing process tree for PID {} (session {})",
+                        pid,
+                        session_id
+                    );
                     crate::test::stacks::kill_process_tree(*pid);
                 }
 
                 // Frida-level kill to update device's internal bookkeeping
                 for pid in &pids_to_remove {
-                    device.kill(*pid)
+                    device
+                        .kill(*pid)
                         .unwrap_or_else(|e| tracing::debug!("Frida cleanup PID {}: {:?}", pid, e));
                 }
 
@@ -1324,7 +1557,7 @@ fn coordinator_worker(cmd_rx: std::sync::mpsc::Receiver<CoordinatorCommand>) {
                 for pid in pids_to_remove {
                     if let Some(session_ptr) = session_ptrs.remove(&pid) {
                         unsafe {
-                            frida_sys::frida_unref(session_ptr as *mut c_void);
+                            detach_and_unref_session(session_ptr, pid, "stop-session");
                         }
                     }
                 }
@@ -1361,26 +1594,54 @@ fn session_worker(
                 serialization_depth,
                 response,
             } => {
-                let result = handle_add_patterns(raw_ptr, &hooks_ready, &session_id, &functions, image_base, mode, serialization_depth);
+                let result = handle_add_patterns(
+                    raw_ptr,
+                    &hooks_ready,
+                    &session_id,
+                    &functions,
+                    image_base,
+                    mode,
+                    serialization_depth,
+                );
                 let _ = response.send(result);
             }
 
-            SessionCommand::RemovePatterns { functions, response } => {
+            SessionCommand::RemovePatterns {
+                functions,
+                response,
+            } => {
                 let result = handle_remove_patterns(raw_ptr, &hooks_ready, &functions);
                 let _ = response.send(result);
             }
 
-            SessionCommand::SetWatches { watches, expr_watches, response } => {
-                let result = handle_set_watches(raw_ptr, &hooks_ready, &session_id, pid, &watches, &expr_watches);
+            SessionCommand::SetWatches {
+                watches,
+                expr_watches,
+                response,
+            } => {
+                let result = handle_set_watches(
+                    raw_ptr,
+                    &hooks_ready,
+                    &session_id,
+                    pid,
+                    &watches,
+                    &expr_watches,
+                );
                 let _ = response.send(result);
             }
 
-            SessionCommand::ReadMemory { recipes_json, response } => {
+            SessionCommand::ReadMemory {
+                recipes_json,
+                response,
+            } => {
                 let result = handle_read_memory(raw_ptr, &read_response, &recipes_json, pid);
                 let _ = response.send(result);
             }
 
-            SessionCommand::WriteMemory { recipes_json, response } => {
+            SessionCommand::WriteMemory {
+                recipes_json,
+                response,
+            } => {
                 let result = handle_write_memory(raw_ptr, &write_response, &recipes_json, pid);
                 let _ = response.send(result);
             }
@@ -1394,8 +1655,9 @@ fn session_worker(
                 }
 
                 let post_result = unsafe {
-                    post_message_raw(raw_ptr, &serde_json::to_string(&message).unwrap())
-                        .map_err(|e| crate::Error::Frida(format!("Failed to send breakpoint: {}", e)))
+                    post_message_raw(raw_ptr, &serde_json::to_string(&message).unwrap()).map_err(
+                        |e| crate::Error::Frida(format!("Failed to send breakpoint: {}", e)),
+                    )
                 };
 
                 let result = match post_result {
@@ -1404,7 +1666,9 @@ fn session_worker(
                         match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                             Ok(_) => Ok(()),
                             Err(_) => {
-                                tracing::warn!("Timed out waiting for breakpoint confirmation (5s)");
+                                tracing::warn!(
+                                    "Timed out waiting for breakpoint confirmation (5s)"
+                                );
                                 // Don't fail — the breakpoint may still work, just wasn't confirmed
                                 Ok(())
                             }
@@ -1415,7 +1679,10 @@ fn session_worker(
                 let _ = response.send(result);
             }
 
-            SessionCommand::RemoveBreakpoint { breakpoint_id, response } => {
+            SessionCommand::RemoveBreakpoint {
+                breakpoint_id,
+                response,
+            } => {
                 let (signal_tx, signal_rx) = std::sync::mpsc::channel();
                 {
                     let mut guard = hooks_ready.lock().unwrap();
@@ -1427,26 +1694,30 @@ fn session_worker(
                     "id": breakpoint_id,
                 });
                 let post_result = unsafe {
-                    post_message_raw(raw_ptr, &serde_json::to_string(&msg).unwrap())
-                        .map_err(|e| crate::Error::Frida(format!("Failed to send removeBreakpoint: {}", e)))
+                    post_message_raw(raw_ptr, &serde_json::to_string(&msg).unwrap()).map_err(|e| {
+                        crate::Error::Frida(format!("Failed to send removeBreakpoint: {}", e))
+                    })
                 };
 
                 let result = match post_result {
-                    Ok(()) => {
-                        match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                            Ok(_) => Ok(()),
-                            Err(_) => {
-                                tracing::warn!("Timed out waiting for breakpoint removal confirmation (5s)");
-                                Ok(())
-                            }
+                    Ok(()) => match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "Timed out waiting for breakpoint removal confirmation (5s)"
+                            );
+                            Ok(())
                         }
-                    }
+                    },
                     Err(e) => Err(e),
                 };
                 let _ = response.send(result);
             }
 
-            SessionCommand::RemoveLogpoint { logpoint_id, response } => {
+            SessionCommand::RemoveLogpoint {
+                logpoint_id,
+                response,
+            } => {
                 let (signal_tx, signal_rx) = std::sync::mpsc::channel();
                 {
                     let mut guard = hooks_ready.lock().unwrap();
@@ -1458,26 +1729,33 @@ fn session_worker(
                     "id": logpoint_id,
                 });
                 let post_result = unsafe {
-                    post_message_raw(raw_ptr, &serde_json::to_string(&msg).unwrap())
-                        .map_err(|e| crate::Error::Frida(format!("Failed to send removeLogpoint: {}", e)))
+                    post_message_raw(raw_ptr, &serde_json::to_string(&msg).unwrap()).map_err(|e| {
+                        crate::Error::Frida(format!("Failed to send removeLogpoint: {}", e))
+                    })
                 };
 
                 let result = match post_result {
-                    Ok(()) => {
-                        match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                            Ok(_) => Ok(()),
-                            Err(_) => {
-                                tracing::warn!("Timed out waiting for logpoint removal confirmation (5s)");
-                                Ok(())
-                            }
+                    Ok(()) => match signal_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "Timed out waiting for logpoint removal confirmation (5s)"
+                            );
+                            Ok(())
                         }
-                    }
+                    },
                     Err(e) => Err(e),
                 };
                 let _ = response.send(result);
             }
 
-            SessionCommand::ResumeThread { thread_id, one_shot_addresses, image_base, return_address, response } => {
+            SessionCommand::ResumeThread {
+                thread_id,
+                one_shot_addresses,
+                image_base,
+                return_address,
+                response,
+            } => {
                 // Two-message protocol for stepping:
                 // 1. Send installStepHooks (if any) — handled at top-level agent context
                 // 2. Send resume — unblocks the paused thread
@@ -1500,9 +1778,10 @@ fn session_worker(
                         post_message_raw(raw_ptr, &serde_json::to_string(&install_msg).unwrap())
                     };
                     if let Err(e) = install_result {
-                        let _ = response.send(Err(crate::Error::Frida(
-                            format!("Failed to send installStepHooks: {}", e)
-                        )));
+                        let _ = response.send(Err(crate::Error::Frida(format!(
+                            "Failed to send installStepHooks: {}",
+                            e
+                        ))));
                         continue;
                     }
                 }
@@ -1522,11 +1801,7 @@ fn session_worker(
                 // Unload and unref the script to prevent memory leaks
                 unsafe {
                     let mut error: *mut frida_sys::GError = std::ptr::null_mut();
-                    frida_sys::frida_script_unload_sync(
-                        raw_ptr,
-                        std::ptr::null_mut(),
-                        &mut error,
-                    );
+                    frida_sys::frida_script_unload_sync(raw_ptr, std::ptr::null_mut(), &mut error);
                     let _ = check_gerror(error);
                     frida_sys::frida_unref(raw_ptr as *mut c_void);
                 }
@@ -1546,7 +1821,12 @@ fn handle_add_patterns(
     mode: HookMode,
     serialization_depth: Option<u32>,
 ) -> Result<u32> {
-    tracing::info!("AddPatterns: {} functions ({:?} mode) for session {}", functions.len(), mode, session_id);
+    tracing::info!(
+        "AddPatterns: {} functions ({:?} mode) for session {}",
+        functions.len(),
+        mode,
+        session_id
+    );
 
     // Split targets: native (address > 0) vs interpreted (address == 0)
     let mut native_funcs: Vec<serde_json::Value> = Vec::new();
@@ -1572,12 +1852,19 @@ fn handle_add_patterns(
         }
     }
 
-    tracing::info!("Split targets: {} native + {} interpreted targets ({:?} mode)",
-                    native_funcs.len(), interpreted_targets.len(), mode);
+    tracing::info!(
+        "Split targets: {} native + {} interpreted targets ({:?} mode)",
+        native_funcs.len(),
+        interpreted_targets.len(),
+        mode
+    );
 
     // Debug: log first interpreted target if any
     if !interpreted_targets.is_empty() {
-        tracing::info!("First interpreted target: {}", serde_json::to_string(&interpreted_targets[0]).unwrap());
+        tracing::info!(
+            "First interpreted target: {}",
+            serde_json::to_string(&interpreted_targets[0]).unwrap()
+        );
     }
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -1613,7 +1900,10 @@ fn handle_add_patterns(
     }
 
     // Debug: log the full message being sent
-    tracing::info!("Sending hooks message: {}", serde_json::to_string_pretty(&hooks_msg).unwrap());
+    tracing::info!(
+        "Sending hooks message: {}",
+        serde_json::to_string_pretty(&hooks_msg).unwrap()
+    );
 
     unsafe {
         post_message_raw(script_ptr, &serde_json::to_string(&hooks_msg).unwrap())
@@ -1626,10 +1916,14 @@ fn handle_add_patterns(
             Ok(count as u32)
         }
         Err(_) => {
-            tracing::warn!("Timed out waiting for hooks confirmation ({}s)", TIMEOUT_PER_CHUNK_SECS);
-            Err(crate::Error::Frida(
-                format!("Agent did not respond within {}s — hooks may not be installed", TIMEOUT_PER_CHUNK_SECS)
-            ))
+            tracing::warn!(
+                "Timed out waiting for hooks confirmation ({}s)",
+                TIMEOUT_PER_CHUNK_SECS
+            );
+            Err(crate::Error::Frida(format!(
+                "Agent did not respond within {}s — hooks may not be installed",
+                TIMEOUT_PER_CHUNK_SECS
+            )))
         }
     }
 }
@@ -1696,7 +1990,10 @@ fn handle_remove_patterns(
             Ok(count as u32)
         }
         Err(_) => {
-            tracing::warn!("Timed out waiting for remove confirmation ({}s)", TIMEOUT_PER_CHUNK_SECS);
+            tracing::warn!(
+                "Timed out waiting for remove confirmation ({}s)",
+                TIMEOUT_PER_CHUNK_SECS
+            );
             Ok(0)
         }
     }
@@ -1713,14 +2010,18 @@ fn handle_set_watches(
 ) -> Result<()> {
     let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
     if !is_alive {
-        return Err(crate::Error::WatchFailed(
-            format!("Process {} is no longer running", pid)
-        ));
+        return Err(crate::Error::WatchFailed(format!(
+            "Process {} is no longer running",
+            pid
+        )));
     }
 
     tracing::info!(
         "SetWatches for session {}: {} native + {} expr watches, PID {} alive",
-        session_id, watches.len(), expr_watches.len(), pid
+        session_id,
+        watches.len(),
+        expr_watches.len(),
+        pid
     );
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -1729,31 +2030,37 @@ fn handle_set_watches(
         *guard = Some(signal_tx);
     }
 
-    let watch_list: Vec<serde_json::Value> = watches.iter().map(|w| {
-        let mut obj = serde_json::json!({
-            "label": w.label,
-            "address": format!("0x{:x}", w.address),
-            "size": w.size,
-            "typeKind": w.type_kind_str,
-            "derefDepth": w.deref_depth,
-            "derefOffset": w.deref_offset,
-            "typeName": w.type_name,
-            "onPatterns": w.on_patterns,
-        });
-        if w.no_slide {
-            obj["noSlide"] = serde_json::json!(true);
-        }
-        obj
-    }).collect();
-
-    let expr_watch_list: Vec<serde_json::Value> = expr_watches.iter().map(|e| {
-        serde_json::json!({
-            "label": e.label,
-            "expr": e.expr,
-            "isGlobal": e.is_global,
-            "onPatterns": e.on_patterns,
+    let watch_list: Vec<serde_json::Value> = watches
+        .iter()
+        .map(|w| {
+            let mut obj = serde_json::json!({
+                "label": w.label,
+                "address": format!("0x{:x}", w.address),
+                "size": w.size,
+                "typeKind": w.type_kind_str,
+                "derefDepth": w.deref_depth,
+                "derefOffset": w.deref_offset,
+                "typeName": w.type_name,
+                "onPatterns": w.on_patterns,
+            });
+            if w.no_slide {
+                obj["noSlide"] = serde_json::json!(true);
+            }
+            obj
         })
-    }).collect();
+        .collect();
+
+    let expr_watch_list: Vec<serde_json::Value> = expr_watches
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "label": e.label,
+                "expr": e.expr,
+                "isGlobal": e.is_global,
+                "onPatterns": e.on_patterns,
+            })
+        })
+        .collect();
 
     let mut watches_msg = serde_json::json!({
         "type": "watches",
@@ -1778,12 +2085,18 @@ fn handle_set_watches(
             let still_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
             if !still_alive {
                 tracing::warn!("Watch confirmation timeout — process {} is dead", pid);
-                Err(crate::Error::WatchFailed(
-                    format!("Process {} terminated before watches could be confirmed", pid)
-                ))
+                Err(crate::Error::WatchFailed(format!(
+                    "Process {} terminated before watches could be confirmed",
+                    pid
+                )))
             } else {
-                tracing::warn!("Timeout waiting for watch confirmation (process {} still alive)", pid);
-                Err(crate::Error::WatchFailed("Timeout waiting for watch confirmation".into()))
+                tracing::warn!(
+                    "Timeout waiting for watch confirmation (process {} still alive)",
+                    pid
+                );
+                Err(crate::Error::WatchFailed(
+                    "Timeout waiting for watch confirmation".into(),
+                ))
             }
         }
     }
@@ -1827,19 +2140,23 @@ fn handle_read_memory(
         match signal_rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(response) => return Ok(response),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(crate::Error::ReadFailed("Response channel closed".to_string()));
+                return Err(crate::Error::ReadFailed(
+                    "Response channel closed".to_string(),
+                ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
                 if !alive {
                     return Err(crate::Error::ReadFailed(
-                        "Process exited before memory read completed".to_string()
+                        "Process exited before memory read completed".to_string(),
                     ));
                 }
             }
         }
     }
-    Err(crate::Error::Frida("Memory read timed out (5s)".to_string()))
+    Err(crate::Error::Frida(
+        "Memory read timed out (5s)".to_string(),
+    ))
 }
 
 fn handle_write_memory(
@@ -1855,27 +2172,32 @@ fn handle_write_memory(
     }
 
     unsafe {
-        post_message_raw(script_ptr, recipes_json)
-            .map_err(|e| crate::Error::WriteFailed(format!("Failed to send write_memory: {}", e)))?;
+        post_message_raw(script_ptr, recipes_json).map_err(|e| {
+            crate::Error::WriteFailed(format!("Failed to send write_memory: {}", e))
+        })?;
     }
 
     for _ in 0..10 {
         match signal_rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(response) => return Ok(response),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(crate::Error::WriteFailed("Response channel closed".to_string()));
+                return Err(crate::Error::WriteFailed(
+                    "Response channel closed".to_string(),
+                ));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
                 if !alive {
                     return Err(crate::Error::WriteFailed(
-                        "Process exited before memory write completed".to_string()
+                        "Process exited before memory write completed".to_string(),
                     ));
                 }
             }
         }
     }
-    Err(crate::Error::WriteFailed("Memory write timed out (5s)".to_string()))
+    Err(crate::Error::WriteFailed(
+        "Memory write timed out (5s)".to_string(),
+    ))
 }
 
 /// Get the parent PID of a process.
@@ -1915,22 +2237,33 @@ fn handle_child_spawn(
         // fallback would assign the child to an arbitrary (wrong) session,
         // causing cross-session event pollution and orphaned session pointers.
         let ppid = get_ppid(child_pid);
-        let ctx = ppid
-            .and_then(|pp| reg.get(&pp))
-            .or_else(|| if reg.len() == 1 { reg.values().next() } else { None });
+        let ctx = ppid.and_then(|pp| reg.get(&pp)).or_else(|| {
+            if reg.len() == 1 {
+                reg.values().next()
+            } else {
+                None
+            }
+        });
         ctx.map(|c| (c.session_id.clone(), c.event_tx.clone(), c.start_ns))
     };
 
     let (session_id, event_tx, start_ns) = match parent_info {
         Some(info) => info,
         None => {
-            tracing::debug!("No active session for child PID {}, resuming without attaching", child_pid);
+            tracing::debug!(
+                "No active session for child PID {}, resuming without attaching",
+                child_pid
+            );
             let _ = device.resume(child_pid);
             return;
         }
     };
 
-    tracing::info!("Attaching to child process {} (session: {})", child_pid, session_id);
+    tracing::info!(
+        "Attaching to child process {} (session: {})",
+        child_pid,
+        session_id
+    );
 
     // Register output context for the child
     let output_ctx = Arc::new(OutputContext {
@@ -1988,7 +2321,10 @@ fn handle_child_spawn(
                         "sessionId": session_id,
                     });
                     unsafe {
-                        let _ = post_message_raw(script_ptr, &serde_json::to_string(&init_msg).unwrap());
+                        let _ = post_message_raw(
+                            script_ptr,
+                            &serde_json::to_string(&init_msg).unwrap(),
+                        );
                     }
 
                     tracing::info!("Agent loaded in child process {}", child_pid);
@@ -2025,9 +2361,17 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
 
     if event_type == EventType::VariableSnapshot {
         return Some(Event {
-            id: json.get("id").and_then(|v| v.as_str())
+            id: json
+                .get("id")
+                .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}-snap-{}", session_id, chrono::Utc::now().timestamp_millis())),
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}-snap-{}",
+                        session_id,
+                        chrono::Utc::now().timestamp_millis()
+                    )
+                }),
             session_id: session_id.to_string(),
             timestamp_ns: json.get("timestampNs")?.as_i64()?,
             thread_id: json.get("threadId")?.as_i64()?,
@@ -2040,9 +2384,17 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
 
     if event_type == EventType::Crash {
         return Some(Event {
-            id: json.get("id").and_then(|v| v.as_str())
+            id: json
+                .get("id")
+                .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}-crash-{}", session_id, chrono::Utc::now().timestamp_millis())),
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}-crash-{}",
+                        session_id,
+                        chrono::Utc::now().timestamp_millis()
+                    )
+                }),
             session_id: session_id.to_string(),
             timestamp_ns: json.get("timestampNs")?.as_i64()?,
             thread_id: json.get("threadId")?.as_i64()?,
@@ -2052,21 +2404,36 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
                 let fm = json.get("frameMemory");
                 let fb = json.get("frameBase");
                 if fm.is_some() || fb.is_some() {
-                    Some(serde_json::json!({
-                        "frameMemory": fm,
-                        "frameBase": fb,
-                    }).to_string())
+                    Some(
+                        serde_json::json!({
+                            "frameMemory": fm,
+                            "frameBase": fb,
+                        })
+                        .to_string(),
+                    )
                 } else {
                     None
                 }
             },
             pid,
-            signal: json.get("signal").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            fault_address: json.get("faultAddress").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            signal: json
+                .get("signal")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            fault_address: json
+                .get("faultAddress")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             registers: json.get("registers").cloned(),
             backtrace: json.get("backtrace").cloned(),
-            exception_type: json.get("exceptionType").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            exception_message: json.get("exceptionMessage").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            exception_type: json
+                .get("exceptionType")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            exception_message: json
+                .get("exceptionMessage")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             throw_backtrace: json.get("throwBacktrace").cloned(),
             ..Event::default()
         });
@@ -2078,27 +2445,52 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
             session_id: session_id.to_string(),
             timestamp_ns: json.get("timestampNs")?.as_i64()?,
             thread_id: json.get("threadId")?.as_i64()?,
-            thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            thread_name: json
+                .get("threadName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             event_type,
-            text: json.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            text: json
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             pid,
             ..Event::default()
         });
     }
 
     // Phase 2: Breakpoint events (Pause, Logpoint, ConditionError)
-    if event_type == EventType::Pause || event_type == EventType::Logpoint || event_type == EventType::ConditionError {
+    if event_type == EventType::Pause
+        || event_type == EventType::Logpoint
+        || event_type == EventType::ConditionError
+    {
         return Some(Event {
             id: json.get("id")?.as_str()?.to_string(),
             session_id: session_id.to_string(),
             timestamp_ns: json.get("timestampNs")?.as_i64()?,
             thread_id: json.get("threadId")?.as_i64()?,
-            thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            thread_name: json
+                .get("threadName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             event_type,
-            breakpoint_id: json.get("breakpointId").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            logpoint_message: json.get("message").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            function_name: json.get("functionName").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default(),
-            source_file: json.get("file").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            breakpoint_id: json
+                .get("breakpointId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            logpoint_message: json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            function_name: json
+                .get("functionName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            source_file: json
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             line_number: json.get("line").and_then(|v| v.as_i64()).map(|n| n as i32),
             pid,
             ..Event::default()
@@ -2110,13 +2502,28 @@ fn parse_event(session_id: &str, json: &serde_json::Value) -> Option<Event> {
         session_id: session_id.to_string(),
         timestamp_ns: json.get("timestampNs")?.as_i64()?,
         thread_id: json.get("threadId")?.as_i64()?,
-        thread_name: json.get("threadName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        parent_event_id: json.get("parentEventId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        thread_name: json
+            .get("threadName")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        parent_event_id: json
+            .get("parentEventId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         event_type,
         function_name: json.get("functionName")?.as_str()?.to_string(),
-        function_name_raw: json.get("functionNameRaw").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        source_file: json.get("sourceFile").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        line_number: json.get("lineNumber").and_then(|v| v.as_i64()).map(|n| n as i32),
+        function_name_raw: json
+            .get("functionNameRaw")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        source_file: json
+            .get("sourceFile")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        line_number: json
+            .get("lineNumber")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32),
         arguments: json.get("arguments").cloned(),
         return_value: json.get("returnValue").cloned(),
         duration_ns: json.get("durationNs").and_then(|v| v.as_i64()),
@@ -2157,7 +2564,9 @@ fn process_death_monitor(
     // Poll until process is dead
     loop {
         let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-        if !alive { break; }
+        if !alive {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     // Give the agent's async crash event time to arrive via GLib
@@ -2179,16 +2588,23 @@ fn process_death_monitor(
         let now_ns = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos() as i64) - start_ns;
+            .as_nanos() as i64)
+            - start_ns;
 
         tracing::info!(
             "Read sanitizer log file for PID {} [{}] ({} bytes)",
-            pid, session_id, output.len()
+            pid,
+            session_id,
+            output.len()
         );
 
         // Emit the full sanitizer report as a stderr event so it's queryable
         let event = Event {
-            id: format!("{}-sanitizer-output-{}", session_id, chrono::Utc::now().timestamp_millis()),
+            id: format!(
+                "{}-sanitizer-output-{}",
+                session_id,
+                chrono::Utc::now().timestamp_millis()
+            ),
             session_id: session_id.clone(),
             timestamp_ns: now_ns,
             event_type: EventType::Stderr,
@@ -2214,7 +2630,11 @@ fn process_death_monitor(
 
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
             if let Some(events) = parsed.get("events").and_then(|v| v.as_array()) {
-                tracing::info!("Recovered crash event from file for PID {} [{}]", pid, session_id);
+                tracing::info!(
+                    "Recovered crash event from file for PID {} [{}]",
+                    pid,
+                    session_id
+                );
                 for event_json in events {
                     if let Some(event) = parse_event(&session_id, event_json) {
                         let _ = event_tx.try_send(event);
@@ -2231,7 +2651,8 @@ fn process_death_monitor(
         if let Some(crash_event) = parse_sanitizer_crash(output, pid, &session_id, start_ns) {
             tracing::info!(
                 "Sanitizer crash detected from log file for PID {} [{}]: {}",
-                pid, session_id,
+                pid,
+                session_id,
                 crash_event.exception_type.as_deref().unwrap_or("unknown")
             );
             let _ = event_tx.try_send(crash_event);
@@ -2241,14 +2662,17 @@ fn process_death_monitor(
 
     // Check stderr buffer for sanitizer output (fallback for cases where
     // log_path wasn't set or sanitizer wrote to stderr directly)
-    let stderr_snapshot = stderr_buffer.lock().ok()
+    let stderr_snapshot = stderr_buffer
+        .lock()
+        .ok()
         .map(|buf| buf.clone())
         .unwrap_or_default();
 
     if let Some(crash_event) = parse_sanitizer_crash(&stderr_snapshot, pid, &session_id, start_ns) {
         tracing::info!(
             "Sanitizer crash detected from stderr for PID {} [{}]: {}",
-            pid, session_id,
+            pid,
+            session_id,
             crash_event.exception_type.as_deref().unwrap_or("unknown")
         );
         let _ = event_tx.try_send(crash_event);
@@ -2280,15 +2704,22 @@ fn process_death_monitor(
             let now_ns = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i64) - start_ns;
+                .as_nanos() as i64)
+                - start_ns;
 
             tracing::info!(
                 "Host-side crash detection: PID {} killed by {} [{}]",
-                pid, signal_name, session_id
+                pid,
+                signal_name,
+                session_id
             );
 
             let event = Event {
-                id: format!("{}-crash-host-{}", session_id, chrono::Utc::now().timestamp_millis()),
+                id: format!(
+                    "{}-crash-host-{}",
+                    session_id,
+                    chrono::Utc::now().timestamp_millis()
+                ),
                 session_id: session_id.clone(),
                 timestamp_ns: now_ns,
                 event_type: EventType::Crash,
@@ -2300,25 +2731,24 @@ fn process_death_monitor(
             let _ = event_tx.try_send(event);
         }
     } else {
-        tracing::debug!("Process {} already reaped (waitpid returned {})", pid, result);
+        tracing::debug!(
+            "Process {} already reaped (waitpid returned {})",
+            pid,
+            result
+        );
     }
 }
 
 /// Parse sanitizer (ASAN/TSAN/UBSAN/MSAN) crash information from stderr output.
 /// Returns a synthetic crash event if sanitizer output is detected.
-fn parse_sanitizer_crash(
-    stderr: &str,
-    pid: u32,
-    session_id: &str,
-    start_ns: i64,
-) -> Option<Event> {
+fn parse_sanitizer_crash(stderr: &str, pid: u32, session_id: &str, start_ns: i64) -> Option<Event> {
     // Match: ==PID==ERROR: AddressSanitizer: SEGV on unknown address 0x... (pc 0x... ... T0)
     // Also matches ThreadSanitizer, MemorySanitizer, UndefinedBehaviorSanitizer
     let error_line = stderr.lines().find(|line| {
-        line.contains("ERROR: AddressSanitizer:") ||
-        line.contains("ERROR: ThreadSanitizer:") ||
-        line.contains("ERROR: MemorySanitizer:") ||
-        line.contains("ERROR: UndefinedBehaviorSanitizer:")
+        line.contains("ERROR: AddressSanitizer:")
+            || line.contains("ERROR: ThreadSanitizer:")
+            || line.contains("ERROR: MemorySanitizer:")
+            || line.contains("ERROR: UndefinedBehaviorSanitizer:")
     })?;
 
     // Extract sanitizer type and error type from the ERROR line
@@ -2346,8 +2776,12 @@ fn parse_sanitizer_crash(
     // Map sanitizer error types to signal names
     let signal = match error_type.as_str() {
         "SEGV" | "access-violation" => "access-violation",
-        "heap-use-after-free" | "heap-buffer-overflow" | "stack-buffer-overflow"
-        | "global-buffer-overflow" | "stack-use-after-return" | "stack-use-after-scope"
+        "heap-use-after-free"
+        | "heap-buffer-overflow"
+        | "stack-buffer-overflow"
+        | "global-buffer-overflow"
+        | "stack-use-after-return"
+        | "stack-use-after-scope"
         | "use-after-poison" => "abort",
         "double-free" | "alloc-dealloc-mismatch" | "new-delete-type-mismatch" => "abort",
         _ => "abort", // Most sanitizer errors end in abort()
@@ -2443,20 +2877,30 @@ fn parse_sanitizer_crash(
     }
 
     // Extract SUMMARY line for the exception message
-    let summary = stderr.lines()
+    let summary = stderr
+        .lines()
         .find(|line| line.contains("SUMMARY:"))
         .map(|line| {
-            line.split("SUMMARY: ").nth(1).unwrap_or(line).trim().to_string()
+            line.split("SUMMARY: ")
+                .nth(1)
+                .unwrap_or(line)
+                .trim()
+                .to_string()
         })
         .unwrap_or_else(|| format!("{}: {}", sanitizer_name, error_type));
 
     let now_ns = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as i64) - start_ns;
+        .as_nanos() as i64)
+        - start_ns;
 
     Some(Event {
-        id: format!("{}-crash-asan-{}", session_id, chrono::Utc::now().timestamp_millis()),
+        id: format!(
+            "{}-crash-asan-{}",
+            session_id,
+            chrono::Utc::now().timestamp_millis()
+        ),
         session_id: session_id.to_string(),
         timestamp_ns: now_ns,
         event_type: EventType::Crash,
@@ -2466,7 +2910,11 @@ fn parse_sanitizer_crash(
         pid: Some(pid),
         exception_type: Some(format!("{}: {}", sanitizer_name, error_type)),
         exception_message: Some(summary),
-        backtrace: if backtrace_frames.is_empty() { None } else { Some(serde_json::json!(backtrace_frames)) },
+        backtrace: if backtrace_frames.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!(backtrace_frames))
+        },
         ..Event::default()
     })
 }
@@ -2532,21 +2980,24 @@ impl FridaSpawner {
     ) -> Result<u32> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.coordinator_tx.send(CoordinatorCommand::Spawn {
-            session_id: session_id.to_string(),
-            command: command.to_string(),
-            args: args.to_vec(),
-            cwd: cwd.map(|s| s.to_string()),
-            env: env.cloned(),
-            event_tx: event_sender,
-            defer_resume,
-            pause_notify_tx,
-            language,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
+        self.coordinator_tx
+            .send(CoordinatorCommand::Spawn {
+                session_id: session_id.to_string(),
+                command: command.to_string(),
+                args: args.to_vec(),
+                cwd: cwd.map(|s| s.to_string()),
+                env: env.cloned(),
+                event_tx: event_sender,
+                defer_resume,
+                pause_notify_tx,
+                language,
+                response: response_tx,
+            })
+            .map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
 
         // No lock held during coordinator round-trip (the expensive part)
-        let spawn_result = response_rx.await
+        let spawn_result = response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))??;
 
         let pid = spawn_result.pid;
@@ -2555,12 +3006,26 @@ impl FridaSpawner {
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let sid = session_id.to_string();
         let handle = thread::spawn(move || {
-            session_worker(sid, spawn_result.script_ptr, spawn_result.hooks_ready, spawn_result.read_response, spawn_result.write_response, pid, session_rx);
+            session_worker(
+                sid,
+                spawn_result.script_ptr,
+                spawn_result.hooks_ready,
+                spawn_result.read_response,
+                spawn_result.write_response,
+                pid,
+                session_rx,
+            );
         });
 
         // Brief internal locks for map insertions
-        self.session_workers.write().unwrap().insert(session_id.to_string(), session_tx);
-        self.session_worker_handles.lock().unwrap().insert(session_id.to_string(), handle);
+        self.session_workers
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), session_tx);
+        self.session_worker_handles
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), handle);
 
         let session = FridaSession {
             project_root: project_root.to_string(),
@@ -2569,7 +3034,10 @@ impl FridaSpawner {
             image_base,
         };
 
-        self.sessions.write().unwrap().insert(session_id.to_string(), session);
+        self.sessions
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), session);
 
         Ok(pid)
     }
@@ -2577,23 +3045,37 @@ impl FridaSpawner {
     /// Resume a previously suspended process (used with defer_resume=true).
     pub async fn resume(&self, pid: u32) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.coordinator_tx.send(CoordinatorCommand::Resume {
-            pid,
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
+        self.coordinator_tx
+            .send(CoordinatorCommand::Resume {
+                pid,
+                response: response_tx,
+            })
+            .map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?
     }
 
-    pub async fn add_patterns(&self, session_id: &str, patterns: &[String], serialization_depth: Option<u32>, resolver: Option<&dyn crate::symbols::SymbolResolver>) -> Result<HookResult> {
+    pub async fn add_patterns(
+        &self,
+        session_id: &str,
+        patterns: &[String],
+        serialization_depth: Option<u32>,
+        resolver: Option<&dyn crate::symbols::SymbolResolver>,
+    ) -> Result<HookResult> {
         // Brief write lock: update hook_manager state and extract session data
         let (mut dwarf_handle, image_base, project_root) = {
             let mut sessions = self.sessions.write().unwrap();
-            let session = sessions.get_mut(session_id)
+            let session = sessions
+                .get_mut(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
             session.hook_manager.add_patterns(patterns);
-            (session.dwarf_handle.clone(), session.image_base, session.project_root.clone())
+            (
+                session.dwarf_handle.clone(),
+                session.image_base,
+                session.project_root.clone(),
+            )
         };
 
         // Group functions by mode — no lock held during expensive DWARF/resolver work
@@ -2606,9 +3088,18 @@ impl FridaSpawner {
             for pattern in patterns {
                 let targets = resolver.resolve_pattern(pattern, Path::new(&project_root))?;
                 let mode = HookManager::classify_with_count(pattern, targets.len());
-                tracing::info!("Pattern '{}' -> {:?} mode ({} targets, resolver)", pattern, mode, targets.len());
+                tracing::info!(
+                    "Pattern '{}' -> {:?} mode ({} targets, resolver)",
+                    pattern,
+                    mode,
+                    targets.len()
+                );
 
-                let target_list = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
+                let target_list = if mode == HookMode::Full {
+                    &mut full_funcs
+                } else {
+                    &mut light_funcs
+                };
                 for target in targets {
                     match target {
                         crate::symbols::ResolvedTarget::SourceLocation { file, line, name } => {
@@ -2620,11 +3111,20 @@ impl FridaSpawner {
                                 line_number: Some(line),
                             });
                         }
-                        crate::symbols::ResolvedTarget::Address { address, name, name_raw, file, line } => {
+                        crate::symbols::ResolvedTarget::Address {
+                            address,
+                            name,
+                            name_raw,
+                            file,
+                            line,
+                        } => {
                             // Skip functions with address 0 — these are declarations or
                             // fully-inlined functions with no out-of-line body to hook.
                             if address == 0 {
-                                tracing::debug!("Skipping unhookable function {} (address 0x0)", name);
+                                tracing::debug!(
+                                    "Skipping unhookable function {} (address 0x0)",
+                                    name
+                                );
                                 continue;
                             }
                             target_list.push(FunctionTarget {
@@ -2644,9 +3144,18 @@ impl FridaSpawner {
             for pattern in patterns {
                 let matches: Vec<&FunctionInfo> = resolve_pattern(&dwarf, pattern, &project_root);
                 let mode = HookManager::classify_with_count(pattern, matches.len());
-                tracing::info!("Pattern '{}' -> {:?} mode ({} functions, DWARF)", pattern, mode, matches.len());
+                tracing::info!(
+                    "Pattern '{}' -> {:?} mode ({} functions, DWARF)",
+                    pattern,
+                    mode,
+                    matches.len()
+                );
 
-                let target = if mode == HookMode::Full { &mut full_funcs } else { &mut light_funcs };
+                let target = if mode == HookMode::Full {
+                    &mut full_funcs
+                } else {
+                    &mut light_funcs
+                };
                 for func in matches {
                     if func.low_pc == 0 {
                         tracing::debug!("Skipping unhookable function {} (low_pc 0x0)", func.name);
@@ -2673,9 +3182,16 @@ impl FridaSpawner {
             warnings.push(format!(
                 "Pattern matched {} functions (limit: {}). Only {} were hooked. \
                  Use more specific patterns like @file:specific_module to stay under the limit.",
-                matched, MAX_HOOKS_PER_CALL, full_funcs.len() + light_funcs.len()
+                matched,
+                MAX_HOOKS_PER_CALL,
+                full_funcs.len() + light_funcs.len()
             ));
-            tracing::warn!("Hook cap: {} matched, {} capped to {}", matched, total, MAX_HOOKS_PER_CALL);
+            tracing::warn!(
+                "Hook cap: {} matched, {} capped to {}",
+                matched,
+                total,
+                MAX_HOOKS_PER_CALL
+            );
         }
 
         // image_base already extracted above from sessions lock
@@ -2683,15 +3199,21 @@ impl FridaSpawner {
 
         // Send chunks for both modes (serialization_depth only on the first chunk overall)
         let mut depth_sent = false;
-        let batches: [(Vec<FunctionTarget>, HookMode); 2] = [
-            (full_funcs, HookMode::Full),
-            (light_funcs, HookMode::Light),
-        ];
+        let batches: [(Vec<FunctionTarget>, HookMode); 2] =
+            [(full_funcs, HookMode::Full), (light_funcs, HookMode::Light)];
 
         'outer: for (funcs, mode) in &batches {
             for chunk in funcs.chunks(CHUNK_SIZE) {
-                let depth = if !depth_sent { depth_sent = true; serialization_depth } else { None };
-                match self.send_add_chunk(session_id, chunk.to_vec(), image_base, *mode, depth).await {
+                let depth = if !depth_sent {
+                    depth_sent = true;
+                    serialization_depth
+                } else {
+                    None
+                };
+                match self
+                    .send_add_chunk(session_id, chunk.to_vec(), image_base, *mode, depth)
+                    .await
+                {
                     // activeCount is the total hooks active (not delta), so use latest value
                     Ok(count) => total_hooks = count,
                     Err(e) => {
@@ -2702,7 +3224,11 @@ impl FridaSpawner {
             }
         }
 
-        Ok(HookResult { installed: total_hooks, matched, warnings })
+        Ok(HookResult {
+            installed: total_hooks,
+            matched,
+            warnings,
+        })
     }
 
     async fn send_add_chunk(
@@ -2717,26 +3243,36 @@ impl FridaSpawner {
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::AddPatterns {
-                functions,
-                image_base,
-                mode,
-                serialization_depth,
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::AddPatterns {
+                    functions,
+                    image_base,
+                    mode,
+                    serialization_depth,
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn remove_patterns(&self, session_id: &str, patterns: &[String], resolver: Option<&dyn crate::symbols::SymbolResolver>) -> Result<u32> {
+    pub async fn remove_patterns(
+        &self,
+        session_id: &str,
+        patterns: &[String],
+        resolver: Option<&dyn crate::symbols::SymbolResolver>,
+    ) -> Result<u32> {
         // Brief lock to extract session data needed for resolution
         let (mut dwarf_handle, project_root) = {
             let sessions = self.sessions.read().unwrap();
-            let session = sessions.get(session_id)
+            let session = sessions
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
             (session.dwarf_handle.clone(), session.project_root.clone())
         };
@@ -2759,7 +3295,13 @@ impl FridaSpawner {
                                 line_number: Some(line),
                             });
                         }
-                        crate::symbols::ResolvedTarget::Address { address, name, name_raw, file, line } => {
+                        crate::symbols::ResolvedTarget::Address {
+                            address,
+                            name,
+                            name_raw,
+                            file,
+                            line,
+                        } => {
                             functions.push(FunctionTarget {
                                 address,
                                 name: name.clone(),
@@ -2793,49 +3335,69 @@ impl FridaSpawner {
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::RemovePatterns {
-                functions,
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::RemovePatterns {
+                    functions,
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn read_memory(&self, session_id: &str, recipes_json: String) -> Result<serde_json::Value> {
+    pub async fn read_memory(
+        &self,
+        session_id: &str,
+        recipes_json: String,
+    ) -> Result<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::ReadMemory {
-                recipes_json,
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::ReadMemory {
+                    recipes_json,
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn write_memory(&self, session_id: &str, recipes_json: String) -> Result<serde_json::Value> {
+    pub async fn write_memory(
+        &self,
+        session_id: &str,
+        recipes_json: String,
+    ) -> Result<serde_json::Value> {
         let (response_tx, response_rx) = oneshot::channel();
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::WriteMemory {
-                recipes_json,
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::WriteMemory {
+                    recipes_json,
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
@@ -2849,14 +3411,19 @@ impl FridaSpawner {
         if let Some(worker_tx) = self.session_workers.write().unwrap().remove(session_id) {
             let _ = worker_tx.send(SessionCommand::Shutdown);
         }
-        let maybe_handle = self.session_worker_handles.lock().unwrap().remove(session_id);
+        let maybe_handle = self
+            .session_worker_handles
+            .lock()
+            .unwrap()
+            .remove(session_id);
         if let Some(handle) = maybe_handle {
             // Use spawn_blocking + timeout to avoid blocking the async runtime
             // indefinitely if the worker is stuck on a recv_timeout (up to 45s).
             let join_result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 tokio::task::spawn_blocking(move || handle.join()),
-            ).await;
+            )
+            .await;
             match join_result {
                 Ok(Ok(_)) => {} // Worker exited cleanly
                 Ok(Err(_)) => tracing::warn!("spawn_blocking panicked joining session worker for {}", session_id),
@@ -2867,16 +3434,23 @@ impl FridaSpawner {
         // Phase 2: Kill processes via coordinator (device.kill)
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.coordinator_tx.send(CoordinatorCommand::StopSession {
-            session_id: session_id.to_string(),
-            response: response_tx,
-        }).map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
+        self.coordinator_tx
+            .send(CoordinatorCommand::StopSession {
+                session_id: session_id.to_string(),
+                response: response_tx,
+            })
+            .map_err(|_| crate::Error::Frida("Coordinator thread died".to_string()))?;
 
         // Timeout prevents hanging if coordinator is blocked on device.kill()
         match tokio::time::timeout(std::time::Duration::from_secs(10), response_rx).await {
-            Ok(result) => result.map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?,
+            Ok(result) => {
+                result.map_err(|_| crate::Error::Frida("Coordinator response lost".to_string()))?
+            }
             Err(_) => {
-                tracing::warn!("Timed out waiting for coordinator to stop session {} (10s)", session_id);
+                tracing::warn!(
+                    "Timed out waiting for coordinator to stop session {} (10s)",
+                    session_id
+                );
                 Ok(())
             }
         }
@@ -2892,22 +3466,27 @@ impl FridaSpawner {
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::SetWatches {
-                watches,
-                expr_watches,
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::SetWatches {
+                    watches,
+                    expr_watches,
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
     pub fn get_patterns(&self, session_id: &str) -> Vec<String> {
         self.sessions
-            .read().unwrap()
+            .read()
+            .unwrap()
             .get(session_id)
             .map(|s| s.hook_manager.active_patterns())
             .unwrap_or_default()
@@ -2926,82 +3505,75 @@ impl FridaSpawner {
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::SetBreakpoint {
-                message,
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::SetBreakpoint {
+                    message,
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn set_breakpoint(
-        &self,
-        session_id: &str,
-        message: serde_json::Value,
-    ) -> Result<()> {
+    pub async fn set_breakpoint(&self, session_id: &str, message: serde_json::Value) -> Result<()> {
         self.send_hook_message(session_id, message).await
     }
 
-    pub async fn set_logpoint(
-        &self,
-        session_id: &str,
-        message: serde_json::Value,
-    ) -> Result<()> {
+    pub async fn set_logpoint(&self, session_id: &str, message: serde_json::Value) -> Result<()> {
         self.send_hook_message(session_id, message).await
     }
 
-    pub async fn remove_breakpoint(
-        &self,
-        session_id: &str,
-        breakpoint_id: &str,
-    ) -> Result<()> {
+    pub async fn remove_breakpoint(&self, session_id: &str, breakpoint_id: &str) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::RemoveBreakpoint {
-                breakpoint_id: breakpoint_id.to_string(),
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::RemoveBreakpoint {
+                    breakpoint_id: breakpoint_id.to_string(),
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn remove_logpoint(
-        &self,
-        session_id: &str,
-        logpoint_id: &str,
-    ) -> Result<()> {
+    pub async fn remove_logpoint(&self, session_id: &str, logpoint_id: &str) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::RemoveLogpoint {
-                logpoint_id: logpoint_id.to_string(),
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::RemoveLogpoint {
+                    logpoint_id: logpoint_id.to_string(),
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 
-    pub async fn resume_thread(
-        &self,
-        session_id: &str,
-        thread_id: u64,
-    ) -> Result<()> {
-        self.resume_thread_with_step(session_id, thread_id, Vec::new(), 0, None).await
+    pub async fn resume_thread(&self, session_id: &str, thread_id: u64) -> Result<()> {
+        self.resume_thread_with_step(session_id, thread_id, Vec::new(), 0, None)
+            .await
     }
 
     /// Resume thread with optional one-shot breakpoints for stepping
@@ -3017,18 +3589,22 @@ impl FridaSpawner {
 
         {
             let workers = self.session_workers.read().unwrap();
-            let worker_tx = workers.get(session_id)
+            let worker_tx = workers
+                .get(session_id)
                 .ok_or_else(|| crate::Error::SessionNotFound(session_id.to_string()))?;
-            worker_tx.send(SessionCommand::ResumeThread {
-                thread_id,
-                one_shot_addresses,
-                image_base,
-                return_address,
-                response: response_tx,
-            }).map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
+            worker_tx
+                .send(SessionCommand::ResumeThread {
+                    thread_id,
+                    one_shot_addresses,
+                    image_base,
+                    return_address,
+                    response: response_tx,
+                })
+                .map_err(|_| crate::Error::Frida("Session worker died".to_string()))?;
         }
 
-        response_rx.await
+        response_rx
+            .await
             .map_err(|_| crate::Error::Frida("Session worker response lost".to_string()))?
     }
 }
@@ -3076,13 +3652,16 @@ mod tests {
 
     #[test]
     fn test_parse_event_stdout() {
-        let event = parse_event("session-1", &json!({
-            "id": "evt-1",
-            "timestampNs": 1000,
-            "threadId": 42,
-            "eventType": "stdout",
-            "text": "hello world\n"
-        }));
+        let event = parse_event(
+            "session-1",
+            &json!({
+                "id": "evt-1",
+                "timestampNs": 1000,
+                "threadId": 42,
+                "eventType": "stdout",
+                "text": "hello world\n"
+            }),
+        );
 
         let e = event.expect("should parse stdout event");
         assert_eq!(e.event_type, EventType::Stdout);
@@ -3095,13 +3674,16 @@ mod tests {
 
     #[test]
     fn test_parse_event_stderr() {
-        let event = parse_event("session-1", &json!({
-            "id": "evt-2",
-            "timestampNs": 2000,
-            "threadId": 1,
-            "eventType": "stderr",
-            "text": "Error: crash\n"
-        }));
+        let event = parse_event(
+            "session-1",
+            &json!({
+                "id": "evt-2",
+                "timestampNs": 2000,
+                "threadId": 1,
+                "eventType": "stderr",
+                "text": "Error: crash\n"
+            }),
+        );
 
         let e = event.expect("should parse stderr event");
         assert_eq!(e.event_type, EventType::Stderr);
@@ -3110,12 +3692,15 @@ mod tests {
 
     #[test]
     fn test_parse_event_stdout_missing_text() {
-        let event = parse_event("session-1", &json!({
-            "id": "evt-3",
-            "timestampNs": 3000,
-            "threadId": 1,
-            "eventType": "stdout"
-        }));
+        let event = parse_event(
+            "session-1",
+            &json!({
+                "id": "evt-3",
+                "timestampNs": 3000,
+                "threadId": 1,
+                "eventType": "stdout"
+            }),
+        );
 
         let e = event.expect("should parse stdout even without text");
         assert_eq!(e.event_type, EventType::Stdout);
@@ -3124,33 +3709,48 @@ mod tests {
 
     #[test]
     fn test_parse_event_stdout_missing_required_fields() {
-        assert!(parse_event("s", &json!({
-            "timestampNs": 1000, "threadId": 1, "eventType": "stdout"
-        })).is_none());
+        assert!(parse_event(
+            "s",
+            &json!({
+                "timestampNs": 1000, "threadId": 1, "eventType": "stdout"
+            })
+        )
+        .is_none());
 
-        assert!(parse_event("s", &json!({
-            "id": "x", "threadId": 1, "eventType": "stdout"
-        })).is_none());
+        assert!(parse_event(
+            "s",
+            &json!({
+                "id": "x", "threadId": 1, "eventType": "stdout"
+            })
+        )
+        .is_none());
 
-        assert!(parse_event("s", &json!({
-            "id": "x", "timestampNs": 1000, "eventType": "stdout"
-        })).is_none());
+        assert!(parse_event(
+            "s",
+            &json!({
+                "id": "x", "timestampNs": 1000, "eventType": "stdout"
+            })
+        )
+        .is_none());
     }
 
     #[test]
     fn test_parse_event_function_enter() {
-        let event = parse_event("session-1", &json!({
-            "id": "evt-4",
-            "timestampNs": 4000,
-            "threadId": 1,
-            "eventType": "function_enter",
-            "functionName": "main::run",
-            "functionNameRaw": "_ZN4main3runEv",
-            "sourceFile": "/src/main.rs",
-            "lineNumber": 10,
-            "parentEventId": null,
-            "arguments": [1, 2]
-        }));
+        let event = parse_event(
+            "session-1",
+            &json!({
+                "id": "evt-4",
+                "timestampNs": 4000,
+                "threadId": 1,
+                "eventType": "function_enter",
+                "functionName": "main::run",
+                "functionNameRaw": "_ZN4main3runEv",
+                "sourceFile": "/src/main.rs",
+                "lineNumber": 10,
+                "parentEventId": null,
+                "arguments": [1, 2]
+            }),
+        );
 
         let e = event.expect("should parse function_enter event");
         assert_eq!(e.event_type, EventType::FunctionEnter);
@@ -3161,10 +3761,14 @@ mod tests {
 
     #[test]
     fn test_parse_event_unknown_type() {
-        assert!(parse_event("s", &json!({
-            "id": "x", "timestampNs": 1000, "threadId": 1,
-            "eventType": "unknown_type"
-        })).is_none());
+        assert!(parse_event(
+            "s",
+            &json!({
+                "id": "x", "timestampNs": 1000, "threadId": 1,
+                "eventType": "unknown_type"
+            })
+        )
+        .is_none());
     }
 
     // --- HooksReadySignal synchronization tests ---
@@ -3295,7 +3899,9 @@ mod tests {
         handler.handle_payload("hooks_updated", &payload);
 
         // Worker should receive the count
-        let count = signal_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let count = signal_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         assert_eq!(count, 512);
     }
 
@@ -3477,11 +4083,20 @@ mod tests {
         // Backtrace
         assert_eq!(notification.backtrace.len(), 2);
         assert_eq!(notification.backtrace[0].address, "0x1000");
-        assert_eq!(notification.backtrace[0].function_name, Some("foo::bar".to_string()));
-        assert_eq!(notification.backtrace[0].file, Some("src/foo.rs".to_string()));
+        assert_eq!(
+            notification.backtrace[0].function_name,
+            Some("foo::bar".to_string())
+        );
+        assert_eq!(
+            notification.backtrace[0].file,
+            Some("src/foo.rs".to_string())
+        );
         assert_eq!(notification.backtrace[0].line, Some(42));
         assert_eq!(notification.backtrace[1].address, "0x2000");
-        assert_eq!(notification.backtrace[1].module_name, Some("libsystem.dylib".to_string()));
+        assert_eq!(
+            notification.backtrace[1].module_name,
+            Some("libsystem.dylib".to_string())
+        );
         assert_eq!(notification.backtrace[1].function_name, None);
 
         // Arguments
