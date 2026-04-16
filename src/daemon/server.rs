@@ -8,8 +8,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::Instant;
+
+/// Out-of-band sender wired into each connection; used by tool handlers to
+/// emit notifications/progress during long-running operations without
+/// blocking the synchronous response path.
+pub type NotificationSender = mpsc::UnboundedSender<String>;
+
+/// RAII guard that aborts a tokio task when dropped. We use this to stop the
+/// progress-emitter as soon as the tool call returns.
+pub(crate) struct AbortOnDrop {
+    pub(crate) handle: tokio::task::AbortHandle,
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60); // 30 minutes
 const MAX_SESSIONS_PER_CONNECTION: usize = 10;
@@ -30,6 +47,10 @@ pub struct Daemon {
     shutdown_signal: Arc<tokio::sync::Notify>,
     /// Vision sidecar for UI element detection
     vision_sidecar: Arc<std::sync::Mutex<crate::ui::vision::VisionSidecar>>,
+    /// Per-connection out-of-band senders. Tool handlers use these to emit
+    /// notifications/progress (MCP 2025-06-18) on long-running operations
+    /// without blocking the synchronous request/response loop.
+    notification_senders: Arc<RwLock<HashMap<String, NotificationSender>>>,
 }
 
 fn format_event(event: &crate::db::Event, verbose: bool) -> serde_json::Value {
@@ -267,6 +288,7 @@ impl Daemon {
             vision_sidecar: Arc::new(std::sync::Mutex::new(
                 crate::ui::vision::VisionSidecar::new(),
             )),
+            notification_senders: Arc::new(RwLock::new(HashMap::new())),
         });
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -395,57 +417,255 @@ impl Daemon {
 
         tracing::info!("Client connected: {}", connection_id);
 
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                break; // EOF
+        // Create an mpsc channel so tool handlers can emit
+        // notifications/progress (MCP 2025-06-18) without blocking the
+        // synchronous request/response loop. The writer task drains this
+        // channel; anyone with the sender can push a JSON-RPC message.
+        let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<String>();
+        self.notification_senders
+            .write()
+            .await
+            .insert(connection_id.clone(), notif_tx.clone());
+
+        let writer_conn_id = connection_id.clone();
+        let writer_handle = tokio::spawn(async move {
+            while let Some(msg) = notif_rx.recv().await {
+                if writer.write_all(msg.as_bytes()).await.is_err() {
+                    break;
+                }
+                if writer.write_all(b"\n").await.is_err() {
+                    break;
+                }
+                if writer.flush().await.is_err() {
+                    break;
+                }
             }
+            tracing::debug!("Writer task exiting for connection {}", writer_conn_id);
+        });
 
-            // Update activity timestamp
-            *self.last_activity.write().await = Instant::now();
+        let read_result: Result<()> = async {
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
 
-            let response = self
-                .handle_message(&line, &mut initialized, &connection_id)
-                .await;
-            let response_json = serde_json::to_string(&response)?;
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+                *self.last_activity.write().await = Instant::now();
+
+                let maybe_response = self
+                    .handle_message(&line, &mut initialized, &connection_id)
+                    .await;
+                let Some(response) = maybe_response else {
+                    continue; // Notification — no response expected.
+                };
+                let response_json = serde_json::to_string(&response)?;
+                // Route through the writer task so ordering with any
+                // in-flight notifications is preserved.
+                if notif_tx.send(response_json).is_err() {
+                    break;
+                }
+            }
+            Ok(())
         }
+        .await;
+
+        // Drop the local sender so the writer task ends once the map entry is
+        // removed and any spawned notification tasks finish.
+        drop(notif_tx);
+        self.notification_senders
+            .write()
+            .await
+            .remove(&connection_id);
+        let _ = writer_handle.await;
 
         tracing::info!("Client disconnected: {}", connection_id);
         self.handle_disconnect(&connection_id).await;
 
-        Ok(())
+        read_result
     }
 
+    /// Spawn a task that emits periodic `notifications/progress` for a tool
+    /// call the client requested progress on. Returns an `AbortOnDrop` guard:
+    /// drop it (at the point the tool call finishes) to stop the stream.
+    async fn spawn_progress_emitter(
+        &self,
+        connection_id: &str,
+        progress_token: &serde_json::Value,
+        call: &McpToolCallRequest,
+    ) -> Option<AbortOnDrop> {
+        let senders = Arc::clone(&self.notification_senders);
+        let runs = Arc::clone(&self.test_runs);
+        let conn_id = connection_id.to_string();
+        let token = progress_token.clone();
+        let tool_name = call.name.clone();
+        let test_run_id = if call.name == "debug_test" {
+            call.arguments
+                .get("testRunId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        let handle = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let mut tick: u64 = 0;
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(1500));
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                tick = tick.saturating_add(1);
+                let elapsed_ms = start.elapsed().as_millis() as f64;
+                let message = match (tool_name.as_str(), test_run_id.as_deref()) {
+                    ("debug_test", Some(run_id)) => {
+                        let r = runs.read().await;
+                        match r.get(run_id).map(|tr| &tr.state) {
+                            Some(crate::test::TestRunState::Running { progress, .. }) => {
+                                let p = progress.lock().unwrap();
+                                format!(
+                                    "running: {} passed / {} failed / {} skipped",
+                                    p.passed, p.failed, p.skipped
+                                )
+                            }
+                            _ => format!("elapsed {:.1}s", elapsed_ms / 1000.0),
+                        }
+                    }
+                    _ => format!("elapsed {:.1}s", elapsed_ms / 1000.0),
+                };
+
+                Self::send_progress_via(
+                    &senders,
+                    &conn_id,
+                    &token,
+                    tick as f64,
+                    None,
+                    Some(&message),
+                )
+                .await;
+            }
+        });
+
+        Some(AbortOnDrop {
+            handle: handle.abort_handle(),
+        })
+    }
+
+    async fn send_progress_via(
+        senders: &Arc<RwLock<HashMap<String, NotificationSender>>>,
+        connection_id: &str,
+        progress_token: &serde_json::Value,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+    ) {
+        let guard = senders.read().await;
+        let Some(tx) = guard.get(connection_id) else {
+            return;
+        };
+
+        let mut params = serde_json::json!({
+            "progressToken": progress_token,
+            "progress": progress,
+        });
+        if let Some(t) = total {
+            params["total"] = serde_json::json!(t);
+        }
+        if let Some(m) = message {
+            params["message"] = serde_json::json!(m);
+        }
+
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": params,
+        });
+
+        if let Ok(s) = serde_json::to_string(&notif) {
+            let _ = tx.send(s);
+        }
+    }
+
+    /// Send a `notifications/progress` to the given connection.
+    /// `progress_token` is whatever the client supplied in `_meta.progressToken`.
+    pub(crate) async fn send_progress_notification(
+        &self,
+        connection_id: &str,
+        progress_token: &serde_json::Value,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+    ) {
+        let senders = self.notification_senders.read().await;
+        let Some(tx) = senders.get(connection_id) else {
+            return;
+        };
+
+        let mut params = serde_json::json!({
+            "progressToken": progress_token,
+            "progress": progress,
+        });
+        if let Some(t) = total {
+            params["total"] = serde_json::json!(t);
+        }
+        if let Some(m) = message {
+            params["message"] = serde_json::json!(m);
+        }
+
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": params,
+        });
+
+        if let Ok(s) = serde_json::to_string(&notif) {
+            let _ = tx.send(s);
+        }
+    }
+
+    /// Handle a JSON-RPC message. Returns `Some(response)` for requests and
+    /// `None` for notifications (which, per JSON-RPC 2.0, must not get a
+    /// response). Sending a response for a notification trips strict clients
+    /// into closing the socket — newer Claude Code behaves this way.
     async fn handle_message(
         &self,
         message: &str,
         initialized: &mut bool,
         connection_id: &str,
-    ) -> JsonRpcResponse {
+    ) -> Option<JsonRpcResponse> {
         let request: JsonRpcRequest = match serde_json::from_str(message) {
             Ok(r) => r,
             Err(e) => {
-                return JsonRpcResponse::error(
+                return Some(JsonRpcResponse::error(
                     serde_json::Value::Null,
                     -32700,
                     format!("Parse error: {}", e),
                     None,
-                );
+                ));
             }
         };
 
+        let is_notification = request.id.is_none();
+
         // Enforce MCP protocol: initialize must be called first
         if !*initialized && request.method != "initialize" {
-            return JsonRpcResponse::error(
-                request.id,
+            // Most MCP clients send `notifications/initialized` right after
+            // the initialize response; treat any notification that arrives
+            // before we've flipped the flag as the implicit "initialized".
+            if is_notification {
+                if request.method.ends_with("initialized") {
+                    *initialized = true;
+                }
+                return None;
+            }
+            return Some(JsonRpcResponse::error(
+                request.id.unwrap_or(serde_json::Value::Null),
                 -32002,
                 "Server not initialized. Call 'initialize' first.".to_string(),
                 None,
-            );
+            ));
         }
 
         let result = match request.method.as_str() {
@@ -456,7 +676,10 @@ impl Daemon {
                 }
                 result
             }
-            "initialized" => Ok(serde_json::json!({})),
+            m if m.starts_with("notifications/") => {
+                // Fire-and-forget; nothing else to do.
+                return None;
+            }
             "tools/list" => self.handle_tools_list().await,
             "tools/call" => self.handle_tools_call(&request.params, connection_id).await,
             _ => Err(crate::Error::Frida(format!(
@@ -465,18 +688,25 @@ impl Daemon {
             ))),
         };
 
-        match result {
-            Ok(value) => JsonRpcResponse::success(request.id, value),
+        // Notifications must never receive a response, even when we have one
+        // prepared (e.g. for an unrecognised method).
+        if is_notification {
+            return None;
+        }
+        let id = request.id.unwrap_or(serde_json::Value::Null);
+
+        Some(match result {
+            Ok(value) => JsonRpcResponse::success(id, value),
             Err(e) => {
                 let mcp_error: McpError = e.into();
                 JsonRpcResponse::error(
-                    request.id,
+                    id,
                     -32000,
                     mcp_error.message,
                     Some(serde_json::to_value(mcp_error.code).unwrap()),
                 )
             }
-        }
+        })
     }
 
     async fn handle_initialize(&self, _params: &serde_json::Value) -> Result<serde_json::Value> {
@@ -844,6 +1074,21 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
     ) -> Result<serde_json::Value> {
         let call: McpToolCallRequest = serde_json::from_value(params.clone())?;
 
+        // MCP 2025-06-18: clients can request progress updates for long-running
+        // ops by passing `_meta.progressToken` in the request params. When set
+        // we spawn a background emitter that streams notifications/progress so
+        // the client's socket stays alive past any per-tool-call timeout.
+        let progress_token = params
+            .get("_meta")
+            .and_then(|m| m.get("progressToken"))
+            .cloned();
+        let emitter_guard = if let Some(token) = progress_token.as_ref() {
+            self.spawn_progress_emitter(connection_id, token, &call)
+                .await
+        } else {
+            None
+        };
+
         let result = match call.name.as_str() {
             "debug_launch" => self.tool_debug_launch(&call.arguments, connection_id).await,
             "debug_trace" => self.tool_debug_trace(&call.arguments, connection_id).await,
@@ -875,6 +1120,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             },
             _ => Err(crate::Error::Frida(format!("Unknown tool: {}", call.name))),
         };
+
+        // The response is about to be written; stop streaming progress.
+        drop(emitter_guard);
 
         match result {
             Ok(value) => {
@@ -2231,10 +2479,15 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let req: crate::mcp::DebugTestStatusRequest = serde_json::from_value(args.clone())?;
         let test_run_id = req.test_run_id;
 
-        // Block for up to 15 seconds, returning immediately if the test completes.
-        // This throttles LLM polling while still providing timely completion results.
-        let poll_interval = std::time::Duration::from_secs(1);
-        let max_wait = std::time::Duration::from_secs(15);
+        // Return immediately with the current state. Earlier versions of this
+        // handler blocked up to 15 s as a long-poll; the newer Claude Code MCP
+        // stdio client closes its proxy socket well before that, producing
+        // `Connection closed` errors for the LLM. Immediate-return plus
+        // MCP-2025-06-18 `notifications/progress` (emitted from
+        // handle_tools_call while the tool handler runs) keeps the client
+        // informed without server-side blocking.
+        let poll_interval = std::time::Duration::from_millis(50);
+        let max_wait = std::time::Duration::from_millis(100);
         let deadline = std::time::Instant::now() + max_wait;
 
         loop {
@@ -2814,6 +3067,7 @@ mod tests {
             vision_sidecar: Arc::new(std::sync::Mutex::new(
                 crate::ui::vision::VisionSidecar::new(),
             )),
+            notification_senders: Arc::new(RwLock::new(HashMap::new())),
         };
 
         (daemon, dir)
@@ -3106,6 +3360,7 @@ mod tests {
             vision_sidecar: Arc::new(std::sync::Mutex::new(
                 crate::ui::vision::VisionSidecar::new(),
             )),
+            notification_senders: Arc::new(RwLock::new(HashMap::new())),
         };
 
         daemon.graceful_shutdown().await;
