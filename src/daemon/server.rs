@@ -941,23 +941,34 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         // Stop sessions concurrently instead of sequentially to prevent
         // cascading hangs (each stop can take up to 5s with the new timeout).
+        //
+        // Test sessions are orphaned, not killed: Claude Code's stdio MCP
+        // transport opens a new socket per tool call (e.g. one for `run`, a
+        // separate one a few seconds later for `status`), so tying session
+        // lifetime to socket lifetime kills the test before it finishes.
+        // Leave test sessions running; the next status poll finds them via
+        // test_run_id regardless of which socket issues it.
         let mut join_set = tokio::task::JoinSet::new();
         for session_id in session_ids {
             if let Ok(Some(session)) = self.session_manager.get_session(&session_id) {
                 if session.status == crate::db::SessionStatus::Running {
-                    let sm = Arc::clone(&self.session_manager);
                     let is_test = test_session_ids.contains(&session_id);
+                    if is_test {
+                        tracing::info!(
+                            "Orphaning test session {} after client disconnect \
+                             (test keeps running; status poll will collect result)",
+                            session_id
+                        );
+                        continue;
+                    }
+                    let sm = Arc::clone(&self.session_manager);
                     join_set.spawn(async move {
                         tracing::info!(
-                            "Cleaning up session {} after client disconnect",
+                            "Cleaning up non-test session {} after client disconnect",
                             session_id
                         );
                         let _ = sm.stop_frida(&session_id).await;
-                        if is_test {
-                            let _ = sm.stop_session_retain(&session_id).await;
-                        } else {
-                            let _ = sm.stop_session(&session_id).await;
-                        }
+                        let _ = sm.stop_session(&session_id).await;
                     });
                 }
             }
@@ -969,20 +980,9 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         })
         .await;
 
-        // Transition running test runs from this connection to Failed
-        {
-            let mut runs = self.test_runs.write().await;
-            for run in runs.values_mut() {
-                if run.connection_id == connection_id {
-                    if matches!(&run.state, crate::test::TestRunState::Running { .. }) {
-                        run.state = crate::test::TestRunState::Failed {
-                            error: "Client disconnected".to_string(),
-                            completed_at: std::time::Instant::now(),
-                        };
-                    }
-                }
-            }
-        }
+        // Do NOT transition running test runs to Failed here. Leaving them in
+        // Running state lets a later status poll (on a fresh socket) collect
+        // the real completion result.
     }
 
     async fn tool_debug_launch(
