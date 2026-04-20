@@ -1,3 +1,17 @@
+# bindgen (used by frida-sys) invokes libclang programmatically and does not
+# inherit the default header search paths that the `clang` driver adds. Set
+# target-triple-specific overrides so `cargo build` works out of the box on
+# each platform. bindgen consumes BINDGEN_EXTRA_CLANG_ARGS_<triple>.
+
 [env]
-# bindgen needs the Xcode SDK sysroot to find system headers like time.h
-BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+# macOS: point at the active Xcode SDK so system headers like <time.h> resolve.
+BINDGEN_EXTRA_CLANG_ARGS_x86_64-apple-darwin = "--sysroot=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+BINDGEN_EXTRA_CLANG_ARGS_aarch64-apple-darwin = "--sysroot=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+
+# Linux: libclang doesn't auto-add /usr/include or the Debian/Ubuntu multiarch
+# per-triple include dir. Its own resource dir (for <stddef.h> etc.) is
+# autodiscovered, so no clang-version-specific path is needed. Non-existent
+# include dirs (e.g. the multiarch path on Fedora/Arch) are ignored with a
+# warning. Requires libclang-dev and libc6-dev.
+BINDGEN_EXTRA_CLANG_ARGS_x86_64-unknown-linux-gnu = "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+BINDGEN_EXTRA_CLANG_ARGS_aarch64-unknown-linux-gnu = "-I/usr/include -I/usr/include/aarch64-linux-gnu"
