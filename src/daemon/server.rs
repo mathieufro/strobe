@@ -241,6 +241,33 @@ fn hook_status_message(
     }
 }
 
+/// Probe whether a daemon is actually serving requests on `socket_path`.
+///
+/// This is more reliable than PID-based liveness on macOS: a "UE" zombie
+/// (process stuck inside `proc_exit`) still appears in the kernel proc table
+/// with `pbi_status == SRUN` and `kill(pid, 0) == 0`, so naive checks lie.
+/// What it cannot do is `accept()` — so we just try to connect with a short
+/// timeout. A real daemon accepts and we return true; a stale socket either
+/// fails to connect or hangs past the timeout, and we return false.
+fn daemon_socket_responsive(socket_path: &std::path::Path) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+    // Use the std (blocking) UnixStream so this works before the tokio runtime
+    // is fully wired into the lock-acquisition path.
+    std::os::unix::net::UnixStream::connect_addr(
+        &match std::os::unix::net::SocketAddr::from_pathname(socket_path) {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        },
+    )
+    .map(|s| {
+        let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    })
+    .is_ok()
+}
+
 impl Daemon {
     pub async fn run() -> Result<()> {
         let strobe_dir = dirs::home_dir()
@@ -251,18 +278,58 @@ impl Daemon {
 
         // Acquire exclusive lock — only one daemon can run at a time.
         // The lock is held for the daemon's entire lifetime (_lock_file lives until run() returns).
+        //
+        // Stale-lock handling: if a previous daemon process became a UE-state zombie
+        // (uninterruptible-exit) on macOS — typically from a corrupted code signature
+        // or a crash during dyld init — its file descriptor (and therefore its flock)
+        // is held by the kernel until reboot. We can't break the kernel-level lock,
+        // but we *can* detect "the only thing holding this lock is a zombie" and
+        // sidestep it by recreating the lock file: `unlink` + recreate gives us a
+        // brand-new inode, so the zombie's stale fd points at the old inode and
+        // contends with no one. The PID file (if present and pointing at a live
+        // process) is the source of truth for "is a real daemon running?".
         let lock_path = strobe_dir.join("daemon.lock");
-        let _lock_file = std::fs::OpenOptions::new()
+        let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .open(&lock_path)?;
 
-        let lock_result =
-            unsafe { libc::flock(_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let mut lock_result =
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if lock_result != 0 {
-            tracing::info!("Another daemon is already running (lock held), exiting");
-            return Ok(());
+            // Another fd holds the lock. Is there actually a daemon serving
+            // requests, or is this a stale UE zombie still pinning the inode?
+            //
+            // We can't trust kill(pid, 0) or proc_pidinfo on macOS: UE zombies
+            // (processes stuck inside `proc_exit`) report as SRUN with no
+            // P_WEXIT flag set. The only signal that's reliably different is
+            // "can a real client open a connection?" — a healthy daemon
+            // accepts on `strobe.sock`; a zombie does not.
+            let socket_path_check = strobe_dir.join("strobe.sock");
+            if daemon_socket_responsive(&socket_path_check) {
+                tracing::info!("Another daemon is already running (socket responsive), exiting");
+                return Ok(());
+            }
+            tracing::warn!(
+                "daemon.lock is held but the socket is not responsive (likely a UE zombie from a previous run); recreating lock file"
+            );
+            drop(lock_file);
+            // Replace the inode so the zombie's stale fd refers to the orphaned old file.
+            let _ = std::fs::remove_file(&lock_path);
+            lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&lock_path)?;
+            lock_result =
+                unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if lock_result != 0 {
+                tracing::error!("Failed to acquire daemon.lock even after recreating it");
+                return Ok(());
+            }
         }
+        // Bind the lock file's lifetime to the rest of run(): when run() returns
+        // (graceful shutdown or fatal error) the fd closes and the lock releases.
+        let _lock_file = lock_file;
 
         let socket_path = strobe_dir.join("strobe.sock");
         let pid_path = strobe_dir.join("strobe.pid");
