@@ -19,6 +19,33 @@ fn ensure_reporter_file() -> String {
     path.to_string()
 }
 
+/// Prefer launching Vitest through a native Node binary instead of `npx`.
+/// Frida cannot reliably spawn/attach to shebang wrapper scripts such as Homebrew's npx.
+fn local_vitest_command(project_root: &Path) -> Option<TestCommand> {
+    let vitest_path = project_root.join("node_modules/vitest/vitest.mjs");
+    if !vitest_path.exists() {
+        return None;
+    }
+
+    Some(TestCommand {
+        program: "node".to_string(),
+        args: vec![vitest_path.to_string_lossy().into_owned()],
+        env: HashMap::new(),
+        cwd: None,
+        remove_env: vec![],
+    })
+}
+
+fn vitest_command(project_root: &Path) -> TestCommand {
+    local_vitest_command(project_root).unwrap_or_else(|| TestCommand {
+        program: "npx".to_string(),
+        args: vec!["vitest".to_string()],
+        env: HashMap::new(),
+        cwd: None,
+        remove_env: vec![],
+    })
+}
+
 pub struct VitestAdapter;
 
 #[derive(Deserialize)]
@@ -92,49 +119,39 @@ impl TestAdapter for VitestAdapter {
 
     fn suite_command(
         &self,
-        _project_root: &Path,
+        project_root: &Path,
         _level: Option<TestLevel>,
         _env: &HashMap<String, String>,
     ) -> crate::Result<TestCommand> {
         let reporter_path = ensure_reporter_file();
-        Ok(TestCommand {
-            program: "npx".to_string(),
-            args: vec![
-                "vitest".to_string(),
-                "run".to_string(),
-                "--pool=threads".to_string(),
-                "--reporter=json".to_string(),
-                format!("--reporter={}", reporter_path),
-                "--no-coverage".to_string(),
-            ],
-            env: HashMap::new(),
-            cwd: None,
-            remove_env: vec![],
-        })
+        let mut cmd = vitest_command(project_root);
+        cmd.args.extend([
+            "run".to_string(),
+            "--pool=threads".to_string(),
+            "--reporter=json".to_string(),
+            format!("--reporter={}", reporter_path),
+            "--no-coverage".to_string(),
+        ]);
+        Ok(cmd)
     }
 
     fn single_test_command(
         &self,
-        _project_root: &Path,
+        project_root: &Path,
         test_name: &str,
     ) -> crate::Result<TestCommand> {
         let reporter_path = ensure_reporter_file();
-        Ok(TestCommand {
-            program: "npx".to_string(),
-            args: vec![
-                "vitest".to_string(),
-                "run".to_string(),
-                "--pool=threads".to_string(),
-                "--reporter=json".to_string(),
-                format!("--reporter={}", reporter_path),
-                "--no-coverage".to_string(),
-                "-t".to_string(),
-                test_name.to_string(),
-            ],
-            env: HashMap::new(),
-            cwd: None,
-            remove_env: vec![],
-        })
+        let mut cmd = vitest_command(project_root);
+        cmd.args.extend([
+            "run".to_string(),
+            "--pool=threads".to_string(),
+            "--reporter=json".to_string(),
+            format!("--reporter={}", reporter_path),
+            "--no-coverage".to_string(),
+            "-t".to_string(),
+            test_name.to_string(),
+        ]);
+        Ok(cmd)
     }
 
     fn command_for_binary(
@@ -663,6 +680,32 @@ mod tests {
             adapter.detect(dir.path(), None) >= 90,
             "vitest.config.ts = max confidence"
         );
+    }
+
+    #[test]
+    fn test_suite_command_uses_local_vitest_with_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = VitestAdapter;
+        let vitest_dir = dir.path().join("node_modules/vitest");
+        std::fs::create_dir_all(&vitest_dir).unwrap();
+        std::fs::write(vitest_dir.join("vitest.mjs"), "").unwrap();
+
+        let cmd = adapter.suite_command(dir.path(), None, &HashMap::new()).unwrap();
+        assert_eq!(cmd.program, "node");
+        assert!(cmd.args[0].ends_with("node_modules/vitest/vitest.mjs"));
+        assert!(cmd.args.contains(&"run".to_string()));
+        assert!(cmd.args.iter().any(|a| a.contains("--reporter=json")));
+    }
+
+    #[test]
+    fn test_suite_command_falls_back_to_npx() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = VitestAdapter;
+
+        let cmd = adapter.suite_command(dir.path(), None, &HashMap::new()).unwrap();
+        assert_eq!(cmd.program, "npx");
+        assert_eq!(cmd.args[0], "vitest");
+        assert!(cmd.args.contains(&"run".to_string()));
     }
 
     #[test]
