@@ -666,11 +666,15 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
 
     flush_failure(&mut failure_ctx, &mut failures);
 
-    if all_tests.is_empty() {
-        passed = summary_passed;
-        failed = summary_failed;
-        skipped = summary_skipped;
-    }
+    // Bun's default reporter prints ✗ per-failure but no per-pass markers —
+    // passes only appear in the trailing summary (" 1582 pass"). When the
+    // summary is present, prefer it as the source of truth for any counter
+    // we counted fewer of via streaming markers. Without this we'd report
+    // passed=0 on a green run and undercount passes whenever bun is run
+    // without a verbose reporter.
+    passed = passed.max(summary_passed);
+    failed = failed.max(summary_failed);
+    skipped = skipped.max(summary_skipped);
 
     let total_duration = all_tests.iter().map(|t| t.duration_ms).sum();
     TestResult {
@@ -1304,13 +1308,34 @@ pub(crate) fn load_orchestrator(project_root: &Path) -> Option<HashMap<String, O
 pub fn update_progress(text: &str, progress: &Arc<Mutex<TestProgress>>) {
     let mut p = progress.lock().unwrap();
 
-    for line in text.lines() {
+    // Bun colorizes test markers (`\x1b[32m✓`, `\x1b[31m✗`) when stderr is
+    // a terminal. Frida's device-level capture preserves those escapes, so
+    // a literal `starts_with('✓')` check would miss every marker. The full
+    // result parser already runs through `strip_ansi_sequences` (see
+    // parse_bun_output); do the same here so the live counters move.
+    let cleaned = strip_ansi_sequences(text);
+    for line in cleaned.lines() {
         let trimmed = line.trim();
 
         // File header → transition to Running
         if is_file_header(trimmed) {
             if p.phase == super::TestPhase::Compiling {
                 p.phase = super::TestPhase::Running;
+            }
+            continue;
+        }
+
+        // Summary counter lines (" 1582 pass", " 17 fail", " 2 skip", " 3 todo").
+        // Bun's default reporter only emits ✗ markers per-test — passes are
+        // only reported in the summary block at the end of the run. Surface
+        // those numbers as soon as they arrive so the live progress reflects
+        // total passed/failed/skipped instead of just the failures we saw
+        // streamed during the run.
+        if let Some((kind, count)) = parse_summary_counter_line(trimmed) {
+            match kind {
+                SummaryKind::Pass => p.passed = p.passed.max(count),
+                SummaryKind::Fail => p.failed = p.failed.max(count),
+                SummaryKind::Skip | SummaryKind::Todo => p.skipped = p.skipped.max(count),
             }
             continue;
         }

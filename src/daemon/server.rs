@@ -578,12 +578,14 @@ impl Daemon {
         let handle = tokio::spawn(async move {
             let start = std::time::Instant::now();
             let mut tick: u64 = 0;
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(1500));
-            interval.tick().await;
+            // First emit at ~250ms so progress is visible even when the parent
+            // tool call returns sub-second (status calls long-poll up to 800ms);
+            // subsequent emits every 1500ms for longer-running tool calls.
+            let mut delay = std::time::Duration::from_millis(250);
 
             loop {
-                interval.tick().await;
+                tokio::time::sleep(delay).await;
+                delay = std::time::Duration::from_millis(1500);
                 tick = tick.saturating_add(1);
                 let elapsed_ms = start.elapsed().as_millis() as f64;
                 let message = match (tool_name.as_str(), test_run_id.as_deref()) {
@@ -2546,16 +2548,46 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let req: crate::mcp::DebugTestStatusRequest = serde_json::from_value(args.clone())?;
         let test_run_id = req.test_run_id;
 
-        // Return immediately with the current state. Earlier versions of this
-        // handler blocked up to 15 s as a long-poll; the newer Claude Code MCP
-        // stdio client closes its proxy socket well before that, producing
-        // `Connection closed` errors for the LLM. Immediate-return plus
-        // MCP-2025-06-18 `notifications/progress` (emitted from
-        // handle_tools_call while the tool handler runs) keeps the client
-        // informed without server-side blocking.
-        let poll_interval = std::time::Duration::from_millis(50);
-        let max_wait = std::time::Duration::from_millis(100);
+        // Long-poll for up to ~800 ms, returning early as soon as the test
+        // state changes (Running → Completed/Failed) OR the progress counters
+        // move. Without this, every poll while a test is mid-run returns the
+        // same numbers it returned 100 ms ago, which the LLM perceives as
+        // "nothing happening". The 800 ms ceiling stays comfortably under the
+        // ~1 s threshold at which Claude Code's MCP stdio client closes its
+        // proxy socket; longer per-tool-call waits previously produced
+        // `Connection closed` errors.
+        let poll_interval = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_millis(800);
         let deadline = std::time::Instant::now() + max_wait;
+
+        // Snapshot the initial counters so we can detect any forward motion.
+        type ProgressSnapshot = (
+            u32,
+            u32,
+            u32,
+            Option<String>,
+            crate::test::TestPhase,
+            Option<String>,
+        );
+        let initial: Option<ProgressSnapshot> = {
+            let runs = self.test_runs.read().await;
+            runs.get(&test_run_id)
+                .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
+            runs.get(&test_run_id).and_then(|tr| match &tr.state {
+                crate::test::TestRunState::Running { progress, .. } => {
+                    let p = progress.lock().unwrap();
+                    Some((
+                        p.passed,
+                        p.failed,
+                        p.skipped,
+                        p.current_test(),
+                        p.phase.clone(),
+                        p.compile_message.clone(),
+                    ))
+                }
+                _ => None,
+            })
+        };
 
         loop {
             let runs = self.test_runs.read().await;
@@ -2564,10 +2596,19 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
 
             match &test_run.state {
-                crate::test::TestRunState::Running { .. } => {
+                crate::test::TestRunState::Running { progress } => {
+                    let progress_changed = initial.as_ref().is_some_and(|init| {
+                        let p = progress.lock().unwrap();
+                        p.passed != init.0
+                            || p.failed != init.1
+                            || p.skipped != init.2
+                            || p.current_test() != init.3
+                            || p.phase != init.4
+                            || p.compile_message != init.5
+                    });
                     drop(runs);
-                    if std::time::Instant::now() >= deadline {
-                        break; // Waited long enough, return current progress
+                    if progress_changed || std::time::Instant::now() >= deadline {
+                        break;
                     }
                     tokio::time::sleep(poll_interval).await;
                 }
