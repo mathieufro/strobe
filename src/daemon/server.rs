@@ -1077,7 +1077,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                         "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' polls for results" },
                         "testRunId": { "type": "string", "description": "Test run ID (required for action: 'status')" },
                         "projectRoot": { "type": "string", "description": "Project root for adapter detection (required for action: 'run')" },
-                        "framework": { "type": "string", "enum": ["cargo", "catch2", "pytest", "unittest", "vitest", "jest", "bun", "deno", "go", "mocha", "gtest"], "description": "Override auto-detection. Usually not needed — framework is detected from projectRoot or command." },
+                        "framework": { "type": "string", "enum": ["cargo", "catch2", "pytest", "unittest", "vitest", "jest", "bun", "deno", "go", "mocha", "gtest", "playwright"], "description": "Override auto-detection. Usually not needed — framework is detected from projectRoot or command." },
                         "level": { "type": "string", "enum": ["unit", "integration", "e2e"], "description": "Filter: unit, integration, e2e. Omit for all." },
                         "test": { "type": "string", "description": "Run a single test by name (substring match — e.g. 'stuck_detector' runs all tests containing that string)" },
                         "command": { "type": "string", "description": "Path to test binary. Required for C++/Catch2 projects." },
