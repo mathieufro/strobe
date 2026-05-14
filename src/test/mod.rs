@@ -145,6 +145,9 @@ pub enum TestRunState {
 pub struct TestRun {
     pub id: String,
     pub state: TestRunState,
+    /// Number of status polls that returned/raced against a running state.
+    /// Used by the daemon to progressively lengthen long-poll waits.
+    pub status_poll_count: u32,
     /// Whether results have been fetched (eligible for cleanup).
     pub fetched: bool,
     /// Frida session ID — always set when running inside Frida.
@@ -986,6 +989,7 @@ mod tests {
         let run = TestRun {
             id: "test-abc123".to_string(),
             state: TestRunState::Running { progress },
+            status_poll_count: 0,
             fetched: false,
             session_id: Some("session-xyz".to_string()),
             project_root: "/project".to_string(),

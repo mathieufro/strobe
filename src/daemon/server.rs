@@ -32,6 +32,14 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60); // 30 minutes
 const MAX_SESSIONS_PER_CONNECTION: usize = 10;
 const MAX_TOTAL_SESSIONS: usize = 50;
 
+fn test_status_long_poll_wait(poll_count: u32) -> Duration {
+    match poll_count {
+        0 => Duration::from_secs(15),
+        1 => Duration::from_secs(30),
+        _ => Duration::from_secs(60),
+    }
+}
+
 pub struct Daemon {
     socket_path: PathBuf,
     pid_path: PathBuf,
@@ -845,7 +853,7 @@ Read globals during function execution (requires DWARF symbols). Max 32 watches.
 ## Running Tests
 
 ALWAYS use `debug_test` — never `cargo test` or test binaries via bash. Only one test run at a time per project.
-`debug_test` returns a `testRunId` immediately. Poll with `debug_test({ action: \"status\", testRunId })` — server blocks up to 15s.
+`debug_test` returns a `testRunId` immediately. Poll with `debug_test({ action: \"status\", testRunId })` until completed/failed. Do not sleep between status polls: the status call long-polls and returns immediately on completion, otherwise backing off 15s → 30s → 60s while tests keep running.
 Status includes `progress.currentTest`, `progress.warnings` (stuck detection), and `sessionId` for live tracing.
 When stuck warnings appear: add traces to investigate, then stop the session.
 Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` (path to test binary).
@@ -1070,11 +1078,11 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             },
             McpTool {
                 name: "debug_test".to_string(),
-                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — poll with action: 'status' for progress and results. Only one test run at a time per project. Use this instead of running test commands via bash.\n\nPretest scripts (e.g. `pretest:e2e` in package.json) are automatically detected and run before spawning tests. Configure timeout via .strobe/settings.json `test.timeoutMs` or the `timeout` parameter.".to_string(),
+                description: "Start a test run asynchronously or poll for results. Returns a testRunId immediately — keep calling action: 'status' until status is completed/failed. Do not insert sleeps between status polls: status long-polls and returns immediately on completion, otherwise backing off 15s → 30s → 60s while tests keep running. Only one test run at a time per project. Use this instead of running test commands via bash.\n\nPretest scripts (e.g. `pretest:e2e` in package.json) are automatically detected and run before spawning tests. Configure timeout via .strobe/settings.json `test.timeoutMs` or the `timeout` parameter.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' polls for results" },
+                        "action": { "type": "string", "enum": ["run", "status"], "description": "Action: 'run' (default) starts a test, 'status' long-polls for results. Call status again immediately while still running; do not add sleeps." },
                         "testRunId": { "type": "string", "description": "Test run ID (required for action: 'status')" },
                         "projectRoot": { "type": "string", "description": "Project root for adapter detection (required for action: 'run')" },
                         "framework": { "type": "string", "enum": ["cargo", "catch2", "pytest", "unittest", "vitest", "jest", "bun", "deno", "go", "mocha", "gtest", "playwright"], "description": "Override auto-detection. Usually not needed — framework is detected from projectRoot or command." },
@@ -2358,6 +2366,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                 crate::test::TestRun {
                     id: test_run_id.clone(),
                     state: crate::test::TestRunState::Running { progress },
+                    status_poll_count: 0,
                     fetched: false,
                     session_id: Some(session_id.clone()),
                     project_root: req.project_root.clone(),
@@ -2548,71 +2557,41 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let req: crate::mcp::DebugTestStatusRequest = serde_json::from_value(args.clone())?;
         let test_run_id = req.test_run_id;
 
-        // Long-poll for up to ~800 ms, returning early as soon as the test
-        // state changes (Running → Completed/Failed) OR the progress counters
-        // move. Without this, every poll while a test is mid-run returns the
-        // same numbers it returned 100 ms ago, which the LLM perceives as
-        // "nothing happening". The 800 ms ceiling stays comfortably under the
-        // ~1 s threshold at which Claude Code's MCP stdio client closes its
-        // proxy socket; longer per-tool-call waits previously produced
-        // `Connection closed` errors.
-        let poll_interval = std::time::Duration::from_millis(100);
-        let max_wait = std::time::Duration::from_millis(800);
-        let deadline = std::time::Instant::now() + max_wait;
-
-        // Snapshot the initial counters so we can detect any forward motion.
-        type ProgressSnapshot = (
-            u32,
-            u32,
-            u32,
-            Option<String>,
-            crate::test::TestPhase,
-            Option<String>,
-        );
-        let initial: Option<ProgressSnapshot> = {
-            let runs = self.test_runs.read().await;
-            runs.get(&test_run_id)
+        // Long-poll status requests so agents can call status again immediately
+        // instead of inventing their own sleep schedule. While the run remains
+        // active, successive polls wait 15s, then 30s, then 60s. Completion or
+        // failure returns immediately.
+        let wait_duration = {
+            let mut runs = self.test_runs.write().await;
+            let test_run = runs
+                .get_mut(&test_run_id)
                 .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
-            runs.get(&test_run_id).and_then(|tr| match &tr.state {
-                crate::test::TestRunState::Running { progress, .. } => {
-                    let p = progress.lock().unwrap();
-                    Some((
-                        p.passed,
-                        p.failed,
-                        p.skipped,
-                        p.current_test(),
-                        p.phase.clone(),
-                        p.compile_message.clone(),
-                    ))
-                }
-                _ => None,
-            })
+            if matches!(test_run.state, crate::test::TestRunState::Running { .. }) {
+                let wait = test_status_long_poll_wait(test_run.status_poll_count);
+                test_run.status_poll_count = test_run.status_poll_count.saturating_add(1);
+                Some(wait)
+            } else {
+                None
+            }
         };
 
-        loop {
-            let runs = self.test_runs.read().await;
-            let test_run = runs
-                .get(&test_run_id)
-                .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
+        if let Some(max_wait) = wait_duration {
+            let poll_interval = std::time::Duration::from_millis(100);
+            let deadline = std::time::Instant::now() + max_wait;
 
-            match &test_run.state {
-                crate::test::TestRunState::Running { progress } => {
-                    let progress_changed = initial.as_ref().is_some_and(|init| {
-                        let p = progress.lock().unwrap();
-                        p.passed != init.0
-                            || p.failed != init.1
-                            || p.skipped != init.2
-                            || p.current_test() != init.3
-                            || p.phase != init.4
-                            || p.compile_message != init.5
-                    });
-                    drop(runs);
-                    if progress_changed || std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::time::sleep(poll_interval).await;
+            loop {
+                let is_running = {
+                    let runs = self.test_runs.read().await;
+                    let test_run = runs
+                        .get(&test_run_id)
+                        .ok_or_else(|| crate::Error::TestRunNotFound(test_run_id.clone()))?;
+                    matches!(test_run.state, crate::test::TestRunState::Running { .. })
+                };
+
+                if !is_running || std::time::Instant::now() >= deadline {
+                    break;
                 }
-                _ => break, // Completed or Failed — return immediately
+                tokio::time::sleep(poll_interval).await;
             }
         }
 
@@ -3205,6 +3184,20 @@ mod tests {
         .to_string()
     }
 
+    fn expect_json_rpc_response(
+        resp: Option<crate::mcp::JsonRpcResponse>,
+    ) -> crate::mcp::JsonRpcResponse {
+        resp.expect("Expected JSON-RPC response")
+    }
+
+    #[test]
+    fn test_debug_test_status_long_poll_backoff() {
+        assert_eq!(test_status_long_poll_wait(0), Duration::from_secs(15));
+        assert_eq!(test_status_long_poll_wait(1), Duration::from_secs(30));
+        assert_eq!(test_status_long_poll_wait(2), Duration::from_secs(60));
+        assert_eq!(test_status_long_poll_wait(99), Duration::from_secs(60));
+    }
+
     #[tokio::test]
     async fn test_initialize_enforcement_rejects_before_init() {
         let (daemon, _dir) = test_daemon();
@@ -3213,7 +3206,8 @@ mod tests {
 
         // Call tools/list before initialize — should be rejected
         let msg = make_request("tools/list", 1);
-        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+        let resp =
+            expect_json_rpc_response(daemon.handle_message(&msg, &mut initialized, conn_id).await);
 
         assert!(!initialized);
         assert!(resp.error.is_some());
@@ -3230,16 +3224,19 @@ mod tests {
 
         // Initialize first
         let init_msg = make_initialize_request();
-        let resp = daemon
-            .handle_message(&init_msg, &mut initialized, conn_id)
-            .await;
+        let resp = expect_json_rpc_response(
+            daemon
+                .handle_message(&init_msg, &mut initialized, conn_id)
+                .await,
+        );
         assert!(initialized);
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
 
         // Now tools/list should succeed
         let msg = make_request("tools/list", 2);
-        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+        let resp =
+            expect_json_rpc_response(daemon.handle_message(&msg, &mut initialized, conn_id).await);
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
@@ -3253,9 +3250,11 @@ mod tests {
         // Send initialize — even with empty params, our handler accepts it (params are ignored)
         // But a truly broken JSON should be rejected at parse level
         let bad_json = "not json at all";
-        let resp = daemon
-            .handle_message(bad_json, &mut initialized, conn_id)
-            .await;
+        let resp = expect_json_rpc_response(
+            daemon
+                .handle_message(bad_json, &mut initialized, conn_id)
+                .await,
+        );
 
         // Parse error should not set initialized
         assert!(!initialized);
@@ -3528,7 +3527,8 @@ mod tests {
             .await;
 
         let msg = make_debug_ui_call("nonexistent-session", "tree", 10);
-        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+        let resp =
+            expect_json_rpc_response(daemon.handle_message(&msg, &mut initialized, conn_id).await);
 
         // Tool errors are wrapped as successful JSON-RPC with isError in content
         let result = resp.result.expect("Should have result");
@@ -3571,7 +3571,8 @@ mod tests {
             .unwrap();
 
         let msg = make_debug_ui_call(&session_id, "tree", 10);
-        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+        let resp =
+            expect_json_rpc_response(daemon.handle_message(&msg, &mut initialized, conn_id).await);
 
         let result = resp.result.expect("Should have result");
         let is_error = result
@@ -3623,7 +3624,8 @@ mod tests {
             }
         })
         .to_string();
-        let resp = daemon.handle_message(&msg, &mut initialized, conn_id).await;
+        let resp =
+            expect_json_rpc_response(daemon.handle_message(&msg, &mut initialized, conn_id).await);
 
         let result = resp.result.expect("Should have result");
         let is_error = result
@@ -3687,7 +3689,8 @@ mod tests {
             }
         })
         .to_string();
-        let resp = daemon.handle_message(&msg, initialized, conn_id).await;
+        let resp =
+            expect_json_rpc_response(daemon.handle_message(&msg, initialized, conn_id).await);
         assert!(resp.error.is_none(), "JSON-RPC error: {:?}", resp.error);
         resp.result.expect("MCP tool call should have result")
     }

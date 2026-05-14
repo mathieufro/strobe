@@ -409,7 +409,7 @@ Ships with a TDD skill that instructs the LLM to guide users toward test-first d
 
 #### Async Test Execution
 
-`debug_test(action: "run")` returns immediately with a `testRunId`. Poll with `debug_test(action: "status", testRunId: ...)` for progress and results. The server blocks up to 15s per poll, throttling LLM calls while providing timely completion. Progress includes `currentTest`, `currentTestElapsedMs`, and `currentTestBaselineMs` (historical average from last 10 runs).
+`debug_test(action: "run")` returns immediately with a `testRunId`. Poll with `debug_test(action: "status", testRunId: ...)` for progress and results. Status calls long-poll and return immediately on completion; while tests keep running they back off 15s, then 30s, then 60s. Progress includes `currentTest`, `currentTestElapsedMs`, and `currentTestBaselineMs` (historical average from last 10 runs).
 
 #### File-Based Settings System
 
