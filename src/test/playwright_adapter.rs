@@ -23,6 +23,306 @@ fn progress_file_path() -> String {
 
 pub struct PlaywrightAdapter;
 
+impl PlaywrightAdapter {
+    pub fn new() -> Self {
+        PlaywrightAdapter
+    }
+
+    /// Run playwright tests and emit an NDJSON event stream into `run_dir`.
+    pub async fn run(
+        &self,
+        project_root: &Path,
+        run_dir: &Path,
+        config: &RunConfig,
+    ) -> std::io::Result<RunResult> {
+        use super::event_stream::{EventStream, FailureDetail, TestEvent};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        std::fs::create_dir_all(run_dir)?;
+        let events_path = run_dir.join("events.ndjson");
+        let mut stream = EventStream::create(&events_path)?;
+
+        let report_path = run_dir.join("pw-report.json");
+        let _ = std::fs::remove_file(&report_path);
+
+        let run_id = format!("pw-{}", super::adapter_util::nano_id());
+        let mode_str = match config.mode {
+            Mode::FirstFail => "first-fail",
+            Mode::CollectAll => "collect-all",
+        };
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let start = std::time::Instant::now();
+
+        stream.emit(TestEvent::RunStarted {
+            run_id: run_id.clone(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            suite: "default".into(),
+            framework: "playwright".into(),
+            mode: mode_str.into(),
+            started_at_ms,
+        })?;
+
+        let pw_path = project_root.join("node_modules/.bin/playwright");
+        let mut args: Vec<String> = vec!["test".into(), "--reporter=json".into()];
+        if config.mode == Mode::FirstFail {
+            args.push("-x".into());
+        }
+        if let Some(filter) = &config.test_filter {
+            args.push(filter.clone());
+        }
+
+        let output = tokio::process::Command::new(&pw_path)
+            .args(&args)
+            .current_dir(project_root)
+            .env("PLAYWRIGHT_JSON_OUTPUT_NAME", &report_path)
+            .output()
+            .await?;
+        let exit_code = output.status.code().unwrap_or(-1);
+        // Playwright may also write JSON to stdout when env var is set; we use the file.
+        // If file is missing, fall back to stdout content.
+        if !report_path.exists() {
+            let _ = std::fs::write(&report_path, &output.stdout);
+        }
+
+        let cases = parse_pw_json(&report_path).unwrap_or_default();
+
+        let mut passed = 0u32;
+        let mut failed = 0u32;
+        let mut skipped = 0u32;
+        for case in &cases {
+            let test_id = format!("{}::{}", case.file, case.title);
+            let artifact_dir = super::adapter_util::artifact_dir(&case.file, &case.title);
+
+            stream.emit(TestEvent::TestStarted {
+                test_id: test_id.clone(),
+                file: case.file.clone(),
+                line: case.line,
+            })?;
+
+            let duration_ms = case.duration_ms;
+
+            match case.status.as_str() {
+                "skipped" | "didnotrun" => {
+                    skipped += 1;
+                    stream.emit(TestEvent::TestSkipped {
+                        test_id,
+                        file: case.file.clone(),
+                        reason: case.status.clone(),
+                    })?;
+                }
+                "failed" | "timedout" | "interrupted" => {
+                    failed += 1;
+                    let code_context = super::adapter_util::read_code_context(
+                        project_root,
+                        &case.file,
+                        case.fail_line.unwrap_or(case.line),
+                    )
+                    .unwrap_or_default();
+                    stream.emit(TestEvent::TestFailed {
+                        test_id,
+                        file: case.file.clone(),
+                        line: case.fail_line.unwrap_or(case.line),
+                        duration_ms,
+                        error: FailureDetail {
+                            message: strip_ansi(case.message.as_deref().unwrap_or("test failed")),
+                            kind: "Error".into(),
+                            stack_frames: vec![],
+                            expected: case.expected.clone(),
+                            actual: case.actual.clone(),
+                            code_context,
+                        },
+                        artifact_dir,
+                    })?;
+                }
+                _ => {
+                    passed += 1;
+                    stream.emit(TestEvent::TestPassed {
+                        test_id,
+                        file: case.file.clone(),
+                        line: case.line,
+                        duration_ms,
+                        artifact_dir,
+                    })?;
+                }
+            }
+        }
+
+        let total = passed + failed + skipped;
+        stream.emit(TestEvent::RunComplete {
+            run_id,
+            exit_code,
+            total,
+            passed,
+            failed,
+            stalled: 0,
+            skipped,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })?;
+
+        Ok(RunResult { exit_code })
+    }
+}
+
+impl Default for PlaywrightAdapter {
+    fn default() -> Self {
+        PlaywrightAdapter::new()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PwCase {
+    file: String,
+    title: String,
+    line: u32,
+    duration_ms: u64,
+    status: String,
+    message: Option<String>,
+    expected: Option<String>,
+    actual: Option<String>,
+    fail_line: Option<u32>,
+}
+
+fn parse_pw_json(path: &Path) -> Option<Vec<PwCase>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let suites = v.get("suites")?.as_array()?;
+    let mut out = Vec::new();
+    collect_suites(suites, &mut out);
+    Some(out)
+}
+
+fn collect_suites(suites: &[serde_json::Value], out: &mut Vec<PwCase>) {
+    for suite in suites {
+        if let Some(specs) = suite.get("specs").and_then(|s| s.as_array()) {
+            for spec in specs {
+                let file = spec
+                    .get("file")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let title = spec
+                    .get("title")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = spec.get("line").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+                let tests = match spec.get("tests").and_then(|t| t.as_array()) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                for t in tests {
+                    let results = match t.get("results").and_then(|r| r.as_array()) {
+                        Some(r) if !r.is_empty() => r,
+                        _ => {
+                            out.push(PwCase {
+                                file: file.clone(),
+                                title: title.clone(),
+                                line,
+                                status: "didnotrun".into(),
+                                ..Default::default()
+                            });
+                            continue;
+                        }
+                    };
+                    // Emit one PwCase per result (per-attempt for retries).
+                    for r in results {
+                        let status = r
+                            .get("status")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let duration_ms =
+                            r.get("duration").and_then(|d| d.as_u64()).unwrap_or(0);
+                        let mut case = PwCase {
+                            file: file.clone(),
+                            title: title.clone(),
+                            line,
+                            duration_ms,
+                            status,
+                            ..Default::default()
+                        };
+                        if case.status == "failed"
+                            || case.status == "timedOut"
+                            || case.status == "interrupted"
+                        {
+                            case.status = case.status.to_lowercase();
+                            if let Some(errs) = r.get("errors").and_then(|e| e.as_array()) {
+                                if let Some(first) = errs.first() {
+                                    if let Some(msg) =
+                                        first.get("message").and_then(|m| m.as_str())
+                                    {
+                                        let (expected, actual) =
+                                            extract_expected_actual(&strip_ansi(msg));
+                                        case.expected = expected;
+                                        case.actual = actual;
+                                        case.message = Some(msg.to_string());
+                                    }
+                                    if let Some(loc) = first.get("location") {
+                                        if let Some(ln) =
+                                            loc.get("line").and_then(|l| l.as_u64())
+                                        {
+                                            case.fail_line = Some(ln as u32);
+                                        }
+                                        if let Some(f) =
+                                            loc.get("file").and_then(|f| f.as_str())
+                                        {
+                                            // Prefer the absolute file path from the error location.
+                                            case.file = f.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        out.push(case);
+                    }
+                }
+            }
+        }
+        if let Some(child) = suite.get("suites").and_then(|s| s.as_array()) {
+            collect_suites(child, out);
+        }
+    }
+}
+
+fn extract_expected_actual(msg: &str) -> (Option<String>, Option<String>) {
+    let mut expected: Option<String> = None;
+    let mut actual: Option<String> = None;
+    for line in msg.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Expected:") {
+            expected = Some(rest.trim().to_string());
+        } else if let Some(rest) = t.strip_prefix("Received:") {
+            actual = Some(rest.trim().to_string());
+        }
+    }
+    (expected, actual)
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{001b}' {
+            // Skip CSI / OSC sequences until a letter terminator.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if nc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl TestAdapter for PlaywrightAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
         // Direct config in project root

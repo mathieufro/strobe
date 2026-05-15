@@ -597,6 +597,22 @@ pub struct DebugTestRequest {
     /// Use when automatic symbol resolution fails in complex projects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbols_path: Option<String>,
+    /// Execution mode for the NDJSON-emitting test path.
+    /// Defaults to `first-fail` (bail at first failure). `collect-all` runs the full suite.
+    #[serde(default)]
+    pub mode: crate::test::adapter::Mode,
+    /// Hard timeout in minutes (1..=240). Defaults to 30. Capped at 240.
+    #[serde(default, deserialize_with = "deserialize_timeout_min")]
+    pub timeout_min: Option<u32>,
+}
+
+fn deserialize_timeout_min<'de, D>(de: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v: Option<u32> = Option::deserialize(de)?;
+    Ok(v.map(|n| n.clamp(1, 240)))
 }
 
 impl DebugTestRequest {
@@ -2570,6 +2586,47 @@ mod test_consolidation_tests {
         });
         let req: DebugTestRequest = serde_json::from_value(json).unwrap();
         assert!(req.action.is_none()); // None treated as "run"
+    }
+
+    #[test]
+    fn default_mode_is_first_fail() {
+        let json = serde_json::json!({ "projectRoot": "/tmp/proj" });
+        let req: DebugTestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.mode, crate::test::adapter::Mode::FirstFail);
+    }
+
+    #[test]
+    fn collect_all_mode_parses() {
+        let json = serde_json::json!({ "projectRoot": "/tmp/proj", "mode": "collect-all" });
+        let req: DebugTestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.mode, crate::test::adapter::Mode::CollectAll);
+    }
+
+    #[test]
+    fn unknown_mode_errors() {
+        let json = serde_json::json!({ "projectRoot": "/tmp/proj", "mode": "explode-on-fail" });
+        let result: std::result::Result<DebugTestRequest, _> = serde_json::from_value(json);
+        let err = result.expect_err("unknown mode must error");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("mode") || msg.contains("variant") || msg.contains("unknown"),
+            "expected mode/variant in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn timeout_min_clamps_to_240() {
+        let json = serde_json::json!({ "projectRoot": "/tmp/proj", "timeoutMin": 999 });
+        let req: DebugTestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.timeout_min, Some(240));
+    }
+
+    #[test]
+    fn timeout_min_clamps_to_one_minimum() {
+        let json = serde_json::json!({ "projectRoot": "/tmp/proj", "timeoutMin": 0 });
+        let req: DebugTestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.timeout_min, Some(1));
     }
 }
 

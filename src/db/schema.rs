@@ -107,6 +107,19 @@ impl Database {
         add_column_if_not_exists(&conn, "events", "breakpoint_id", "TEXT")?;
         add_column_if_not_exists(&conn, "events", "logpoint_message", "TEXT")?;
 
+        // Per-test adaptive stuck detection: rolling green-time stats.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS test_stats (
+                project_root TEXT NOT NULL,
+                test_id TEXT NOT NULL,
+                durations_ms TEXT NOT NULL,
+                median_ms INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (project_root, test_id)
+            )",
+            [],
+        )?;
+
         // C++ exception tracing columns
         add_column_if_not_exists(&conn, "events", "exception_type", "TEXT")?;
         add_column_if_not_exists(&conn, "events", "exception_message", "TEXT")?;

@@ -1,5 +1,18 @@
 pub mod adapter;
+pub mod adaptive_detector;
+#[cfg(test)]
+mod adaptive_detector_tests;
+pub mod adapter_util;
+pub mod artifacts;
+#[cfg(test)]
+mod artifacts_tests;
 pub mod bun_adapter;
+#[cfg(test)]
+mod bun_adapter_tests;
+pub mod event_stream;
+#[cfg(test)]
+mod event_stream_tests;
+
 pub mod cargo_adapter;
 pub mod catch2_adapter;
 pub mod deno_adapter;
@@ -9,11 +22,18 @@ pub mod jest_adapter;
 pub mod mocha_adapter;
 pub mod output;
 pub mod playwright_adapter;
+#[cfg(test)]
+mod playwright_adapter_tests;
 pub mod pytest_adapter;
 pub mod stacks;
 pub mod stuck_detector;
+pub mod summary;
+#[cfg(test)]
+mod summary_tests;
 pub mod unittest_adapter;
 pub mod vitest_adapter;
+#[cfg(test)]
+mod vitest_adapter_tests;
 
 use serde::Serialize;
 use std::collections::HashMap;

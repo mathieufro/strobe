@@ -9,6 +9,295 @@ use super::TestProgress;
 
 pub struct BunAdapter;
 
+impl BunAdapter {
+    pub fn new() -> Self {
+        BunAdapter
+    }
+
+    /// Run bun tests and emit an NDJSON event stream into `run_dir`.
+    ///
+    /// Spawns `bun test` with the junit reporter, parses the XML + stderr to
+    /// reconstruct per-test events, and writes them as they are derived. With
+    /// `Mode::FirstFail`, passes `--bail=1` so bun stops after the first failure.
+    pub async fn run(
+        &self,
+        project_root: &Path,
+        run_dir: &Path,
+        config: &RunConfig,
+    ) -> std::io::Result<RunResult> {
+        use super::event_stream::{EventStream, FailureDetail, TestEvent};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        std::fs::create_dir_all(run_dir)?;
+        let events_path = run_dir.join("events.ndjson");
+        let mut stream = EventStream::create(&events_path)?;
+
+        let junit_path = run_dir.join("junit.xml");
+        let _ = std::fs::remove_file(&junit_path);
+
+        let run_id = format!("bun-{}", super::adapter_util::nano_id());
+        let mode_str = match config.mode {
+            Mode::FirstFail => "first-fail",
+            Mode::CollectAll => "collect-all",
+        };
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let start_instant = std::time::Instant::now();
+
+        stream.emit(TestEvent::RunStarted {
+            run_id: run_id.clone(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            suite: "default".into(),
+            framework: "bun".into(),
+            mode: mode_str.into(),
+            started_at_ms,
+        })?;
+
+        let mut args: Vec<String> = vec!["test".into()];
+        if config.mode == Mode::FirstFail {
+            args.push("--bail=1".into());
+        }
+        args.push("--reporter=junit".into());
+        args.push(format!("--reporter-outfile={}", junit_path.display()));
+        if let Some(filter) = &config.test_filter {
+            args.push(filter.clone());
+        }
+
+        let output = tokio::process::Command::new("bun")
+            .args(&args)
+            .current_dir(project_root)
+            .output()
+            .await?;
+        let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        let cases = parse_junit(&junit_path).unwrap_or_default();
+        let failure_details = parse_stderr_failures(&stderr_text);
+
+        let mut passed = 0u32;
+        let mut failed = 0u32;
+        let mut skipped = 0u32;
+        for case in &cases {
+            let test_id = format!("{}::{}", case.file, case.name);
+            let artifact_dir = super::adapter_util::artifact_dir(&case.file, &case.name);
+
+            stream.emit(TestEvent::TestStarted {
+                test_id: test_id.clone(),
+                file: case.file.clone(),
+                line: case.line,
+            })?;
+
+            let duration_ms = (case.time_sec * 1000.0) as u64;
+
+            if case.skipped {
+                skipped += 1;
+                stream.emit(TestEvent::TestSkipped {
+                    test_id,
+                    file: case.file.clone(),
+                    reason: "skipped".into(),
+                })?;
+            } else if case.failed {
+                failed += 1;
+                let detail = failure_details
+                    .iter()
+                    .find(|d| d.matches(&case.file, &case.name))
+                    .cloned();
+                let code_context =
+                    super::adapter_util::read_code_context(project_root, &case.file, case.line)
+                        .unwrap_or_default();
+                let (message, expected, actual) = match detail {
+                    Some(d) => (d.message, d.expected, d.actual),
+                    None => ("test failed".into(), None, None),
+                };
+                stream.emit(TestEvent::TestFailed {
+                    test_id,
+                    file: case.file.clone(),
+                    line: case.line,
+                    duration_ms,
+                    error: FailureDetail {
+                        message,
+                        kind: "AssertionError".into(),
+                        stack_frames: vec![],
+                        expected,
+                        actual,
+                        code_context,
+                    },
+                    artifact_dir,
+                })?;
+            } else {
+                passed += 1;
+                stream.emit(TestEvent::TestPassed {
+                    test_id,
+                    file: case.file.clone(),
+                    line: case.line,
+                    duration_ms,
+                    artifact_dir,
+                })?;
+            }
+        }
+
+        let total = passed + failed + skipped;
+        stream.emit(TestEvent::RunComplete {
+            run_id,
+            exit_code,
+            total,
+            passed,
+            failed,
+            stalled: 0,
+            skipped,
+            duration_ms: start_instant.elapsed().as_millis() as u64,
+        })?;
+
+        Ok(RunResult { exit_code })
+    }
+}
+
+impl Default for BunAdapter {
+    fn default() -> Self {
+        BunAdapter::new()
+    }
+}
+
+/// One testcase row parsed out of a bun junit.xml report.
+#[derive(Debug, Default)]
+struct JUnitCase {
+    file: String,
+    name: String,
+    line: u32,
+    time_sec: f64,
+    failed: bool,
+    skipped: bool,
+}
+
+fn parse_junit(path: &Path) -> Option<Vec<JUnitCase>> {
+    let xml = std::fs::read_to_string(path).ok()?;
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(&xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut cases: Vec<JUnitCase> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name_str = std::str::from_utf8(e.name().as_ref()).unwrap_or("").to_string();
+                if name_str == "testcase" {
+                    let mut case = JUnitCase::default();
+                    for attr in e.attributes().flatten() {
+                        let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+                        let val = attr
+                            .unescape_value()
+                            .map(|v| v.into_owned())
+                            .unwrap_or_default();
+                        match key {
+                            "file" => case.file = val,
+                            "name" => case.name = val,
+                            "line" => case.line = val.parse().unwrap_or(0),
+                            "time" => case.time_sec = val.parse().unwrap_or(0.0),
+                            _ => {}
+                        }
+                    }
+                    cases.push(case);
+                } else if name_str == "failure" {
+                    if let Some(last) = cases.last_mut() {
+                        last.failed = true;
+                    }
+                } else if name_str == "skipped" {
+                    if let Some(last) = cases.last_mut() {
+                        last.skipped = true;
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Some(cases)
+}
+
+#[derive(Debug, Clone)]
+struct StderrFailure {
+    file: String,
+    line: u32,
+    message: String,
+    expected: Option<String>,
+    actual: Option<String>,
+}
+
+impl StderrFailure {
+    fn matches(&self, file: &str, _name: &str) -> bool {
+        self.file.ends_with(file) || file.ends_with(&self.file) || self.file == file
+    }
+}
+
+/// Parse bun's stderr to extract failure messages with expected/received pairs.
+fn parse_stderr_failures(stderr: &str) -> Vec<StderrFailure> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = stderr.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(rest) = line.trim_start().strip_prefix("error: ") {
+            let mut message = rest.to_string();
+            let mut expected: Option<String> = None;
+            let mut actual: Option<String> = None;
+            // Look ahead for Expected/Received lines and a stack frame.
+            let mut j = i + 1;
+            let mut file = String::new();
+            let mut file_line: u32 = 0;
+            while j < lines.len() && j < i + 30 {
+                let l = lines[j];
+                if let Some(v) = l.trim_start().strip_prefix("Expected: ") {
+                    expected = Some(v.trim().trim_matches('"').to_string());
+                } else if let Some(v) = l.trim_start().strip_prefix("Received: ") {
+                    actual = Some(v.trim().trim_matches('"').to_string());
+                } else if let Some(at_idx) = l.find(" at ") {
+                    let frame = &l[at_idx + 4..];
+                    if let Some(open) = frame.find('(') {
+                        if let Some(close) = frame.rfind(')') {
+                            let path = &frame[open + 1..close];
+                            if let Some((p, lineno)) = path.rsplit_once(':') {
+                                if let Some((p2, _col)) = p.rsplit_once(':') {
+                                    file = p2.to_string();
+                                    file_line = lineno.parse().unwrap_or(0);
+                                } else {
+                                    file = p.to_string();
+                                    file_line = lineno.parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if expected.is_some() || actual.is_some() {
+                message = format!("expected {} got {}",
+                    expected.as_deref().unwrap_or("?"),
+                    actual.as_deref().unwrap_or("?"));
+            }
+            out.push(StderrFailure {
+                file,
+                line: file_line,
+                message,
+                expected,
+                actual,
+            });
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 impl TestAdapter for BunAdapter {
     fn detect(&self, project_root: &Path, _command: Option<&str>) -> u8 {
         // Direct bunfig.toml — strong signal for bun:test

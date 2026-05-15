@@ -126,6 +126,36 @@ pub struct ProjectInfo {
     pub test_files: u32,
 }
 
+/// Test execution mode for the new NDJSON-emitting adapter path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// Stop after the first failure (bail=1).
+    FirstFail,
+    /// Run every test to completion regardless of failures.
+    CollectAll,
+}
+
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::FirstFail
+    }
+}
+
+/// Configuration for the NDJSON-emitting run path.
+#[derive(Debug, Clone, Default)]
+pub struct RunConfig {
+    /// Filter passed to the test runner (e.g. file substring for bun).
+    pub test_filter: Option<String>,
+    pub mode: Mode,
+}
+
+/// Result returned by an NDJSON-emitting run.
+#[derive(Debug, Clone)]
+pub struct RunResult {
+    pub exit_code: i32,
+}
+
 pub trait TestAdapter: Send + Sync {
     /// Scan projectRoot for signals. Returns 0-100 confidence. Highest wins.
     fn detect(&self, project_root: &Path, command: Option<&str>) -> u8;

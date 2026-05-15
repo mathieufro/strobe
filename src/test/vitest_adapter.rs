@@ -48,6 +48,272 @@ fn vitest_command(project_root: &Path) -> TestCommand {
 
 pub struct VitestAdapter;
 
+impl VitestAdapter {
+    pub fn new() -> Self {
+        VitestAdapter
+    }
+
+    /// Run vitest and emit an NDJSON event stream into `run_dir`.
+    pub async fn run(
+        &self,
+        project_root: &Path,
+        run_dir: &Path,
+        config: &RunConfig,
+    ) -> std::io::Result<RunResult> {
+        use super::event_stream::{EventStream, FailureDetail, TestEvent};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        std::fs::create_dir_all(run_dir)?;
+        let events_path = run_dir.join("events.ndjson");
+        let mut stream = EventStream::create(&events_path)?;
+
+        let report_path = run_dir.join("vitest-report.json");
+        let _ = std::fs::remove_file(&report_path);
+
+        let run_id = format!("vitest-{}", super::adapter_util::nano_id());
+        let mode_str = match config.mode {
+            Mode::FirstFail => "first-fail",
+            Mode::CollectAll => "collect-all",
+        };
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let start = std::time::Instant::now();
+
+        stream.emit(TestEvent::RunStarted {
+            run_id: run_id.clone(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            suite: "default".into(),
+            framework: "vitest".into(),
+            mode: mode_str.into(),
+            started_at_ms,
+        })?;
+
+        let cmd = vitest_command(project_root);
+        let mut args = cmd.args.clone();
+        args.push("run".into());
+        if config.mode == Mode::FirstFail {
+            args.push("--bail=1".into());
+        }
+        args.push("--reporter=json".into());
+        args.push(format!("--outputFile={}", report_path.display()));
+        if let Some(filter) = &config.test_filter {
+            args.push(filter.clone());
+        }
+
+        let output = tokio::process::Command::new(&cmd.program)
+            .args(&args)
+            .current_dir(project_root)
+            .output()
+            .await?;
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        let cases = parse_vitest_json(&report_path).unwrap_or_default();
+
+        let mut passed = 0u32;
+        let mut failed = 0u32;
+        let mut skipped = 0u32;
+        for case in &cases {
+            let test_id = format!("{}::{}", case.file, case.name);
+            let artifact_dir = super::adapter_util::artifact_dir(&case.file, &case.name);
+
+            stream.emit(TestEvent::TestStarted {
+                test_id: test_id.clone(),
+                file: case.file.clone(),
+                line: case.line,
+            })?;
+
+            let duration_ms = (case.time_sec * 1000.0) as u64;
+
+            if case.skipped {
+                skipped += 1;
+                stream.emit(TestEvent::TestSkipped {
+                    test_id,
+                    file: case.file.clone(),
+                    reason: "skipped".into(),
+                })?;
+            } else if case.failed {
+                failed += 1;
+                let code_context = super::adapter_util::read_code_context(
+                    project_root,
+                    &case.file,
+                    case.line,
+                )
+                .unwrap_or_default();
+                stream.emit(TestEvent::TestFailed {
+                    test_id,
+                    file: case.file.clone(),
+                    line: case.line,
+                    duration_ms,
+                    error: FailureDetail {
+                        message: case.failure_message.clone().unwrap_or_default(),
+                        kind: case.failure_kind.clone().unwrap_or_else(|| "AssertionError".into()),
+                        stack_frames: vec![],
+                        expected: case.expected.clone(),
+                        actual: case.actual.clone(),
+                        code_context,
+                    },
+                    artifact_dir,
+                })?;
+            } else {
+                passed += 1;
+                stream.emit(TestEvent::TestPassed {
+                    test_id,
+                    file: case.file.clone(),
+                    line: case.line,
+                    duration_ms,
+                    artifact_dir,
+                })?;
+            }
+        }
+
+        let total = passed + failed + skipped;
+        stream.emit(TestEvent::RunComplete {
+            run_id,
+            exit_code,
+            total,
+            passed,
+            failed,
+            stalled: 0,
+            skipped,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })?;
+
+        Ok(RunResult { exit_code })
+    }
+}
+
+impl Default for VitestAdapter {
+    fn default() -> Self {
+        VitestAdapter::new()
+    }
+}
+
+#[derive(Debug, Default)]
+struct VitestCase {
+    file: String,
+    name: String,
+    line: u32,
+    time_sec: f64,
+    failed: bool,
+    skipped: bool,
+    failure_message: Option<String>,
+    failure_kind: Option<String>,
+    expected: Option<String>,
+    actual: Option<String>,
+}
+
+/// Parse vitest's `--reporter=json` report file into per-test cases.
+fn parse_vitest_json(path: &Path) -> Option<Vec<VitestCase>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let test_results = v.get("testResults")?.as_array()?;
+    let mut cases = Vec::new();
+    for file_result in test_results {
+        let file = file_result
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        let assertions = match file_result.get("assertionResults").and_then(|a| a.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for a in assertions {
+            let title = a
+                .get("fullName")
+                .and_then(|s| s.as_str())
+                .or_else(|| a.get("title").and_then(|s| s.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let status = a.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let duration_ms = a
+                .get("duration")
+                .and_then(|d| d.as_f64())
+                .unwrap_or(0.0);
+            let mut case = VitestCase {
+                file: file.clone(),
+                name: title,
+                line: 0,
+                time_sec: duration_ms / 1000.0,
+                failed: status == "failed",
+                skipped: matches!(status, "pending" | "skipped" | "todo"),
+                failure_message: None,
+                failure_kind: None,
+                expected: None,
+                actual: None,
+            };
+            if case.failed {
+                if let Some(msgs) = a.get("failureMessages").and_then(|m| m.as_array()) {
+                    if let Some(first) = msgs.first().and_then(|m| m.as_str()) {
+                        let (line, expected, actual, message, kind) =
+                            extract_from_failure_text(first, &file);
+                        case.line = line;
+                        case.expected = expected;
+                        case.actual = actual;
+                        case.failure_message = Some(message);
+                        case.failure_kind = kind;
+                    }
+                }
+            }
+            cases.push(case);
+        }
+    }
+    Some(cases)
+}
+
+/// Extract (line, expected, actual, message, kind) from a vitest failure body.
+fn extract_from_failure_text(
+    text: &str,
+    file: &str,
+) -> (u32, Option<String>, Option<String>, String, Option<String>) {
+    let mut line: u32 = 0;
+    let mut expected: Option<String> = None;
+    let mut actual: Option<String> = None;
+    let mut message = String::new();
+    let mut kind: Option<String> = None;
+
+    let lines: Vec<&str> = text.lines().collect();
+    if let Some(first) = lines.first() {
+        if let Some((k, rest)) = first.split_once(": ") {
+            kind = Some(k.trim().to_string());
+            message = rest.trim().to_string();
+        } else {
+            message = first.trim().to_string();
+        }
+    }
+
+    for raw in &lines {
+        let l = raw.trim_end();
+        let trimmed = l.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            if expected.is_none() && !rest.is_empty() {
+                expected = Some(rest.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("+ ") {
+            if actual.is_none() && !rest.is_empty() {
+                actual = Some(rest.to_string());
+            }
+        }
+        // Stack frames: "at <name> (path:line:col)" or "at path:line:col"
+        if line == 0 && trimmed.starts_with("at ") && trimmed.contains(file) {
+            if let Some(file_idx) = trimmed.find(file) {
+                let after = &trimmed[file_idx + file.len()..];
+                if let Some(rest) = after.strip_prefix(':') {
+                    let line_str: String =
+                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = line_str.parse::<u32>() {
+                        line = n;
+                    }
+                }
+            }
+        }
+    }
+
+    (line, expected, actual, message, kind)
+}
+
 #[derive(Deserialize)]
 struct VitestReport {
     #[serde(rename = "numPassedTests", default)]
