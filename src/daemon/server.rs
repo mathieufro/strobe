@@ -2341,6 +2341,16 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             &uuid::Uuid::new_v4().to_string()[..8]
         );
 
+        // Live log file path: ~/.strobe/runs/<test_run_id>.log
+        let log_path: Option<std::path::PathBuf> = dirs::home_dir().map(|home| {
+            home.join(".strobe")
+                .join("runs")
+                .join(format!("{}.log", test_run_id))
+        });
+        let log_path_str: Option<String> = log_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+
         // Atomic check + insert under a single write lock (fixes TOCTOU race)
         {
             let mut runs = self.test_runs.write().await;
@@ -2371,6 +2381,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     session_id: Some(session_id.clone()),
                     project_root: req.project_root.clone(),
                     connection_id: connection_id.to_string(),
+                    log_path: log_path_str.clone(),
                 },
             );
         }
@@ -2391,6 +2402,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
         let run_id = test_run_id.clone();
         let test_runs = std::sync::Arc::clone(&self.test_runs);
         let req_clone = req.clone();
+        let log_path_clone = log_path.clone();
 
         tokio::spawn(async move {
             let runner = crate::test::TestRunner::new();
@@ -2413,6 +2425,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     &connection_id_owned,
                     &session_id_clone,
                     progress_clone,
+                    log_path_clone.as_deref(),
                 )
                 .await;
 
@@ -2548,6 +2561,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             test_run_id,
             status: "running".to_string(),
             framework: framework_name,
+            log_path: log_path_str,
         };
 
         Ok(serde_json::to_value(response)?)
@@ -2683,6 +2697,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     result: None,
                     error: None,
                     session_id: test_run.session_id.clone(),
+                    log_path: test_run.log_path.clone(),
                 }
             }
             crate::test::TestRunState::Completed { response, .. } => {
@@ -2698,6 +2713,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     result: Some(response.clone()),
                     error: hint,
                     session_id: test_run.session_id.clone(),
+                    log_path: test_run.log_path.clone(),
                 }
             }
             crate::test::TestRunState::Failed { error, .. } => {
@@ -2708,6 +2724,7 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
                     result: None,
                     error: Some(error.clone()),
                     session_id: test_run.session_id.clone(),
+                    log_path: test_run.log_path.clone(),
                 }
             }
         };

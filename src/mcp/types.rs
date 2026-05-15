@@ -653,6 +653,10 @@ pub struct DebugTestStartResponse {
     pub test_run_id: String,
     pub status: String,
     pub framework: String,
+    /// Absolute path to a live log file containing stdout+stderr from the run.
+    /// Tail this file with Read (offset/limit) to watch output between status polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 // ============ debug_test_status ============
@@ -677,6 +681,10 @@ pub struct DebugTestStatusResponse {
     /// Frida session ID — use with debug_trace/debug_stop to instrument or kill the test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Absolute path to the live log file (stdout+stderr). Tail with Read between polls
+    /// to inspect output without waiting for completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -156,6 +156,8 @@ pub struct TestRun {
     pub project_root: String,
     /// Connection that owns this test run (for per-connection isolation).
     pub connection_id: String,
+    /// Path to the live log file (stdout+stderr) for this run.
+    pub log_path: Option<String>,
 }
 
 pub struct TestRunner {
@@ -251,6 +253,7 @@ impl TestRunner {
         _connection_id: &str,
         session_id: &str,
         progress: Arc<Mutex<TestProgress>>,
+        log_path: Option<&Path>,
     ) -> crate::Result<TestRunResult> {
         let adapter = self.detect_adapter(project_root, framework, command)?;
         let framework_name = adapter.name().to_string();
@@ -412,6 +415,21 @@ impl TestRunner {
 
         let detector_handle = tokio::spawn(async move { detector.run().await });
 
+        // Open the live log file (stdout+stderr mirror) once. Truncates any prior file
+        // with the same test_run_id so tails are not contaminated by a previous run.
+        let mut log_file: Option<std::fs::File> = log_path.and_then(|p| {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::File::create(p) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(path = %p.display(), err = %e, "Failed to open live log file");
+                    None
+                }
+            }
+        });
+
         // Progress-aware polling loop — poll DB for stdout events
         let mut last_seen_timestamp_ns: i64 = 0;
         let poll_interval = std::time::Duration::from_millis(500);
@@ -484,6 +502,10 @@ impl TestRunner {
                         }
                         if let Some(text) = &event.text {
                             update_fn(text, &progress);
+                            if let Some(f) = log_file.as_mut() {
+                                use std::io::Write;
+                                let _ = f.write_all(text.as_bytes());
+                            }
                         }
                     }
                 }
@@ -994,6 +1016,7 @@ mod tests {
             session_id: Some("session-xyz".to_string()),
             project_root: "/project".to_string(),
             connection_id: "conn-1".to_string(),
+            log_path: None,
         };
         assert_eq!(run.session_id.as_deref(), Some("session-xyz"));
     }
