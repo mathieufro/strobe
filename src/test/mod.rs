@@ -288,7 +288,7 @@ impl TestRunner {
         let framework_name = adapter.name().to_string();
 
         // Build command — dispatch through trait methods for binary-based adapters
-        let test_cmd = if let Some(cmd) = command {
+        let mut test_cmd = if let Some(cmd) = command {
             if let Some(test_name) = test {
                 adapter.single_test_for_binary(cmd, test_name)?
             } else {
@@ -299,6 +299,28 @@ impl TestRunner {
         } else {
             adapter.suite_command(project_root, level, env)?
         };
+
+        // Snapshot-update flag — set by the daemon when `update_snapshots: true`
+        // is passed to debug_test. Honored by frameworks that have a CLI flag
+        // for refreshing baselines (Playwright: `--update-snapshots=all`,
+        // Vitest: `--update`). Other frameworks ignore the env var. We append
+        // here rather than inside every adapter's single_test_command so the
+        // trait surface stays narrow.
+        if env.get("STROBE_UPDATE_SNAPSHOTS").map(|v| v == "1").unwrap_or(false) {
+            match framework_name.as_str() {
+                "playwright" => {
+                    if !test_cmd.args.iter().any(|a| a.starts_with("--update-snapshots")) {
+                        test_cmd.args.push("--update-snapshots=all".to_string());
+                    }
+                }
+                "vitest" | "jest" => {
+                    if !test_cmd.args.iter().any(|a| a == "--update" || a == "-u") {
+                        test_cmd.args.push("--update".to_string());
+                    }
+                }
+                _ => {} // bun/cargo/etc. — no snapshot-update CLI flag.
+            }
+        }
 
         // Timeout priority: explicit param > settings.json > adapter default
         let settings = crate::config::resolve(Some(project_root));
@@ -343,10 +365,14 @@ impl TestRunner {
             }
         }
 
-        // Use Frida only when the caller wants trace instrumentation. Plain
-        // spawn is the default — it avoids the macOS codesign dance, Gatekeeper
-        // checks, and TTY-shaped FDs that defeat NO_COLOR.
-        let use_frida = !trace_patterns.is_empty();
+        // Use Frida only when the caller wants trace instrumentation OR the
+        // framework relies on the runtime hooks Strobe installs (Playwright
+        // execs `bun → node`; macOS `posix_spawn` doesn't reliably carry the
+        // stdout pipe across that exec, so plain mode captures zero output).
+        // Plain spawn is the default elsewhere — avoids the macOS codesign
+        // dance, Gatekeeper checks, and TTY-shaped FDs that defeat NO_COLOR.
+        let needs_frida_for_runtime = framework_name == "playwright";
+        let use_frida = !trace_patterns.is_empty() || needs_frida_for_runtime;
         // Resolve program to absolute path (Frida's Device.spawn doesn't do
         // PATH lookup). The bun re-entitlement step only matters for Frida.
         let program = if use_frida {

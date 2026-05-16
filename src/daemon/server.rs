@@ -2411,7 +2411,13 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
 
         tokio::spawn(async move {
             let runner = crate::test::TestRunner::new();
-            let env = req_clone.env.unwrap_or_default();
+            let mut env = req_clone.env.unwrap_or_default();
+            // `update_snapshots` flows through env so individual adapters
+            // can opt-in to the right CLI flag (playwright/vitest both have
+            // one; bun/cargo/etc. simply ignore the env var).
+            if req_clone.update_snapshots.unwrap_or(false) {
+                env.insert("STROBE_UPDATE_SNAPSHOTS".to_string(), "1".to_string());
+            }
             let trace_patterns = req_clone.trace_patterns.unwrap_or_default();
             let project_root = std::path::PathBuf::from(&req_clone.project_root);
 

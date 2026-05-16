@@ -604,6 +604,11 @@ pub struct DebugTestRequest {
     /// Hard timeout in minutes (1..=240). Defaults to 30. Capped at 240.
     #[serde(default, deserialize_with = "deserialize_timeout_min")]
     pub timeout_min: Option<u32>,
+    /// Update visual / snapshot baselines instead of asserting against them.
+    /// Honored by Playwright (`--update-snapshots=all`) and Vitest (`--update`).
+    /// Ignored by frameworks that don't have a snapshot-update CLI flag.
+    #[serde(default, alias = "update_snapshots")]
+    pub update_snapshots: Option<bool>,
 }
 
 fn deserialize_timeout_min<'de, D>(de: D) -> std::result::Result<Option<u32>, D::Error>

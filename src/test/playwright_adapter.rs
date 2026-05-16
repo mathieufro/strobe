@@ -357,6 +357,8 @@ impl TestAdapter for PlaywrightAdapter {
         // Invoke Playwright CLI directly via bun (not bunx) to avoid exec-replacement
         // that confuses Frida's process tracking. No --reporter on CLI — playwright.config.ts
         // detects the Strobe reporter file on disk and uses both JUnit + progress reporter.
+        // `--update-snapshots=all` is appended generically by TestRunner::run
+        // when env contains STROBE_UPDATE_SNAPSHOTS=1.
         Ok(TestCommand {
             program: "bun".to_string(),
             args: vec![
