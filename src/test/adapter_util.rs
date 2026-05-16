@@ -2,6 +2,53 @@
 
 use std::path::Path;
 
+/// Strip ANSI escape sequences (CSI / SGR / cursor / OSC) from text.
+///
+/// Used when persisting captured stdout/stderr to a log file. Bun ignores
+/// `NO_COLOR` (oven-sh/bun#21136) and frameworks routinely emit color codes
+/// when spawned through a pty — those codes are pure noise once written to
+/// disk. Stripping in the writer covers every adapter uniformly.
+pub fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    // CSI sequence — read until a final byte in @..~
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC sequence — terminated by BEL (\x07) or ESC \
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{07}' {
+                            break;
+                        }
+                        if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Two-byte escape (e.g. ESC = / ESC > / ESC c) — drop next.
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Sanitize file + test name into a safe artifact directory.
 /// Truncates to ≤208 chars with a hash suffix when too long.
 pub fn artifact_dir(file: &str, name: &str) -> String {

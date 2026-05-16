@@ -980,27 +980,11 @@ pub(crate) fn parse_bun_output(output: &str) -> TestResult {
     }
 }
 
+/// Thin shim — bun_adapter's parser was written before adapter_util existed;
+/// keep the local name so the call sites read naturally, but delegate to
+/// the canonical implementation so there's a single ANSI stripper to audit.
 fn strip_ansi_sequences(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if matches!(chars.peek(), Some('[')) {
-                chars.next();
-                while let Some(next) = chars.next() {
-                    if ('@'..='~').contains(&next) {
-                        break;
-                    }
-                }
-                continue;
-            }
-            continue;
-        }
-        out.push(ch);
-    }
-
-    out
+    super::adapter_util::strip_ansi(input)
 }
 
 enum SummaryKind {

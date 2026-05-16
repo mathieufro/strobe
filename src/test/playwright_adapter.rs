@@ -301,26 +301,10 @@ fn extract_expected_actual(msg: &str) -> (Option<String>, Option<String>) {
     (expected, actual)
 }
 
+/// Delegate to the canonical stripper in adapter_util so there's one
+/// implementation to maintain and test.
 fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{001b}' {
-            // Skip CSI / OSC sequences until a letter terminator.
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    super::adapter_util::strip_ansi(s)
 }
 
 impl TestAdapter for PlaywrightAdapter {

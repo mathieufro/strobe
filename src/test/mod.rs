@@ -12,6 +12,8 @@ mod bun_adapter_tests;
 pub mod event_stream;
 #[cfg(test)]
 mod event_stream_tests;
+pub mod log_router;
+pub mod plain_spawn;
 
 pub mod cargo_adapter;
 pub mod catch2_adapter;
@@ -256,8 +258,15 @@ impl TestRunner {
         }
     }
 
-    /// Run tests inside Frida with DB-based progress polling.
-    /// Always spawns via Frida — the LLM can add trace patterns at any time via debug_trace.
+    /// Run tests with DB-based progress polling.
+    ///
+    /// Two spawn paths share the polling/parse/log pipeline:
+    ///   * **Plain** (`tokio::process::Command`) — used when no `trace_patterns`
+    ///     are supplied. Cheaper: no Frida attach, no macOS code-sign dance,
+    ///     no TTY-shaped FDs (so `NO_COLOR` is honored). Stdout/stderr are
+    ///     piped into the same `events` table Frida writes to.
+    ///   * **Frida** — used when the caller passes trace patterns. Required
+    ///     for `debug_trace` instrumentation; everything else is unchanged.
     pub async fn run(
         &self,
         project_root: &Path,
@@ -334,8 +343,17 @@ impl TestRunner {
             }
         }
 
-        // Resolve program to absolute path (Frida's Device.spawn doesn't do PATH lookup)
-        let program = resolve_program(&test_cmd.program);
+        // Use Frida only when the caller wants trace instrumentation. Plain
+        // spawn is the default — it avoids the macOS codesign dance, Gatekeeper
+        // checks, and TTY-shaped FDs that defeat NO_COLOR.
+        let use_frida = !trace_patterns.is_empty();
+        // Resolve program to absolute path (Frida's Device.spawn doesn't do
+        // PATH lookup). The bun re-entitlement step only matters for Frida.
+        let program = if use_frida {
+            resolve_program(&test_cmd.program)
+        } else {
+            resolve_program_plain(&test_cmd.program)
+        };
 
         // Inherit parent environment, then overlay test-specific and user-provided vars.
         // envp() replaces the environment entirely, so we must include everything.
@@ -343,6 +361,16 @@ impl TestRunner {
         for key in &test_cmd.remove_env {
             combined_env.remove(key);
         }
+        // Default to plain (no-ANSI) output so the captured log stays grep-friendly
+        // and doesn't waste tokens on terminal color escapes. Frameworks honor
+        // either NO_COLOR (universal) or FORCE_COLOR=0 (bun/vitest/playwright).
+        // Caller env wins — set FORCE_COLOR=1 explicitly to opt back in.
+        combined_env
+            .entry("NO_COLOR".to_string())
+            .or_insert_with(|| "1".to_string());
+        combined_env
+            .entry("FORCE_COLOR".to_string())
+            .or_insert_with(|| "0".to_string());
         combined_env.extend(test_cmd.env.clone());
         combined_env.extend(env.clone());
 
@@ -355,27 +383,31 @@ impl TestRunner {
             0,
         )?;
 
-        // Spawn via Frida — defer resume if we need to install hooks first
-        let has_trace_patterns = !trace_patterns.is_empty();
         let spawn_cwd = test_cmd
             .cwd
             .as_deref()
             .unwrap_or(project_root.to_str().unwrap_or("."));
-        let pid = session_manager
-            .spawn_with_frida(
-                session_id,
-                &program,
-                &test_cmd.args,
-                Some(spawn_cwd),
-                project_root.to_str().unwrap_or("."),
-                Some(&combined_env),
-                has_trace_patterns, // defer_resume: install hooks before running
-                None,               // symbols_path: test runner uses automatic resolution
-            )
-            .await?;
 
-        // Apply trace patterns BEFORE resuming the process
-        if has_trace_patterns {
+        // Plain-mode child handle. Kept alive so kill-on-drop fires if the
+        // polling loop exits before the child does. Frida mode owns the
+        // process via session_manager and leaves this `None`.
+        let mut plain_child: Option<tokio::process::Child> = None;
+
+        let pid = if use_frida {
+            let pid = session_manager
+                .spawn_with_frida(
+                    session_id,
+                    &program,
+                    &test_cmd.args,
+                    Some(spawn_cwd),
+                    project_root.to_str().unwrap_or("."),
+                    Some(&combined_env),
+                    true, // defer_resume: install hooks before running
+                    None, // symbols_path: test runner uses automatic resolution
+                )
+                .await?;
+
+            // Apply trace patterns BEFORE resuming the process.
             session_manager.add_patterns(session_id, trace_patterns)?;
             match session_manager
                 .update_frida_patterns(session_id, Some(trace_patterns), None, None)
@@ -388,9 +420,22 @@ impl TestRunner {
                     tracing::warn!("Failed to apply trace patterns for test session: {}", e);
                 }
             }
-            // NOW resume — hooks are installed
             session_manager.resume_process(pid).await?;
-        }
+            pid
+        } else {
+            // No instrumentation requested — skip Frida entirely.
+            let (pid, child) = plain_spawn::spawn_plain(
+                session_manager.db().clone(),
+                session_id,
+                &program,
+                &test_cmd.args,
+                Some(Path::new(spawn_cwd)),
+                &combined_env,
+            )
+            .await?;
+            plain_child = Some(child);
+            pid
+        };
 
         // Select progress updater based on adapter
         let progress_fn: Option<fn(&str, &Arc<Mutex<TestProgress>>)> = match framework_name.as_str()
@@ -437,18 +482,31 @@ impl TestRunner {
 
         // Open the live log file (stdout+stderr mirror) once. Truncates any prior file
         // with the same test_run_id so tails are not contaminated by a previous run.
-        let mut log_file: Option<std::fs::File> = log_path.and_then(|p| {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        // Structured run directory layout. `log_path` (when present) is a
+        // file path INSIDE the run dir (server.rs sets it to summary.md);
+        // its parent is the run dir itself. Layout:
+        //
+        //     <run_dir>/
+        //       summary.md           ← live append; agents tail -f this
+        //       failures.md          ← live append; only failed/stalled rows
+        //       raw.log              ← unfiltered fallback
+        //       tests/<safe-id>/
+        //         stdout.log
+        //         stderr.log
+        let run_dir = match log_path {
+            Some(p) => p
+                .parent()
+                .map(|x| x.to_path_buf())
+                .unwrap_or_else(|| std::env::temp_dir().join(format!("strobe-{}", session_id))),
+            None => std::env::temp_dir().join(format!("strobe-{}", session_id)),
+        };
+        let mut router = match log_router::LogRouter::new(&run_dir, &framework_name) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(path = %run_dir.display(), err = %e, "Failed to open log router");
+                None
             }
-            match std::fs::File::create(p) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    tracing::warn!(path = %p.display(), err = %e, "Failed to open live log file");
-                    None
-                }
-            }
-        });
+        };
 
         // Progress-aware polling loop — poll DB for stdout events
         let mut last_seen_timestamp_ns: i64 = 0;
@@ -469,11 +527,29 @@ impl TestRunner {
         loop {
             let process_alive = stacks::is_process_alive(pid);
 
-            // Try to reap zombie — kill(pid, 0) returns true for zombies but
-            // waitpid detects actual exit. Without this, the loop runs until
-            // hard_timeout for every normal test completion.
+            // Detect process exit. The two spawn paths use different APIs:
+            //   * Frida-spawned children belong to session_manager and get
+            //     reaped via libc::waitpid here.
+            //   * Plain-spawned children are owned by `plain_child`; tokio
+            //     installs a SIGCHLD handler that prevents libc::waitpid from
+            //     seeing the exit, so we must consult try_wait() instead.
             let mut reaped = false;
-            {
+            if let Some(ref mut child) = plain_child {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        // Reconstruct the raw status word libc uses elsewhere.
+                        // ExitStatusExt::into_raw is Unix-only; we already
+                        // require Unix throughout this module.
+                        use std::os::unix::process::ExitStatusExt;
+                        reaped_status = Some(status.into_raw());
+                        reaped = true;
+                    }
+                    Ok(None) => {} // still running
+                    Err(e) => {
+                        tracing::warn!(err = %e, "try_wait on plain child failed");
+                    }
+                }
+            } else {
                 let mut status: i32 = 0;
                 let wp = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
                 if wp > 0 {
@@ -522,9 +598,15 @@ impl TestRunner {
                         }
                         if let Some(text) = &event.text {
                             update_fn(text, &progress);
-                            if let Some(f) = log_file.as_mut() {
-                                use std::io::Write;
-                                let _ = f.write_all(text.as_bytes());
+                            // Strip ANSI once (bun ignores NO_COLOR — oven-sh/bun#21136)
+                            // then route through the LogRouter. It owns every artifact
+                            // in <run_dir>/ (raw.log, summary.md live, per-test dirs).
+                            let cleaned = adapter_util::strip_ansi(text);
+                            if let Some(r) = router.as_mut() {
+                                let _ = match event.event_type {
+                                    crate::db::EventType::Stderr => r.ingest_stderr(&cleaned),
+                                    _ => r.ingest_stdout(&cleaned),
+                                };
                             }
                         }
                     }
@@ -577,6 +659,14 @@ impl TestRunner {
 
         // Abort detector
         detector_handle.abort();
+
+        // Finalize router — drains any partial trailing lines into per-test
+        // dirs, writes summary.md + failures.md indexing the whole run.
+        if let Some(r) = router.as_mut() {
+            if let Err(e) = r.finalize() {
+                tracing::warn!(err = %e, "log router finalize failed");
+            }
+        }
 
         // Playwright: the spawned process exits before tests finish (exec-replacement).
         // Wait for the progress file to stop growing, polling + updating progress as we go.
@@ -745,24 +835,11 @@ impl TestRunner {
     }
 }
 
-/// Resolve a program name to an absolute path via PATH lookup.
-/// Frida's Device.spawn() doesn't do PATH resolution like a shell.
+/// Resolve a program name to an absolute path via PATH lookup, plus any
+/// Frida-specific preparation (macOS bun re-entitlement). Use this when the
+/// spawn will go through Frida.
 fn resolve_program(program: &str) -> String {
-    let resolved = if program.contains('/') {
-        program.to_string()
-    } else if let Ok(path_var) = std::env::var("PATH") {
-        let mut found = None;
-        for dir in path_var.split(':') {
-            let full = format!("{}/{}", dir, program);
-            if Path::new(&full).exists() {
-                found = Some(full);
-                break;
-            }
-        }
-        found.unwrap_or_else(|| program.to_string())
-    } else {
-        program.to_string()
-    };
+    let resolved = resolve_program_plain(program);
 
     #[cfg(target_os = "macos")]
     {
@@ -773,6 +850,24 @@ fn resolve_program(program: &str) -> String {
     {
         resolved
     }
+}
+
+/// PATH lookup only — no codesign / entitlement re-signing. Use this for the
+/// plain (non-Frida) spawn path: a normal child inherits the user's bun,
+/// which doesn't need the `get-task-allow` entitlement.
+fn resolve_program_plain(program: &str) -> String {
+    if program.contains('/') {
+        return program.to_string();
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let full = format!("{}/{}", dir, program);
+            if Path::new(&full).exists() {
+                return full;
+            }
+        }
+    }
+    program.to_string()
 }
 
 #[cfg(target_os = "macos")]

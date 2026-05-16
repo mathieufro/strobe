@@ -2341,11 +2341,16 @@ Do NOT pass `framework` unless auto-detection fails. For C++, provide `command` 
             &uuid::Uuid::new_v4().to_string()[..8]
         );
 
-        // Live log file path: ~/.strobe/runs/<test_run_id>.log
+        // Run directory: ~/.strobe/runs/<test_run_id>/
+        // The `log_path` we hand the test runner points at the LIVE summary
+        // file inside that dir — agents `tail -f` it during a run, then drop
+        // into per-test dirs after a failure. All other artifacts (raw.log,
+        // failures.md, tests/<id>/{stdout,stderr}.log) live alongside.
         let log_path: Option<std::path::PathBuf> = dirs::home_dir().map(|home| {
             home.join(".strobe")
                 .join("runs")
-                .join(format!("{}.log", test_run_id))
+                .join(test_run_id.clone())
+                .join("summary.md")
         });
         let log_path_str: Option<String> = log_path
             .as_ref()
