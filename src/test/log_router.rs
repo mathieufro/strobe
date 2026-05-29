@@ -638,7 +638,17 @@ fn parse_playwright_marker(line: &str) -> Option<(String, Status, Option<u64>)> 
     } else {
         after_index
     };
-    let (name, duration_ms) = split_trailing_paren_duration(after_project);
+    // Drop the leading `› file:line:col ›` segment(s) and keep only the
+    // actual test title. Playwright's list reporter shape is:
+    //   "› file.spec.ts:3:5 › describe > test name (10ms)"
+    // We split on the U+203A separator and keep the LAST piece — that's the
+    // test title (with describe chain still inside it). The file/line are
+    // already redundant with the per-test directory's sanitized path.
+    let after_locator = match after_project.rfind('\u{203A}') {
+        Some(i) => after_project[i + '\u{203A}'.len_utf8()..].trim_start(),
+        None => after_project,
+    };
+    let (name, duration_ms) = split_trailing_paren_duration(after_locator);
     if name.is_empty() {
         return None;
     }
