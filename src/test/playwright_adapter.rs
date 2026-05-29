@@ -21,6 +21,24 @@ fn progress_file_path() -> String {
     PROGRESS_FILE.to_string()
 }
 
+/// Escape a literal test name so Playwright's `--grep` (which compiles its
+/// argument with `new RegExp(...)`) matches it verbatim. Without this, a name
+/// containing regex metacharacters (`[Phase 9] … visuals + app-registry …`)
+/// silently matches zero tests and the run exits clean having done nothing.
+fn escape_grep_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        if matches!(
+            ch,
+            '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 pub struct PlaywrightAdapter;
 
 impl PlaywrightAdapter {
@@ -364,6 +382,10 @@ impl TestAdapter for PlaywrightAdapter {
             args: vec![
                 "node_modules/@playwright/test/cli.js".to_string(),
                 "test".to_string(),
+                // Capture a full browser trace for failures (CLI overrides config).
+                // The custom reporter surfaces the trace.zip path per test so it
+                // lands in <run_dir>/tests/<id>/stderr.log.
+                "--trace=retain-on-failure".to_string(),
             ],
             env,
             cwd,
@@ -389,7 +411,9 @@ impl TestAdapter for PlaywrightAdapter {
                 "node_modules/@playwright/test/cli.js".to_string(),
                 "test".to_string(),
                 "--grep".to_string(),
-                test_name.to_string(),
+                escape_grep_regex(test_name),
+                // Full browser trace for failures (see suite_command).
+                "--trace=retain-on-failure".to_string(),
             ],
             env,
             cwd,
@@ -707,6 +731,26 @@ mod tests {
             .unwrap();
         assert!(cmd.args.contains(&"--grep".to_string()));
         assert!(cmd.args.contains(&"login page".to_string()));
+    }
+
+    #[test]
+    fn test_single_test_command_escapes_regex_metachars() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = PlaywrightAdapter
+            .single_test_command(
+                dir.path(),
+                "[Phase 9] S3b role list/detail visuals + app-registry scopes",
+            )
+            .unwrap();
+        // The grep value must be a regex-escaped literal so it matches the
+        // test title verbatim instead of being parsed as a regex (where `+`
+        // is a quantifier and `[...]` a char class → zero matches).
+        let grep_idx = cmd.args.iter().position(|a| a == "--grep").unwrap();
+        let grep_val = &cmd.args[grep_idx + 1];
+        assert_eq!(
+            grep_val,
+            r"\[Phase 9\] S3b role list/detail visuals \+ app-registry scopes"
+        );
     }
 
     #[test]

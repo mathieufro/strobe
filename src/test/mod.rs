@@ -408,6 +408,22 @@ impl TestRunner {
         combined_env.extend(test_cmd.env.clone());
         combined_env.extend(env.clone());
 
+        // Expose the run directory so framework reporters (e.g. the Playwright
+        // reporter) can write complete per-test artifacts — full stdout/stderr,
+        // error + stack, and copied browser-trace/screenshot/error-context files
+        // — directly into <run_dir>/tests/<id>/, which the live stream's capped
+        // pending buffer cannot carry in full.
+        {
+            let rd = match &log_path {
+                Some(p) => p
+                    .parent()
+                    .map(|x| x.to_path_buf())
+                    .unwrap_or_else(|| std::env::temp_dir().join(format!("strobe-{}", session_id))),
+                None => std::env::temp_dir().join(format!("strobe-{}", session_id)),
+            };
+            combined_env.insert("STROBE_RUN_DIR".to_string(), rd.to_string_lossy().into_owned());
+        }
+
         // Create session BEFORE spawning — writer task needs FK to exist
         // when events arrive (interpreted processes start immediately)
         session_manager.create_session(
