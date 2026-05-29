@@ -365,14 +365,22 @@ impl TestRunner {
             }
         }
 
-        // Use Frida only when the caller wants trace instrumentation OR the
-        // framework relies on the runtime hooks Strobe installs (Playwright
-        // execs `bun → node`; macOS `posix_spawn` doesn't reliably carry the
-        // stdout pipe across that exec, so plain mode captures zero output).
-        // Plain spawn is the default elsewhere — avoids the macOS codesign
-        // dance, Gatekeeper checks, and TTY-shaped FDs that defeat NO_COLOR.
-        let needs_frida_for_runtime = framework_name == "playwright";
-        let use_frida = !trace_patterns.is_empty() || needs_frida_for_runtime;
+        // Use Frida ONLY when the caller explicitly wants trace instrumentation.
+        // Plain spawn is the default for every framework — it avoids the macOS
+        // codesign dance, Gatekeeper checks, and TTY-shaped FDs that defeat
+        // NO_COLOR.
+        //
+        // Playwright must NOT be force-instrumented: it launches a tree of child
+        // processes immediately at startup (esbuild config transpile, globalSetup
+        // servers, per-worker runtimes, browsers). Frida's self-spawn-then-attach
+        // races that fork storm and crashes the runtime before the agent loads
+        // ("Process exited before Frida could attach"). Result/progress capture
+        // does not need Frida anyway — the Playwright adapter ships a file-based
+        // reporter (STROBE_PROGRESS_FILE) that `update_progress`/`parse_output`
+        // read directly, independent of the stdout pipe surviving the bun→node
+        // exec. (Tracing browser E2E tests is a rare, explicit request: passing
+        // trace_patterns opts into Frida, accepting the macOS fork caveat.)
+        let use_frida = !trace_patterns.is_empty();
         // Resolve program to absolute path (Frida's Device.spawn doesn't do
         // PATH lookup). The bun re-entitlement step only matters for Frida.
         let program = if use_frida {
