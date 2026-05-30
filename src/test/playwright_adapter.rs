@@ -548,9 +548,11 @@ impl TestAdapter for PlaywrightAdapter {
     }
 
     fn default_timeout(&self, _level: Option<TestLevel>) -> u64 {
-        600_000 // 10 minutes — browser startup, fixtures, network calls.
-                // Large E2E suites (100+ tests) can easily exceed 5 minutes.
-                // Override via .strobe/settings.json "test.timeoutMs" or debug_test timeout param.
+        900_000 // 15 minutes — browser startup, per-worker server provisioning,
+                // visual snapshots, real LLM/Meili. A full ~236-test suite is ~10 min
+                // and under CPU contention can exceed 600s; a too-low ceiling kills a
+                // PASSING run into a partial result. Override via .strobe/settings.json
+                // "test.timeoutMs" or the debug_test timeout param.
     }
 }
 
