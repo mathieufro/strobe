@@ -536,11 +536,19 @@ impl TestAdapter for BunAdapter {
     }
 
     fn default_timeout(&self, level: Option<TestLevel>) -> u64 {
+        // These are CEILINGS, not expected durations. Critically, when a repo has
+        // no .strobe level→suite wiring, `bun test` runs the WHOLE surface in one
+        // process (e.g. ~535 files / ~9 min for a large monorepo) regardless of
+        // `level`. The old ceilings (60s unit / 120s none) silently killed such
+        // runs mid-flight via kill_process_tree, leaving bun's junit.xml partial
+        // → "0 pass, N fail" — a completed-looking report that is actually a
+        // truncation. Generous ceilings prevent that; scoped runs finish well
+        // under them, so the higher values cost nothing on small runs.
         match level {
-            Some(TestLevel::Unit) => 60_000,
-            Some(TestLevel::Integration) => 180_000,
-            Some(TestLevel::E2e) => 300_000,
-            None => 120_000,
+            Some(TestLevel::Unit) => 300_000,
+            Some(TestLevel::Integration) => 420_000,
+            Some(TestLevel::E2e) => 900_000,
+            None => 900_000,
         }
     }
 

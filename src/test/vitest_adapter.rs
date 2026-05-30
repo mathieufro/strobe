@@ -491,11 +491,15 @@ impl TestAdapter for VitestAdapter {
     }
 
     fn default_timeout(&self, level: Option<TestLevel>) -> u64 {
+        // Ceilings, not expected durations. A no-level run executes the whole
+        // vitest surface in one process; the old 180s `None` ceiling could kill
+        // a large web-unit suite mid-flight and report a truncated partial as if
+        // complete. Generous ceilings; small/scoped runs finish well under them.
         match level {
-            Some(TestLevel::Unit) => 120_000,
-            Some(TestLevel::Integration) => 300_000,
+            Some(TestLevel::Unit) => 300_000,
+            Some(TestLevel::Integration) => 420_000,
             Some(TestLevel::E2e) => 600_000,
-            None => 180_000,
+            None => 600_000,
         }
     }
 }
