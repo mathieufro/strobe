@@ -1,89 +1,85 @@
 # Strobe
 
-LLM-native debugging infrastructure. Launch programs, trace functions at runtime, observe execution — no recompilation needed.
+Runtime debugging for LLM agents. Launch a program, trace its functions, set breakpoints, read memory and query what actually executed, all over MCP and without recompiling.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/mathieufro/strobe/main/install.sh | bash
 ```
 
-## What It Does
+## Why
 
-Strobe gives LLMs (and humans) runtime visibility into compiled programs through an MCP interface. Instead of print-debugging or reading code to guess what's happening, Strobe instruments live processes and lets you observe actual execution.
+An agent that cannot see a program run has to guess from the source. It reads more files, adds print statements, re-runs the same test and reports the same result. Strobe gives it eyes: it instruments the live process with Frida and exposes the execution timeline through MCP tools, so the agent can find the wrong code path, the unregistered handler or the compile-time guard that no amount of reading reveals.
 
 ```
-Claude Code ──MCP──> strobe daemon ──Frida──> your program
-                         │
-                    SQLite timeline
+Claude Code --MCP--> strobe daemon --Frida--> your program
+                          |
+                     SQLite timeline
               (function calls, stdout, crashes)
 ```
 
-**Core workflow:**
-1. Launch a program — stdout/stderr captured automatically
-2. Read output first — crashes and errors are often enough
-3. Add targeted traces on the live process if needed
-4. Query the execution timeline to understand what happened
-5. Set breakpoints, read memory, watch variables — all without restarting
+The workflow it enables:
 
-## Features
+1. Launch the program. stdout and stderr are captured.
+2. Read the output first. A crash or an assertion is often enough.
+3. If not, add targeted traces on the live process.
+4. Query the timeline to see what ran, with what arguments, returning what.
+5. Set breakpoints, step, read memory, watch variables. No restart needed.
 
-### MCP Tools
+## Tools
 
 | Tool | What it does |
-|------|-------------|
-| `debug_launch` | Spawn process with Frida attached, capture stdout/stderr |
-| `debug_session` | Get status, stop, list retained, or delete sessions |
-| `debug_trace` | Add/remove function trace patterns and variable watches at runtime |
-| `debug_query` | Search the execution timeline (functions, output, crashes) |
-| `debug_breakpoint` | Set breakpoints and logpoints with conditions |
-| `debug_continue` | Resume execution, step over/into/out |
-| `debug_memory` | Read/write process memory, poll variables over time |
-| `debug_test` | Run tests inside Frida (Cargo, Catch2), structured results |
-| `debug_ui` | Query accessibility tree + AI vision for UI element detection |
-| `debug_ui_action` | Interact with UI elements (click, type, set value, key, scroll, drag) |
+|---|---|
+| `debug_launch` | Spawn a process with Frida attached, capture stdout and stderr |
+| `debug_session` | Status, stop, list retained sessions, delete |
+| `debug_trace` | Add or remove function trace patterns and variable watches at runtime |
+| `debug_query` | Search the execution timeline: functions, output, crashes |
+| `debug_breakpoint` | Breakpoints and logpoints, with conditions |
+| `debug_continue` | Resume, step over, step into, step out |
+| `debug_memory` | Read and write process memory, poll variables over time |
+| `debug_test` | Run tests inside Frida (Cargo, Catch2, pytest) with structured results |
+| `debug_ui` | Accessibility tree plus AI vision for UI element detection |
+| `debug_ui_action` | Click, type, set a value, press a key, scroll, drag |
 
-### Trace Patterns
+### Trace patterns
 
 ```
-foo::bar       exact function
-foo::*         direct children of foo
-foo::**        all descendants
-*::validate    named function, one level deep
-@file:auth.cpp functions from a source file
+foo::bar        exact function
+foo::*          direct children of foo
+foo::**         all descendants
+*::validate     a named function, one level deep
+@file:auth.cpp  every function from a source file
 ```
 
-### Variable Watches
+### Variable watches
 
-Watch globals during specific function execution:
+Watch globals while specific functions run:
+
 ```json
 { "variable": "gTempo", "on": ["audio::process"] }
 { "address": "0x1234", "type": "f64", "label": "tempo" }
 { "expr": "ptr(0x5678).readU32()", "label": "custom" }
 ```
 
-### Test Runner
+### Test runner
 
-Runs tests inside Frida — add traces mid-test without restarting. Smart stuck detection catches deadlocks in ~8 seconds.
+Tests run inside Frida, so traces can be added mid-test without restarting. Stuck detection catches a deadlock in about eight seconds.
 
 ```
-debug_test({ projectRoot: "." })           // run all tests
-debug_test({ projectRoot: ".", test: "auth" })  // run matching test
+debug_test({ projectRoot: "." })                 // everything
+debug_test({ projectRoot: ".", test: "auth" })   // matching tests
 ```
 
-Supports **Cargo** (Rust), **Catch2** (C++), and **pytest/unittest** (Python).
+Supports Cargo (Rust), Catch2 (C++), pytest and unittest (Python).
 
-### UI Observation (macOS)
+### UI observation (macOS)
 
-Combines native accessibility tree with AI-powered vision (OmniParser v2.0) to detect UI elements:
+The native accessibility tree merged with AI vision (OmniParser v2.0), so custom-drawn widgets get bounding boxes, labels and confidence scores next to the native ones.
 
 ```
 debug_ui({ sessionId, mode: "both", vision: true })
 ```
 
-Returns merged tree: AX nodes for native widgets + vision-detected custom elements with bounding boxes, labels, and confidence scores.
-
-### Active Debugging
-
-Set breakpoints with conditions, step through code, read/write memory:
+### Active debugging
 
 ```
 debug_breakpoint({ sessionId, add: [{ function: "parse", condition: "args[0] > 100" }] })
@@ -91,57 +87,37 @@ debug_continue({ sessionId, action: "step-over" })
 debug_memory({ sessionId, targets: [{ variable: "gCounter" }] })
 ```
 
-## Installation
+## Install
 
-### Prerequisites
+Prerequisites: macOS arm64 or x86_64 (Linux: tracing works, UI observation is macOS only), a Rust toolchain ([rustup.rs](https://rustup.rs)), Node.js 18 or later for the Frida agent.
 
-- **macOS** arm64 or x86_64 (Linux: core tracing works, UI observation is macOS-only)
-- **Rust** toolchain ([rustup.rs](https://rustup.rs))
-- **Node.js** 18+ (for building the Frida agent)
-
-### Quick Install
+Quick install clones the repo, builds from source, installs to `~/.strobe/` and configures MCP for Claude Code:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mathieufro/strobe/main/install.sh | bash
 ```
 
-This clones the repo, builds from source, installs to `~/.strobe/`, and configures MCP for Claude Code.
-
-### Manual Install
+Manual install:
 
 ```bash
 git clone https://github.com/mathieufro/strobe.git
 cd strobe
-
-# Build agent (TypeScript, must be first)
-cd agent && npm install && npm run build && cd ..
-
-# Build daemon (Rust)
-cargo build --release
-
-# Configure MCP
-./target/release/strobe install
+cd agent && npm install && npm run build && cd ..   # Frida agent first
+cargo build --release                               # daemon
+./target/release/strobe install                     # MCP configuration
 ```
 
-> **Linux note:** If the Rust build fails with `fatal error: 'time.h' file not found` from bindgen,
-> set the system include paths explicitly:
-> ```bash
-> BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include -I/usr/include/$(uname -m)-linux-gnu" cargo build --release
-> ```
-
-### Vision Setup (Optional)
-
-AI vision requires Python 3.10-3.12, PyTorch, and OmniParser v2.0 models (~3.5 GB total):
+On Linux, if bindgen fails with `fatal error: 'time.h' file not found`, pass the include paths explicitly:
 
 ```bash
-strobe setup-vision
+BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include -I/usr/include/$(uname -m)-linux-gnu" cargo build --release
 ```
 
-This creates a Python venv at `~/.strobe/vision-env/`, installs ML dependencies, and downloads the fine-tuned YOLO + Florence-2 models.
+Optional AI vision needs Python 3.10 to 3.12, PyTorch and the OmniParser v2.0 models (about 3.5 GB). `strobe setup-vision` creates the venv at `~/.strobe/vision-env/` and downloads the YOLO and Florence-2 models.
 
 ## Configuration
 
-Settings in `~/.strobe/settings.json` (all optional):
+`~/.strobe/settings.json`, all keys optional, with `.strobe/settings.json` in a project taking precedence:
 
 ```json
 {
@@ -152,67 +128,65 @@ Settings in `~/.strobe/settings.json` (all optional):
 }
 ```
 
-Project-level overrides in `.strobe/settings.json` take precedence.
-
 ## Architecture
 
 ```
-MCP Client ──stdio──> strobe mcp (proxy) ──unix socket──> strobe daemon
-                                                              │
-                                              ┌───────────────┼───────────────┐
-                                              │               │               │
+MCP client --stdio--> strobe mcp (proxy) --unix socket--> strobe daemon
+                                                              |
+                                              +---------------+---------------+
+                                              |               |               |
                                         SessionManager    FridaWorker     SQLite DB
                                         (DWARF cache,     (spawn, attach,  (events,
                                          hook state)       agent inject)   sessions)
-                                              │
-                                        ┌─────┴─────┐
-                                        │           │
+                                              |
+                                        +-----+-----+
+                                        |           |
                                     TestRunner  VisionSidecar
                                     (Cargo,     (Python,
                                      Catch2)     OmniParser)
 ```
 
-- **Daemon**: Long-running process on `~/.strobe/strobe.sock`. One per user, auto-starts on first MCP call, shuts down after 30 min idle.
-- **Frida Agent**: TypeScript injected into target process. CModule tracer for 10-50x faster native hooks.
-- **DWARF Parser**: Parallel compilation unit parsing via rayon. Identifies user code, resolves variables.
-- **Event Store**: SQLite WAL mode. 200k event FIFO buffer per session (configurable up to 10M).
+- **Daemon.** One per user on `~/.strobe/strobe.sock`, started on the first MCP call, stopped after 30 minutes idle.
+- **Frida agent.** TypeScript injected into the target. A CModule tracer makes native hooks 10 to 50 times faster than JavaScript hooks.
+- **DWARF parser.** Compilation units parsed in parallel with rayon. Tells user code from library code and resolves variables.
+- **Event store.** SQLite in WAL mode, a 200k-event FIFO per session, configurable up to 10M.
 
-## Language Support
-
-| Language | Tracing | Tests | Debug Symbols |
-|----------|---------|-------|---------------|
-| C | Yes | Catch2 | DWARF |
-| C++ | Yes | Catch2 | DWARF + demangling |
-| Rust | Yes | Cargo | DWARF + demangling |
-| Swift | Yes | — | DWARF |
-| Python | Yes (CPython 3.11+) | pytest, unittest | Source-level (sys.settrace) |
-
-## Performance
+| Language | Tracing | Tests | Symbols |
+|---|---|---|---|
+| C | yes | Catch2 | DWARF |
+| C++ | yes | Catch2 | DWARF, demangled |
+| Rust | yes | Cargo | DWARF, demangled |
+| Swift | yes | | DWARF |
+| Python | yes (CPython 3.11+) | pytest, unittest | source level (`sys.settrace`) |
 
 | Operation | Time |
-|-----------|------|
-| DWARF parse (100k functions) | 0.27s |
-| Process spawn + attach | ~1s |
-| Function trace overhead | ~1-5 us/call (CModule) |
-| Event query (200k events) | <10ms |
-| UI observation (AX only) | <50ms |
-| UI observation (AX + vision) | ~2s |
+|---|---|
+| DWARF parse, 100k functions | 0.27 s |
+| Spawn and attach | about 1 s |
+| Trace overhead per call | 1 to 5 us (CModule) |
+| Query over 200k events | under 10 ms |
+| UI observation, accessibility only | under 50 ms |
+| UI observation with vision | about 2 s |
 
-## Project Structure
+## Layout
 
 ```
 src/
-  daemon/         Server, session management, tool dispatch
-  frida_collector/ Frida FFI, process spawn/attach, agent injection
-  dwarf/          DWARF symbol parsing (gimli + rayon)
-  mcp/            JSON-RPC protocol, stdio proxy
-  db/             SQLite schema, event storage
-  test/           Test runner, adapters, stuck detection
-  ui/             Accessibility, screenshot capture, vision merge
-agent/            TypeScript Frida agent (CModule tracer)
-vision-sidecar/   Python OmniParser v2.0 wrapper
-skills/           Claude Code debugging skill
+  daemon/            server, session management, tool dispatch
+  frida_collector/   Frida FFI, spawn and attach, agent injection
+  dwarf/             DWARF parsing (gimli + rayon)
+  mcp/               JSON-RPC protocol, stdio proxy
+  db/                SQLite schema, event storage
+  test/              test runner, adapters, stuck detection
+  ui/                accessibility, screenshots, vision merge
+agent/               TypeScript Frida agent (CModule tracer)
+vision-sidecar/      Python OmniParser v2.0 wrapper
+skills/              Claude Code debugging skills
 ```
+
+## Related
+
+- [atelier](https://github.com/mathieufro/atelier) and [atelier-cc](https://github.com/mathieufro/atelier-cc): autonomous coding pipelines whose implement and e2e stages run on Strobe.
 
 ## License
 
